@@ -1,0 +1,26 @@
+[matrix]
+homeserver = "https://matrix.example.com"
+access_token = "syt_..."
+user_id = "@bot:example.com"
+device_id = "DEVICEID"
+room_id = "!roomid:example.com"
+# Messages from users not in this list are silently ignored.
+# Leave empty ([]) to allow all users.
+allowed_users = ["@you:example.com"]
+# E2EE recovery key — obtain from Element → Settings → Security → Secure Backup
+recovery_key = "EsT... "
+# Where to store matrix-sdk state / crypto DB (default: ~/.local/share/sapphire-agent/matrix)
+# state_dir = "~/.local/share/sapphire-agent/matrix"
+
+# Directory containing AGENT.md and MEMORY.md.
+# Defaults to the same directory as this config file.
+# workspace_dir = "~/.config/sapphire-agent"
+
+[anthropic]
+api_key = "sk-ant-..."
+# Model to use. Defaults to claude-opus-4-6.
+model = "claude-opus-4-6"
+# Maximum tokens in the response. Defaults to 8192.
+max_tokens = 8192
+# System prompt sent at the beginning of every conversation.
+system_prompt = "You are a helpful personal assistant."

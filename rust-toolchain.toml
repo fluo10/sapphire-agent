@@ -1,0 +1,6 @@
+# Rust 1.94 has a compiler bug (rust-lang/rust#152942) that causes
+# "queries overflow the depth limit" when compiling matrix-sdk 0.16.
+# Pinned to 1.93.1 until the bug is fixed upstream.
+# Track: https://github.com/matrix-org/matrix-rust-sdk/issues/6254
+[toolchain]
+channel = "1.93.1"
