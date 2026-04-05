@@ -1,10 +1,12 @@
 use crate::config::AnthropicConfig;
-use crate::provider::{ChatMessage, ChatResponse, Provider, Role};
+use crate::provider::{ChatMessage, ChatResponse, ContentPart, Provider, Role, ToolCall, ToolSpec};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use tracing::debug;
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -28,7 +30,9 @@ impl AnthropicProvider {
     }
 }
 
-// ---------- Request types ----------
+// ---------------------------------------------------------------------------
+// Request types
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
 struct Request<'a> {
@@ -36,17 +40,54 @@ struct Request<'a> {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<&'a str>,
-    messages: Vec<ApiMessage<'a>>,
+    messages: Vec<ApiMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ApiToolSpec<'a>>>,
 }
 
 #[derive(Debug, Serialize)]
-struct ApiMessage<'a> {
-    role: &'a str,
-    content: &'a str,
+struct ApiToolSpec<'a> {
+    name: &'a str,
+    description: &'a str,
+    input_schema: &'a Value,
 }
 
-// ---------- Response types ----------
+#[derive(Debug, Serialize)]
+struct ApiMessage {
+    role: String,
+    content: ApiContent,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ApiContent {
+    /// Simple string (user/assistant text only — wire-format shorthand).
+    Text(String),
+    /// Array of typed content blocks (required for tool use/results).
+    Parts(Vec<ApiPart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ApiPart {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// SSE response types
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -55,10 +96,7 @@ enum SseEvent {
     #[serde(rename = "message_start")]
     MessageStart { message: MessageStartData },
     #[serde(rename = "content_block_start")]
-    ContentBlockStart {
-        index: usize,
-        content_block: ContentBlock,
-    },
+    ContentBlockStart { index: usize, content_block: ContentBlockMeta },
     #[serde(rename = "content_block_delta")]
     ContentBlockDelta { index: usize, delta: Delta },
     #[serde(rename = "content_block_stop")]
@@ -79,10 +117,12 @@ struct MessageStartData {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct ContentBlock {
+struct ContentBlockMeta {
     #[serde(rename = "type")]
     kind: String,
+    /// Present for `tool_use` blocks.
+    id: Option<String>,
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,7 +145,55 @@ struct ApiError {
     message: String,
 }
 
-// ---------- Provider implementation ----------
+// ---------------------------------------------------------------------------
+// Block accumulator (for streaming)
+// ---------------------------------------------------------------------------
+
+enum Block {
+    Text { text: String },
+    ToolUse { id: String, name: String, input_json: String },
+}
+
+// ---------------------------------------------------------------------------
+// Conversion helpers
+// ---------------------------------------------------------------------------
+
+fn chat_message_to_api(msg: &ChatMessage) -> ApiMessage {
+    let role = match msg.role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    };
+
+    // If there's exactly one Text part and no other parts, use the wire shorthand.
+    if msg.parts.len() == 1 {
+        if let ContentPart::Text(text) = &msg.parts[0] {
+            return ApiMessage { role: role.to_string(), content: ApiContent::Text(text.clone()) };
+        }
+    }
+
+    let parts: Vec<ApiPart> = msg
+        .parts
+        .iter()
+        .map(|p| match p {
+            ContentPart::Text(t) => ApiPart::Text { text: t.clone() },
+            ContentPart::ToolUse { id, name, input } => ApiPart::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            },
+            ContentPart::ToolResult { tool_use_id, content } => ApiPart::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+            },
+        })
+        .collect();
+
+    ApiMessage { role: role.to_string(), content: ApiContent::Parts(parts) }
+}
+
+// ---------------------------------------------------------------------------
+// Provider implementation
+// ---------------------------------------------------------------------------
 
 #[async_trait]
 impl Provider for AnthropicProvider {
@@ -117,17 +205,21 @@ impl Provider for AnthropicProvider {
         &self,
         system: Option<&str>,
         messages: &[ChatMessage],
+        tools: Option<&[ToolSpec]>,
     ) -> Result<ChatResponse> {
-        let api_messages: Vec<ApiMessage<'_>> = messages
-            .iter()
-            .map(|m| ApiMessage {
-                role: match m.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                },
-                content: &m.content,
-            })
-            .collect();
+        let api_messages: Vec<ApiMessage> =
+            messages.iter().map(chat_message_to_api).collect();
+
+        let api_tools: Option<Vec<ApiToolSpec<'_>>> = tools.map(|specs| {
+            specs
+                .iter()
+                .map(|s| ApiToolSpec {
+                    name: s.name,
+                    description: s.description,
+                    input_schema: &s.input_schema,
+                })
+                .collect()
+        });
 
         let body = Request {
             model: &self.model,
@@ -135,6 +227,7 @@ impl Provider for AnthropicProvider {
             system,
             messages: api_messages,
             stream: true,
+            tools: api_tools,
         };
 
         debug!("Sending request to Anthropic API (model={})", self.model);
@@ -156,45 +249,96 @@ impl Provider for AnthropicProvider {
             bail!("Anthropic API error {status}: {body}");
         }
 
-        // Parse SSE stream
+        // Parse SSE stream, tracking content blocks by index.
         let mut stream = response.bytes_stream();
-        let mut accumulated = String::new();
         let mut buffer = String::new();
+        // BTreeMap preserves insertion order by index.
+        let mut blocks: BTreeMap<usize, Block> = BTreeMap::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("Error reading SSE stream")?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-            // SSE events are separated by double newlines
             while let Some(pos) = buffer.find("\n\n") {
                 let event_str = buffer[..pos].to_string();
                 buffer.drain(..pos + 2);
 
                 for line in event_str.lines() {
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        if data == "[DONE]" {
-                            break;
+                    let Some(data) = line.strip_prefix("data: ") else { continue };
+                    if data == "[DONE]" {
+                        break;
+                    }
+                    match serde_json::from_str::<SseEvent>(data) {
+                        Ok(SseEvent::ContentBlockStart { index, content_block }) => {
+                            match content_block.kind.as_str() {
+                                "text" => {
+                                    blocks.insert(index, Block::Text { text: String::new() });
+                                }
+                                "tool_use" => {
+                                    blocks.insert(
+                                        index,
+                                        Block::ToolUse {
+                                            id: content_block.id.unwrap_or_default(),
+                                            name: content_block.name.unwrap_or_default(),
+                                            input_json: String::new(),
+                                        },
+                                    );
+                                }
+                                _ => {}
+                            }
                         }
-                        match serde_json::from_str::<SseEvent>(data) {
-                            Ok(SseEvent::ContentBlockDelta {
-                                delta: Delta::Text { text },
-                                ..
-                            }) => {
-                                accumulated.push_str(&text);
+                        Ok(SseEvent::ContentBlockDelta { index, delta }) => {
+                            match delta {
+                                Delta::Text { text } => {
+                                    if let Some(Block::Text { text: acc }) =
+                                        blocks.get_mut(&index)
+                                    {
+                                        acc.push_str(&text);
+                                    }
+                                }
+                                Delta::InputJson { partial_json } => {
+                                    if let Some(Block::ToolUse { input_json, .. }) =
+                                        blocks.get_mut(&index)
+                                    {
+                                        input_json.push_str(&partial_json);
+                                    }
+                                }
                             }
-                            Ok(SseEvent::Error { error }) => {
-                                bail!("Anthropic stream error: {}", error.message);
-                            }
-                            Ok(_) => {} // other events ignored
-                            Err(e) => {
-                                debug!("Failed to parse SSE event: {e} | data: {data}");
-                            }
+                        }
+                        Ok(SseEvent::Error { error }) => {
+                            bail!("Anthropic stream error: {}", error.message);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            debug!("Failed to parse SSE event: {e} | data: {data}");
                         }
                     }
                 }
             }
         }
 
-        Ok(ChatResponse { text: accumulated })
+        // Assemble final response from accumulated blocks.
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+
+        for block in blocks.into_values() {
+            match block {
+                Block::Text { text } if !text.is_empty() => {
+                    text_parts.push(text);
+                }
+                Block::ToolUse { id, name, input_json } => {
+                    let input = if input_json.is_empty() {
+                        json!({})
+                    } else {
+                        serde_json::from_str(&input_json).unwrap_or(json!({}))
+                    };
+                    tool_calls.push(ToolCall { id, name, input });
+                }
+                _ => {}
+            }
+        }
+
+        let text = if text_parts.is_empty() { None } else { Some(text_parts.join("")) };
+        Ok(ChatResponse { text, tool_calls })
     }
 }

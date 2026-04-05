@@ -3177,8 +3177,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-retrieve"
-version = "0.1.1"
-source = "git+https://github.com/fluo10/sapphire-journal?rev=266e6b0#266e6b052d2cc34568dfc6fff02763ab453185a6"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20f0d97c29051f7bf03aa4aca980238bfc7806126e5d248caed9dfc5828e504e"
 dependencies = [
  "serde",
  "serde_json",
@@ -3189,8 +3190,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-sync"
-version = "0.1.0"
-source = "git+https://github.com/fluo10/sapphire-journal?rev=266e6b0#266e6b052d2cc34568dfc6fff02763ab453185a6"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0aa0d48fe71f49908878829f930534998fda159fcbc91839d5e1d00f09d9fb0"
 dependencies = [
  "git2",
  "thiserror 2.0.18",
@@ -3198,8 +3200,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-workspace"
-version = "0.1.0"
-source = "git+https://github.com/fluo10/sapphire-journal?rev=266e6b0#266e6b052d2cc34568dfc6fff02763ab453185a6"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5646e3c29051603eb679aee40eb3faea76fe04788bd2285ee167f895eeb6900"
 dependencies = [
  "indexmap",
  "sapphire-retrieve",
@@ -4348,7 +4351,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

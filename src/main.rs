@@ -2,6 +2,7 @@ mod agent;
 mod channel;
 mod config;
 mod provider;
+mod tools;
 mod workspace;
 
 use agent::Agent;
@@ -10,8 +11,9 @@ use channel::matrix::MatrixChannel;
 use clap::{Parser, Subcommand};
 use config::Config;
 use provider::anthropic::AnthropicProvider;
+use sapphire_workspace::{Workspace as SwWorkspace, WorkspaceState};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing_subscriber::{EnvFilter, fmt};
 use workspace::Workspace;
 
@@ -43,9 +45,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-
     let config_path = cli.config.unwrap_or_else(Config::default_path);
-
     let config = Config::load(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
@@ -60,7 +60,6 @@ async fn main() -> Result<()> {
             println!("  Anthropic max_tok : {}", config.anthropic.max_tokens);
             println!("  Workspace dir     : {}", workspace_dir.display());
             println!();
-            // Show status of each workspace file (openclaw-compatible set)
             let workspace_files = [
                 ("AGENTS.md / AGENT.md", vec!["AGENTS.md", "AGENT.md"]),
                 ("SOUL.md",              vec!["SOUL.md"]),
@@ -72,12 +71,10 @@ async fn main() -> Result<()> {
                 ("MEMORY.md",            vec!["MEMORY.md", "memory.md"]),
             ];
             for (label, candidates) in &workspace_files {
-                let found = candidates
-                    .iter()
-                    .find_map(|f| {
-                        let p = workspace_dir.join(f);
-                        if p.exists() { Some(*f) } else { None }
-                    });
+                let found = candidates.iter().find_map(|f| {
+                    let p = workspace_dir.join(f);
+                    if p.exists() { Some(*f) } else { None }
+                });
                 match found {
                     Some(f) => println!("  {label:<28} found ({f})"),
                     None    => println!("  {label:<28} -"),
@@ -86,10 +83,36 @@ async fn main() -> Result<()> {
         }
         Command::Run => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
-            let workspace = Arc::new(Workspace::new(workspace_dir));
+
+            // ── Bootstrap file loader (AGENTS.md, SOUL.md, MEMORY.md …) ────
+            let workspace = Arc::new(Workspace::new(workspace_dir.clone()));
+
+            // ── sapphire-workspace (search, file ops, git sync) ─────────────
+            // `Workspace::resolve` opens the dir without requiring a marker.
+            let sw_workspace = SwWorkspace::resolve(Some(&workspace_dir))
+                .context("Failed to resolve sapphire-workspace")?;
+            let ws_state = WorkspaceState::open(sw_workspace)
+                .context("Failed to open WorkspaceState")?;
+            // Initial index sync (catches any files already in the dir)
+            if let Err(e) = ws_state.sync() {
+                tracing::warn!("Initial workspace sync failed: {e}");
+            }
+            let ws_state = Arc::new(Mutex::new(ws_state));
+
+            // ── Tools ───────────────────────────────────────────────────────
+            let tool_set = Arc::new(tools::default_tool_set(Arc::clone(&ws_state)));
+
+            // ── Channel + Provider ──────────────────────────────────────────
             let channel = Arc::new(MatrixChannel::new(&config.matrix));
             let provider = Arc::new(AnthropicProvider::new(&config.anthropic));
-            let agent = Arc::new(Agent::new(config, channel, provider, workspace));
+
+            let agent = Arc::new(Agent::new(
+                config,
+                channel,
+                provider,
+                workspace,
+                Some(tool_set),
+            ));
             agent.run().await?;
         }
     }

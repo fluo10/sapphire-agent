@@ -1,13 +1,16 @@
 use crate::channel::{Channel, OutgoingMessage};
 use crate::config::Config;
 use crate::provider::{ChatMessage, Provider};
+use crate::tools::ToolSet;
 use crate::workspace::Workspace;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-/// Conversation history keyed by (room_id, thread_id_or_none).
+/// Maximum number of tool-call rounds per message to prevent infinite loops.
+const MAX_TOOL_ROUNDS: usize = 10;
+
 type ConversationKey = (String, Option<String>);
 
 pub struct Agent {
@@ -15,7 +18,7 @@ pub struct Agent {
     channel: Arc<dyn Channel>,
     provider: Arc<dyn Provider>,
     workspace: Arc<Workspace>,
-    /// In-memory conversation history per room/thread.
+    tools: Option<Arc<ToolSet>>,
     history: tokio::sync::Mutex<HashMap<ConversationKey, Vec<ChatMessage>>>,
 }
 
@@ -25,12 +28,14 @@ impl Agent {
         channel: Arc<dyn Channel>,
         provider: Arc<dyn Provider>,
         workspace: Arc<Workspace>,
+        tools: Option<Arc<ToolSet>>,
     ) -> Self {
         Self {
             config,
             channel,
             provider,
             workspace,
+            tools,
             history: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -87,58 +92,141 @@ impl Agent {
 
         let key: ConversationKey = (incoming.room_id.clone(), incoming.thread_id.clone());
 
-        // Build system prompt fresh on each message so edits to AGENT.md /
-        // MEMORY.md take effect immediately (files are mtime-cached).
+        // Build system prompt (mtime-cached; includes AGENTS.md, SOUL.md, MEMORY.md …)
         let system_prompt = self
             .workspace
             .build_system_prompt(self.config.anthropic.system_prompt.as_deref())
             .await;
-        let system = if system_prompt.is_empty() {
-            None
-        } else {
-            Some(system_prompt)
-        };
+        let system = if system_prompt.is_empty() { None } else { Some(system_prompt) };
 
         // Append user message to history
         {
             let mut history = self.history.lock().await;
-            let conv = history.entry(key.clone()).or_default();
-            conv.push(ChatMessage::user(&incoming.content));
+            history
+                .entry(key.clone())
+                .or_default()
+                .push(ChatMessage::user(&incoming.content));
         }
 
         let _ = self.channel.start_typing(&incoming.room_id).await;
 
-        let messages = {
-            let history = self.history.lock().await;
-            history.get(&key).cloned().unwrap_or_default()
-        };
+        let tool_specs = self.tools.as_ref().map(|t| t.specs().to_vec());
 
-        let response = self.provider.chat(system.as_deref(), &messages).await;
+        // Tool-calling loop
+        let final_text = loop {
+            let messages = {
+                let history = self.history.lock().await;
+                history.get(&key).cloned().unwrap_or_default()
+            };
+
+            let round = messages
+                .iter()
+                .filter(|m| {
+                    m.parts
+                        .iter()
+                        .any(|p| matches!(p, crate::provider::ContentPart::ToolUse { .. }))
+                })
+                .count();
+
+            if round >= MAX_TOOL_ROUNDS {
+                warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS}), stopping");
+                break None;
+            }
+
+            let response = self
+                .provider
+                .chat(
+                    system.as_deref(),
+                    &messages,
+                    tool_specs.as_deref(),
+                )
+                .await;
+
+            match response {
+                Err(e) => {
+                    error!("Provider error: {e:#}");
+                    let _ = self.channel.stop_typing(&incoming.room_id).await;
+                    let out = OutgoingMessage::new(
+                        format!("⚠️ Error: {e}"),
+                        incoming.room_id.clone(),
+                    );
+                    let _ = self.channel.send(&out).await;
+                    return Ok(());
+                }
+                Ok(resp) if !resp.has_tool_calls() => {
+                    // No more tool calls — done.
+                    let text = resp.text.unwrap_or_default();
+                    // Store assistant response in history
+                    {
+                        let mut history = self.history.lock().await;
+                        history
+                            .entry(key.clone())
+                            .or_default()
+                            .push(ChatMessage::assistant(&text));
+                    }
+                    break Some(text);
+                }
+                Ok(resp) => {
+                    // Execute tool calls
+                    let tool_calls = resp.tool_calls.clone();
+
+                    // Store assistant message with tool calls in history
+                    {
+                        let mut history = self.history.lock().await;
+                        history
+                            .entry(key.clone())
+                            .or_default()
+                            .push(ChatMessage::assistant_with_tools(
+                                resp.text.clone(),
+                                tool_calls.clone(),
+                            ));
+                    }
+
+                    // Execute each tool (blocking, in a spawn_blocking to avoid
+                    // blocking the async runtime — workspace ops use std I/O).
+                    let tools = Arc::clone(self.tools.as_ref().unwrap());
+                    let results: Vec<(String, String)> = {
+                        let calls = tool_calls.clone();
+                        tokio::task::spawn_blocking(move || {
+                            calls
+                                .iter()
+                                .map(|c| {
+                                    info!("Executing tool: {} (id={})", c.name, c.id);
+                                    let result = tools.execute(c);
+                                    info!("Tool {} result: {}", c.name, result);
+                                    (c.id.clone(), result)
+                                })
+                                .collect()
+                        })
+                        .await
+                        .unwrap_or_default()
+                    };
+
+                    // Append tool results to history
+                    {
+                        let mut history = self.history.lock().await;
+                        history
+                            .entry(key.clone())
+                            .or_default()
+                            .push(ChatMessage::tool_results(results));
+                    }
+                }
+            }
+        };
 
         let _ = self.channel.stop_typing(&incoming.room_id).await;
 
-        match response {
-            Ok(resp) => {
-                {
-                    let mut history = self.history.lock().await;
-                    let conv = history.entry(key).or_default();
-                    conv.push(ChatMessage::assistant(&resp.text));
-                }
-
-                let outgoing = OutgoingMessage {
-                    content: resp.text,
+        if let Some(text) = final_text {
+            if !text.is_empty() {
+                let out = OutgoingMessage {
+                    content: text,
                     room_id: incoming.room_id,
                     thread_id: incoming.thread_id,
                 };
                 self.channel
-                    .send(&outgoing)
+                    .send(&out)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to send response: {e:#}"))?;
-            }
-            Err(e) => {
-                error!("Provider error: {e:#}");
-                let outgoing = OutgoingMessage::new(format!("⚠️ Error: {e}"), incoming.room_id);
-                let _ = self.channel.send(&outgoing).await;
             }
         }
 

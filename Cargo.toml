@@ -69,4 +69,4 @@ shellexpand = "3.1"
 
 # Workspace: file indexing, FTS, vector search, git sync
 # lancedb/fastembed are heavy optional features — disabled by default here
-sapphire-workspace = { git = "https://github.com/fluo10/sapphire-journal", rev = "266e6b0", package = "sapphire-workspace", default-features = false, features = ["git-sync"] }
+sapphire-workspace = { version = "0.2.0", default-features = false, features = ["git-sync"] }
