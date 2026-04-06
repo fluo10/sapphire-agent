@@ -19,11 +19,12 @@ tokio = { version = "1.50", default-features = false, features = [
     "signal",
 ] }
 
-# HTTP client (Anthropic API)
+# HTTP client (Anthropic API + tool HTTP calls)
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
     "stream",
+    "blocking",
 ] }
 
 # Matrix client + E2EE
@@ -66,6 +67,12 @@ directories = "6.0"
 
 # Shell path expansion (~/)
 shellexpand = "3.1"
+
+# Date/time with serde support (human-readable ISO 8601 timestamps)
+chrono = { version = "0.4", features = ["serde"] }
+
+# Time-ordered unique IDs for session files
+uuid = { version = "1", features = ["v7"] }
 
 # Workspace: file indexing, FTS, vector search, git sync
 # lancedb/fastembed are heavy optional features — disabled by default here

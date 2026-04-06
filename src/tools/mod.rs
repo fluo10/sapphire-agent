@@ -1,3 +1,4 @@
+pub mod builtin_tools;
 pub mod workspace_tools;
 
 use crate::provider::{ToolCall, ToolSpec};
@@ -45,16 +46,31 @@ impl ToolSet {
 
 
 /// Build the default tool set backed by a sapphire-workspace WorkspaceState.
+///
+/// `tavily_api_key`: if provided, the `web_search` tool is included.
 pub fn default_tool_set(
     state: Arc<Mutex<sapphire_workspace::WorkspaceState>>,
+    tavily_api_key: Option<String>,
 ) -> ToolSet {
+    use builtin_tools::*;
     use workspace_tools::*;
-    ToolSet::new(vec![
+
+    let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(MemoryAppendTool::new(Arc::clone(&state))),
         Box::new(MemoryWriteTool::new(Arc::clone(&state))),
         Box::new(WorkspaceReadTool::new(Arc::clone(&state))),
         Box::new(WorkspaceWriteTool::new(Arc::clone(&state))),
         Box::new(WorkspaceSearchTool::new(Arc::clone(&state))),
         Box::new(WorkspaceSyncTool::new(Arc::clone(&state))),
-    ])
+        Box::new(ReadFileTool::new()),
+        Box::new(WriteFileTool::new(Arc::clone(&state))),
+        Box::new(DeleteFileTool::new(Arc::clone(&state))),
+        Box::new(TerminalTool::new()),
+    ];
+
+    if let Some(key) = tavily_api_key {
+        tools.push(Box::new(WebSearchTool::new(key)));
+    }
+
+    ToolSet::new(tools)
 }

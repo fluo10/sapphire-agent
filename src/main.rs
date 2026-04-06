@@ -2,6 +2,7 @@ mod agent;
 mod channel;
 mod config;
 mod provider;
+mod session;
 mod tools;
 mod workspace;
 
@@ -12,6 +13,7 @@ use clap::{Parser, Subcommand};
 use config::Config;
 use provider::anthropic::AnthropicProvider;
 use sapphire_workspace::{Workspace as SwWorkspace, WorkspaceState};
+use session::SessionStore;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -100,7 +102,14 @@ async fn main() -> Result<()> {
             let ws_state = Arc::new(Mutex::new(ws_state));
 
             // ── Tools ───────────────────────────────────────────────────────
-            let tool_set = Arc::new(tools::default_tool_set(Arc::clone(&ws_state)));
+            let tool_set = Arc::new(tools::default_tool_set(
+                Arc::clone(&ws_state),
+                config.tools.tavily_api_key.clone(),
+            ));
+
+            // ── Session store ───────────────────────────────────────────────
+            let sessions_dir = config.resolved_sessions_dir(&workspace_dir);
+            let session_store = SessionStore::new(sessions_dir);
 
             // ── Channel + Provider ──────────────────────────────────────────
             let channel = Arc::new(MatrixChannel::new(&config.matrix));
@@ -112,6 +121,7 @@ async fn main() -> Result<()> {
                 provider,
                 workspace,
                 Some(tool_set),
+                session_store,
             ));
             agent.run().await?;
         }

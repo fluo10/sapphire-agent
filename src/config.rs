@@ -6,9 +6,22 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub matrix: MatrixConfig,
     pub anthropic: AnthropicConfig,
+    /// Tool configuration (search APIs, etc.).
+    #[serde(default)]
+    pub tools: ToolsConfig,
     /// Directory containing AGENT.md and MEMORY.md.
     /// Defaults to the config file's parent directory.
     pub workspace_dir: Option<String>,
+    /// Directory for persisted JSONL sessions.
+    /// Defaults to `~/.local/share/sapphire-agent/sessions`.
+    pub sessions_dir: Option<String>,
+}
+
+/// Configuration for built-in tools.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ToolsConfig {
+    /// Tavily API key for `web_search`. If absent the tool is not registered.
+    pub tavily_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -75,6 +88,17 @@ impl Config {
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf()
+        }
+    }
+
+    /// Resolve the sessions directory for JSONL persistence.
+    ///
+    /// Explicit config value > `<workspace_dir>/sessions` (default).
+    pub fn resolved_sessions_dir(&self, workspace_dir: &Path) -> PathBuf {
+        if let Some(dir) = &self.sessions_dir {
+            PathBuf::from(shellexpand::tilde(dir).as_ref())
+        } else {
+            workspace_dir.join("sessions")
         }
     }
 

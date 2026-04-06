@@ -1,7 +1,7 @@
 use crate::provider::ToolSpec;
 use crate::tools::Tool;
 use anyhow::{Context, Result};
-use sapphire_workspace::WorkspaceState;
+use sapphire_workspace::{RetrieveDb, WorkspaceState};
 use serde_json::json;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -207,7 +207,7 @@ impl Tool for WorkspaceWriteTool {
 // workspace_search
 // ---------------------------------------------------------------------------
 
-/// Full-text search across workspace files.
+/// Full-text and semantic search across workspace files.
 pub struct WorkspaceSearchTool {
     state: Arc<Mutex<WorkspaceState>>,
     spec: ToolSpec,
@@ -219,7 +219,10 @@ impl WorkspaceSearchTool {
             state,
             spec: ToolSpec {
                 name: "workspace_search",
-                description: "Full-text search across all indexed files in the workspace. \
+                description: "Search across all indexed files in the workspace. \
+                    Two modes are available: \
+                    'fts' (full-text / BM25, always available) and \
+                    'semantic' (vector similarity, requires an embedder to be configured — falls back to fts if unavailable). \
                     Returns matching file titles and paths.",
                 input_schema: json!({
                     "type": "object",
@@ -227,6 +230,12 @@ impl WorkspaceSearchTool {
                         "query": {
                             "type": "string",
                             "description": "Search query."
+                        },
+                        "mode": {
+                            "type": "string",
+                            "description": "Search mode: 'fts' (full-text, default) or 'semantic' (vector similarity).",
+                            "enum": ["fts", "semantic"],
+                            "default": "fts"
                         },
                         "limit": {
                             "type": "integer",
@@ -242,12 +251,45 @@ impl WorkspaceSearchTool {
 }
 
 impl Tool for WorkspaceSearchTool {
-    fn spec(&self) -> &ToolSpec { &self.spec }
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
 
     fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let query = input["query"].as_str().context("missing 'query'")?;
         let limit = input["limit"].as_u64().unwrap_or(10) as usize;
+        let mode = input["mode"].as_str().unwrap_or("fts");
+
         let state = lock(&self.state);
+
+        if mode == "semantic" {
+            if let Some(embedder) = state.embedder() {
+                let vecs = embedder
+                    .embed_texts(&[query])
+                    .context("Failed to embed query")?;
+                let query_vec: Vec<f32> = vecs
+                    .into_iter()
+                    .next()
+                    .context("Embedder returned no vectors")?;
+                let chunk_results = state
+                    .retrieve_db()
+                    .search_similar(&query_vec, limit * 3)
+                    .context("Vector similarity search failed")?;
+                let results = RetrieveDb::dedup_chunk_results(chunk_results, limit);
+
+                if results.is_empty() {
+                    return Ok("No results found.".to_string());
+                }
+                let lines: Vec<String> = results
+                    .iter()
+                    .map(|r| format!("- {} ({}) [score: {:.4}]", r.title, r.path, r.score))
+                    .collect();
+                return Ok(format!("[semantic]\n{}", lines.join("\n")));
+            }
+            // Embedder not configured — fall through to FTS with a notice
+        }
+
+        // FTS (default or fallback)
         let results = state
             .retrieve_db()
             .search_fts(query, limit)
@@ -257,11 +299,16 @@ impl Tool for WorkspaceSearchTool {
             return Ok("No results found.".to_string());
         }
 
+        let header = if mode == "semantic" {
+            "[fts — semantic fallback: no embedder configured]\n"
+        } else {
+            "[fts]\n"
+        };
         let lines: Vec<String> = results
             .iter()
             .map(|r| format!("- {} ({})", r.title, r.path))
             .collect();
-        Ok(lines.join("\n"))
+        Ok(format!("{}{}", header, lines.join("\n")))
     }
 }
 

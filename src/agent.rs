@@ -1,17 +1,16 @@
 use crate::channel::{Channel, OutgoingMessage};
 use crate::config::Config;
 use crate::provider::{ChatMessage, Provider};
+use crate::session::{ConversationKey, SessionStore};
 use crate::tools::ToolSet;
 use crate::workspace::Workspace;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
 /// Maximum number of tool-call rounds per message to prevent infinite loops.
 const MAX_TOOL_ROUNDS: usize = 10;
-
-type ConversationKey = (String, Option<String>);
 
 pub struct Agent {
     config: Config,
@@ -19,7 +18,11 @@ pub struct Agent {
     provider: Arc<dyn Provider>,
     workspace: Arc<Workspace>,
     tools: Option<Arc<ToolSet>>,
-    history: tokio::sync::Mutex<HashMap<ConversationKey, Vec<ChatMessage>>>,
+    session_store: Arc<SessionStore>,
+    /// In-memory conversation history, keyed by (room_id, thread_id).
+    history: Mutex<HashMap<ConversationKey, Vec<ChatMessage>>>,
+    /// Maps each ConversationKey to its current active session file (ULID string).
+    active_sessions: Mutex<HashMap<ConversationKey, String>>,
 }
 
 impl Agent {
@@ -29,14 +32,22 @@ impl Agent {
         provider: Arc<dyn Provider>,
         workspace: Arc<Workspace>,
         tools: Option<Arc<ToolSet>>,
+        session_store: SessionStore,
     ) -> Self {
+        let (history, active_sessions) = session_store.load_all();
+        info!(
+            "Loaded {} session(s) from disk",
+            active_sessions.len()
+        );
         Self {
             config,
             channel,
             provider,
             workspace,
             tools,
-            history: tokio::sync::Mutex::new(HashMap::new()),
+            session_store: Arc::new(session_store),
+            history: Mutex::new(history),
+            active_sessions: Mutex::new(active_sessions),
         }
     }
 
@@ -84,6 +95,36 @@ impl Agent {
         Ok(())
     }
 
+    /// Return the active session_id for `key`, creating a new session file if needed.
+    async fn get_or_create_session(&self, key: &ConversationKey) -> String {
+        let mut sessions = self.active_sessions.lock().await;
+        if let Some(id) = sessions.get(key) {
+            return id.clone();
+        }
+        let channel_name = self.channel.name().to_string();
+        match self.session_store.create_session(key, &channel_name) {
+            Ok(id) => {
+                sessions.insert(key.clone(), id.clone());
+                id
+            }
+            Err(e) => {
+                warn!("Failed to create session file: {e}");
+                // Return a sentinel so callers can still run without persistence
+                String::new()
+            }
+        }
+    }
+
+    /// Persist `msg` to the session store for `key`. No-op if session creation failed.
+    fn persist(&self, session_id: &str, msg: &ChatMessage) {
+        if session_id.is_empty() {
+            return;
+        }
+        if let Err(e) = self.session_store.append(session_id, msg) {
+            warn!("Failed to persist message: {e}");
+        }
+    }
+
     async fn handle_message(
         &self,
         incoming: crate::channel::IncomingMessage,
@@ -91,6 +132,7 @@ impl Agent {
         info!("Message from {}: {}", incoming.sender, incoming.content);
 
         let key: ConversationKey = (incoming.room_id.clone(), incoming.thread_id.clone());
+        let session_id = self.get_or_create_session(&key).await;
 
         // Build system prompt (mtime-cached; includes AGENTS.md, SOUL.md, MEMORY.md …)
         let system_prompt = self
@@ -99,13 +141,11 @@ impl Agent {
             .await;
         let system = if system_prompt.is_empty() { None } else { Some(system_prompt) };
 
-        // Append user message to history
+        // Append user message to history and session store
         {
-            let mut history = self.history.lock().await;
-            history
-                .entry(key.clone())
-                .or_default()
-                .push(ChatMessage::user(&incoming.content));
+            let msg = ChatMessage::user(&incoming.content);
+            self.history.lock().await.entry(key.clone()).or_default().push(msg.clone());
+            self.persist(&session_id, &msg);
         }
 
         let _ = self.channel.start_typing(&incoming.room_id).await;
@@ -115,8 +155,7 @@ impl Agent {
         // Tool-calling loop
         let final_text = loop {
             let messages = {
-                let history = self.history.lock().await;
-                history.get(&key).cloned().unwrap_or_default()
+                self.history.lock().await.get(&key).cloned().unwrap_or_default()
             };
 
             let round = messages
@@ -135,11 +174,7 @@ impl Agent {
 
             let response = self
                 .provider
-                .chat(
-                    system.as_deref(),
-                    &messages,
-                    tool_specs.as_deref(),
-                )
+                .chat(system.as_deref(), &messages, tool_specs.as_deref())
                 .await;
 
             match response {
@@ -154,36 +189,20 @@ impl Agent {
                     return Ok(());
                 }
                 Ok(resp) if !resp.has_tool_calls() => {
-                    // No more tool calls — done.
                     let text = resp.text.unwrap_or_default();
-                    // Store assistant response in history
-                    {
-                        let mut history = self.history.lock().await;
-                        history
-                            .entry(key.clone())
-                            .or_default()
-                            .push(ChatMessage::assistant(&text));
-                    }
+                    let msg = ChatMessage::assistant(&text);
+                    self.history.lock().await.entry(key.clone()).or_default().push(msg.clone());
+                    self.persist(&session_id, &msg);
                     break Some(text);
                 }
                 Ok(resp) => {
-                    // Execute tool calls
                     let tool_calls = resp.tool_calls.clone();
 
-                    // Store assistant message with tool calls in history
-                    {
-                        let mut history = self.history.lock().await;
-                        history
-                            .entry(key.clone())
-                            .or_default()
-                            .push(ChatMessage::assistant_with_tools(
-                                resp.text.clone(),
-                                tool_calls.clone(),
-                            ));
-                    }
+                    let msg = ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
+                    self.history.lock().await.entry(key.clone()).or_default().push(msg.clone());
+                    self.persist(&session_id, &msg);
 
-                    // Execute each tool (blocking, in a spawn_blocking to avoid
-                    // blocking the async runtime — workspace ops use std I/O).
+                    // Execute each tool (spawn_blocking — workspace ops use std I/O)
                     let tools = Arc::clone(self.tools.as_ref().unwrap());
                     let results: Vec<(String, String)> = {
                         let calls = tool_calls.clone();
@@ -202,14 +221,9 @@ impl Agent {
                         .unwrap_or_default()
                     };
 
-                    // Append tool results to history
-                    {
-                        let mut history = self.history.lock().await;
-                        history
-                            .entry(key.clone())
-                            .or_default()
-                            .push(ChatMessage::tool_results(results));
-                    }
+                    let msg = ChatMessage::tool_results(results);
+                    self.history.lock().await.entry(key.clone()).or_default().push(msg.clone());
+                    self.persist(&session_id, &msg);
                 }
             }
         };
