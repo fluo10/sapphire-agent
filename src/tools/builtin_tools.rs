@@ -309,16 +309,19 @@ impl Tool for DeleteFileTool {
 // ---------------------------------------------------------------------------
 
 pub struct TerminalTool {
+    workspace_root: PathBuf,
     spec: ToolSpec,
 }
 
 impl TerminalTool {
-    pub fn new() -> Self {
+    pub fn new(workspace_root: PathBuf) -> Self {
         Self {
+            workspace_root,
             spec: ToolSpec {
                 name: "terminal",
                 description: "Execute a shell command and return its output. \
                     Returns stdout, stderr, and exit code. \
+                    The default working directory is the workspace root. \
                     Use the timeout parameter for long-running commands (default 60 s, max 600 s). \
                     Not suitable for interactive commands or persistent daemons.",
                 input_schema: json!({
@@ -337,7 +340,7 @@ impl TerminalTool {
                         },
                         "workdir": {
                             "type": "string",
-                            "description": "Working directory (absolute or ~/... path). Defaults to the user's HOME."
+                            "description": "Working directory (absolute or ~/... path). Defaults to the workspace root."
                         }
                     },
                     "required": ["command"]
@@ -355,17 +358,17 @@ impl Tool for TerminalTool {
     fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let command = input["command"].as_str().context("missing 'command'")?;
         let timeout_secs = input["timeout"].as_u64().unwrap_or(60).min(600);
-        let workdir = input["workdir"].as_str().map(expand_path);
+        let workdir = input["workdir"]
+            .as_str()
+            .map(expand_path)
+            .unwrap_or_else(|| self.workspace_root.clone());
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg(command)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        if let Some(wd) = &workdir {
-            cmd.current_dir(wd);
-        }
+            .stderr(Stdio::piped())
+            .current_dir(&workdir);
 
         let child = cmd.spawn().context("Failed to spawn command")?;
         let pid = child.id();

@@ -55,6 +55,13 @@ pub fn default_tool_set(
     use builtin_tools::*;
     use workspace_tools::*;
 
+    let workspace_root = state
+        .lock()
+        .expect("WorkspaceState mutex poisoned")
+        .workspace
+        .root
+        .clone();
+
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(MemoryAppendTool::new(Arc::clone(&state))),
         Box::new(MemoryWriteTool::new(Arc::clone(&state))),
@@ -65,7 +72,7 @@ pub fn default_tool_set(
         Box::new(ReadFileTool::new()),
         Box::new(WriteFileTool::new(Arc::clone(&state))),
         Box::new(DeleteFileTool::new(Arc::clone(&state))),
-        Box::new(TerminalTool::new()),
+        Box::new(TerminalTool::new(workspace_root)),
     ];
 
     if let Some(key) = tavily_api_key {
