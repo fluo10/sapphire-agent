@@ -4,7 +4,12 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
-    pub matrix: MatrixConfig,
+    /// Matrix channel configuration. Required if `discord` is not set.
+    #[serde(default)]
+    pub matrix: Option<MatrixConfig>,
+    /// Discord channel configuration. Required if `matrix` is not set.
+    #[serde(default)]
+    pub discord: Option<DiscordConfig>,
     pub anthropic: AnthropicConfig,
     /// Tool configuration (search APIs, etc.).
     #[serde(default)]
@@ -57,10 +62,25 @@ impl MatrixConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiscordConfig {
+    pub bot_token: String,
+    /// Text channel IDs the bot listens to. Empty = all channels the bot can see.
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
+    /// Discord user IDs allowed to interact. Empty = all users.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicConfig {
     pub api_key: String,
     #[serde(default = "default_model")]
     pub model: String,
+    /// Cheaper model for casual (non-coding) conversations.
+    /// If set, the agent uses this model by default and switches to `model`
+    /// when the message appears to be coding-related.
+    pub light_model: Option<String>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     pub system_prompt: Option<String>,

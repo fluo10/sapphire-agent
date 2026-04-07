@@ -77,3 +77,12 @@ uuid = { version = "1", features = ["v7"] }
 # Workspace: file indexing, FTS, vector search, git sync
 # lancedb/fastembed are heavy optional features — disabled by default here
 sapphire-workspace = { version = "0.2.0", default-features = false, features = ["git-sync"] }
+
+# Discord bot (gateway + HTTP, rustls TLS)
+# Requires MESSAGE_CONTENT privileged intent enabled in Discord Developer Portal
+serenity = { version = "0.12", default-features = false, features = [
+    "client",
+    "gateway",
+    "model",
+    "rustls_backend",
+] }

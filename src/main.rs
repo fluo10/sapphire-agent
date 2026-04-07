@@ -10,6 +10,7 @@ mod workspace;
 
 use agent::Agent;
 use anyhow::{Context, Result};
+use channel::discord::DiscordChannel;
 use channel::matrix::MatrixChannel;
 use clap::{Parser, Subcommand};
 use config::Config;
@@ -24,7 +25,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use workspace::Workspace;
 
 #[derive(Parser)]
-#[command(name = "sapphire-agent", about = "Personal AI assistant — Matrix + Anthropic")]
+#[command(name = "sapphire-agent", about = "Personal AI assistant — Anthropic + Matrix/Discord")]
 struct Cli {
     /// Path to config file (default: ~/.config/sapphire-agent/config.toml)
     #[arg(short, long, value_name = "FILE")]
@@ -59,9 +60,18 @@ async fn main() -> Result<()> {
         Command::Verify => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
             println!("Config OK");
-            println!("  Matrix homeserver : {}", config.matrix.homeserver);
-            println!("  Matrix user_id    : {}", config.matrix.user_id);
-            println!("  Matrix room_id    : {}", config.matrix.room_id);
+            if let Some(m) = &config.matrix {
+                println!("  Channel           : matrix");
+                println!("  Matrix homeserver : {}", m.homeserver);
+                println!("  Matrix user_id    : {}", m.user_id);
+                println!("  Matrix room_id    : {}", m.room_id);
+            } else if let Some(d) = &config.discord {
+                println!("  Channel           : discord");
+                println!("  Discord channels  : {:?}", d.channel_ids);
+                println!("  Allowed users     : {:?}", d.allowed_users);
+            } else {
+                println!("  Channel           : NONE (add [discord] or [matrix] to config)");
+            }
             println!("  Anthropic model   : {}", config.anthropic.model);
             println!("  Anthropic max_tok : {}", config.anthropic.max_tokens);
             println!("  Workspace dir     : {}", workspace_dir.display());
@@ -115,7 +125,15 @@ async fn main() -> Result<()> {
             let session_store = Arc::new(SessionStore::new(sessions_dir));
 
             // ── Channel + Provider ──────────────────────────────────────────
-            let channel = Arc::new(MatrixChannel::new(&config.matrix));
+            let channel: Arc<dyn channel::Channel> = if let Some(d) = &config.discord {
+                Arc::new(DiscordChannel::new(d).context("Failed to initialise Discord channel")?)
+            } else if let Some(m) = &config.matrix {
+                Arc::new(MatrixChannel::new(m))
+            } else {
+                anyhow::bail!(
+                    "No channel configured. Add [discord] or [matrix] to config.toml"
+                );
+            };
             let provider: Arc<dyn provider::Provider> =
                 Arc::new(AnthropicProvider::new(&config.anthropic));
 

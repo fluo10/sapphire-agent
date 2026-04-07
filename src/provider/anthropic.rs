@@ -15,6 +15,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub struct AnthropicProvider {
     api_key: String,
     model: String,
+    light_model: Option<String>,
     max_tokens: u32,
     client: Client,
 }
@@ -24,10 +25,43 @@ impl AnthropicProvider {
         Self {
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
+            light_model: cfg.light_model.clone(),
             max_tokens: cfg.max_tokens,
             client: Client::new(),
         }
     }
+
+    /// Choose model based on message content.
+    /// Uses `light_model` for casual chat, `model` for coding-related requests.
+    fn select_model(&self, messages: &[ChatMessage]) -> &str {
+        let Some(light) = &self.light_model else {
+            return &self.model;
+        };
+        let last_user_text = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .and_then(|m| m.text())
+            .unwrap_or_default();
+        if is_coding_related(&last_user_text) { &self.model } else { light }
+    }
+}
+
+/// Heuristic: return true if the text looks like a coding/technical request.
+fn is_coding_related(text: &str) -> bool {
+    if text.contains("```") {
+        return true;
+    }
+    let lower = text.to_lowercase();
+    let keywords = [
+        "code", "implement", "function", "method", "class", "struct",
+        "enum", "trait", "bug", "error", "debug", "fix", "compile",
+        "refactor", "test", "algorithm", "api", "library", "crate",
+        "cargo", "npm", "syntax", "variable", "type", "rust", "python",
+        "javascript", "typescript", "java", "go ", " sql", "bash",
+        "script", "コード", "実装", "関数", "バグ", "エラー", "デバッグ",
+    ];
+    keywords.iter().any(|kw| lower.contains(kw))
 }
 
 // ---------------------------------------------------------------------------
@@ -221,8 +255,10 @@ impl Provider for AnthropicProvider {
                 .collect()
         });
 
+        let model = self.select_model(messages);
+
         let body = Request {
-            model: &self.model,
+            model,
             max_tokens: self.max_tokens,
             system,
             messages: api_messages,
@@ -230,7 +266,7 @@ impl Provider for AnthropicProvider {
             tools: api_tools,
         };
 
-        debug!("Sending request to Anthropic API (model={})", self.model);
+        debug!("Sending request to Anthropic API (model={model})");
 
         let response = self
             .client

@@ -1,3 +1,4 @@
+pub mod discord;
 pub mod matrix;
 
 use async_trait::async_trait;
