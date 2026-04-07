@@ -1,9 +1,10 @@
 use crate::provider::ToolSpec;
 use crate::tools::Tool;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use sapphire_workspace::{RetrieveDb, WorkspaceState};
 use serde_json::json;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -15,95 +16,148 @@ fn lock(state: &Mutex<WorkspaceState>) -> std::sync::MutexGuard<'_, WorkspaceSta
 }
 
 // ---------------------------------------------------------------------------
-// memory_append
+// memory
 // ---------------------------------------------------------------------------
 
-/// Append text to MEMORY.md (creates it if it doesn't exist).
-pub struct MemoryAppendTool {
-    state: Arc<Mutex<WorkspaceState>>,
-    spec: ToolSpec,
-}
+const ENTRY_SEP: &str = "\n\n---\n\n";
 
-impl MemoryAppendTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
-        Self {
-            state,
-            spec: ToolSpec {
-                name: "memory_append",
-                description: "Append text to MEMORY.md in the workspace. \
-                    Use this to persist important information across conversations.",
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": "The text to append to MEMORY.md (Markdown is fine)."
-                        }
-                    },
-                    "required": ["text"]
-                }),
-            },
+/// Validate and resolve a workspace-relative path, rejecting traversal.
+fn resolve_workspace_path(workspace_root: &Path, rel: &str) -> Result<PathBuf> {
+    let rel_path = Path::new(rel);
+    for component in rel_path.components() {
+        if component == Component::ParentDir {
+            anyhow::bail!("Path traversal not allowed: {}", rel);
         }
     }
+    Ok(workspace_root.join(rel_path))
 }
 
-impl Tool for MemoryAppendTool {
-    fn spec(&self) -> &ToolSpec { &self.spec }
-
-    fn execute(&self, input: &serde_json::Value) -> Result<String> {
-        let text = input["text"].as_str().context("missing 'text'")?;
-        let state = lock(&self.state);
-        let content = format!("\n{text}\n");
-        state
-            .append_file(Path::new("MEMORY.md"), &content)
-            .context("Failed to append to MEMORY.md")?;
-        Ok("Appended to MEMORY.md".to_string())
+/// Split file content into entries (separator: `\n\n---\n\n`).
+fn split_entries(content: &str) -> Vec<&str> {
+    if content.trim().is_empty() {
+        vec![]
+    } else {
+        content.split(ENTRY_SEP).collect()
     }
 }
 
-// ---------------------------------------------------------------------------
-// memory_write
-// ---------------------------------------------------------------------------
+/// Join entries back into file content.
+fn join_entries(entries: &[&str]) -> String {
+    entries.join(ENTRY_SEP)
+}
 
-/// Overwrite MEMORY.md with new content.
-pub struct MemoryWriteTool {
-    state: Arc<Mutex<WorkspaceState>>,
+/// Entry-based persistent memory management for workspace markdown files.
+pub struct MemoryTool {
+    workspace_root: PathBuf,
     spec: ToolSpec,
 }
 
-impl MemoryWriteTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+impl MemoryTool {
+    pub fn new(workspace_root: PathBuf) -> Self {
         Self {
-            state,
+            workspace_root,
             spec: ToolSpec {
-                name: "memory_write",
-                description: "Overwrite MEMORY.md with new content. \
-                    Use this to reorganize or rewrite the entire long-term memory file.",
+                name: "memory",
+                description: "Add, replace, or remove an entry in a workspace markdown file. \
+                    Files are entry-based, separated by horizontal rules (---). \
+                    Use MEMORY.md for agent notes, USER.md for user profile, \
+                    memory/daily/YYYY-MM-DD.md for daily logs. \
+                    Parent directories are created automatically.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["add", "replace", "remove"],
+                            "description": "Operation to perform."
+                        },
+                        "target": {
+                            "type": "string",
+                            "description": "Workspace-relative file path, e.g. \"MEMORY.md\" or \"memory/daily/2026-04-07.md\"."
+                        },
                         "content": {
                             "type": "string",
-                            "description": "The new content for MEMORY.md."
+                            "description": "Entry content (required for add and replace)."
+                        },
+                        "old_text": {
+                            "type": "string",
+                            "description": "Substring that uniquely identifies the entry to replace or remove (required for replace and remove)."
                         }
                     },
-                    "required": ["content"]
+                    "required": ["action", "target"]
                 }),
             },
         }
     }
 }
 
-impl Tool for MemoryWriteTool {
-    fn spec(&self) -> &ToolSpec { &self.spec }
+#[async_trait]
+impl Tool for MemoryTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
 
-    fn execute(&self, input: &serde_json::Value) -> Result<String> {
-        let content = input["content"].as_str().context("missing 'content'")?;
-        let state = lock(&self.state);
-        state
-            .write_file(Path::new("MEMORY.md"), content)
-            .context("Failed to write MEMORY.md")?;
-        Ok("MEMORY.md updated".to_string())
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let action = input["action"].as_str().context("missing 'action'")?;
+        let target = input["target"].as_str().context("missing 'target'")?;
+
+        let abs_path = resolve_workspace_path(&self.workspace_root, target)?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = abs_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directories for {target}"))?;
+        }
+
+        match action {
+            "add" => {
+                let content = input["content"].as_str().context("missing 'content' for add")?;
+                let existing = std::fs::read_to_string(&abs_path).unwrap_or_default();
+                let new_content = if existing.trim().is_empty() {
+                    content.to_string()
+                } else {
+                    format!("{}{}{}", existing.trim_end(), ENTRY_SEP, content)
+                };
+                std::fs::write(&abs_path, &new_content)
+                    .with_context(|| format!("Failed to write {target}"))?;
+                Ok(format!("Added entry to {target}"))
+            }
+
+            "replace" => {
+                let content = input["content"].as_str().context("missing 'content' for replace")?;
+                let old_text = input["old_text"].as_str().context("missing 'old_text' for replace")?;
+                let existing = std::fs::read_to_string(&abs_path)
+                    .with_context(|| format!("Failed to read {target}"))?;
+                let entries: Vec<&str> = split_entries(&existing);
+                let idx = entries
+                    .iter()
+                    .position(|e| e.contains(old_text))
+                    .with_context(|| format!("No entry containing {:?} found in {target}", old_text))?;
+                let mut new_entries = entries.clone();
+                new_entries[idx] = content;
+                std::fs::write(&abs_path, join_entries(&new_entries))
+                    .with_context(|| format!("Failed to write {target}"))?;
+                Ok(format!("Replaced entry in {target}"))
+            }
+
+            "remove" => {
+                let old_text = input["old_text"].as_str().context("missing 'old_text' for remove")?;
+                let existing = std::fs::read_to_string(&abs_path)
+                    .with_context(|| format!("Failed to read {target}"))?;
+                let entries: Vec<&str> = split_entries(&existing);
+                let idx = entries
+                    .iter()
+                    .position(|e| e.contains(old_text))
+                    .with_context(|| format!("No entry containing {:?} found in {target}", old_text))?;
+                let new_entries: Vec<&str> =
+                    entries.iter().enumerate().filter(|(i, _)| *i != idx).map(|(_, e)| *e).collect();
+                std::fs::write(&abs_path, join_entries(&new_entries))
+                    .with_context(|| format!("Failed to write {target}"))?;
+                Ok(format!("Removed entry from {target}"))
+            }
+
+            other => anyhow::bail!("Unknown action: {other}"),
+        }
     }
 }
 
@@ -140,10 +194,11 @@ impl WorkspaceReadTool {
     }
 }
 
+#[async_trait]
 impl Tool for WorkspaceReadTool {
     fn spec(&self) -> &ToolSpec { &self.spec }
 
-    fn execute(&self, input: &serde_json::Value) -> Result<String> {
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let rel = input["path"].as_str().context("missing 'path'")?;
         let state = lock(&self.state);
         let abs = state.workspace.root.join(rel);
@@ -189,10 +244,11 @@ impl WorkspaceWriteTool {
     }
 }
 
+#[async_trait]
 impl Tool for WorkspaceWriteTool {
     fn spec(&self) -> &ToolSpec { &self.spec }
 
-    fn execute(&self, input: &serde_json::Value) -> Result<String> {
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let rel = input["path"].as_str().context("missing 'path'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
         let state = lock(&self.state);
@@ -250,12 +306,13 @@ impl WorkspaceSearchTool {
     }
 }
 
+#[async_trait]
 impl Tool for WorkspaceSearchTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
 
-    fn execute(&self, input: &serde_json::Value) -> Result<String> {
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let query = input["query"].as_str().context("missing 'query'")?;
         let limit = input["limit"].as_u64().unwrap_or(10) as usize;
         let mode = input["mode"].as_str().unwrap_or("fts");
@@ -286,7 +343,6 @@ impl Tool for WorkspaceSearchTool {
                     .collect();
                 return Ok(format!("[semantic]\n{}", lines.join("\n")));
             }
-            // Embedder not configured — fall through to FTS with a notice
         }
 
         // FTS (default or fallback)
@@ -339,16 +395,15 @@ impl WorkspaceSyncTool {
     }
 }
 
+#[async_trait]
 impl Tool for WorkspaceSyncTool {
     fn spec(&self) -> &ToolSpec { &self.spec }
 
-    fn execute(&self, _input: &serde_json::Value) -> Result<String> {
+    async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
         let state = lock(&self.state);
 
-        // Sync index
         let (upserted, removed) = state.sync().context("Failed to sync workspace index")?;
 
-        // Git commit + push if backend is configured
         if let Some(backend) = state.sync_backend() {
             backend.sync().context("Git sync failed")?;
             Ok(format!(

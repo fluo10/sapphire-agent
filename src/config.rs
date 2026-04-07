@@ -13,8 +13,12 @@ pub struct Config {
     /// Defaults to the config file's parent directory.
     pub workspace_dir: Option<String>,
     /// Directory for persisted JSONL sessions.
-    /// Defaults to `~/.local/share/sapphire-agent/sessions`.
+    /// Defaults to `<workspace_dir>/sessions`.
     pub sessions_dir: Option<String>,
+    /// Hour (0–23, local time) at which a new "day" begins.
+    /// Used for session resets and daily log generation. Default: 0 (midnight).
+    #[serde(default)]
+    pub day_boundary_hour: u8,
 }
 
 /// Configuration for built-in tools.

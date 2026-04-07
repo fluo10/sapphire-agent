@@ -1,13 +1,11 @@
 use crate::provider::ToolSpec;
 use crate::tools::Tool;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use sapphire_workspace::WorkspaceState;
 use serde_json::json;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -26,7 +24,6 @@ fn truncate_output(s: &str) -> String {
     if s.len() <= MAX {
         return s.to_string();
     }
-    // Find safe char boundaries
     let head_end = s.floor_char_boundary(HEAD);
     let tail_start = s.floor_char_boundary(s.len() - TAIL);
     format!(
@@ -81,12 +78,13 @@ impl ReadFileTool {
     }
 }
 
+#[async_trait]
 impl Tool for ReadFileTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
 
-    fn execute(&self, input: &serde_json::Value) -> Result<String> {
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = input["limit"].as_u64().unwrap_or(500).min(2000) as usize;
@@ -185,12 +183,13 @@ impl WriteFileTool {
     }
 }
 
+#[async_trait]
 impl Tool for WriteFileTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
 
-    fn execute(&self, input: &serde_json::Value) -> Result<String> {
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
 
@@ -270,12 +269,13 @@ impl DeleteFileTool {
     }
 }
 
+#[async_trait]
 impl Tool for DeleteFileTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
 
-    fn execute(&self, input: &serde_json::Value) -> Result<String> {
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let path = expand_path(path_str);
 
@@ -350,12 +350,16 @@ impl TerminalTool {
     }
 }
 
+#[async_trait]
 impl Tool for TerminalTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
 
-    fn execute(&self, input: &serde_json::Value) -> Result<String> {
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        use std::time::Duration;
+        use tokio::process::Command;
+
         let command = input["command"].as_str().context("missing 'command'")?;
         let timeout_secs = input["timeout"].as_u64().unwrap_or(60).min(600);
         let workdir = input["workdir"]
@@ -366,19 +370,20 @@ impl Tool for TerminalTool {
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg(command)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .current_dir(&workdir);
 
         let child = cmd.spawn().context("Failed to spawn command")?;
         let pid = child.id();
 
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            tx.send(child.wait_with_output()).ok();
-        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            child.wait_with_output(),
+        )
+        .await;
 
-        match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+        match result {
             Ok(Ok(output)) => {
                 let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
                 let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
@@ -394,10 +399,11 @@ impl Tool for TerminalTool {
             }
             Ok(Err(e)) => Err(e.into()),
             Err(_) => {
-                // Kill the timed-out process tree
-                let _ = Command::new("kill")
-                    .args(["-9", &pid.to_string()])
-                    .output();
+                if let Some(pid) = pid {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &pid.to_string()])
+                        .output();
+                }
                 Ok(format!(
                     "[exit: 124]\nCommand timed out after {timeout_secs}s"
                 ))
@@ -444,16 +450,17 @@ impl WebSearchTool {
     }
 }
 
+#[async_trait]
 impl Tool for WebSearchTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
 
-    fn execute(&self, input: &serde_json::Value) -> Result<String> {
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let query = input["query"].as_str().context("missing 'query'")?;
         let limit = input["limit"].as_u64().unwrap_or(5).min(10) as usize;
 
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::Client::new();
         let resp = client
             .post("https://api.tavily.com/search")
             .json(&json!({
@@ -462,15 +469,16 @@ impl Tool for WebSearchTool {
                 "max_results": limit,
             }))
             .send()
+            .await
             .context("Tavily API request failed")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().unwrap_or_default();
+            let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Tavily API error {status}: {body}");
         }
 
-        let data: serde_json::Value = resp.json().context("Failed to parse Tavily response")?;
+        let data: serde_json::Value = resp.json().await.context("Failed to parse Tavily response")?;
         let results = data["results"]
             .as_array()
             .context("Unexpected Tavily response format (missing 'results')")?;

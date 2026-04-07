@@ -1,9 +1,10 @@
 use crate::channel::{Channel, OutgoingMessage};
 use crate::config::Config;
-use crate::provider::{ChatMessage, Provider};
-use crate::session::{ConversationKey, SessionStore};
+use crate::provider::{ChatMessage, ContentPart, Provider, ToolCall};
+use crate::session::{ConversationKey, SessionStore, local_date_for_timestamp};
 use crate::tools::ToolSet;
 use crate::workspace::Workspace;
+use chrono::{Local, NaiveDate};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -11,6 +12,19 @@ use tracing::{error, info, warn};
 
 /// Maximum number of tool-call rounds per message to prevent infinite loops.
 const MAX_TOOL_ROUNDS: usize = 10;
+
+// ---------------------------------------------------------------------------
+// System prompt snapshot (frozen per ConversationKey, refreshed daily)
+// ---------------------------------------------------------------------------
+
+struct SystemSnapshot {
+    system_prompt: String,
+    date: NaiveDate,
+}
+
+// ---------------------------------------------------------------------------
+// Agent
+// ---------------------------------------------------------------------------
 
 pub struct Agent {
     config: Config,
@@ -23,6 +37,10 @@ pub struct Agent {
     history: Mutex<HashMap<ConversationKey, Vec<ChatMessage>>>,
     /// Maps each ConversationKey to its current active session file (ULID string).
     active_sessions: Mutex<HashMap<ConversationKey, String>>,
+    /// Per-ConversationKey system prompt snapshot, refreshed when the local date changes.
+    snapshots: Mutex<HashMap<ConversationKey, SystemSnapshot>>,
+    /// Background prefetch cache: workspace search results for the next turn.
+    prefetch_cache: Mutex<HashMap<ConversationKey, String>>,
 }
 
 impl Agent {
@@ -32,22 +50,21 @@ impl Agent {
         provider: Arc<dyn Provider>,
         workspace: Arc<Workspace>,
         tools: Option<Arc<ToolSet>>,
-        session_store: SessionStore,
+        session_store: Arc<SessionStore>,
     ) -> Self {
         let (history, active_sessions) = session_store.load_all();
-        info!(
-            "Loaded {} session(s) from disk",
-            active_sessions.len()
-        );
+        info!("Loaded {} session(s) from disk", active_sessions.len());
         Self {
             config,
             channel,
             provider,
             workspace,
             tools,
-            session_store: Arc::new(session_store),
+            session_store,
             history: Mutex::new(history),
             active_sessions: Mutex::new(active_sessions),
+            snapshots: Mutex::new(HashMap::new()),
+            prefetch_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -95,6 +112,10 @@ impl Agent {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Session helpers
+    // -----------------------------------------------------------------------
+
     /// Return the active session_id for `key`, creating a new session file if needed.
     async fn get_or_create_session(&self, key: &ConversationKey) -> String {
         let mut sessions = self.active_sessions.lock().await;
@@ -109,13 +130,12 @@ impl Agent {
             }
             Err(e) => {
                 warn!("Failed to create session file: {e}");
-                // Return a sentinel so callers can still run without persistence
                 String::new()
             }
         }
     }
 
-    /// Persist `msg` to the session store for `key`. No-op if session creation failed.
+    /// Persist `msg` to the session store. No-op if session creation failed.
     fn persist(&self, session_id: &str, msg: &ChatMessage) {
         if session_id.is_empty() {
             return;
@@ -125,23 +145,104 @@ impl Agent {
         }
     }
 
+    /// If the active session for `key` started on a different local day,
+    /// close it and clear the in-memory state so a new session is created.
+    async fn maybe_reset_session(&self, key: &ConversationKey) {
+        let boundary = self.config.day_boundary_hour;
+        let today = local_date_for_timestamp(Local::now(), boundary);
+
+        let session_id = {
+            let sessions = self.active_sessions.lock().await;
+            match sessions.get(key) {
+                Some(id) if !id.is_empty() => id.clone(),
+                _ => return,
+            }
+        };
+
+        let session_path = self
+            .session_store
+            .sessions_dir
+            .join(format!("{session_id}.jsonl"));
+
+        if read_session_date(&session_path, boundary) < today {
+            info!("Day boundary crossed for {key:?}; resetting session");
+
+            if let Err(e) = self.session_store.close_session(&session_id) {
+                warn!("Failed to close session {session_id}: {e}");
+            }
+
+            self.history.lock().await.remove(key);
+            self.active_sessions.lock().await.remove(key);
+            self.snapshots.lock().await.remove(key);
+            self.prefetch_cache.lock().await.remove(key);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // System prompt snapshot
+    // -----------------------------------------------------------------------
+
+    /// Return the system prompt for `key`, rebuilding if the local date has changed.
+    async fn get_system_prompt(&self, key: &ConversationKey) -> Option<String> {
+        let boundary = self.config.day_boundary_hour;
+        let today = local_date_for_timestamp(Local::now(), boundary);
+
+        {
+            let snapshots = self.snapshots.lock().await;
+            if let Some(snap) = snapshots.get(key) {
+                if snap.date == today {
+                    return if snap.system_prompt.is_empty() {
+                        None
+                    } else {
+                        Some(snap.system_prompt.clone())
+                    };
+                }
+            }
+        }
+
+        let system_prompt = self
+            .workspace
+            .build_system_prompt(self.config.anthropic.system_prompt.as_deref())
+            .await;
+
+        self.snapshots.lock().await.insert(
+            key.clone(),
+            SystemSnapshot { system_prompt: system_prompt.clone(), date: today },
+        );
+
+        if system_prompt.is_empty() { None } else { Some(system_prompt) }
+    }
+
+    // -----------------------------------------------------------------------
+    // Message handling
+    // -----------------------------------------------------------------------
+
     async fn handle_message(
-        &self,
+        self: Arc<Self>,
         incoming: crate::channel::IncomingMessage,
     ) -> anyhow::Result<()> {
         info!("Message from {}: {}", incoming.sender, incoming.content);
 
         let key: ConversationKey = (incoming.room_id.clone(), incoming.thread_id.clone());
+
+        // Check for day boundary → maybe reset session + snapshot
+        self.maybe_reset_session(&key).await;
+
         let session_id = self.get_or_create_session(&key).await;
 
-        // Build system prompt (mtime-cached; includes AGENTS.md, SOUL.md, MEMORY.md …)
-        let system_prompt = self
-            .workspace
-            .build_system_prompt(self.config.anthropic.system_prompt.as_deref())
-            .await;
-        let system = if system_prompt.is_empty() { None } else { Some(system_prompt) };
+        // Get system prompt (snapshot: rebuilt at most once per local day per key)
+        let system = self.get_system_prompt(&key).await;
 
-        // Append user message to history and session store
+        // Inject prefetch context from previous turn (if any)
+        let prefetch_result = self.prefetch_cache.lock().await.remove(&key);
+        let system_with_context = match (system, prefetch_result) {
+            (Some(sys), Some(ctx)) if !ctx.is_empty() && ctx != "No results found." => {
+                Some(format!("{sys}\n\n---\n\n<memory-context>\n{ctx}\n</memory-context>"))
+            }
+            (sys, _) => sys,
+        };
+
+        // Append user message
         {
             let msg = ChatMessage::user(&incoming.content);
             self.history.lock().await.entry(key.clone()).or_default().push(msg.clone());
@@ -160,11 +261,7 @@ impl Agent {
 
             let round = messages
                 .iter()
-                .filter(|m| {
-                    m.parts
-                        .iter()
-                        .any(|p| matches!(p, crate::provider::ContentPart::ToolUse { .. }))
-                })
+                .filter(|m| m.parts.iter().any(|p| matches!(p, ContentPart::ToolUse { .. })))
                 .count();
 
             if round >= MAX_TOOL_ROUNDS {
@@ -174,18 +271,20 @@ impl Agent {
 
             let response = self
                 .provider
-                .chat(system.as_deref(), &messages, tool_specs.as_deref())
+                .chat(system_with_context.as_deref(), &messages, tool_specs.as_deref())
                 .await;
 
             match response {
                 Err(e) => {
                     error!("Provider error: {e:#}");
                     let _ = self.channel.stop_typing(&incoming.room_id).await;
-                    let out = OutgoingMessage::new(
-                        format!("⚠️ Error: {e}"),
-                        incoming.room_id.clone(),
-                    );
-                    let _ = self.channel.send(&out).await;
+                    let _ = self
+                        .channel
+                        .send(&OutgoingMessage::new(
+                            format!("⚠️ Error: {e}"),
+                            incoming.room_id.clone(),
+                        ))
+                        .await;
                     return Ok(());
                 }
                 Ok(resp) if !resp.has_tool_calls() => {
@@ -197,29 +296,30 @@ impl Agent {
                 }
                 Ok(resp) => {
                     let tool_calls = resp.tool_calls.clone();
-
                     let msg = ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
                     self.history.lock().await.entry(key.clone()).or_default().push(msg.clone());
                     self.persist(&session_id, &msg);
 
-                    // Execute each tool (spawn_blocking — workspace ops use std I/O)
+                    // Execute tools concurrently
                     let tools = Arc::clone(self.tools.as_ref().unwrap());
-                    let results: Vec<(String, String)> = {
-                        let calls = tool_calls.clone();
-                        tokio::task::spawn_blocking(move || {
-                            calls
-                                .iter()
-                                .map(|c| {
-                                    info!("Executing tool: {} (id={})", c.name, c.id);
-                                    let result = tools.execute(c);
-                                    info!("Tool {} result: {}", c.name, result);
-                                    (c.id.clone(), result)
-                                })
-                                .collect()
-                        })
-                        .await
-                        .unwrap_or_default()
-                    };
+                    let mut handles = Vec::with_capacity(tool_calls.len());
+                    for call in tool_calls {
+                        let tools = Arc::clone(&tools);
+                        handles.push(tokio::spawn(async move {
+                            info!("Executing tool: {} (id={})", call.name, call.id);
+                            let result = tools.execute(&call).await;
+                            info!("Tool {} result: {}", call.name, result);
+                            (call.id, result)
+                        }));
+                    }
+
+                    let mut results = Vec::with_capacity(handles.len());
+                    for handle in handles {
+                        match handle.await {
+                            Ok(r) => results.push(r),
+                            Err(e) => warn!("Tool task panicked: {e}"),
+                        }
+                    }
 
                     let msg = ChatMessage::tool_results(results);
                     self.history.lock().await.entry(key.clone()).or_default().push(msg.clone());
@@ -234,16 +334,73 @@ impl Agent {
             if !text.is_empty() {
                 let out = OutgoingMessage {
                     content: text,
-                    room_id: incoming.room_id,
-                    thread_id: incoming.thread_id,
+                    room_id: incoming.room_id.clone(),
+                    thread_id: incoming.thread_id.clone(),
                 };
                 self.channel
                     .send(&out)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to send response: {e:#}"))?;
             }
+
+            // Spawn background prefetch for next turn
+            if let Some(tools) = &self.tools {
+                let tools = Arc::clone(tools);
+                let agent = Arc::clone(&self);
+                let key_clone = key.clone();
+                let query = incoming.content.clone();
+                tokio::spawn(async move {
+                    let input = serde_json::json!({ "query": query, "limit": 5 });
+                    let result = tools
+                        .execute(&ToolCall {
+                            id: "prefetch".to_string(),
+                            name: "workspace_search".to_string(),
+                            input,
+                        })
+                        .await;
+                    agent.prefetch_cache.lock().await.insert(key_clone, result);
+                });
+            }
         }
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Read the created_at date of a session file and convert to the local day.
+fn read_session_date(path: &std::path::Path, boundary_hour: u8) -> NaiveDate {
+    use std::io::{BufRead, BufReader};
+
+    let fallback = local_date_for_timestamp(Local::now(), boundary_hour);
+
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return fallback,
+    };
+
+    let first_line = match BufReader::new(file).lines().next() {
+        Some(Ok(l)) => l,
+        _ => return fallback,
+    };
+
+    #[derive(serde::Deserialize)]
+    struct MetaLine {
+        meta: MetaCreatedAt,
+    }
+    #[derive(serde::Deserialize)]
+    struct MetaCreatedAt {
+        created_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    match serde_json::from_str::<MetaLine>(&first_line) {
+        Ok(ml) => {
+            let local = ml.meta.created_at.with_timezone(&Local);
+            local_date_for_timestamp(local, boundary_hour)
+        }
+        Err(_) => fallback,
     }
 }

@@ -1,6 +1,8 @@
 mod agent;
 mod channel;
 mod config;
+mod daily_log;
+mod heartbeat;
 mod provider;
 mod session;
 mod tools;
@@ -11,6 +13,8 @@ use anyhow::{Context, Result};
 use channel::matrix::MatrixChannel;
 use clap::{Parser, Subcommand};
 use config::Config;
+use daily_log::catchup_pending_logs;
+use heartbeat::Heartbeat;
 use provider::anthropic::AnthropicProvider;
 use sapphire_workspace::{Workspace as SwWorkspace, WorkspaceState};
 use session::SessionStore;
@@ -61,6 +65,7 @@ async fn main() -> Result<()> {
             println!("  Anthropic model   : {}", config.anthropic.model);
             println!("  Anthropic max_tok : {}", config.anthropic.max_tokens);
             println!("  Workspace dir     : {}", workspace_dir.display());
+            println!("  Day boundary hour : {}:00 local", config.day_boundary_hour);
             println!();
             let workspace_files = [
                 ("AGENTS.md / AGENT.md", vec!["AGENTS.md", "AGENT.md"]),
@@ -90,12 +95,10 @@ async fn main() -> Result<()> {
             let workspace = Arc::new(Workspace::new(workspace_dir.clone()));
 
             // ── sapphire-workspace (search, file ops, git sync) ─────────────
-            // `Workspace::resolve` opens the dir without requiring a marker.
             let sw_workspace = SwWorkspace::resolve(Some(&workspace_dir))
                 .context("Failed to resolve sapphire-workspace")?;
             let ws_state = WorkspaceState::open(sw_workspace)
                 .context("Failed to open WorkspaceState")?;
-            // Initial index sync (catches any files already in the dir)
             if let Err(e) = ws_state.sync() {
                 tracing::warn!("Initial workspace sync failed: {e}");
             }
@@ -109,12 +112,32 @@ async fn main() -> Result<()> {
 
             // ── Session store ───────────────────────────────────────────────
             let sessions_dir = config.resolved_sessions_dir(&workspace_dir);
-            let session_store = SessionStore::new(sessions_dir);
+            let session_store = Arc::new(SessionStore::new(sessions_dir));
 
             // ── Channel + Provider ──────────────────────────────────────────
             let channel = Arc::new(MatrixChannel::new(&config.matrix));
-            let provider = Arc::new(AnthropicProvider::new(&config.anthropic));
+            let provider: Arc<dyn provider::Provider> =
+                Arc::new(AnthropicProvider::new(&config.anthropic));
 
+            // ── Catch up on any pending daily logs (agent was offline) ──────
+            catchup_pending_logs(
+                &session_store,
+                provider.as_ref(),
+                &workspace_dir,
+                config.day_boundary_hour,
+            )
+            .await;
+
+            // ── Heartbeat (daily log at boundary hour) ───────────────────────
+            let heartbeat = Heartbeat {
+                day_boundary_hour: config.day_boundary_hour,
+                session_store: Arc::clone(&session_store),
+                provider: Arc::clone(&provider),
+                workspace_dir: workspace_dir.clone(),
+            };
+            tokio::spawn(heartbeat.run());
+
+            // ── Agent ───────────────────────────────────────────────────────
             let agent = Arc::new(Agent::new(
                 config,
                 channel,

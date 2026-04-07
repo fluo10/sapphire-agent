@@ -3,15 +3,17 @@ pub mod workspace_tools;
 
 use crate::provider::{ToolCall, ToolSpec};
 use anyhow::Result;
+use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 
 /// A tool the agent can invoke.
+#[async_trait]
 pub trait Tool: Send + Sync {
     /// The spec advertised to the LLM.
     fn spec(&self) -> &ToolSpec;
 
     /// Execute the tool with the given JSON input.
-    fn execute(&self, input: &serde_json::Value) -> Result<String>;
+    async fn execute(&self, input: &serde_json::Value) -> Result<String>;
 }
 
 /// A collection of tools with their specs.
@@ -31,10 +33,10 @@ impl ToolSet {
     }
 
     /// Execute a tool call; returns a human-readable result string.
-    pub fn execute(&self, call: &ToolCall) -> String {
+    pub async fn execute(&self, call: &ToolCall) -> String {
         for tool in &self.tools {
             if tool.spec().name == call.name {
-                return match tool.execute(&call.input) {
+                return match tool.execute(&call.input).await {
                     Ok(result) => result,
                     Err(e) => format!("Error: {e:#}"),
                 };
@@ -63,8 +65,7 @@ pub fn default_tool_set(
         .clone();
 
     let mut tools: Vec<Box<dyn Tool>> = vec![
-        Box::new(MemoryAppendTool::new(Arc::clone(&state))),
-        Box::new(MemoryWriteTool::new(Arc::clone(&state))),
+        Box::new(MemoryTool::new(workspace_root.clone())),
         Box::new(WorkspaceReadTool::new(Arc::clone(&state))),
         Box::new(WorkspaceWriteTool::new(Arc::clone(&state))),
         Box::new(WorkspaceSearchTool::new(Arc::clone(&state))),

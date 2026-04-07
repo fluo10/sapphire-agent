@@ -16,7 +16,7 @@
 //! of this line means the session is no longer active.
 
 use crate::provider::{ChatMessage, ContentPart, Role};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -80,7 +80,7 @@ struct ClosedLine {
 // ---------------------------------------------------------------------------
 
 pub struct SessionStore {
-    sessions_dir: PathBuf,
+    pub sessions_dir: PathBuf,
 }
 
 impl SessionStore {
@@ -148,8 +148,7 @@ impl SessionStore {
         HashMap<ConversationKey, Vec<ChatMessage>>,
         HashMap<ConversationKey, String>,
     ) {
-        // Collect (session_id, meta, messages, is_closed) per file
-        type SessionEntry = (String, ConversationKey, Vec<ChatMessage>, bool);
+        type SessionEntry = (String, ConversationKey, Vec<StoredMessage>, bool);
         let mut entries: Vec<SessionEntry> = Vec::new();
 
         let dir = match fs::read_dir(&self.sessions_dir) {
@@ -181,13 +180,136 @@ impl SessionStore {
 
         for (session_id, key, messages, is_closed) in entries {
             if !is_closed {
-                // Later entries (larger ULID) overwrite earlier ones
-                history.insert(key.clone(), messages);
+                let chat_messages = messages.into_iter().map(|m| m.into_chat_message()).collect();
+                history.insert(key.clone(), chat_messages);
                 active.insert(key, session_id);
             }
         }
 
         (history, active)
+    }
+
+    /// Return all sessions that contain at least one message falling within
+    /// the given local-time day window.
+    ///
+    /// The "day" is `[date @ boundary_hour:00:00 local, (date+1) @ boundary_hour:00:00 local)`.
+    pub fn sessions_for_day(
+        &self,
+        date: NaiveDate,
+        boundary_hour: u8,
+    ) -> Vec<(SessionMeta, Vec<StoredMessage>)> {
+        let (day_start, day_end) = day_window(date, boundary_hour);
+
+        let dir = match fs::read_dir(&self.sessions_dir) {
+            Ok(d) => d,
+            Err(_) => return vec![],
+        };
+
+        let mut results = Vec::new();
+
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            // mtime pre-filter: skip files last modified before day_start - 1 day
+            if let Ok(meta_fs) = path.metadata() {
+                if let Ok(mtime) = meta_fs.modified() {
+                    let mtime_utc: DateTime<Utc> = mtime.into();
+                    if mtime_utc < day_start - Duration::days(1) {
+                        continue;
+                    }
+                }
+            }
+
+            if let Some((meta, messages, _)) = load_session_file(&path) {
+                let day_messages: Vec<StoredMessage> = messages
+                    .into_iter()
+                    .filter(|m| m.timestamp >= day_start && m.timestamp < day_end)
+                    .collect();
+
+                if !day_messages.is_empty() {
+                    results.push((meta, day_messages));
+                }
+            }
+        }
+
+        // Sort by session created_at for chronological ordering
+        results.sort_by_key(|(meta, _)| meta.created_at);
+        results
+    }
+
+    /// Return all local dates for which at least one session message exists.
+    /// Used by daily_log to find dates that need a log generated.
+    pub fn all_session_dates(&self, boundary_hour: u8) -> Vec<NaiveDate> {
+        let dir = match fs::read_dir(&self.sessions_dir) {
+            Ok(d) => d,
+            Err(_) => return vec![],
+        };
+
+        let mut dates = std::collections::HashSet::new();
+
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            if let Some((_, messages, _)) = load_session_file(&path) {
+                for msg in messages {
+                    let local_ts = msg.timestamp.with_timezone(&Local);
+                    let date = local_date_for_timestamp(local_ts, boundary_hour);
+                    dates.insert(date);
+                }
+            }
+        }
+
+        let mut sorted: Vec<NaiveDate> = dates.into_iter().collect();
+        sorted.sort();
+        sorted
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Day window helpers
+// ---------------------------------------------------------------------------
+
+/// Compute the UTC start and end of the local-time day window for `date`
+/// with a given `boundary_hour`.
+///
+/// Window: `[date @ boundary_hour:00:00 local, (date+1day) @ boundary_hour:00:00 local)`
+fn day_window(date: NaiveDate, boundary_hour: u8) -> (DateTime<Utc>, DateTime<Utc>) {
+    let start_local = date
+        .and_hms_opt(boundary_hour as u32, 0, 0)
+        .expect("valid time");
+    let end_local = (date + Duration::days(1))
+        .and_hms_opt(boundary_hour as u32, 0, 0)
+        .expect("valid time");
+
+    let start_utc = Local
+        .from_local_datetime(&start_local)
+        .single()
+        .unwrap_or_else(|| Local.from_local_datetime(&start_local).earliest().unwrap())
+        .with_timezone(&Utc);
+
+    let end_utc = Local
+        .from_local_datetime(&end_local)
+        .single()
+        .unwrap_or_else(|| Local.from_local_datetime(&end_local).earliest().unwrap())
+        .with_timezone(&Utc);
+
+    (start_utc, end_utc)
+}
+
+/// Given a local timestamp, return the local date it belongs to for a given
+/// `boundary_hour`. Timestamps before `boundary_hour` belong to the previous day.
+pub fn local_date_for_timestamp(local_ts: DateTime<Local>, boundary_hour: u8) -> NaiveDate {
+    let date = local_ts.date_naive();
+    if local_ts.hour() < boundary_hour as u32 {
+        date - Duration::days(1)
+    } else {
+        date
     }
 }
 
@@ -199,7 +321,9 @@ impl SessionStore {
 ///
 /// Returns `(meta, messages, is_closed)` or `None` if the file is unreadable
 /// or has a malformed first line.
-fn load_session_file(path: &Path) -> Option<(SessionMeta, Vec<ChatMessage>, bool)> {
+///
+/// Messages are returned as `StoredMessage` (with timestamps preserved).
+fn load_session_file(path: &Path) -> Option<(SessionMeta, Vec<StoredMessage>, bool)> {
     let file = fs::File::open(path).ok()?;
     let mut lines = BufReader::new(file).lines();
 
@@ -229,7 +353,7 @@ fn load_session_file(path: &Path) -> Option<(SessionMeta, Vec<ChatMessage>, bool
             is_closed = true;
         } else if value.get("timestamp").is_some() {
             match serde_json::from_value::<StoredMessage>(value) {
-                Ok(stored) => messages.push(stored.into_chat_message()),
+                Ok(stored) => messages.push(stored),
                 Err(e) => {
                     warn!("Skipping malformed message in {}: {e}", path.display());
                 }
