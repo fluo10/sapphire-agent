@@ -1,9 +1,11 @@
 mod agent;
+mod call;
 mod channel;
 mod config;
 mod daily_log;
 mod heartbeat;
 mod provider;
+mod serve;
 mod session;
 mod tools;
 mod workspace;
@@ -39,10 +41,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the agent (default)
-    Run,
+    /// Start the agent — Matrix/Discord channels + HTTP API server (default)
+    Serve {
+        /// Override bind address (e.g. 127.0.0.1:9000)
+        #[arg(long, value_name = "ADDR")]
+        bind: Option<String>,
+    },
     /// Validate the config file and exit
     Verify,
+    /// Interactive session with a running serve server
+    Call {
+        /// Server base URL
+        #[arg(long, default_value = "http://localhost:9000")]
+        server: String,
+        /// Existing session UUID to resume
+        #[arg(long)]
+        session: Option<String>,
+        /// List available API sessions and exit
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 #[tokio::main]
@@ -54,11 +72,17 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // `call` needs no config file — handle before loading config
+    if let Some(Command::Call { server, session, list }) = cli.command {
+        return call::run(server, session, list).await;
+    }
+
     let config_path = cli.config.unwrap_or_else(Config::default_path);
     let config = Config::load(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
-    match cli.command.unwrap_or(Command::Run) {
+    match cli.command.unwrap_or(Command::Serve { bind: None }) {
         Command::Verify => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
             println!("Config OK");
@@ -100,7 +124,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Run => {
+        Command::Serve { bind } => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
 
             // ── Bootstrap file loader (AGENTS.md, SOUL.md, MEMORY.md …) ────
@@ -122,52 +146,78 @@ async fn main() -> Result<()> {
                 config.tools.tavily_api_key.clone(),
             ));
 
-            // ── Session store ───────────────────────────────────────────────
-            let sessions_dir = config.resolved_sessions_dir(&workspace_dir);
-            let session_store = Arc::new(SessionStore::new(sessions_dir));
+            // ── Session store base directory ────────────────────────────────
+            let sessions_base = config.resolved_sessions_dir(&workspace_dir);
 
-            // ── Channel + Provider ──────────────────────────────────────────
-            let channel: Arc<dyn channel::Channel> = if let Some(d) = &config.discord {
-                Arc::new(DiscordChannel::new(d).context("Failed to initialise Discord channel")?)
-            } else if let Some(m) = &config.matrix {
-                Arc::new(MatrixChannel::new(m))
-            } else {
-                anyhow::bail!(
-                    "No channel configured. Add [discord] or [matrix] to config.toml"
-                );
-            };
+            // ── Provider ────────────────────────────────────────────────────
             let provider: Arc<dyn provider::Provider> =
                 Arc::new(AnthropicProvider::new(&config.anthropic));
 
-            // ── Catch up on any pending daily logs (agent was offline) ──────
-            catchup_pending_logs(
-                &session_store,
-                provider.as_ref(),
-                &workspace_dir,
-                config.day_boundary_hour,
-            )
-            .await;
+            // ── API session store (sessions/api/) ───────────────────────────
+            let api_session_store = Arc::new(SessionStore::new(sessions_base.join("api")));
 
-            // ── Heartbeat (daily log at boundary hour) ───────────────────────
-            let heartbeat = Heartbeat {
-                day_boundary_hour: config.day_boundary_hour,
-                session_store: Arc::clone(&session_store),
-                provider: Arc::clone(&provider),
-                workspace_dir: workspace_dir.clone(),
-            };
-            tokio::spawn(heartbeat.run());
+            // ── Channel + Agent (Matrix or Discord, if configured) ──────────
+            if config.matrix.is_some() || config.discord.is_some() {
+                let channel_name =
+                    if config.discord.is_some() { "discord" } else { "matrix" };
+                let channel_session_store =
+                    Arc::new(SessionStore::new(sessions_base.join(channel_name)));
 
-            // ── Agent ───────────────────────────────────────────────────────
-            let agent = Arc::new(Agent::new(
-                config,
-                channel,
-                provider,
-                workspace,
-                Some(tool_set),
-                session_store,
-            ));
-            agent.run().await?;
+                let channel: Arc<dyn channel::Channel> = if let Some(d) = &config.discord {
+                    Arc::new(
+                        DiscordChannel::new(d)
+                            .context("Failed to initialise Discord channel")?,
+                    )
+                } else if let Some(m) = &config.matrix {
+                    Arc::new(MatrixChannel::new(m))
+                } else {
+                    unreachable!()
+                };
+
+                // ── Catch up on any pending daily logs ──────────────────────
+                catchup_pending_logs(
+                    &channel_session_store,
+                    provider.as_ref(),
+                    &workspace_dir,
+                    config.day_boundary_hour,
+                )
+                .await;
+
+                // ── Heartbeat (daily log at boundary hour) ──────────────────
+                let heartbeat = Heartbeat {
+                    day_boundary_hour: config.day_boundary_hour,
+                    session_store: Arc::clone(&channel_session_store),
+                    provider: Arc::clone(&provider),
+                    workspace_dir: workspace_dir.clone(),
+                };
+                tokio::spawn(heartbeat.run());
+
+                // ── Agent ───────────────────────────────────────────────────
+                let agent = Arc::new(Agent::new(
+                    config.clone(),
+                    channel,
+                    Arc::clone(&provider),
+                    Arc::clone(&workspace),
+                    Some(Arc::clone(&tool_set)),
+                    channel_session_store,
+                ));
+                tokio::spawn(async move {
+                    if let Err(e) = agent.run().await {
+                        tracing::error!("Agent error: {e:#}");
+                    }
+                });
+            }
+
+            // ── HTTP API server ─────────────────────────────────────────────
+            let addr = bind
+                .or_else(|| {
+                    config.serve.as_ref().map(|s| format!("{}:{}", s.host, s.port))
+                })
+                .unwrap_or_else(|| "127.0.0.1:9000".to_string());
+
+            serve::run(addr, config, provider, workspace, tool_set, api_session_store).await?;
         }
+        Command::Call { .. } => unreachable!(),
     }
 
     Ok(())

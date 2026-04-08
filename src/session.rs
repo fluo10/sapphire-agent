@@ -189,6 +189,54 @@ impl SessionStore {
         (history, active)
     }
 
+    /// List metadata for all sessions in this store (used by API for session listing).
+    pub fn list_sessions(&self) -> Vec<SessionMeta> {
+        let dir = match fs::read_dir(&self.sessions_dir) {
+            Ok(d) => d,
+            Err(_) => return vec![],
+        };
+        let mut metas: Vec<SessionMeta> = dir
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .filter_map(|e| load_session_file(&e.path()).map(|(meta, _, _)| meta))
+            .collect();
+        metas.sort_by_key(|m| m.created_at);
+        metas
+    }
+
+    /// Load a single session's conversation history by ID.
+    /// Returns None if the file doesn't exist or is malformed.
+    pub fn load_session(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+        let path = self.session_path(session_id);
+        let (_, messages, _) = load_session_file(&path)?;
+        Some(messages.into_iter().map(|m| m.into_chat_message()).collect())
+    }
+
+    /// Ensure a session file exists for the given caller-supplied ID.
+    /// Unlike `create_session`, this uses the provided ID rather than generating a new UUID.
+    pub fn ensure_session(
+        &self,
+        session_id: &str,
+        key: &ConversationKey,
+        channel: &str,
+    ) -> anyhow::Result<()> {
+        fs::create_dir_all(&self.sessions_dir)?;
+        let path = self.session_path(session_id);
+        if !path.exists() {
+            let meta = SessionMeta {
+                session_id: session_id.to_string(),
+                room_id: key.0.clone(),
+                thread_id: key.1.clone(),
+                channel: channel.to_string(),
+                created_at: Utc::now(),
+            };
+            let line = serde_json::to_string(&MetaLine { meta })?;
+            let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+            writeln!(file, "{line}")?;
+        }
+        Ok(())
+    }
+
     /// Return all sessions that contain at least one message falling within
     /// the given local-time day window.
     ///

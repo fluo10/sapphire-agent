@@ -14,6 +14,9 @@ pub struct Config {
     /// Tool configuration (search APIs, etc.).
     #[serde(default)]
     pub tools: ToolsConfig,
+    /// HTTP API server configuration.
+    #[serde(default)]
+    pub serve: Option<ServeConfig>,
     /// Directory containing AGENT.md and MEMORY.md.
     /// Defaults to the config file's parent directory.
     pub workspace_dir: Option<String>,
@@ -24,6 +27,23 @@ pub struct Config {
     /// Used for session resets and daily log generation. Default: 0 (midnight).
     #[serde(default)]
     pub day_boundary_hour: u8,
+}
+
+/// Configuration for the HTTP API server (serve command).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ServeConfig {
+    #[serde(default = "default_serve_host")]
+    pub host: String,
+    #[serde(default = "default_serve_port")]
+    pub port: u16,
+}
+
+fn default_serve_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_serve_port() -> u16 {
+    9000
 }
 
 /// Configuration for built-in tools.
