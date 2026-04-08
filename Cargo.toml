@@ -8,6 +8,10 @@ description = "My personal AI assistant — Matrix + Anthropic only"
 name = "sapphire-agent"
 path = "src/main.rs"
 
+[features]
+default = ["lancedb-store"]
+lancedb-store = ["sapphire-workspace/lancedb-store"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.50", default-features = false, features = [
@@ -75,8 +79,8 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v7"] }
 
 # Workspace: file indexing, FTS, vector search, git sync
-# lancedb/fastembed are heavy optional features — disabled by default here
-sapphire-workspace = { version = "0.2.0", default-features = false, features = ["git-sync"] }
+# lancedb-store is gated behind the "lancedb-store" feature (default on)
+sapphire-workspace = { version = "0.5.0", default-features = false, features = ["git-sync"] }
 
 # Discord bot (gateway + HTTP, rustls TLS)
 # Requires MESSAGE_CONTENT privileged intent enabled in Discord Developer Portal

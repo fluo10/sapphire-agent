@@ -17,7 +17,9 @@ use config::Config;
 use daily_log::catchup_pending_logs;
 use heartbeat::Heartbeat;
 use provider::anthropic::AnthropicProvider;
-use sapphire_workspace::{Workspace as SwWorkspace, WorkspaceState};
+use sapphire_workspace::{AppContext, Workspace as SwWorkspace, WorkspaceState};
+
+static APP_CTX: AppContext = AppContext::new("sapphire-agent");
 use session::SessionStore;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -105,7 +107,7 @@ async fn main() -> Result<()> {
             let workspace = Arc::new(Workspace::new(workspace_dir.clone()));
 
             // ── sapphire-workspace (search, file ops, git sync) ─────────────
-            let sw_workspace = SwWorkspace::resolve(Some(&workspace_dir))
+            let sw_workspace = SwWorkspace::resolve(&APP_CTX, Some(&workspace_dir))
                 .context("Failed to resolve sapphire-workspace")?;
             let ws_state = WorkspaceState::open(sw_workspace)
                 .context("Failed to open WorkspaceState")?;
