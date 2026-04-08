@@ -40,6 +40,11 @@ pub struct ServeState {
     /// In-memory conversation history, keyed by session_id.
     /// Lazy-loaded from JSONL on first access.
     sessions: tokio::sync::Mutex<HashMap<String, Vec<ChatMessage>>>,
+    /// Sessions that have been issued an ID via `initialize` but have not yet
+    /// received a message — file creation is deferred until the first chat so
+    /// that quitting without sending anything leaves no empty file behind.
+    /// Maps internal UUID → reserved public_id (grain-id).
+    pending_sessions: tokio::sync::Mutex<HashMap<String, String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +115,7 @@ pub async fn run(
         tools,
         api_session_store,
         sessions: tokio::sync::Mutex::new(HashMap::new()),
+        pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -211,17 +217,19 @@ async fn handle_initialize(
         None => (uuid::Uuid::now_v7().to_string(), true),
     };
 
-    let key: ConversationKey = (session_id.clone(), None);
-    let public_id = match state.api_session_store.ensure_session(&session_id, &key, "api") {
-        Ok(pub_id) => pub_id,
-        Err(e) => {
-            warn!("Failed to ensure session file {session_id}: {e}");
-            None
-        }
-    };
-
-    // If resuming: pre-load history into memory
-    if !is_new {
+    // For brand-new sessions, defer file creation until the first chat arrives.
+    // Reserve the public_id now so the client can display it immediately.
+    let public_id = if is_new {
+        let pid = grain_id::GrainId::random().to_string();
+        state
+            .pending_sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), pid.clone());
+        Some(pid)
+    } else {
+        // Existing session: load metadata to retrieve the stored public_id
+        // and pre-load history into memory.
         let mut sessions = state.sessions.lock().await;
         sessions.entry(session_id.clone()).or_insert_with(|| {
             state
@@ -229,7 +237,14 @@ async fn handle_initialize(
                 .load_session(&session_id)
                 .unwrap_or_default()
         });
-    }
+        // Look up the public_id from the existing file metadata.
+        state
+            .api_session_store
+            .list_sessions()
+            .into_iter()
+            .find(|m| m.session_id == session_id)
+            .and_then(|m| m.public_id)
+    };
 
     let mut result = json!({
         "session_id": session_id,
@@ -422,9 +437,15 @@ async fn run_turn(
     };
     let is_first_turn = history.is_empty();
 
-    // 2. Ensure JSONL file exists
+    // 2. Ensure JSONL file exists. If this session was deferred at initialize
+    //    time, commit it now using the reserved public_id.
     let key: ConversationKey = (session_id.clone(), None);
-    if let Err(e) = state.api_session_store.ensure_session(&session_id, &key, "api").map(|_| ()) {
+    let pending_pub_id = state.pending_sessions.lock().await.remove(&session_id);
+    if let Err(e) = state
+        .api_session_store
+        .ensure_session(&session_id, &key, "api", pending_pub_id)
+        .map(|_| ())
+    {
         warn!("Failed to ensure session file: {e}");
     }
 

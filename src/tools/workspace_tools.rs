@@ -48,14 +48,14 @@ fn join_entries(entries: &[&str]) -> String {
 
 /// Entry-based persistent memory management for workspace markdown files.
 pub struct MemoryTool {
-    workspace_root: PathBuf,
+    state: Arc<Mutex<WorkspaceState>>,
     spec: ToolSpec,
 }
 
 impl MemoryTool {
-    pub fn new(workspace_root: PathBuf) -> Self {
+    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
         Self {
-            workspace_root,
+            state,
             spec: ToolSpec {
                 name: "memory",
                 description: "Add, replace, or remove an entry in a workspace markdown file. \
@@ -101,13 +101,10 @@ impl Tool for MemoryTool {
         let action = input["action"].as_str().context("missing 'action'")?;
         let target = input["target"].as_str().context("missing 'target'")?;
 
-        let abs_path = resolve_workspace_path(&self.workspace_root, target)?;
-
-        // Ensure parent directory exists
-        if let Some(parent) = abs_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directories for {target}"))?;
-        }
+        // Validate (no path traversal) and compute absolute path for reads.
+        let workspace_root = lock(&self.state).workspace.root.clone();
+        let abs_path = resolve_workspace_path(&workspace_root, target)?;
+        let rel_path = Path::new(target);
 
         match action {
             "add" => {
@@ -118,7 +115,8 @@ impl Tool for MemoryTool {
                 } else {
                     format!("{}{}{}", existing.trim_end(), ENTRY_SEP, content)
                 };
-                std::fs::write(&abs_path, &new_content)
+                lock(&self.state)
+                    .write_file(rel_path, &new_content)
                     .with_context(|| format!("Failed to write {target}"))?;
                 Ok(format!("Added entry to {target}"))
             }
@@ -135,7 +133,9 @@ impl Tool for MemoryTool {
                     .with_context(|| format!("No entry containing {:?} found in {target}", old_text))?;
                 let mut new_entries = entries.clone();
                 new_entries[idx] = content;
-                std::fs::write(&abs_path, join_entries(&new_entries))
+                let joined = join_entries(&new_entries);
+                lock(&self.state)
+                    .write_file(rel_path, &joined)
                     .with_context(|| format!("Failed to write {target}"))?;
                 Ok(format!("Replaced entry in {target}"))
             }
@@ -151,7 +151,9 @@ impl Tool for MemoryTool {
                     .with_context(|| format!("No entry containing {:?} found in {target}", old_text))?;
                 let new_entries: Vec<&str> =
                     entries.iter().enumerate().filter(|(i, _)| *i != idx).map(|(_, e)| *e).collect();
-                std::fs::write(&abs_path, join_entries(&new_entries))
+                let joined = join_entries(&new_entries);
+                lock(&self.state)
+                    .write_file(rel_path, &joined)
                     .with_context(|| format!("Failed to write {target}"))?;
                 Ok(format!("Removed entry from {target}"))
             }

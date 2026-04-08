@@ -47,25 +47,55 @@ fn next_id() -> u64 {
     REQUEST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-pub async fn run(server: String, session: Option<String>, list: bool) -> Result<()> {
+pub async fn run(
+    server: String,
+    session: Option<String>,
+    list: bool,
+    message: Option<String>,
+    history: bool,
+    json: bool,
+) -> Result<()> {
     let base = server.trim_end_matches('/').to_string();
     let client = reqwest::Client::new();
+
+    // ── --list mode ─────────────────────────────────────────────────────────
+    if list {
+        // For listing we still need an MCP session header but don't care which.
+        let (mcp_session_id, _, _) = initialize_session(&client, &base, session).await?;
+        list_sessions(&client, &base, &mcp_session_id, json).await?;
+        return Ok(());
+    }
 
     // ── Initialize session ──────────────────────────────────────────────────
     let (mut mcp_session_id, actual_session_id, is_new) =
         initialize_session(&client, &base, session).await?;
 
-    // ── --list mode ─────────────────────────────────────────────────────────
-    if list {
-        list_sessions(&client, &base, &mcp_session_id).await?;
+    // ── --history dump-only mode ────────────────────────────────────────────
+    if history {
+        dump_history(&client, &base, &mcp_session_id, json, true).await?;
+        return Ok(());
+    }
+
+    // ── --message one-shot mode ─────────────────────────────────────────────
+    if let Some(text) = message {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("--message requires non-empty text");
+        }
+        send_chat(&client, &base, &mcp_session_id, trimmed, json).await?;
+        if !json {
+            println!();
+        }
         return Ok(());
     }
 
     // ── REPL ────────────────────────────────────────────────────────────────
+    // --json is a no-op in REPL mode (text output is always human-readable).
+    let _ = json;
     println!("sapphire-agent call  (session: {actual_session_id})");
     if !is_new {
         println!("[resumed existing session]\n");
-        if let Err(e) = dump_history(&client, &base, &mcp_session_id).await {
+        if let Err(e) = dump_history(&client, &base, &mcp_session_id, false, false).await {
             eprintln!("[warning: failed to load history: {e:#}]");
         }
     }
@@ -106,7 +136,7 @@ pub async fn run(server: String, session: Option<String>, list: bool) -> Result<
             _ => {}
         }
 
-        if let Err(e) = send_chat(&client, &base, &mcp_session_id, trimmed).await {
+        if let Err(e) = send_chat(&client, &base, &mcp_session_id, trimmed, false).await {
             eprintln!("[error: {e:#}]");
         }
         println!();
@@ -172,6 +202,8 @@ async fn dump_history(
     client: &reqwest::Client,
     base: &str,
     mcp_session_id: &str,
+    json_mode: bool,
+    standalone: bool,
 ) -> Result<()> {
     let body = json!({
         "jsonrpc": "2.0",
@@ -196,11 +228,21 @@ async fn dump_history(
     }
 
     let messages = val["result"]["messages"].as_array().cloned().unwrap_or_default();
+
+    if json_mode {
+        // Emit the raw messages array as a single JSON object.
+        let out = json!({ "messages": messages });
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+
     if messages.is_empty() {
         return Ok(());
     }
 
-    println!("──── history ────");
+    if !standalone {
+        println!("──── history ────");
+    }
     for msg in &messages {
         let role = msg["role"].as_str().unwrap_or("?");
         let parts = msg["parts"].as_array().cloned().unwrap_or_default();
@@ -228,7 +270,9 @@ async fn dump_history(
             }
         }
     }
-    println!("──── end of history ────\n");
+    if !standalone {
+        println!("──── end of history ────\n");
+    }
     Ok(())
 }
 
@@ -240,6 +284,7 @@ async fn list_sessions(
     client: &reqwest::Client,
     base: &str,
     mcp_session_id: &str,
+    json_mode: bool,
 ) -> Result<()> {
     let body = json!({
         "jsonrpc": "2.0",
@@ -260,15 +305,21 @@ async fn list_sessions(
 
     let sessions = val["result"]["sessions"]
         .as_array()
-        .map(|v| v.as_slice())
-        .unwrap_or(&[]);
+        .cloned()
+        .unwrap_or_default();
+
+    if json_mode {
+        let out = json!({ "sessions": sessions });
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
 
     if sessions.is_empty() {
         println!("No sessions found.");
     } else {
         println!("{:<10}  {:<30}  {}", "ID", "Title", "Created at");
         println!("{}", "-".repeat(64));
-        for s in sessions {
+        for s in &sessions {
             let pub_id = s["public_id"].as_str().unwrap_or("-");
             let title = s["title"].as_str().unwrap_or("(untitled)");
             let created = s["created_at"].as_str().unwrap_or("?");
@@ -288,6 +339,7 @@ async fn send_chat(
     base: &str,
     mcp_session_id: &str,
     content: &str,
+    json_mode: bool,
 ) -> Result<()> {
     let id = next_id();
     let body = json!({
@@ -309,17 +361,38 @@ async fn send_chat(
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
 
-    while let Some(chunk) = stream.next().await {
+    // For JSON mode, accumulate events until the final result and emit one
+    // structured object at the end.
+    let mut json_tools: Vec<Value> = Vec::new();
+    let mut json_content: Option<String> = None;
+    let mut json_error: Option<String> = None;
+
+    'outer: while let Some(chunk) = stream.next().await {
         buf.push_str(&String::from_utf8_lossy(&chunk?));
         while let Some(pos) = buf.find("\n\n") {
             let raw = buf[..pos].to_string();
             buf.drain(..pos + 2);
             if let Some(data) = parse_sse_data(&raw) {
-                if handle_event(&data) {
+                if json_mode {
+                    if collect_event(&data, &mut json_tools, &mut json_content, &mut json_error) {
+                        break 'outer;
+                    }
+                } else if handle_event(&data) {
                     return Ok(());
                 }
             }
         }
+    }
+
+    if json_mode {
+        let mut out = json!({
+            "content": json_content.unwrap_or_default(),
+            "tools": json_tools,
+        });
+        if let Some(err) = json_error {
+            out["error"] = Value::String(err);
+        }
+        println!("{}", serde_json::to_string(&out)?);
     }
 
     Ok(())
@@ -334,6 +407,31 @@ fn parse_sse_data(raw: &str) -> Option<Value> {
     let data_line = raw.lines().find(|l| l.starts_with("data:"))?;
     let data = data_line.strip_prefix("data:").unwrap_or("").trim();
     serde_json::from_str(data).ok()
+}
+
+/// Collect SSE events into JSON output buffers. Returns true when done.
+fn collect_event(
+    val: &Value,
+    tools: &mut Vec<Value>,
+    content: &mut Option<String>,
+    error: &mut Option<String>,
+) -> bool {
+    if let Some(method) = val["method"].as_str() {
+        if method == "tool_start" {
+            let name = val["params"]["name"].as_str().unwrap_or("?").to_string();
+            let id = val["params"]["id"].as_str().unwrap_or("").to_string();
+            tools.push(json!({ "id": id, "name": name }));
+        }
+        false
+    } else if val.get("result").is_some() {
+        *content = val["result"]["content"].as_str().map(|s| s.to_string());
+        true
+    } else if let Some(err) = val.get("error") {
+        *error = err["message"].as_str().map(|s| s.to_string());
+        true
+    } else {
+        false
+    }
 }
 
 /// Handle a JSON-RPC 2.0 SSE event. Returns true when the final result arrives.

@@ -60,6 +60,18 @@ enum Command {
         /// List available API sessions and exit
         #[arg(long)]
         list: bool,
+        /// Send a single message and exit instead of entering the REPL.
+        /// Useful as a CJK-safe fallback or for IDE/editor integration.
+        #[arg(short, long, value_name = "TEXT")]
+        message: Option<String>,
+        /// Dump the session history and exit (no message sent, no REPL).
+        /// Intended for IDE integrations restoring a session.
+        #[arg(long)]
+        history: bool,
+        /// Emit machine-readable JSON output. Applies to --list, --history,
+        /// and --message; ignored in REPL mode.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -74,8 +86,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // `call` needs no config file — handle before loading config
-    if let Some(Command::Call { server, session, list }) = cli.command {
-        return call::run(server, session, list).await;
+    if let Some(Command::Call { server, session, list, message, history, json }) = cli.command {
+        return call::run(server, session, list, message, history, json).await;
     }
 
     let config_path = cli.config.unwrap_or_else(Config::default_path);
@@ -154,14 +166,19 @@ async fn main() -> Result<()> {
                 Arc::new(AnthropicProvider::new(&config.anthropic));
 
             // ── API session store (sessions/api/) ───────────────────────────
-            let api_session_store = Arc::new(SessionStore::new(sessions_base.join("api")));
+            let api_session_store = Arc::new(SessionStore::with_workspace(
+                sessions_base.join("api"),
+                Arc::clone(&ws_state),
+            ));
 
             // ── Channel + Agent (Matrix or Discord, if configured) ──────────
             if config.matrix.is_some() || config.discord.is_some() {
                 let channel_name =
                     if config.discord.is_some() { "discord" } else { "matrix" };
-                let channel_session_store =
-                    Arc::new(SessionStore::new(sessions_base.join(channel_name)));
+                let channel_session_store = Arc::new(SessionStore::with_workspace(
+                    sessions_base.join(channel_name),
+                    Arc::clone(&ws_state),
+                ));
 
                 let channel: Arc<dyn channel::Channel> = if let Some(d) = &config.discord {
                     Arc::new(

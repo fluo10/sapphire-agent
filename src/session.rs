@@ -17,11 +17,13 @@
 
 use crate::provider::{ChatMessage, ContentPart, Role};
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
+use sapphire_workspace::WorkspaceState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -92,15 +94,72 @@ struct TitleLine {
 
 pub struct SessionStore {
     pub sessions_dir: PathBuf,
+    /// Optional sapphire-workspace state. When set, file modifications notify
+    /// the workspace so the index/cache and git staging stay in sync.
+    ws_state: Option<Arc<Mutex<WorkspaceState>>>,
 }
 
 impl SessionStore {
     pub fn new(sessions_dir: PathBuf) -> Self {
-        Self { sessions_dir }
+        Self { sessions_dir, ws_state: None }
+    }
+
+    pub fn with_workspace(
+        sessions_dir: PathBuf,
+        ws_state: Arc<Mutex<WorkspaceState>>,
+    ) -> Self {
+        Self { sessions_dir, ws_state: Some(ws_state) }
     }
 
     fn session_path(&self, session_id: &str) -> PathBuf {
         self.sessions_dir.join(format!("{session_id}.jsonl"))
+    }
+
+    /// Notify sapphire-workspace that a session file was created or modified.
+    /// No-op if no WorkspaceState is attached or the path is outside the workspace.
+    fn notify_updated(&self, abs_path: &Path) {
+        let Some(state) = &self.ws_state else { return };
+        let guard = match state.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("WorkspaceState mutex poisoned: {e}");
+                return;
+            }
+        };
+        if !abs_path.starts_with(&guard.workspace.root) {
+            return;
+        }
+        if let Err(e) = guard.on_file_updated(abs_path) {
+            warn!("Failed to notify workspace of update {}: {e}", abs_path.display());
+        }
+    }
+
+    /// Notify sapphire-workspace that a session file was deleted.
+    fn notify_deleted(&self, abs_path: &Path) {
+        let Some(state) = &self.ws_state else { return };
+        let guard = match state.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("WorkspaceState mutex poisoned: {e}");
+                return;
+            }
+        };
+        if !abs_path.starts_with(&guard.workspace.root) {
+            return;
+        }
+        if let Err(e) = guard.on_file_deleted(abs_path) {
+            warn!("Failed to notify workspace of delete {}: {e}", abs_path.display());
+        }
+    }
+
+    /// Delete a session file (used when an empty session is discarded).
+    pub fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
+        let path = self.session_path(session_id);
+        if path.exists() {
+            fs::remove_file(&path)?;
+            self.notify_deleted(&path);
+        }
+        Ok(())
     }
 
     /// Create a new session file for `key`. Returns the new session_id (ULID string).
@@ -117,11 +176,11 @@ impl SessionStore {
             title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta })?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.session_path(&session_id))?;
+        let path = self.session_path(&session_id);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;
+        drop(file);
+        self.notify_updated(&path);
         Ok(session_id)
     }
 
@@ -129,11 +188,11 @@ impl SessionStore {
     pub fn append(&self, session_id: &str, msg: &ChatMessage) -> anyhow::Result<()> {
         let stored = StoredMessage::from_chat(msg);
         let line = serde_json::to_string(&stored)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.session_path(session_id))?;
+        let path = self.session_path(session_id);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;
+        drop(file);
+        self.notify_updated(&path);
         Ok(())
     }
 
@@ -141,11 +200,11 @@ impl SessionStore {
     /// The session becomes inactive; future messages create a new session.
     pub fn close_session(&self, session_id: &str) -> anyhow::Result<()> {
         let line = serde_json::to_string(&ClosedLine { closed_at: Utc::now() })?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.session_path(session_id))?;
+        let path = self.session_path(session_id);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;
+        drop(file);
+        self.notify_updated(&path);
         Ok(())
     }
 
@@ -228,13 +287,15 @@ impl SessionStore {
     /// Ensure a session file exists for the given caller-supplied ID.
     /// Unlike `create_session`, this uses the provided ID rather than generating a new UUID.
     ///
-    /// For API sessions (`channel == "api"`), a grain-id `public_id` is generated on creation.
+    /// For API sessions (`channel == "api"`), a grain-id `public_id` is generated on creation
+    /// unless `public_id_override` is supplied (used to commit a deferred public_id).
     /// Returns the `public_id` if present (new or existing).
     pub fn ensure_session(
         &self,
         session_id: &str,
         key: &ConversationKey,
         channel: &str,
+        public_id_override: Option<String>,
     ) -> anyhow::Result<Option<String>> {
         fs::create_dir_all(&self.sessions_dir)?;
         let path = self.session_path(session_id);
@@ -245,7 +306,10 @@ impl SessionStore {
             return Ok(pub_id);
         }
         let public_id = if channel == "api" {
-            Some(grain_id::GrainId::random().to_string())
+            Some(
+                public_id_override
+                    .unwrap_or_else(|| grain_id::GrainId::random().to_string()),
+            )
         } else {
             None
         };
@@ -261,17 +325,19 @@ impl SessionStore {
         let line = serde_json::to_string(&MetaLine { meta })?;
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;
+        drop(file);
+        self.notify_updated(&path);
         Ok(public_id)
     }
 
     /// Append a title for a session (append-only; last line wins on read).
     pub fn set_title(&self, session_id: &str, title: &str) -> anyhow::Result<()> {
         let line = serde_json::to_string(&TitleLine { session_title: title.to_string() })?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.session_path(session_id))?;
+        let path = self.session_path(session_id);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;
+        drop(file);
+        self.notify_updated(&path);
         Ok(())
     }
 
