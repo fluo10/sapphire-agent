@@ -279,6 +279,7 @@ impl Agent {
         let tool_specs = self.tools.as_ref().map(|t| t.specs().to_vec());
 
         // Tool-calling loop
+        let mut accumulated_text: Vec<String> = Vec::new();
         let final_text = loop {
             let messages = {
                 self.history.lock().await.get(&key).cloned().unwrap_or_default()
@@ -291,7 +292,7 @@ impl Agent {
 
             if round >= MAX_TOOL_ROUNDS {
                 warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS}), stopping");
-                break None;
+                break Some(accumulated_text.join("\n\n"));
             }
 
             let response = self
@@ -317,10 +318,16 @@ impl Agent {
                     let msg = ChatMessage::assistant(&text);
                     self.history.lock().await.entry(key.clone()).or_default().push(msg.clone());
                     self.persist(&session_id, &msg);
-                    break Some(text);
+                    if !text.is_empty() {
+                        accumulated_text.push(text);
+                    }
+                    break Some(accumulated_text.join("\n\n"));
                 }
                 Ok(resp) => {
                     let tool_calls = resp.tool_calls.clone();
+                    if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
+                        accumulated_text.push(t.clone());
+                    }
                     let msg = ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
                     self.history.lock().await.entry(key.clone()).or_default().push(msg.clone());
                     self.persist(&session_id, &msg);
