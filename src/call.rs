@@ -5,11 +5,43 @@
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use reedline::{
+    Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline, Signal,
+};
 use serde_json::{Value, json};
-use std::io::{Write, stdin, stdout, stderr};
+use std::borrow::Cow;
+use std::io::{Write, stderr, stdout};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Minimal prompt for reedline: just "> ".
+struct SimplePrompt;
+
+impl Prompt for SimplePrompt {
+    fn render_prompt_left(&self) -> Cow<str> {
+        Cow::Borrowed("> ")
+    }
+    fn render_prompt_right(&self) -> Cow<str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_multiline_indicator(&self) -> Cow<str> {
+        Cow::Borrowed("::: ")
+    }
+    fn render_prompt_history_search_indicator(
+        &self,
+        history_search: PromptHistorySearch,
+    ) -> Cow<str> {
+        let prefix = match history_search.status {
+            PromptHistorySearchStatus::Passing => "",
+            PromptHistorySearchStatus::Failing => "failing ",
+        };
+        Cow::Owned(format!("({}reverse-search: {}) ", prefix, history_search.term))
+    }
+}
 
 fn next_id() -> u64 {
     REQUEST_ID.fetch_add(1, Ordering::Relaxed)
@@ -32,23 +64,25 @@ pub async fn run(server: String, session: Option<String>, list: bool) -> Result<
     // ── REPL ────────────────────────────────────────────────────────────────
     println!("sapphire-agent call  (session: {actual_session_id})");
     if !is_new {
-        println!("[resumed existing session]");
+        println!("[resumed existing session]\n");
+        if let Err(e) = dump_history(&client, &base, &mcp_session_id).await {
+            eprintln!("[warning: failed to load history: {e:#}]");
+        }
     }
     println!("Commands: /clear  /help  /quit\n");
 
-    loop {
-        print!("> ");
-        stdout().flush()?;
+    let mut line_editor = Reedline::create();
+    let prompt = SimplePrompt;
 
-        let mut line = String::new();
-        match stdin().read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
+    loop {
+        let line = match line_editor.read_line(&prompt) {
+            Ok(Signal::Success(buf)) => buf,
+            Ok(Signal::CtrlC) | Ok(Signal::CtrlD) => break,
             Err(e) => {
-                eprintln!("Error reading stdin: {e}");
+                eprintln!("Error reading input: {e}");
                 break;
             }
-        }
+        };
 
         let trimmed = line.trim();
         match trimmed {
@@ -128,6 +162,74 @@ async fn initialize_session(
     let is_new = result["is_new"].as_bool().unwrap_or(true);
 
     Ok((mcp_session_id, display_id, is_new))
+}
+
+// ---------------------------------------------------------------------------
+// History dump (on session resume)
+// ---------------------------------------------------------------------------
+
+async fn dump_history(
+    client: &reqwest::Client,
+    base: &str,
+    mcp_session_id: &str,
+) -> Result<()> {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": next_id(),
+        "method": "get_session",
+        "params": null,
+    });
+
+    let val: Value = client
+        .post(format!("{base}/mcp"))
+        .header("mcp-session-id", mcp_session_id)
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    if let Some(err) = val.get("error") {
+        let msg = err["message"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("{msg}");
+    }
+
+    let messages = val["result"]["messages"].as_array().cloned().unwrap_or_default();
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    println!("──── history ────");
+    for msg in &messages {
+        let role = msg["role"].as_str().unwrap_or("?");
+        let parts = msg["parts"].as_array().cloned().unwrap_or_default();
+        for part in parts {
+            match part["type"].as_str() {
+                Some("text") => {
+                    let text = part["text"].as_str().unwrap_or("");
+                    if text.is_empty() {
+                        continue;
+                    }
+                    match role {
+                        "user" => println!("> {text}"),
+                        "assistant" => println!("{text}\n"),
+                        _ => println!("{text}"),
+                    }
+                }
+                Some("tool_use") => {
+                    let name = part["name"].as_str().unwrap_or("?");
+                    println!("[tool: {name}]");
+                }
+                Some("tool_result") => {
+                    // Skip tool results in the dump to keep it readable
+                }
+                _ => {}
+            }
+        }
+    }
+    println!("──── end of history ────\n");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

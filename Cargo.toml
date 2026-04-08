@@ -83,6 +83,12 @@ uuid = { version = "1", features = ["v7"] }
 # lancedb-store is gated behind the "lancedb-store" feature (default on)
 sapphire-workspace = { version = "0.5.0", default-features = false, features = ["git-sync"] }
 
+# Human-readable session IDs for API sessions
+grain-id = { path = "../grain-id", features = ["serde"] }
+
+# Readline for the `call` REPL (CJK-safe input, history, cursor movement)
+reedline = "0.39"
+
 # HTTP server (serve command)
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 

@@ -104,6 +104,15 @@ impl Workspace {
             parts.push(b.to_string());
         }
 
+        // Inject current date/time so the agent has temporal awareness
+        // (needed for tools like `memory` which write date-stamped files).
+        let now_local = chrono::Local::now();
+        parts.push(format!(
+            "# Current Date and Time\n\n{} ({})",
+            now_local.format("%Y-%m-%d %H:%M:%S %z"),
+            now_local.format("%A")
+        ));
+
         for def in WORKSPACE_FILES {
             if let Some((filename, content)) = self.read_first_existing(def.candidates).await {
                 debug!("Injecting workspace file: {filename}");

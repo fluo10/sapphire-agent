@@ -143,6 +143,7 @@ async fn mcp_post(
         "initialize" => handle_initialize(state, req_id, req.params, session_id).await,
         "chat" => handle_chat(state, req_id, req.params, session_id).await,
         "list_sessions" => handle_list_sessions(state, req_id).await,
+        "get_session" => handle_get_session(state, req_id, session_id).await,
         _ => {
             let body = error_response(req_id, -32601, "Method not found");
             body.into_response()
@@ -335,6 +336,60 @@ async fn handle_list_sessions(state: Arc<ServeState>, req_id: Value) -> axum::re
 }
 
 // ---------------------------------------------------------------------------
+// get_session  — returns stored messages for the current session
+// ---------------------------------------------------------------------------
+
+async fn handle_get_session(
+    state: Arc<ServeState>,
+    req_id: Value,
+    session_id: Option<String>,
+) -> axum::response::Response {
+    let session_id = match session_id {
+        Some(id) => id,
+        None => {
+            let body = error_response(req_id, -32602, "Missing Mcp-Session-Id header");
+            return body.into_response();
+        }
+    };
+
+    let messages = state
+        .api_session_store
+        .load_session(&session_id)
+        .unwrap_or_default();
+
+    let items: Vec<Value> = messages
+        .iter()
+        .map(|m| {
+            let role = match m.role {
+                crate::provider::Role::User => "user",
+                crate::provider::Role::Assistant => "assistant",
+            };
+            let parts: Vec<Value> = m
+                .parts
+                .iter()
+                .map(|p| match p {
+                    ContentPart::Text(t) => json!({ "type": "text", "text": t }),
+                    ContentPart::ToolUse { id, name, input } => {
+                        json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+                    }
+                    ContentPart::ToolResult { tool_use_id, content } => {
+                        json!({ "type": "tool_result", "tool_use_id": tool_use_id, "content": content })
+                    }
+                })
+                .collect();
+            json!({ "role": role, "parts": parts })
+        })
+        .collect();
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": { "messages": items },
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Turn processing (tool-calling loop)
 // ---------------------------------------------------------------------------
 
@@ -391,6 +446,7 @@ async fn run_turn(
 
     // 5. Tool-calling loop
     let tool_specs = state.tools.specs().to_vec();
+    let mut accumulated_text: Vec<String> = Vec::new();
     let final_text = loop {
         let round = history
             .iter()
@@ -420,10 +476,16 @@ async fn run_turn(
                 if let Err(e) = state.api_session_store.append(&session_id, &msg) {
                     warn!("Failed to persist assistant message: {e}");
                 }
-                break Some(text);
+                if !text.is_empty() {
+                    accumulated_text.push(text);
+                }
+                break Some(accumulated_text.join("\n\n"));
             }
             Ok(resp) => {
                 let tool_calls = resp.tool_calls.clone();
+                if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
+                    accumulated_text.push(t.clone());
+                }
                 let msg = ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
                 history.push(msg.clone());
                 if let Err(e) = state.api_session_store.append(&session_id, &msg) {
