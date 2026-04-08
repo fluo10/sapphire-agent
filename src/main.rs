@@ -4,6 +4,8 @@ mod channel;
 mod config;
 mod daily_log;
 mod heartbeat;
+mod heartbeat_config;
+mod memory_compaction;
 mod provider;
 mod serve;
 mod session;
@@ -19,7 +21,7 @@ use config::Config;
 use daily_log::catchup_pending_logs;
 use heartbeat::Heartbeat;
 use provider::anthropic::AnthropicProvider;
-use sapphire_workspace::{AppContext, Workspace as SwWorkspace, WorkspaceState};
+use sapphire_workspace::{AppContext, Workspace as SwWorkspace, WorkspaceConfig, WorkspaceState};
 
 static APP_CTX: AppContext = AppContext::new("sapphire-agent");
 use session::SessionStore;
@@ -121,7 +123,6 @@ async fn main() -> Result<()> {
                 ("IDENTITY.md",          vec!["IDENTITY.md"]),
                 ("USER.md",              vec!["USER.md"]),
                 ("TOOLS.md",             vec!["TOOLS.md"]),
-                ("HEARTBEAT.md",         vec!["HEARTBEAT.md"]),
                 ("BOOTSTRAP.md",         vec!["BOOTSTRAP.md"]),
                 ("MEMORY.md",            vec!["MEMORY.md", "memory.md"]),
             ];
@@ -145,12 +146,44 @@ async fn main() -> Result<()> {
             // ── sapphire-workspace (search, file ops, git sync) ─────────────
             let sw_workspace = SwWorkspace::resolve(&APP_CTX, Some(&workspace_dir))
                 .context("Failed to resolve sapphire-workspace")?;
+            // Load the workspace config so we can read sync_interval_minutes.
+            let ws_config = WorkspaceConfig::load_from(&sw_workspace.config_path())
+                .unwrap_or_default();
+            let ws_sync_interval = ws_config.sync.sync_interval();
             let ws_state = WorkspaceState::open(sw_workspace)
                 .context("Failed to open WorkspaceState")?;
             if let Err(e) = ws_state.sync() {
                 tracing::warn!("Initial workspace sync failed: {e}");
             }
             let ws_state = Arc::new(Mutex::new(ws_state));
+
+            // ── Periodic workspace sync (if enabled in workspace config) ────
+            if let Some(dur) = ws_sync_interval {
+                tracing::info!(
+                    "Periodic workspace sync enabled: every {}s",
+                    dur.as_secs()
+                );
+                let ws = Arc::clone(&ws_state);
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(dur);
+                    tick.tick().await; // skip immediate fire
+                    loop {
+                        tick.tick().await;
+                        let state = ws.lock().expect("ws_state mutex poisoned");
+                        match state.sync() {
+                            Ok((u, r)) => {
+                                tracing::info!("Periodic ws sync: {u} upserted, {r} removed");
+                                if let Some(backend) = state.sync_backend() {
+                                    if let Err(e) = backend.sync() {
+                                        tracing::warn!("Periodic ws git sync failed: {e:#}");
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::warn!("Periodic ws index sync failed: {e:#}"),
+                        }
+                    }
+                });
+            }
 
             // ── Tools ───────────────────────────────────────────────────────
             let tool_set = Arc::new(tools::default_tool_set(
@@ -200,15 +233,6 @@ async fn main() -> Result<()> {
                 )
                 .await;
 
-                // ── Heartbeat (daily log at boundary hour) ──────────────────
-                let heartbeat = Heartbeat {
-                    day_boundary_hour: config.day_boundary_hour,
-                    session_store: Arc::clone(&channel_session_store),
-                    provider: Arc::clone(&provider),
-                    workspace_dir: workspace_dir.clone(),
-                };
-                tokio::spawn(heartbeat.run());
-
                 // ── Agent ───────────────────────────────────────────────────
                 let agent = Arc::new(Agent::new(
                     config.clone(),
@@ -216,10 +240,35 @@ async fn main() -> Result<()> {
                     Arc::clone(&provider),
                     Arc::clone(&workspace),
                     Some(Arc::clone(&tool_set)),
-                    channel_session_store,
+                    Arc::clone(&channel_session_store),
                 ));
+
+                // ── Heartbeat (day-boundary + cron loops) ───────────────────
+                let default_room_id = config
+                    .matrix
+                    .as_ref()
+                    .map(|m| m.room_id.clone())
+                    .or_else(|| {
+                        config
+                            .discord
+                            .as_ref()
+                            .and_then(|d| d.channel_ids.first().cloned())
+                    });
+                let heartbeat = Heartbeat {
+                    workspace_dir: workspace_dir.clone(),
+                    day_boundary_hour: config.day_boundary_hour,
+                    daily_log_enabled: config.daily_log_enabled,
+                    memory_compaction_enabled: config.memory_compaction_enabled,
+                    session_store: Arc::clone(&channel_session_store),
+                    provider: Arc::clone(&provider),
+                    agent: Arc::clone(&agent),
+                    default_room_id,
+                };
+                heartbeat.spawn();
+
+                let agent_run = Arc::clone(&agent);
                 tokio::spawn(async move {
-                    if let Err(e) = agent.run().await {
+                    if let Err(e) = agent_run.run().await {
                         tracing::error!("Agent error: {e:#}");
                     }
                 });

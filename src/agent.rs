@@ -68,6 +68,31 @@ impl Agent {
         }
     }
 
+    /// Heartbeat trigger: inject a system-style prompt as if it were an
+    /// incoming message, so the agent runs through the normal handle_message
+    /// pipeline (history, tool loop, channel send) without faking a user
+    /// utterance. The content is wrapped with `[Heartbeat: <name>]` so the
+    /// agent can recognise (via AGENTS.md / HEARTBEAT.md instructions) that
+    /// this is a system trigger, not a real user message.
+    pub async fn trigger(
+        self: &Arc<Self>,
+        task_name: &str,
+        prompt: &str,
+        room_id: &str,
+    ) -> anyhow::Result<()> {
+        let content = format!("[Heartbeat: {task_name}]\n\n{prompt}");
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let incoming = crate::channel::IncomingMessage {
+            id: format!("heartbeat-{task_name}-{now_ms}"),
+            sender: "heartbeat".to_string(),
+            content,
+            room_id: room_id.to_string(),
+            timestamp: now_ms,
+            thread_id: None,
+        };
+        Arc::clone(self).handle_message(incoming).await
+    }
+
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let (tx, mut rx) = mpsc::channel(64);
 

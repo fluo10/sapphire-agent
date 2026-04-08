@@ -27,6 +27,16 @@ pub struct Config {
     /// Used for session resets and daily log generation. Default: 0 (midnight).
     #[serde(default)]
     pub day_boundary_hour: u8,
+    /// Whether to generate a daily log at the day boundary. Default: true.
+    #[serde(default = "default_true")]
+    pub daily_log_enabled: bool,
+    /// Whether to compact MEMORY.md at the day boundary. Default: true.
+    #[serde(default = "default_true")]
+    pub memory_compaction_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Configuration for the HTTP API server (serve command).

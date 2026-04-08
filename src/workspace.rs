@@ -47,10 +47,6 @@ static WORKSPACE_FILES: &[WorkspaceFileDef] = &[
         heading: "# Tools",
     },
     WorkspaceFileDef {
-        candidates: &["HEARTBEAT.md"],
-        heading: "# Heartbeat",
-    },
-    WorkspaceFileDef {
         candidates: &["BOOTSTRAP.md"],
         heading: "# Bootstrap",
     },
