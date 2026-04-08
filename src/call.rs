@@ -114,14 +114,20 @@ async fn initialize_session(
         .unwrap_or_else(|| session_id_req.to_string());
 
     let val: Value = resp.json().await?;
+    if let Some(err) = val.get("error") {
+        let msg = err["message"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("{msg}");
+    }
     let result = &val["result"];
-    let actual_session_id = result["session_id"]
+    // Prefer human-readable grain-id for display; fall back to UUID
+    let display_id = result["public_id"]
         .as_str()
+        .or_else(|| result["session_id"].as_str())
         .unwrap_or(&mcp_session_id)
         .to_string();
     let is_new = result["is_new"].as_bool().unwrap_or(true);
 
-    Ok((mcp_session_id, actual_session_id, is_new))
+    Ok((mcp_session_id, display_id, is_new))
 }
 
 // ---------------------------------------------------------------------------
@@ -158,12 +164,13 @@ async fn list_sessions(
     if sessions.is_empty() {
         println!("No sessions found.");
     } else {
-        println!("{:<38}  {}", "Session ID", "Created at");
-        println!("{}", "-".repeat(62));
+        println!("{:<10}  {:<30}  {}", "ID", "Title", "Created at");
+        println!("{}", "-".repeat(64));
         for s in sessions {
-            let id = s["session_id"].as_str().unwrap_or("?");
+            let pub_id = s["public_id"].as_str().unwrap_or("-");
+            let title = s["title"].as_str().unwrap_or("(untitled)");
             let created = s["created_at"].as_str().unwrap_or("?");
-            println!("{id:<38}  {created}");
+            println!("{pub_id:<10}  {title:<30}  {created}");
         }
     }
 

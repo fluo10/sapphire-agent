@@ -54,7 +54,7 @@ enum Command {
         /// Server base URL
         #[arg(long, default_value = "http://localhost:9000")]
         server: String,
-        /// Existing session UUID to resume
+        /// Grain-id of an existing session to resume (e.g. a3b7k9p)
         #[arg(long)]
         session: Option<String>,
         /// List available API sessions and exit

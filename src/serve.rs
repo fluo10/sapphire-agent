@@ -171,18 +171,39 @@ async fn handle_initialize(
     params: Option<Value>,
     existing_header_session: Option<String>,
 ) -> axum::response::Response {
-    // Determine session ID: header > params > generate new
-    let provided_id = existing_header_session.or_else(|| {
-        params
+    // Resolve to an internal UUID session_id.
+    // - Mcp-Session-Id header: already a UUID (internal), use directly.
+    // - params.session_id: must be a 7-char grain-id (public) or "new"/absent.
+    let resolved: Option<String> = if let Some(uuid) = existing_header_session {
+        // Header carries the internal UUID we issued — trust it directly.
+        Some(uuid)
+    } else {
+        let param_id = params
             .as_ref()
             .and_then(|p| p["session_id"].as_str())
             .filter(|s| *s != "new")
-            .map(|s| s.to_string())
-    });
+            .map(|s| s.to_string());
 
-    let (session_id, is_new) = match provided_id {
+        match param_id {
+            None => None,
+            Some(ref id) if id.len() == 7 => {
+                match state.api_session_store.find_by_public_id(id) {
+                    Some(uuid) => Some(uuid),
+                    None => {
+                        let body = error_response(req_id, -32602, "Session not found");
+                        return body.into_response();
+                    }
+                }
+            }
+            Some(_) => {
+                let body = error_response(req_id, -32602, "Invalid session id (expected 7-char grain-id)");
+                return body.into_response();
+            }
+        }
+    };
+
+    let (session_id, is_new) = match resolved {
         Some(id) => {
-            // Check if it already exists
             let exists = state.api_session_store.load_session(&id).is_some();
             (id, !exists)
         }
@@ -190,9 +211,13 @@ async fn handle_initialize(
     };
 
     let key: ConversationKey = (session_id.clone(), None);
-    if let Err(e) = state.api_session_store.ensure_session(&session_id, &key, "api") {
-        warn!("Failed to ensure session file {session_id}: {e}");
-    }
+    let public_id = match state.api_session_store.ensure_session(&session_id, &key, "api") {
+        Ok(pub_id) => pub_id,
+        Err(e) => {
+            warn!("Failed to ensure session file {session_id}: {e}");
+            None
+        }
+    };
 
     // If resuming: pre-load history into memory
     if !is_new {
@@ -205,10 +230,13 @@ async fn handle_initialize(
         });
     }
 
-    let result = json!({
+    let mut result = json!({
         "session_id": session_id,
         "is_new": is_new,
     });
+    if let Some(ref pub_id) = public_id {
+        result["public_id"] = json!(pub_id);
+    }
 
     let body = json!({
         "jsonrpc": "2.0",
@@ -284,10 +312,17 @@ async fn handle_list_sessions(state: Arc<ServeState>, req_id: Value) -> axum::re
     let items: Vec<Value> = metas
         .into_iter()
         .map(|m| {
-            json!({
+            let mut v = json!({
                 "session_id": m.session_id,
                 "created_at": m.created_at,
-            })
+            });
+            if let Some(pub_id) = m.public_id {
+                v["public_id"] = json!(pub_id);
+            }
+            if let Some(title) = m.title {
+                v["title"] = json!(title);
+            }
+            v
         })
         .collect();
 
@@ -330,10 +365,11 @@ async fn run_turn(
             })
             .clone()
     };
+    let is_first_turn = history.is_empty();
 
     // 2. Ensure JSONL file exists
     let key: ConversationKey = (session_id.clone(), None);
-    if let Err(e) = state.api_session_store.ensure_session(&session_id, &key, "api") {
+    if let Err(e) = state.api_session_store.ensure_session(&session_id, &key, "api").map(|_| ()) {
         warn!("Failed to ensure session file: {e}");
     }
 
@@ -438,7 +474,7 @@ async fn run_turn(
     };
 
     // 6. Send final result
-    match final_text {
+    match &final_text {
         Some(text) => {
             send(result_event(&req_id, json!({ "content": text }))).await;
         }
@@ -448,5 +484,54 @@ async fn run_turn(
     }
 
     // 7. Update in-memory sessions map
-    state.sessions.lock().await.insert(session_id, history);
+    state.sessions.lock().await.insert(session_id.clone(), history);
+
+    // 8. Generate and store session title after the first successful turn
+    if is_first_turn {
+        if let Some(text) = final_text {
+            let state2 = Arc::clone(&state);
+            let sid = session_id.clone();
+            let user_msg = user_message.clone();
+            tokio::spawn(async move {
+                if let Some(title) = generate_session_title(&*state2.provider, &user_msg, &text).await {
+                    if let Err(e) = state2.api_session_store.set_title(&sid, &title) {
+                        warn!("Failed to store session title: {e}");
+                    }
+                }
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Title generation
+// ---------------------------------------------------------------------------
+
+async fn generate_session_title(
+    provider: &dyn Provider,
+    user_message: &str,
+    assistant_response: &str,
+) -> Option<String> {
+    let user_snippet = &user_message[..user_message.len().min(300)];
+    let asst_snippet = &assistant_response[..assistant_response.len().min(300)];
+    let prompt = format!(
+        "Generate a concise title (max 60 characters) for this conversation. \
+        Respond with only the title text — no quotes, no punctuation at the end.\n\n\
+        User: {user_snippet}\nAssistant: {asst_snippet}"
+    );
+    let messages = vec![ChatMessage::user(&prompt)];
+    match provider.chat(None, &messages, None).await {
+        Ok(resp) => resp.text.map(|t| {
+            let t = t.trim().to_string();
+            if t.chars().count() > 60 {
+                t.chars().take(60).collect()
+            } else {
+                t
+            }
+        }),
+        Err(e) => {
+            warn!("Title generation failed: {e:#}");
+            None
+        }
+    }
 }

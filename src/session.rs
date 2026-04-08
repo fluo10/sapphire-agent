@@ -39,6 +39,12 @@ pub struct SessionMeta {
     pub thread_id: Option<String>,
     pub channel: String,
     pub created_at: DateTime<Utc>,
+    /// Human-readable alias (grain-id, 7 chars). Only set for API sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_id: Option<String>,
+    /// Short auto-generated title, populated from a later `session_title` line.
+    #[serde(skip)]
+    pub title: Option<String>,
 }
 
 /// A single stored message: `ChatMessage` + wall-clock timestamp.
@@ -75,6 +81,11 @@ struct ClosedLine {
     closed_at: DateTime<Utc>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct TitleLine {
+    session_title: String,
+}
+
 // ---------------------------------------------------------------------------
 // SessionStore
 // ---------------------------------------------------------------------------
@@ -102,6 +113,8 @@ impl SessionStore {
             thread_id: key.1.clone(),
             channel: channel.to_string(),
             created_at: Utc::now(),
+            public_id: None,
+            title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta })?;
         let mut file = OpenOptions::new()
@@ -214,27 +227,70 @@ impl SessionStore {
 
     /// Ensure a session file exists for the given caller-supplied ID.
     /// Unlike `create_session`, this uses the provided ID rather than generating a new UUID.
+    ///
+    /// For API sessions (`channel == "api"`), a grain-id `public_id` is generated on creation.
+    /// Returns the `public_id` if present (new or existing).
     pub fn ensure_session(
         &self,
         session_id: &str,
         key: &ConversationKey,
         channel: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
         fs::create_dir_all(&self.sessions_dir)?;
         let path = self.session_path(session_id);
-        if !path.exists() {
-            let meta = SessionMeta {
-                session_id: session_id.to_string(),
-                room_id: key.0.clone(),
-                thread_id: key.1.clone(),
-                channel: channel.to_string(),
-                created_at: Utc::now(),
-            };
-            let line = serde_json::to_string(&MetaLine { meta })?;
-            let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-            writeln!(file, "{line}")?;
+        if path.exists() {
+            // Return existing public_id if the file already existed
+            let pub_id = load_session_file(&path)
+                .and_then(|(meta, _, _)| meta.public_id);
+            return Ok(pub_id);
         }
+        let public_id = if channel == "api" {
+            Some(grain_id::GrainId::random().to_string())
+        } else {
+            None
+        };
+        let meta = SessionMeta {
+            session_id: session_id.to_string(),
+            room_id: key.0.clone(),
+            thread_id: key.1.clone(),
+            channel: channel.to_string(),
+            created_at: Utc::now(),
+            public_id: public_id.clone(),
+            title: None,
+        };
+        let line = serde_json::to_string(&MetaLine { meta })?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(file, "{line}")?;
+        Ok(public_id)
+    }
+
+    /// Append a title for a session (append-only; last line wins on read).
+    pub fn set_title(&self, session_id: &str, title: &str) -> anyhow::Result<()> {
+        let line = serde_json::to_string(&TitleLine { session_title: title.to_string() })?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.session_path(session_id))?;
+        writeln!(file, "{line}")?;
         Ok(())
+    }
+
+    /// Find a session by its human-readable `public_id` (grain-id).
+    /// Returns the internal UUID `session_id` if found.
+    pub fn find_by_public_id(&self, public_id: &str) -> Option<String> {
+        let dir = fs::read_dir(&self.sessions_dir).ok()?;
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some((meta, _, _)) = load_session_file(&path) {
+                if meta.public_id.as_deref() == Some(public_id) {
+                    return Some(meta.session_id);
+                }
+            }
+        }
+        None
     }
 
     /// Return all sessions that contain at least one message falling within
@@ -378,7 +434,7 @@ fn load_session_file(path: &Path) -> Option<(SessionMeta, Vec<StoredMessage>, bo
     // First line must be the meta object
     let first = lines.next()?.ok()?;
     let meta_line: MetaLine = serde_json::from_str(first.trim()).ok()?;
-    let meta = meta_line.meta;
+    let mut meta = meta_line.meta;
 
     let mut messages = Vec::new();
     let mut is_closed = false;
@@ -399,6 +455,8 @@ fn load_session_file(path: &Path) -> Option<(SessionMeta, Vec<StoredMessage>, bo
 
         if value.get("closed_at").is_some() {
             is_closed = true;
+        } else if let Some(title) = value.get("session_title").and_then(|v| v.as_str()) {
+            meta.title = Some(title.to_string());
         } else if value.get("timestamp").is_some() {
             match serde_json::from_value::<StoredMessage>(value) {
                 Ok(stored) => messages.push(stored),
