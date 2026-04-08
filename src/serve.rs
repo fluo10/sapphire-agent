@@ -125,7 +125,14 @@ pub async fn run(
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("sapphire-agent: API server listening on http://{addr}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                error!("Failed to install Ctrl-C handler: {e}");
+            }
+            info!("HTTP server shutting down...");
+        })
+        .await?;
     Ok(())
 }
 
