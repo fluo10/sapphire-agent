@@ -48,10 +48,7 @@ pub trait Channel: Send + Sync {
     async fn send(&self, message: &OutgoingMessage) -> anyhow::Result<()>;
 
     /// Long-running: receive messages and forward them through `tx`.
-    async fn listen(
-        &self,
-        tx: tokio::sync::mpsc::Sender<IncomingMessage>,
-    ) -> anyhow::Result<()>;
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<IncomingMessage>) -> anyhow::Result<()>;
 
     async fn start_typing(&self, _room_id: &str) -> anyhow::Result<()> {
         Ok(())

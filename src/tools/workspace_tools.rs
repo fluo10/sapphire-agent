@@ -108,7 +108,9 @@ impl Tool for MemoryTool {
 
         match action {
             "add" => {
-                let content = input["content"].as_str().context("missing 'content' for add")?;
+                let content = input["content"]
+                    .as_str()
+                    .context("missing 'content' for add")?;
                 let existing = std::fs::read_to_string(&abs_path).unwrap_or_default();
                 let new_content = if existing.trim().is_empty() {
                     content.to_string()
@@ -122,15 +124,21 @@ impl Tool for MemoryTool {
             }
 
             "replace" => {
-                let content = input["content"].as_str().context("missing 'content' for replace")?;
-                let old_text = input["old_text"].as_str().context("missing 'old_text' for replace")?;
+                let content = input["content"]
+                    .as_str()
+                    .context("missing 'content' for replace")?;
+                let old_text = input["old_text"]
+                    .as_str()
+                    .context("missing 'old_text' for replace")?;
                 let existing = std::fs::read_to_string(&abs_path)
                     .with_context(|| format!("Failed to read {target}"))?;
                 let entries: Vec<&str> = split_entries(&existing);
                 let idx = entries
                     .iter()
                     .position(|e| e.contains(old_text))
-                    .with_context(|| format!("No entry containing {:?} found in {target}", old_text))?;
+                    .with_context(|| {
+                        format!("No entry containing {:?} found in {target}", old_text)
+                    })?;
                 let mut new_entries = entries.clone();
                 new_entries[idx] = content;
                 let joined = join_entries(&new_entries);
@@ -141,16 +149,24 @@ impl Tool for MemoryTool {
             }
 
             "remove" => {
-                let old_text = input["old_text"].as_str().context("missing 'old_text' for remove")?;
+                let old_text = input["old_text"]
+                    .as_str()
+                    .context("missing 'old_text' for remove")?;
                 let existing = std::fs::read_to_string(&abs_path)
                     .with_context(|| format!("Failed to read {target}"))?;
                 let entries: Vec<&str> = split_entries(&existing);
                 let idx = entries
                     .iter()
                     .position(|e| e.contains(old_text))
-                    .with_context(|| format!("No entry containing {:?} found in {target}", old_text))?;
-                let new_entries: Vec<&str> =
-                    entries.iter().enumerate().filter(|(i, _)| *i != idx).map(|(_, e)| *e).collect();
+                    .with_context(|| {
+                        format!("No entry containing {:?} found in {target}", old_text)
+                    })?;
+                let new_entries: Vec<&str> = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != idx)
+                    .map(|(_, e)| *e)
+                    .collect();
                 let joined = join_entries(&new_entries);
                 lock(&self.state)
                     .write_file(rel_path, &joined)
@@ -198,14 +214,15 @@ impl WorkspaceReadTool {
 
 #[async_trait]
 impl Tool for WorkspaceReadTool {
-    fn spec(&self) -> &ToolSpec { &self.spec }
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let rel = input["path"].as_str().context("missing 'path'")?;
         let state = lock(&self.state);
         let abs = state.workspace.root.join(rel);
-        std::fs::read_to_string(&abs)
-            .with_context(|| format!("Failed to read {rel}"))
+        std::fs::read_to_string(&abs).with_context(|| format!("Failed to read {rel}"))
     }
 }
 
@@ -248,7 +265,9 @@ impl WorkspaceWriteTool {
 
 #[async_trait]
 impl Tool for WorkspaceWriteTool {
-    fn spec(&self) -> &ToolSpec { &self.spec }
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let rel = input["path"].as_str().context("missing 'path'")?;
@@ -399,7 +418,9 @@ impl WorkspaceSyncTool {
 
 #[async_trait]
 impl Tool for WorkspaceSyncTool {
-    fn spec(&self) -> &ToolSpec { &self.spec }
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
 
     async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
         let state = lock(&self.state);

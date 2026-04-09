@@ -46,7 +46,6 @@ impl ToolSet {
     }
 }
 
-
 /// Build the default tool set backed by a sapphire-workspace WorkspaceState.
 ///
 /// `tavily_api_key`: if provided, the `web_search` tool is included.

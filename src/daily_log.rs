@@ -23,9 +23,7 @@ pub fn pending_log_dates(
     let today = crate::session::local_date_for_timestamp(Local::now(), boundary_hour);
 
     let mut dates = session_store.all_session_dates(boundary_hour);
-    dates.retain(|&date| {
-        date < today && !daily_log_path(workspace_dir, date).exists()
-    });
+    dates.retain(|&date| date < today && !daily_log_path(workspace_dir, date).exists());
     dates
 }
 
@@ -55,7 +53,9 @@ pub async fn generate_daily_log(
 
     let user_msg = ChatMessage::user(&transcript);
     let response = provider.chat(Some(system), &[user_msg], None).await?;
-    let summary = response.text.unwrap_or_else(|| "(no summary generated)".to_string());
+    let summary = response
+        .text
+        .unwrap_or_else(|| "(no summary generated)".to_string());
 
     let log_path = daily_log_path(workspace_dir, date);
     if let Some(parent) = log_path.parent() {
@@ -87,7 +87,10 @@ fn format_sessions(sessions: &[(SessionMeta, Vec<StoredMessage>)], date: NaiveDa
 
     for (meta, messages) in sessions {
         let thread = meta.thread_id.as_deref().unwrap_or("main");
-        parts.push(format!("## Session {} (thread: {})\n", meta.session_id, thread));
+        parts.push(format!(
+            "## Session {} (thread: {})\n",
+            meta.session_id, thread
+        ));
 
         for msg in messages {
             let text: Vec<&str> = msg

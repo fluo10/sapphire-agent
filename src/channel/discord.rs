@@ -2,11 +2,11 @@ use crate::channel::{Channel, IncomingMessage, OutgoingMessage};
 use crate::config::DiscordConfig;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use serenity::Client;
 use serenity::all::{
     ChannelId, Context as SerenityCtx, EventHandler, GatewayIntents, Message, Ready,
 };
 use serenity::http::Http;
-use serenity::Client;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{OnceCell, mpsc};
@@ -35,9 +35,7 @@ impl EventHandler for DiscordHandler {
         }
 
         let channel_id = msg.channel_id.get();
-        if !self.allowed_channel_ids.is_empty()
-            && !self.allowed_channel_ids.contains(&channel_id)
-        {
+        if !self.allowed_channel_ids.is_empty() && !self.allowed_channel_ids.contains(&channel_id) {
             debug!("Ignoring message from channel {channel_id} (not in allowed list)");
             return;
         }
@@ -99,7 +97,10 @@ impl DiscordChannel {
         let allowed_user_ids = cfg
             .allowed_users
             .iter()
-            .map(|s| s.parse::<u64>().context("Invalid Discord user ID in allowed_users"))
+            .map(|s| {
+                s.parse::<u64>()
+                    .context("Invalid Discord user ID in allowed_users")
+            })
             .collect::<Result<HashSet<_>>>()?;
 
         Ok(Self {
