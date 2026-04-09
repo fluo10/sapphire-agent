@@ -120,10 +120,7 @@ impl Workspace {
     }
 
     /// Try each candidate filename in order; return the first one found.
-    async fn read_first_existing(
-        &self,
-        candidates: &[&str],
-    ) -> Option<(String, String)> {
+    async fn read_first_existing(&self, candidates: &[&str]) -> Option<(String, String)> {
         for &filename in candidates {
             if let Some(content) = self.read_file(filename).await {
                 return Some((filename.to_string(), content));
@@ -161,7 +158,10 @@ impl Workspace {
                         );
                         self.cache.lock().await.insert(
                             path,
-                            CachedFile { content: content.clone(), mtime },
+                            CachedFile {
+                                content: content.clone(),
+                                mtime,
+                            },
                         );
                         Some(content)
                     }

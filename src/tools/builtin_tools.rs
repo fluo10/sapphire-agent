@@ -232,7 +232,11 @@ impl Tool for WriteFileTool {
                 .with_context(|| format!("Failed to write '{}'", path.display()))?;
         }
 
-        Ok(format!("Written: {} ({} bytes)", path.display(), content.len()))
+        Ok(format!(
+            "Written: {} ({} bytes)",
+            path.display(),
+            content.len()
+        ))
     }
 }
 
@@ -292,9 +296,7 @@ impl Tool for DeleteFileTool {
                 .lock()
                 .expect("WorkspaceState mutex poisoned")
                 .delete_file(relative)
-                .with_context(|| {
-                    format!("Failed to delete '{}' via workspace", path.display())
-                })?;
+                .with_context(|| format!("Failed to delete '{}' via workspace", path.display()))?;
         } else {
             std::fs::remove_file(&path)
                 .with_context(|| format!("Failed to delete '{}'", path.display()))?;
@@ -377,11 +379,8 @@ impl Tool for TerminalTool {
         let child = cmd.spawn().context("Failed to spawn command")?;
         let pid = child.id();
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -478,7 +477,10 @@ impl Tool for WebSearchTool {
             anyhow::bail!("Tavily API error {status}: {body}");
         }
 
-        let data: serde_json::Value = resp.json().await.context("Failed to parse Tavily response")?;
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse Tavily response")?;
         let results = data["results"]
             .as_array()
             .context("Unexpected Tavily response format (missing 'results')")?;

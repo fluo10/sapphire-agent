@@ -43,7 +43,11 @@ impl AnthropicProvider {
             .find(|m| m.role == Role::User)
             .and_then(|m| m.text())
             .unwrap_or_default();
-        if is_coding_related(&last_user_text) { &self.model } else { light }
+        if is_coding_related(&last_user_text) {
+            &self.model
+        } else {
+            light
+        }
     }
 }
 
@@ -54,12 +58,45 @@ fn is_coding_related(text: &str) -> bool {
     }
     let lower = text.to_lowercase();
     let keywords = [
-        "code", "implement", "function", "method", "class", "struct",
-        "enum", "trait", "bug", "error", "debug", "fix", "compile",
-        "refactor", "test", "algorithm", "api", "library", "crate",
-        "cargo", "npm", "syntax", "variable", "type", "rust", "python",
-        "javascript", "typescript", "java", "go ", " sql", "bash",
-        "script", "コード", "実装", "関数", "バグ", "エラー", "デバッグ",
+        "code",
+        "implement",
+        "function",
+        "method",
+        "class",
+        "struct",
+        "enum",
+        "trait",
+        "bug",
+        "error",
+        "debug",
+        "fix",
+        "compile",
+        "refactor",
+        "test",
+        "algorithm",
+        "api",
+        "library",
+        "crate",
+        "cargo",
+        "npm",
+        "syntax",
+        "variable",
+        "type",
+        "rust",
+        "python",
+        "javascript",
+        "typescript",
+        "java",
+        "go ",
+        " sql",
+        "bash",
+        "script",
+        "コード",
+        "実装",
+        "関数",
+        "バグ",
+        "エラー",
+        "デバッグ",
     ];
     keywords.iter().any(|kw| lower.contains(kw))
 }
@@ -130,7 +167,10 @@ enum SseEvent {
     #[serde(rename = "message_start")]
     MessageStart { message: MessageStartData },
     #[serde(rename = "content_block_start")]
-    ContentBlockStart { index: usize, content_block: ContentBlockMeta },
+    ContentBlockStart {
+        index: usize,
+        content_block: ContentBlockMeta,
+    },
     #[serde(rename = "content_block_delta")]
     ContentBlockDelta { index: usize, delta: Delta },
     #[serde(rename = "content_block_stop")]
@@ -184,8 +224,14 @@ struct ApiError {
 // ---------------------------------------------------------------------------
 
 enum Block {
-    Text { text: String },
-    ToolUse { id: String, name: String, input_json: String },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input_json: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +247,10 @@ fn chat_message_to_api(msg: &ChatMessage) -> ApiMessage {
     // If there's exactly one Text part and no other parts, use the wire shorthand.
     if msg.parts.len() == 1 {
         if let ContentPart::Text(text) = &msg.parts[0] {
-            return ApiMessage { role: role.to_string(), content: ApiContent::Text(text.clone()) };
+            return ApiMessage {
+                role: role.to_string(),
+                content: ApiContent::Text(text.clone()),
+            };
         }
     }
 
@@ -215,14 +264,20 @@ fn chat_message_to_api(msg: &ChatMessage) -> ApiMessage {
                 name: name.clone(),
                 input: input.clone(),
             },
-            ContentPart::ToolResult { tool_use_id, content } => ApiPart::ToolResult {
+            ContentPart::ToolResult {
+                tool_use_id,
+                content,
+            } => ApiPart::ToolResult {
                 tool_use_id: tool_use_id.clone(),
                 content: content.clone(),
             },
         })
         .collect();
 
-    ApiMessage { role: role.to_string(), content: ApiContent::Parts(parts) }
+    ApiMessage {
+        role: role.to_string(),
+        content: ApiContent::Parts(parts),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -241,8 +296,7 @@ impl Provider for AnthropicProvider {
         messages: &[ChatMessage],
         tools: Option<&[ToolSpec]>,
     ) -> Result<ChatResponse> {
-        let api_messages: Vec<ApiMessage> =
-            messages.iter().map(chat_message_to_api).collect();
+        let api_messages: Vec<ApiMessage> = messages.iter().map(chat_message_to_api).collect();
 
         let api_tools: Option<Vec<ApiToolSpec<'_>>> = tools.map(|specs| {
             specs
@@ -300,47 +354,51 @@ impl Provider for AnthropicProvider {
                 buffer.drain(..pos + 2);
 
                 for line in event_str.lines() {
-                    let Some(data) = line.strip_prefix("data: ") else { continue };
+                    let Some(data) = line.strip_prefix("data: ") else {
+                        continue;
+                    };
                     if data == "[DONE]" {
                         break;
                     }
                     match serde_json::from_str::<SseEvent>(data) {
-                        Ok(SseEvent::ContentBlockStart { index, content_block }) => {
-                            match content_block.kind.as_str() {
-                                "text" => {
-                                    blocks.insert(index, Block::Text { text: String::new() });
-                                }
-                                "tool_use" => {
-                                    blocks.insert(
-                                        index,
-                                        Block::ToolUse {
-                                            id: content_block.id.unwrap_or_default(),
-                                            name: content_block.name.unwrap_or_default(),
-                                            input_json: String::new(),
-                                        },
-                                    );
-                                }
-                                _ => {}
+                        Ok(SseEvent::ContentBlockStart {
+                            index,
+                            content_block,
+                        }) => match content_block.kind.as_str() {
+                            "text" => {
+                                blocks.insert(
+                                    index,
+                                    Block::Text {
+                                        text: String::new(),
+                                    },
+                                );
                             }
-                        }
-                        Ok(SseEvent::ContentBlockDelta { index, delta }) => {
-                            match delta {
-                                Delta::Text { text } => {
-                                    if let Some(Block::Text { text: acc }) =
-                                        blocks.get_mut(&index)
-                                    {
-                                        acc.push_str(&text);
-                                    }
-                                }
-                                Delta::InputJson { partial_json } => {
-                                    if let Some(Block::ToolUse { input_json, .. }) =
-                                        blocks.get_mut(&index)
-                                    {
-                                        input_json.push_str(&partial_json);
-                                    }
+                            "tool_use" => {
+                                blocks.insert(
+                                    index,
+                                    Block::ToolUse {
+                                        id: content_block.id.unwrap_or_default(),
+                                        name: content_block.name.unwrap_or_default(),
+                                        input_json: String::new(),
+                                    },
+                                );
+                            }
+                            _ => {}
+                        },
+                        Ok(SseEvent::ContentBlockDelta { index, delta }) => match delta {
+                            Delta::Text { text } => {
+                                if let Some(Block::Text { text: acc }) = blocks.get_mut(&index) {
+                                    acc.push_str(&text);
                                 }
                             }
-                        }
+                            Delta::InputJson { partial_json } => {
+                                if let Some(Block::ToolUse { input_json, .. }) =
+                                    blocks.get_mut(&index)
+                                {
+                                    input_json.push_str(&partial_json);
+                                }
+                            }
+                        },
                         Ok(SseEvent::Error { error }) => {
                             bail!("Anthropic stream error: {}", error.message);
                         }
@@ -362,7 +420,11 @@ impl Provider for AnthropicProvider {
                 Block::Text { text } if !text.is_empty() => {
                     text_parts.push(text);
                 }
-                Block::ToolUse { id, name, input_json } => {
+                Block::ToolUse {
+                    id,
+                    name,
+                    input_json,
+                } => {
                     let input = if input_json.is_empty() {
                         json!({})
                     } else {
@@ -374,7 +436,11 @@ impl Provider for AnthropicProvider {
             }
         }
 
-        let text = if text_parts.is_empty() { None } else { Some(text_parts.join("")) };
+        let text = if text_parts.is_empty() {
+            None
+        } else {
+            Some(text_parts.join(""))
+        };
         Ok(ChatResponse { text, tool_calls })
     }
 }

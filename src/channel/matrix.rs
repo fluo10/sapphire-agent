@@ -74,10 +74,7 @@ impl MatrixChannel {
             .await
             .context("Failed to build Matrix client")?;
 
-        let user_id: OwnedUserId = self
-            .user_id
-            .parse()
-            .context("Invalid user_id in config")?;
+        let user_id: OwnedUserId = self.user_id.parse().context("Invalid user_id in config")?;
 
         let session = MatrixSession {
             meta: SessionMeta {
@@ -128,8 +125,7 @@ impl Channel for MatrixChannel {
         let mut content = RoomMessageEventContent::text_markdown(&message.content);
 
         if let Some(thread_id) = &message.thread_id {
-            let thread_root: OwnedEventId =
-                thread_id.parse().context("Invalid thread_id")?;
+            let thread_root: OwnedEventId = thread_id.parse().context("Invalid thread_id")?;
             content.relates_to = Some(Relation::Thread(Thread::plain(
                 thread_root.clone(),
                 thread_root,
@@ -161,9 +157,7 @@ impl Channel for MatrixChannel {
                     if event.sender.as_str() == bot_user_id {
                         return;
                     }
-                    if !allowed_users.is_empty()
-                        && !allowed_users.contains(event.sender.as_str())
-                    {
+                    if !allowed_users.is_empty() && !allowed_users.contains(event.sender.as_str()) {
                         debug!("Ignoring message from non-allowed user: {}", event.sender);
                         return;
                     }

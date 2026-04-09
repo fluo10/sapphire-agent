@@ -12,8 +12,8 @@ use crate::tools::ToolSet;
 use crate::workspace::Workspace;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -200,17 +200,19 @@ async fn handle_initialize(
 
         match param_id {
             None => None,
-            Some(ref id) if id.len() == 7 => {
-                match state.api_session_store.find_by_public_id(id) {
-                    Some(uuid) => Some(uuid),
-                    None => {
-                        let body = error_response(req_id, -32602, "Session not found");
-                        return body.into_response();
-                    }
+            Some(ref id) if id.len() == 7 => match state.api_session_store.find_by_public_id(id) {
+                Some(uuid) => Some(uuid),
+                None => {
+                    let body = error_response(req_id, -32602, "Session not found");
+                    return body.into_response();
                 }
-            }
+            },
             Some(_) => {
-                let body = error_response(req_id, -32602, "Invalid session id (expected 7-char grain-id)");
+                let body = error_response(
+                    req_id,
+                    -32602,
+                    "Invalid session id (expected 7-char grain-id)",
+                );
                 return body.into_response();
             }
         }
@@ -478,7 +480,11 @@ async fn run_turn(
     let final_text = loop {
         let round = history
             .iter()
-            .filter(|m| m.parts.iter().any(|p| matches!(p, ContentPart::ToolUse { .. })))
+            .filter(|m| {
+                m.parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::ToolUse { .. }))
+            })
             .count();
 
         if round >= MAX_TOOL_ROUNDS {
@@ -531,8 +537,8 @@ async fn run_turn(
 
                 // Execute all tools concurrently
                 let tools = Arc::clone(&state.tools);
-                let results: Vec<(String, String)> = futures_util::future::join_all(
-                    tool_calls.iter().map(|c| {
+                let results: Vec<(String, String)> =
+                    futures_util::future::join_all(tool_calls.iter().map(|c| {
                         let tools = Arc::clone(&tools);
                         let c = c.clone();
                         async move {
@@ -541,9 +547,8 @@ async fn run_turn(
                             info!("Tool {} done", c.name);
                             (c.id, result)
                         }
-                    }),
-                )
-                .await;
+                    }))
+                    .await;
 
                 // Notify client of each tool completing
                 for call in &tool_calls {
@@ -574,7 +579,11 @@ async fn run_turn(
     }
 
     // 7. Update in-memory sessions map
-    state.sessions.lock().await.insert(session_id.clone(), history);
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), history);
 
     // 8. Generate and store session title after the first successful turn
     if is_first_turn {
@@ -583,7 +592,9 @@ async fn run_turn(
             let sid = session_id.clone();
             let user_msg = user_message.clone();
             tokio::spawn(async move {
-                if let Some(title) = generate_session_title(&*state2.provider, &user_msg, &text).await {
+                if let Some(title) =
+                    generate_session_title(&*state2.provider, &user_msg, &text).await
+                {
                     if let Err(e) = state2.api_session_store.set_title(&sid, &title) {
                         warn!("Failed to store session title: {e}");
                     }

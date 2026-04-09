@@ -39,7 +39,10 @@ impl Prompt for SimplePrompt {
             PromptHistorySearchStatus::Passing => "",
             PromptHistorySearchStatus::Failing => "failing ",
         };
-        Cow::Owned(format!("({}reverse-search: {}) ", prefix, history_search.term))
+        Cow::Owned(format!(
+            "({}reverse-search: {}) ",
+            prefix, history_search.term
+        ))
     }
 }
 
@@ -227,7 +230,10 @@ async fn dump_history(
         anyhow::bail!("{msg}");
     }
 
-    let messages = val["result"]["messages"].as_array().cloned().unwrap_or_default();
+    let messages = val["result"]["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
 
     if json_mode {
         // Emit the raw messages array as a single JSON object.

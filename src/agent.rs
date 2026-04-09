@@ -232,10 +232,17 @@ impl Agent {
 
         self.snapshots.lock().await.insert(
             key.clone(),
-            SystemSnapshot { system_prompt: system_prompt.clone(), date: today },
+            SystemSnapshot {
+                system_prompt: system_prompt.clone(),
+                date: today,
+            },
         );
 
-        if system_prompt.is_empty() { None } else { Some(system_prompt) }
+        if system_prompt.is_empty() {
+            None
+        } else {
+            Some(system_prompt)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -261,16 +268,21 @@ impl Agent {
         // Inject prefetch context from previous turn (if any)
         let prefetch_result = self.prefetch_cache.lock().await.remove(&key);
         let system_with_context = match (system, prefetch_result) {
-            (Some(sys), Some(ctx)) if !ctx.is_empty() && ctx != "No results found." => {
-                Some(format!("{sys}\n\n---\n\n<memory-context>\n{ctx}\n</memory-context>"))
-            }
+            (Some(sys), Some(ctx)) if !ctx.is_empty() && ctx != "No results found." => Some(
+                format!("{sys}\n\n---\n\n<memory-context>\n{ctx}\n</memory-context>"),
+            ),
             (sys, _) => sys,
         };
 
         // Append user message
         {
             let msg = ChatMessage::user(&incoming.content);
-            self.history.lock().await.entry(key.clone()).or_default().push(msg.clone());
+            self.history
+                .lock()
+                .await
+                .entry(key.clone())
+                .or_default()
+                .push(msg.clone());
             self.persist(&session_id, &msg);
         }
 
@@ -282,12 +294,21 @@ impl Agent {
         let mut accumulated_text: Vec<String> = Vec::new();
         let final_text = loop {
             let messages = {
-                self.history.lock().await.get(&key).cloned().unwrap_or_default()
+                self.history
+                    .lock()
+                    .await
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default()
             };
 
             let round = messages
                 .iter()
-                .filter(|m| m.parts.iter().any(|p| matches!(p, ContentPart::ToolUse { .. })))
+                .filter(|m| {
+                    m.parts
+                        .iter()
+                        .any(|p| matches!(p, ContentPart::ToolUse { .. }))
+                })
                 .count();
 
             if round >= MAX_TOOL_ROUNDS {
@@ -297,7 +318,11 @@ impl Agent {
 
             let response = self
                 .provider
-                .chat(system_with_context.as_deref(), &messages, tool_specs.as_deref())
+                .chat(
+                    system_with_context.as_deref(),
+                    &messages,
+                    tool_specs.as_deref(),
+                )
                 .await;
 
             match response {
@@ -316,7 +341,12 @@ impl Agent {
                 Ok(resp) if !resp.has_tool_calls() => {
                     let text = resp.text.unwrap_or_default();
                     let msg = ChatMessage::assistant(&text);
-                    self.history.lock().await.entry(key.clone()).or_default().push(msg.clone());
+                    self.history
+                        .lock()
+                        .await
+                        .entry(key.clone())
+                        .or_default()
+                        .push(msg.clone());
                     self.persist(&session_id, &msg);
                     if !text.is_empty() {
                         accumulated_text.push(text);
@@ -328,8 +358,14 @@ impl Agent {
                     if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
                         accumulated_text.push(t.clone());
                     }
-                    let msg = ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
-                    self.history.lock().await.entry(key.clone()).or_default().push(msg.clone());
+                    let msg =
+                        ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
+                    self.history
+                        .lock()
+                        .await
+                        .entry(key.clone())
+                        .or_default()
+                        .push(msg.clone());
                     self.persist(&session_id, &msg);
 
                     // Execute tools concurrently
@@ -354,7 +390,12 @@ impl Agent {
                     }
 
                     let msg = ChatMessage::tool_results(results);
-                    self.history.lock().await.entry(key.clone()).or_default().push(msg.clone());
+                    self.history
+                        .lock()
+                        .await
+                        .entry(key.clone())
+                        .or_default()
+                        .push(msg.clone());
                     self.persist(&session_id, &msg);
                 }
             }

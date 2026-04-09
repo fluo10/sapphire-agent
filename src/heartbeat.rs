@@ -85,24 +85,28 @@ impl Heartbeat {
             let enabled: Vec<_> = tasks.into_iter().filter(|t| t.meta.enabled).collect();
 
             let now = Local::now();
-            let (next_at, due_names): (chrono::DateTime<Local>, Vec<(String, String, Option<String>)>) =
-                match next_due(&enabled, now) {
-                    None => {
-                        // No tasks (or none with valid schedules); poll the
-                        // directory periodically in case files are added.
-                        tokio::time::sleep(StdDuration::from_secs(60)).await;
-                        continue;
-                    }
-                    Some((at, due)) => {
-                        let extracted = due
-                            .into_iter()
-                            .map(|t| (t.name.clone(), t.body.clone(), t.meta.room_id.clone()))
-                            .collect();
-                        (at, extracted)
-                    }
-                };
+            let (next_at, due_names): (
+                chrono::DateTime<Local>,
+                Vec<(String, String, Option<String>)>,
+            ) = match next_due(&enabled, now) {
+                None => {
+                    // No tasks (or none with valid schedules); poll the
+                    // directory periodically in case files are added.
+                    tokio::time::sleep(StdDuration::from_secs(60)).await;
+                    continue;
+                }
+                Some((at, due)) => {
+                    let extracted = due
+                        .into_iter()
+                        .map(|t| (t.name.clone(), t.body.clone(), t.meta.room_id.clone()))
+                        .collect();
+                    (at, extracted)
+                }
+            };
 
-            let wait = (next_at - now).to_std().unwrap_or(StdDuration::from_secs(0));
+            let wait = (next_at - now)
+                .to_std()
+                .unwrap_or(StdDuration::from_secs(0));
             info!(
                 "Heartbeat cron: next fire in {:.0}s ({} task(s))",
                 wait.as_secs_f64(),
@@ -120,7 +124,9 @@ impl Heartbeat {
                         }
                     }
                     None => {
-                        warn!("Heartbeat cron: task {name} has no room_id and no default; skipping");
+                        warn!(
+                            "Heartbeat cron: task {name} has no room_id and no default; skipping"
+                        );
                     }
                 }
             }
@@ -130,8 +136,8 @@ impl Heartbeat {
     /// Compute how long to sleep until the next day-boundary time.
     fn time_until_next_boundary(&self) -> StdDuration {
         let now = Local::now();
-        let boundary = NaiveTime::from_hms_opt(self.day_boundary_hour as u32, 0, 0)
-            .expect("valid hour 0–23");
+        let boundary =
+            NaiveTime::from_hms_opt(self.day_boundary_hour as u32, 0, 0).expect("valid hour 0–23");
 
         let now_time = now.time();
         let secs_until = if now_time < boundary {

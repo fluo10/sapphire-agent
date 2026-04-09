@@ -67,7 +67,10 @@ impl StoredMessage {
     }
 
     pub fn into_chat_message(self) -> ChatMessage {
-        ChatMessage { role: self.role, parts: self.parts }
+        ChatMessage {
+            role: self.role,
+            parts: self.parts,
+        }
     }
 }
 
@@ -101,14 +104,17 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn new(sessions_dir: PathBuf) -> Self {
-        Self { sessions_dir, ws_state: None }
+        Self {
+            sessions_dir,
+            ws_state: None,
+        }
     }
 
-    pub fn with_workspace(
-        sessions_dir: PathBuf,
-        ws_state: Arc<Mutex<WorkspaceState>>,
-    ) -> Self {
-        Self { sessions_dir, ws_state: Some(ws_state) }
+    pub fn with_workspace(sessions_dir: PathBuf, ws_state: Arc<Mutex<WorkspaceState>>) -> Self {
+        Self {
+            sessions_dir,
+            ws_state: Some(ws_state),
+        }
     }
 
     fn session_path(&self, session_id: &str) -> PathBuf {
@@ -130,7 +136,10 @@ impl SessionStore {
             return;
         }
         if let Err(e) = guard.on_file_updated(abs_path) {
-            warn!("Failed to notify workspace of update {}: {e}", abs_path.display());
+            warn!(
+                "Failed to notify workspace of update {}: {e}",
+                abs_path.display()
+            );
         }
     }
 
@@ -148,7 +157,10 @@ impl SessionStore {
             return;
         }
         if let Err(e) = guard.on_file_deleted(abs_path) {
-            warn!("Failed to notify workspace of delete {}: {e}", abs_path.display());
+            warn!(
+                "Failed to notify workspace of delete {}: {e}",
+                abs_path.display()
+            );
         }
     }
 
@@ -199,7 +211,9 @@ impl SessionStore {
     /// Close a session by appending a `closed_at` marker.
     /// The session becomes inactive; future messages create a new session.
     pub fn close_session(&self, session_id: &str) -> anyhow::Result<()> {
-        let line = serde_json::to_string(&ClosedLine { closed_at: Utc::now() })?;
+        let line = serde_json::to_string(&ClosedLine {
+            closed_at: Utc::now(),
+        })?;
         let path = self.session_path(session_id);
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;
@@ -252,7 +266,10 @@ impl SessionStore {
 
         for (session_id, key, messages, is_closed) in entries {
             if !is_closed {
-                let chat_messages = messages.into_iter().map(|m| m.into_chat_message()).collect();
+                let chat_messages = messages
+                    .into_iter()
+                    .map(|m| m.into_chat_message())
+                    .collect();
                 history.insert(key.clone(), chat_messages);
                 active.insert(key, session_id);
             }
@@ -281,7 +298,12 @@ impl SessionStore {
     pub fn load_session(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
         let path = self.session_path(session_id);
         let (_, messages, _) = load_session_file(&path)?;
-        Some(messages.into_iter().map(|m| m.into_chat_message()).collect())
+        Some(
+            messages
+                .into_iter()
+                .map(|m| m.into_chat_message())
+                .collect(),
+        )
     }
 
     /// Ensure a session file exists for the given caller-supplied ID.
@@ -301,15 +323,11 @@ impl SessionStore {
         let path = self.session_path(session_id);
         if path.exists() {
             // Return existing public_id if the file already existed
-            let pub_id = load_session_file(&path)
-                .and_then(|(meta, _, _)| meta.public_id);
+            let pub_id = load_session_file(&path).and_then(|(meta, _, _)| meta.public_id);
             return Ok(pub_id);
         }
         let public_id = if channel == "api" {
-            Some(
-                public_id_override
-                    .unwrap_or_else(|| grain_id::GrainId::random().to_string()),
-            )
+            Some(public_id_override.unwrap_or_else(|| grain_id::GrainId::random().to_string()))
         } else {
             None
         };
@@ -332,7 +350,9 @@ impl SessionStore {
 
     /// Append a title for a session (append-only; last line wins on read).
     pub fn set_title(&self, session_id: &str, title: &str) -> anyhow::Result<()> {
-        let line = serde_json::to_string(&TitleLine { session_title: title.to_string() })?;
+        let line = serde_json::to_string(&TitleLine {
+            session_title: title.to_string(),
+        })?;
         let path = self.session_path(session_id);
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;

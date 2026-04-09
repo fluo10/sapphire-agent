@@ -55,7 +55,10 @@ impl HeartbeatTask {
         match Schedule::from_str(&normalised) {
             Ok(s) => Some(s),
             Err(e) => {
-                warn!("heartbeat task {}: invalid schedule {:?}: {e}", self.name, raw);
+                warn!(
+                    "heartbeat task {}: invalid schedule {:?}: {e}",
+                    self.name, raw
+                );
                 None
             }
         }
@@ -108,7 +111,10 @@ pub fn load_heartbeat_dir(dir: &Path) -> Vec<HeartbeatTask> {
         };
         match parse_task(name, &raw) {
             Some(t) => tasks.push(t),
-            None => warn!("heartbeat task {} skipped (no/invalid frontmatter)", path.display()),
+            None => warn!(
+                "heartbeat task {} skipped (no/invalid frontmatter)",
+                path.display()
+            ),
         }
     }
     tasks
@@ -116,7 +122,9 @@ pub fn load_heartbeat_dir(dir: &Path) -> Vec<HeartbeatTask> {
 
 /// Split a Markdown file with YAML frontmatter into (frontmatter, body).
 fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
-    let rest = raw.strip_prefix("---\n").or_else(|| raw.strip_prefix("---\r\n"))?;
+    let rest = raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))?;
     // Find the closing `---` on its own line.
     let mut idx = 0;
     for line in rest.split_inclusive('\n') {
@@ -143,7 +151,9 @@ fn parse_task(name: String, raw: &str) -> Option<HeartbeatTask> {
     Some(HeartbeatTask {
         name,
         meta,
-        body: body.trim_start_matches(|c: char| c == '\n' || c == '\r').to_string(),
+        body: body
+            .trim_start_matches(|c: char| c == '\n' || c == '\r')
+            .to_string(),
     })
 }
 
@@ -189,7 +199,8 @@ mod tests {
 
     #[test]
     fn parse_with_room() {
-        let raw = "---\nschedule: \"@hourly\"\nroom_id: \"!room:example\"\nenabled: false\n---\nbody";
+        let raw =
+            "---\nschedule: \"@hourly\"\nroom_id: \"!room:example\"\nenabled: false\n---\nbody";
         let task = parse_task("t".to_string(), raw).unwrap();
         assert_eq!(task.meta.room_id.as_deref(), Some("!room:example"));
         assert!(!task.meta.enabled);

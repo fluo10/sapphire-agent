@@ -31,7 +31,10 @@ use tracing_subscriber::{EnvFilter, fmt};
 use workspace::Workspace;
 
 #[derive(Parser)]
-#[command(name = "sapphire-agent", about = "Personal AI assistant — Anthropic + Matrix/Discord")]
+#[command(
+    name = "sapphire-agent",
+    about = "Personal AI assistant — Anthropic + Matrix/Discord"
+)]
 struct Cli {
     /// Path to config file (default: ~/.config/sapphire-agent/config.toml)
     #[arg(short, long, value_name = "FILE")]
@@ -88,7 +91,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // `call` needs no config file — handle before loading config
-    if let Some(Command::Call { server, session, list, message, history, json }) = cli.command {
+    if let Some(Command::Call {
+        server,
+        session,
+        list,
+        message,
+        history,
+        json,
+    }) = cli.command
+    {
         return call::run(server, session, list, message, history, json).await;
     }
 
@@ -115,16 +126,19 @@ async fn main() -> Result<()> {
             println!("  Anthropic model   : {}", config.anthropic.model);
             println!("  Anthropic max_tok : {}", config.anthropic.max_tokens);
             println!("  Workspace dir     : {}", workspace_dir.display());
-            println!("  Day boundary hour : {}:00 local", config.day_boundary_hour);
+            println!(
+                "  Day boundary hour : {}:00 local",
+                config.day_boundary_hour
+            );
             println!();
             let workspace_files = [
                 ("AGENTS.md / AGENT.md", vec!["AGENTS.md", "AGENT.md"]),
-                ("SOUL.md",              vec!["SOUL.md"]),
-                ("IDENTITY.md",          vec!["IDENTITY.md"]),
-                ("USER.md",              vec!["USER.md"]),
-                ("TOOLS.md",             vec!["TOOLS.md"]),
-                ("BOOTSTRAP.md",         vec!["BOOTSTRAP.md"]),
-                ("MEMORY.md",            vec!["MEMORY.md", "memory.md"]),
+                ("SOUL.md", vec!["SOUL.md"]),
+                ("IDENTITY.md", vec!["IDENTITY.md"]),
+                ("USER.md", vec!["USER.md"]),
+                ("TOOLS.md", vec!["TOOLS.md"]),
+                ("BOOTSTRAP.md", vec!["BOOTSTRAP.md"]),
+                ("MEMORY.md", vec!["MEMORY.md", "memory.md"]),
             ];
             for (label, candidates) in &workspace_files {
                 let found = candidates.iter().find_map(|f| {
@@ -133,7 +147,7 @@ async fn main() -> Result<()> {
                 });
                 match found {
                     Some(f) => println!("  {label:<28} found ({f})"),
-                    None    => println!("  {label:<28} -"),
+                    None => println!("  {label:<28} -"),
                 }
             }
         }
@@ -147,11 +161,11 @@ async fn main() -> Result<()> {
             let sw_workspace = SwWorkspace::resolve(&APP_CTX, Some(&workspace_dir))
                 .context("Failed to resolve sapphire-workspace")?;
             // Load the workspace config so we can read sync_interval_minutes.
-            let ws_config = WorkspaceConfig::load_from(&sw_workspace.config_path())
-                .unwrap_or_default();
+            let ws_config =
+                WorkspaceConfig::load_from(&sw_workspace.config_path()).unwrap_or_default();
             let ws_sync_interval = ws_config.sync.sync_interval();
-            let ws_state = WorkspaceState::open(sw_workspace)
-                .context("Failed to open WorkspaceState")?;
+            let ws_state =
+                WorkspaceState::open(sw_workspace).context("Failed to open WorkspaceState")?;
             if let Err(e) = ws_state.sync() {
                 tracing::warn!("Initial workspace sync failed: {e}");
             }
@@ -159,10 +173,7 @@ async fn main() -> Result<()> {
 
             // ── Periodic workspace sync (if enabled in workspace config) ────
             if let Some(dur) = ws_sync_interval {
-                tracing::info!(
-                    "Periodic workspace sync enabled: every {}s",
-                    dur.as_secs()
-                );
+                tracing::info!("Periodic workspace sync enabled: every {}s", dur.as_secs());
                 let ws = Arc::clone(&ws_state);
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(dur);
@@ -206,8 +217,11 @@ async fn main() -> Result<()> {
 
             // ── Channel + Agent (Matrix or Discord, if configured) ──────────
             if config.matrix.is_some() || config.discord.is_some() {
-                let channel_name =
-                    if config.discord.is_some() { "discord" } else { "matrix" };
+                let channel_name = if config.discord.is_some() {
+                    "discord"
+                } else {
+                    "matrix"
+                };
                 let channel_session_store = Arc::new(SessionStore::with_workspace(
                     sessions_base.join(channel_name),
                     Arc::clone(&ws_state),
@@ -215,8 +229,7 @@ async fn main() -> Result<()> {
 
                 let channel: Arc<dyn channel::Channel> = if let Some(d) = &config.discord {
                     Arc::new(
-                        DiscordChannel::new(d)
-                            .context("Failed to initialise Discord channel")?,
+                        DiscordChannel::new(d).context("Failed to initialise Discord channel")?,
                     )
                 } else if let Some(m) = &config.matrix {
                     Arc::new(MatrixChannel::new(m))
@@ -244,16 +257,17 @@ async fn main() -> Result<()> {
                 ));
 
                 // ── Heartbeat (day-boundary + cron loops) ───────────────────
-                let default_room_id = config
-                    .matrix
-                    .as_ref()
-                    .map(|m| m.room_id.clone())
-                    .or_else(|| {
-                        config
-                            .discord
-                            .as_ref()
-                            .and_then(|d| d.channel_ids.first().cloned())
-                    });
+                let default_room_id =
+                    config
+                        .matrix
+                        .as_ref()
+                        .map(|m| m.room_id.clone())
+                        .or_else(|| {
+                            config
+                                .discord
+                                .as_ref()
+                                .and_then(|d| d.channel_ids.first().cloned())
+                        });
                 let heartbeat = Heartbeat {
                     workspace_dir: workspace_dir.clone(),
                     day_boundary_hour: config.day_boundary_hour,
@@ -277,11 +291,22 @@ async fn main() -> Result<()> {
             // ── HTTP API server ─────────────────────────────────────────────
             let addr = bind
                 .or_else(|| {
-                    config.serve.as_ref().map(|s| format!("{}:{}", s.host, s.port))
+                    config
+                        .serve
+                        .as_ref()
+                        .map(|s| format!("{}:{}", s.host, s.port))
                 })
                 .unwrap_or_else(|| "127.0.0.1:9000".to_string());
 
-            serve::run(addr, config, provider, workspace, tool_set, api_session_store).await?;
+            serve::run(
+                addr,
+                config,
+                provider,
+                workspace,
+                tool_set,
+                api_session_store,
+            )
+            .await?;
         }
         Command::Call { .. } => unreachable!(),
     }
