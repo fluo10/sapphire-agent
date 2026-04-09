@@ -2,7 +2,14 @@
 name = "sapphire-agent"
 version = "0.1.0"
 edition = "2024"
-description = "My personal AI assistant — Matrix + Anthropic only"
+description = "A personal AI assistant agent with Matrix/Discord channels, Anthropic backend, and a sapphire-workspace memory layer"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/fluo10/sapphire-agent"
+homepage = "https://github.com/fluo10/sapphire-agent"
+keywords = ["ai", "agent", "anthropic", "matrix", "discord"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+exclude = ["/.github", "/.gitignore", "/.claude", "/.vscode", "/rust-toolchain.toml", "/config.example.toml"]
 
 [[bin]]
 name = "sapphire-agent"
@@ -90,7 +97,7 @@ uuid = { version = "1", features = ["v7"] }
 sapphire-workspace = { version = "0.5.0", default-features = false, features = ["git-sync"] }
 
 # Human-readable session IDs for API sessions
-grain-id = { path = "../grain-id", features = ["serde"] }
+grain-id = { version = "0.14", features = ["serde"] }
 
 # Readline for the `call` REPL (CJK-safe input, history, cursor movement)
 reedline = "0.39"
