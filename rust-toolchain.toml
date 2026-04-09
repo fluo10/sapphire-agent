@@ -4,3 +4,4 @@
 # Track: https://github.com/matrix-org/matrix-rust-sdk/issues/6254
 [toolchain]
 channel = "1.93.1"
+components = ["clippy", "rustfmt"]
