@@ -12,6 +12,16 @@ recovery_key = "EsT... "
 # Where to store matrix-sdk state / crypto DB (default: ~/.local/share/sapphire-agent/matrix)
 # state_dir = "~/.local/share/sapphire-agent/matrix"
 
+# Disable heartbeat (day-boundary + cron) tasks. Useful for test
+# environments that share the same workspace to avoid duplicate tasks.
+# heartbeat_enabled = false
+
+# Cold-standby mode: only perform git sync — no channel listening,
+# no heartbeat, no HTTP server. The process stays alive for periodic
+# sync and shuts down on Ctrl-C. Manual switchover to active mode
+# by flipping this flag and restarting.
+# standby_mode = true
+
 # Directory containing AGENT.md and MEMORY.md.
 # Defaults to the same directory as this config file.
 # workspace_dir = "~/.config/sapphire-agent"
