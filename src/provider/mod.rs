@@ -3,6 +3,7 @@ pub mod anthropic;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 
 // ---------------------------------------------------------------------------
 // Tool definitions
@@ -11,8 +12,8 @@ use serde_json::Value;
 /// Tool specification passed to the LLM.
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: Cow<'static, str>,
+    pub description: Cow<'static, str>,
     pub input_schema: Value,
 }
 

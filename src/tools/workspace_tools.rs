@@ -160,8 +160,8 @@ impl MemoryAddTool {
         Self {
             state,
             spec: ToolSpec {
-                name: "memory_add",
-                description: Box::leak(description.into_boxed_str()),
+                name: "memory_add".into(),
+                description: description.into(),
                 input_schema: memory_entry_schema(true),
             },
         }
@@ -210,10 +210,10 @@ impl MemoryUpdateTool {
         Self {
             state,
             spec: ToolSpec {
-                name: "memory_update",
+                name: "memory_update".into(),
                 description: "Overwrite an existing memory entry at \
                     memory/<category>/<slug>.md. Fails if the file does not exist \
-                    (use memory_add to create it).",
+                    (use memory_add to create it).".into(),
                 input_schema: memory_entry_schema(true),
             },
         }
@@ -263,7 +263,7 @@ impl MemoryAppendTool {
         Self {
             state,
             spec: ToolSpec {
-                name: "memory_append",
+                name: "memory_append".into(),
                 description: "Append content to the end of a memory entry at \
                     memory/<category>/<slug>.md, creating the file if it does \
                     not exist. Cheaper than memory_read + memory_update when you \
@@ -271,7 +271,7 @@ impl MemoryAppendTool {
                     A blank line is inserted between the existing body and the \
                     new content; add your own Markdown heading if you want a \
                     section break. Frontmatter counters (updated_at) are \
-                    maintained automatically.",
+                    maintained automatically.".into(),
                 input_schema: memory_entry_schema(true),
             },
         }
@@ -341,12 +341,12 @@ impl MemoryReadTool {
         Self {
             state,
             spec: ToolSpec {
-                name: "memory_read",
+                name: "memory_read".into(),
                 description: "Read a memory entry at memory/<category>/<slug>.md \
                     and return its body. Side effect: updates the file's \
                     frontmatter (last_read_at = now, read_count += 1) so that \
                     recency and frequency can inform future weighting. \
-                    Use workspace_read instead for a non-tracking read.",
+                    Use workspace_read instead for a non-tracking read.".into(),
                 input_schema: memory_entry_schema(false),
             },
         }
@@ -392,8 +392,8 @@ impl MemoryRemoveTool {
         Self {
             state,
             spec: ToolSpec {
-                name: "memory_remove",
-                description: "Delete a memory entry at memory/<category>/<slug>.md.",
+                name: "memory_remove".into(),
+                description: "Delete a memory entry at memory/<category>/<slug>.md.".into(),
                 input_schema: memory_entry_schema(false),
             },
         }
@@ -433,9 +433,9 @@ impl WorkspaceReadTool {
         Self {
             state,
             spec: ToolSpec {
-                name: "workspace_read",
+                name: "workspace_read".into(),
                 description: "Read the contents of a file in the workspace \
-                    (path relative to workspace root, e.g. \"notes/2025-01.md\").",
+                    (path relative to workspace root, e.g. \"notes/2025-01.md\").".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -480,9 +480,9 @@ impl WorkspaceWriteTool {
         Self {
             state,
             spec: ToolSpec {
-                name: "workspace_write",
+                name: "workspace_write".into(),
                 description: "Write content to a file in the workspace \
-                    (creates or overwrites). Path is relative to workspace root.",
+                    (creates or overwrites). Path is relative to workspace root.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -534,12 +534,12 @@ impl WorkspaceSearchTool {
         Self {
             state,
             spec: ToolSpec {
-                name: "workspace_search",
+                name: "workspace_search".into(),
                 description: "Search across all indexed files in the workspace. \
                     Two modes are available: \
                     'fts' (full-text / BM25, always available) and \
                     'semantic' (vector similarity, requires an embedder to be configured — falls back to fts if unavailable). \
-                    Returns matching file titles and paths.",
+                    Returns matching file titles and paths.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -643,9 +643,9 @@ impl WorkspaceSyncTool {
         Self {
             state,
             spec: ToolSpec {
-                name: "workspace_sync",
+                name: "workspace_sync".into(),
                 description: "Sync the workspace: index all files and, if a git \
-                    remote is configured, commit and push changes.",
+                    remote is configured, commit and push changes.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {}

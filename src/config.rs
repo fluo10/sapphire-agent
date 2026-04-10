@@ -71,6 +71,47 @@ fn default_serve_port() -> u16 {
 pub struct ToolsConfig {
     /// Tavily API key for `web_search`. If absent the tool is not registered.
     pub tavily_api_key: Option<String>,
+    /// External MCP servers to connect to. Each server's tools are registered
+    /// with the naming convention `mcp__<name>__<tool_name>`.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+/// Configuration for a single external MCP server.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpServerConfig {
+    /// Human-readable name (used in tool prefix: `mcp__<name>__<tool>`).
+    pub name: String,
+    /// Transport configuration.
+    #[serde(flatten)]
+    pub transport: McpTransportConfig,
+}
+
+/// Transport configuration for connecting to an MCP server.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum McpTransportConfig {
+    /// Streamable HTTP transport.
+    #[serde(rename = "http")]
+    Http {
+        /// Server URL (e.g. `http://localhost:3000/mcp`).
+        url: String,
+        /// Optional API key / bearer token.
+        #[serde(default)]
+        api_key: Option<String>,
+    },
+    /// stdio transport — spawn a child process and communicate via stdin/stdout.
+    #[serde(rename = "stdio")]
+    Stdio {
+        /// Command to execute (e.g. `"npx"`, `"uvx"`, `"/path/to/server"`).
+        command: String,
+        /// Command arguments.
+        #[serde(default)]
+        args: Vec<String>,
+        /// Additional environment variables passed to the child process.
+        #[serde(default)]
+        env: std::collections::HashMap<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

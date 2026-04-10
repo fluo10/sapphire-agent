@@ -302,8 +302,8 @@ impl Provider for AnthropicProvider {
             specs
                 .iter()
                 .map(|s| ApiToolSpec {
-                    name: s.name,
-                    description: s.description,
+                    name: &s.name,
+                    description: &s.description,
                     input_schema: &s.input_schema,
                 })
                 .collect()

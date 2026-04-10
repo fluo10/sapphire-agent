@@ -1,6 +1,7 @@
 pub mod builtin_tools;
 pub mod workspace_tools;
 
+use crate::config::McpServerConfig;
 use crate::provider::{ToolCall, ToolSpec};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -49,9 +50,12 @@ impl ToolSet {
 /// Build the default tool set backed by a sapphire-workspace WorkspaceState.
 ///
 /// `tavily_api_key`: if provided, the `web_search` tool is included.
-pub fn default_tool_set(
+/// `mcp_servers`: external MCP servers whose tools are registered with the
+/// naming convention `mcp__<name>__<tool_name>`.
+pub async fn default_tool_set(
     state: Arc<Mutex<sapphire_workspace::WorkspaceState>>,
     tavily_api_key: Option<String>,
+    mcp_servers: &[McpServerConfig],
 ) -> ToolSet {
     use builtin_tools::*;
     use workspace_tools::*;
@@ -76,11 +80,19 @@ pub fn default_tool_set(
         Box::new(ReadFileTool::new()),
         Box::new(WriteFileTool::new(Arc::clone(&state))),
         Box::new(DeleteFileTool::new(Arc::clone(&state))),
-        Box::new(TerminalTool::new(workspace_root)),
+        Box::new(TerminalTool::new(workspace_root.clone())),
     ];
 
     if let Some(key) = tavily_api_key {
         tools.push(Box::new(WebSearchTool::new(key)));
+    }
+
+    // External MCP server tools
+    if !mcp_servers.is_empty() {
+        let workspace_root_str = workspace_root.to_string_lossy();
+        let mcp_tools =
+            crate::mcp_client::create_mcp_tools(mcp_servers, &workspace_root_str).await;
+        tools.extend(mcp_tools);
     }
 
     ToolSet::new(tools)
