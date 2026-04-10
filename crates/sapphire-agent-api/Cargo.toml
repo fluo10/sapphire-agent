@@ -1,0 +1,27 @@
+[package]
+name = "sapphire-agent-api"
+version = "0.1.0"
+edition = "2024"
+description = "Client library and shared types for sapphire-agent"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/fluo10/sapphire-agent"
+
+[dependencies]
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "stream",
+] }
+
+# Serialization
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+
+# Futures utilities (SSE streaming)
+futures-util = "0.3"
+
+# Readline for the REPL (CJK-safe input, history, cursor movement)
+reedline = "0.39"
