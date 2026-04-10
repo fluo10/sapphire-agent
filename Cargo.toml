@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/sapphire-agent-api", "crates/sapphire-call"]
+
 [package]
 name = "sapphire-agent"
 version = "0.1.0"
@@ -99,8 +102,8 @@ sapphire-workspace = { version = "0.5.0", default-features = false, features = [
 # Human-readable session IDs for API sessions
 grain-id = { version = "0.14", features = ["serde"] }
 
-# Readline for the `call` REPL (CJK-safe input, history, cursor movement)
-reedline = "0.39"
+# Client library (shared with sapphire-call)
+sapphire-agent-api = { path = "crates/sapphire-agent-api" }
 
 # HTTP server (serve command)
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

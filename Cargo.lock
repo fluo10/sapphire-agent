@@ -6061,8 +6061,8 @@ dependencies = [
  "futures-util",
  "grain-id",
  "matrix-sdk",
- "reedline",
  "reqwest",
+ "sapphire-agent-api",
  "sapphire-workspace",
  "serde",
  "serde_json",
@@ -6076,6 +6076,28 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "sapphire-agent-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "reedline",
+ "reqwest",
+ "serde_json",
+]
+
+[[package]]
+name = "sapphire-call"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "sapphire-agent-api",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
