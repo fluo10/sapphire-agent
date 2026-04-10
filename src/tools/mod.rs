@@ -64,7 +64,11 @@ pub fn default_tool_set(
         .clone();
 
     let mut tools: Vec<Box<dyn Tool>> = vec![
-        Box::new(MemoryTool::new(Arc::clone(&state))),
+        Box::new(MemoryAddTool::new(Arc::clone(&state))),
+        Box::new(MemoryReadTool::new(Arc::clone(&state))),
+        Box::new(MemoryAppendTool::new(Arc::clone(&state))),
+        Box::new(MemoryUpdateTool::new(Arc::clone(&state))),
+        Box::new(MemoryRemoveTool::new(Arc::clone(&state))),
         Box::new(WorkspaceReadTool::new(Arc::clone(&state))),
         Box::new(WorkspaceWriteTool::new(Arc::clone(&state))),
         Box::new(WorkspaceSearchTool::new(Arc::clone(&state))),
