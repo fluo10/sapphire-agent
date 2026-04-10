@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use sapphire_workspace::SyncConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -43,6 +44,13 @@ pub struct Config {
     /// sync without actively processing messages. Default: false.
     #[serde(default)]
     pub standby_mode: bool,
+    /// Workspace sync configuration.
+    ///
+    /// The workspace-level config (`{workspace_dir}/.sapphire-agent/config.toml`)
+    /// provides shared defaults. This per-user `[sync]` section, when present,
+    /// takes precedence — allowing each user to override the workspace defaults.
+    #[serde(default)]
+    pub sync: Option<SyncConfig>,
 }
 
 fn default_true() -> bool {
