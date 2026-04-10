@@ -46,11 +46,11 @@ impl ReadFileTool {
     pub fn new() -> Self {
         Self {
             spec: ToolSpec {
-                name: "read_file",
+                name: "read_file".into(),
                 description: "Read a file from the filesystem with optional line-based pagination. \
                     Returns lines prefixed with their 1-indexed line number in 'N|content' format. \
                     Use offset and limit for large files. \
-                    Cannot read binary files or device paths (/dev/, /proc/).",
+                    Cannot read binary files or device paths (/dev/, /proc/).".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -159,11 +159,11 @@ impl WriteFileTool {
         Self {
             state,
             spec: ToolSpec {
-                name: "write_file",
+                name: "write_file".into(),
                 description: "Write content to a file, completely replacing its existing content. \
                     Creates the file and any missing parent directories automatically. \
                     When the target file is inside the workspace, the search index is updated automatically. \
-                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.).",
+                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.).".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -254,10 +254,10 @@ impl DeleteFileTool {
         Self {
             state,
             spec: ToolSpec {
-                name: "delete_file",
+                name: "delete_file".into(),
                 description: "Delete a file from the filesystem. \
                     When the file is inside the workspace, it is also removed from the search index automatically. \
-                    Cannot delete directories.",
+                    Cannot delete directories.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -320,12 +320,12 @@ impl TerminalTool {
         Self {
             workspace_root,
             spec: ToolSpec {
-                name: "terminal",
+                name: "terminal".into(),
                 description: "Execute a shell command and return its output. \
                     Returns stdout, stderr, and exit code. \
                     The default working directory is the workspace root. \
                     Use the timeout parameter for long-running commands (default 60 s, max 600 s). \
-                    Not suitable for interactive commands or persistent daemons.",
+                    Not suitable for interactive commands or persistent daemons.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -425,9 +425,9 @@ impl WebSearchTool {
         Self {
             api_key,
             spec: ToolSpec {
-                name: "web_search",
+                name: "web_search".into(),
                 description: "Search the web for up-to-date information using Tavily. \
-                    Returns titles, URLs, and short content excerpts for the top results.",
+                    Returns titles, URLs, and short content excerpts for the top results.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

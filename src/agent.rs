@@ -288,7 +288,14 @@ impl Agent {
 
         let _ = self.channel.start_typing(&incoming.room_id).await;
 
-        let tool_specs = self.tools.as_ref().map(|t| t.specs().to_vec());
+        // Refresh MCP tools if any server signalled a change.
+        if let Some(tools) = &self.tools {
+            tools.refresh_if_needed().await;
+        }
+        let tool_specs = match &self.tools {
+            Some(t) => Some(t.specs().await),
+            None => None,
+        };
 
         // Tool-calling loop
         let mut accumulated_text: Vec<String> = Vec::new();
