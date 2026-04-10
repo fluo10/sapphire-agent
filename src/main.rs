@@ -130,6 +130,8 @@ async fn main() -> Result<()> {
                 "  Day boundary hour : {}:00 local",
                 config.day_boundary_hour
             );
+            println!("  Heartbeat enabled : {}", config.heartbeat_enabled);
+            println!("  Standby mode      : {}", config.standby_mode);
             println!();
             let workspace_files = [
                 ("AGENTS.md / AGENT.md", vec!["AGENTS.md", "AGENT.md"]),
@@ -215,8 +217,16 @@ async fn main() -> Result<()> {
                 Arc::clone(&ws_state),
             ));
 
+            if config.standby_mode {
+                tracing::info!(
+                    "Standby mode enabled: git sync only, skipping channel and heartbeat"
+                );
+            }
+
             // ── Channel + Agent (Matrix or Discord, if configured) ──────────
-            if config.matrix.is_some() || config.discord.is_some() {
+            if !config.standby_mode
+                && (config.matrix.is_some() || config.discord.is_some())
+            {
                 let channel_name = if config.discord.is_some() {
                     "discord"
                 } else {
@@ -278,7 +288,11 @@ async fn main() -> Result<()> {
                     agent: Arc::clone(&agent),
                     default_room_id,
                 };
-                heartbeat.spawn();
+                if config.heartbeat_enabled {
+                    heartbeat.spawn();
+                } else {
+                    tracing::info!("Heartbeat disabled by config");
+                }
 
                 let agent_run = Arc::clone(&agent);
                 tokio::spawn(async move {
@@ -288,25 +302,35 @@ async fn main() -> Result<()> {
                 });
             }
 
-            // ── HTTP API server ─────────────────────────────────────────────
-            let addr = bind
-                .or_else(|| {
-                    config
-                        .serve
-                        .as_ref()
-                        .map(|s| format!("{}:{}", s.host, s.port))
-                })
-                .unwrap_or_else(|| "127.0.0.1:9000".to_string());
+            if config.standby_mode {
+                // In standby mode, keep the process alive for periodic git
+                // sync only — no HTTP server, no channel, no heartbeat.
+                tracing::info!("Standby mode: waiting for shutdown signal (Ctrl-C)");
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("Failed to listen for Ctrl-C");
+                tracing::info!("Shutting down standby process");
+            } else {
+                // ── HTTP API server ─────────────────────────────────────────
+                let addr = bind
+                    .or_else(|| {
+                        config
+                            .serve
+                            .as_ref()
+                            .map(|s| format!("{}:{}", s.host, s.port))
+                    })
+                    .unwrap_or_else(|| "127.0.0.1:9000".to_string());
 
-            serve::run(
-                addr,
-                config,
-                provider,
-                workspace,
-                tool_set,
-                api_session_store,
-            )
-            .await?;
+                serve::run(
+                    addr,
+                    config,
+                    provider,
+                    workspace,
+                    tool_set,
+                    api_session_store,
+                )
+                .await?;
+            }
         }
         Command::Call { .. } => unreachable!(),
     }

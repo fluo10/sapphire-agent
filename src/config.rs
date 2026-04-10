@@ -33,6 +33,16 @@ pub struct Config {
     /// Whether to compact MEMORY.md at the day boundary. Default: true.
     #[serde(default = "default_true")]
     pub memory_compaction_enabled: bool,
+    /// Whether to enable heartbeat (day-boundary + cron) tasks. Default: true.
+    /// Set to false in test environments to avoid duplicate heartbeat tasks
+    /// when both test and production instances share the same config.
+    #[serde(default = "default_true")]
+    pub heartbeat_enabled: bool,
+    /// Cold-standby mode: only perform git sync, skip channel listening and
+    /// heartbeat tasks. Useful for maintaining a backup node that stays in
+    /// sync without actively processing messages. Default: false.
+    #[serde(default)]
+    pub standby_mode: bool,
 }
 
 fn default_true() -> bool {
