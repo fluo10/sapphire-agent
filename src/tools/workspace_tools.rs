@@ -2,9 +2,11 @@ use crate::provider::ToolSpec;
 use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sapphire_workspace::{RetrieveDb, WorkspaceState};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -19,163 +21,400 @@ fn lock(state: &Mutex<WorkspaceState>) -> std::sync::MutexGuard<'_, WorkspaceSta
 // memory
 // ---------------------------------------------------------------------------
 
-const ENTRY_SEP: &str = "\n\n---\n\n";
+/// Validate a `category` or `slug` segment: non-empty, no path separators,
+/// no parent-dir components, no leading dot.
+fn validate_segment(kind: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{kind} must not be empty");
+    }
+    if value == "." || value == ".." {
+        anyhow::bail!("{kind} must not be '.' or '..'");
+    }
+    if value.starts_with('.') {
+        anyhow::bail!("{kind} must not start with '.'");
+    }
+    if value.contains('/') || value.contains('\\') || value.contains('\0') {
+        anyhow::bail!("{kind} must not contain path separators: {value:?}");
+    }
+    Ok(())
+}
 
-/// Validate and resolve a workspace-relative path, rejecting traversal.
-fn resolve_workspace_path(workspace_root: &Path, rel: &str) -> Result<PathBuf> {
-    let rel_path = Path::new(rel);
-    for component in rel_path.components() {
-        if component == Component::ParentDir {
-            anyhow::bail!("Path traversal not allowed: {}", rel);
+const MEMORY_CATEGORY_GUIDE: &str =
+    "Category is mandatory and free-form, but prefer these conventions: \
+     'daily' (date-stamped daily logs, slug = YYYY-MM-DD), \
+     'dictionary' (short term/definition lookups for names, acronyms, jargon), \
+     'knowledge' (longer-form facts, procedures, decisions, learnings — default when unsure). \
+     Other categories (e.g. 'recipe', 'project') may be introduced freely.";
+
+fn memory_entry_path(state: &Mutex<WorkspaceState>, category: &str, slug: &str) -> Result<(String, std::path::PathBuf)> {
+    validate_segment("category", category)?;
+    validate_segment("slug", slug)?;
+    let rel = format!("memory/{category}/{slug}.md");
+    let abs = lock(state).workspace.root.join(&rel);
+    Ok((rel, abs))
+}
+
+/// YAML frontmatter tracked on each memory entry file.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct MemoryMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_read_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    read_count: u64,
+}
+
+/// Split `---\n…\n---\n` YAML frontmatter off the front of a Markdown file.
+fn split_memory_frontmatter(raw: &str) -> Option<(&str, &str)> {
+    let rest = raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))?;
+    let mut idx = 0;
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(|c| c == '\n' || c == '\r');
+        if trimmed == "---" {
+            let fm = &rest[..idx];
+            let body_start = idx + line.len();
+            return Some((fm, &rest[body_start..]));
         }
+        idx += line.len();
     }
-    Ok(workspace_root.join(rel_path))
+    None
 }
 
-/// Split file content into entries (separator: `\n\n---\n\n`).
-fn split_entries(content: &str) -> Vec<&str> {
-    if content.trim().is_empty() {
-        vec![]
-    } else {
-        content.split(ENTRY_SEP).collect()
+/// Parse a memory file into `(meta, body)`. Files without frontmatter yield
+/// a default `MemoryMeta` and the full raw content as body (enables seamless
+/// migration of pre-existing files).
+fn parse_memory_file(raw: &str) -> (MemoryMeta, String) {
+    match split_memory_frontmatter(raw) {
+        Some((fm, body)) => {
+            let meta: MemoryMeta = serde_yaml::from_str(fm).unwrap_or_default();
+            let body = body
+                .trim_start_matches(|c: char| c == '\n' || c == '\r')
+                .to_string();
+            (meta, body)
+        }
+        None => (MemoryMeta::default(), raw.to_string()),
     }
 }
 
-/// Join entries back into file content.
-fn join_entries(entries: &[&str]) -> String {
-    entries.join(ENTRY_SEP)
+/// Serialize `(meta, body)` back into a Markdown file with YAML frontmatter.
+fn serialize_memory_file(meta: &MemoryMeta, body: &str) -> Result<String> {
+    let fm = serde_yaml::to_string(meta).context("failed to serialize memory frontmatter")?;
+    let body_trimmed = body.trim_start_matches(|c: char| c == '\n' || c == '\r');
+    Ok(format!("---\n{fm}---\n\n{body_trimmed}"))
 }
 
-/// Entry-based persistent memory management for workspace markdown files.
-pub struct MemoryTool {
+fn memory_entry_schema(include_content: bool) -> serde_json::Value {
+    let mut props = serde_json::Map::new();
+    props.insert(
+        "category".into(),
+        json!({
+            "type": "string",
+            "description": "Category directory under memory/, e.g. \"knowledge\", \"dictionary\", \"daily\"."
+        }),
+    );
+    props.insert(
+        "slug".into(),
+        json!({
+            "type": "string",
+            "description": "File stem (without .md), e.g. \"sapphire-agent-memory-design\" or \"2026-04-10\"."
+        }),
+    );
+    let mut required = vec!["category", "slug"];
+    if include_content {
+        props.insert(
+            "content".into(),
+            json!({
+                "type": "string",
+                "description": "Full file content."
+            }),
+        );
+        required.push("content");
+    }
+    json!({
+        "type": "object",
+        "properties": props,
+        "required": required,
+    })
+}
+
+// -- memory_add --------------------------------------------------------------
+
+/// Create a new one-file memory entry under `memory/<category>/<slug>.md`.
+pub struct MemoryAddTool {
     state: Arc<Mutex<WorkspaceState>>,
     spec: ToolSpec,
 }
 
-impl MemoryTool {
+impl MemoryAddTool {
     pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+        let description = format!(
+            "Create a new memory entry at memory/<category>/<slug>.md. \
+             Fails if the file already exists (use memory_update to overwrite). \
+             Each file holds one self-contained entry retrievable via workspace_search. {MEMORY_CATEGORY_GUIDE}"
+        );
         Self {
             state,
             spec: ToolSpec {
-                name: "memory",
-                description: "Add, replace, or remove an entry in a workspace markdown file. \
-                    Files are entry-based, separated by horizontal rules (---). \
-                    Use MEMORY.md for agent notes, USER.md for user profile, \
-                    memory/daily/YYYY-MM-DD.md for daily logs. \
-                    Parent directories are created automatically.",
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["add", "replace", "remove"],
-                            "description": "Operation to perform."
-                        },
-                        "target": {
-                            "type": "string",
-                            "description": "Workspace-relative file path, e.g. \"MEMORY.md\" or \"memory/daily/2026-04-07.md\"."
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Entry content (required for add and replace)."
-                        },
-                        "old_text": {
-                            "type": "string",
-                            "description": "Substring that uniquely identifies the entry to replace or remove (required for replace and remove)."
-                        }
-                    },
-                    "required": ["action", "target"]
-                }),
+                name: "memory_add",
+                description: Box::leak(description.into_boxed_str()),
+                input_schema: memory_entry_schema(true),
             },
         }
     }
 }
 
 #[async_trait]
-impl Tool for MemoryTool {
+impl Tool for MemoryAddTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
-        let action = input["action"].as_str().context("missing 'action'")?;
-        let target = input["target"].as_str().context("missing 'target'")?;
-
-        // Validate (no path traversal) and compute absolute path for reads.
-        let workspace_root = lock(&self.state).workspace.root.clone();
-        let abs_path = resolve_workspace_path(&workspace_root, target)?;
-        let rel_path = Path::new(target);
-
-        match action {
-            "add" => {
-                let content = input["content"]
-                    .as_str()
-                    .context("missing 'content' for add")?;
-                let existing = std::fs::read_to_string(&abs_path).unwrap_or_default();
-                let new_content = if existing.trim().is_empty() {
-                    content.to_string()
-                } else {
-                    format!("{}{}{}", existing.trim_end(), ENTRY_SEP, content)
-                };
-                lock(&self.state)
-                    .write_file(rel_path, &new_content)
-                    .with_context(|| format!("Failed to write {target}"))?;
-                Ok(format!("Added entry to {target}"))
-            }
-
-            "replace" => {
-                let content = input["content"]
-                    .as_str()
-                    .context("missing 'content' for replace")?;
-                let old_text = input["old_text"]
-                    .as_str()
-                    .context("missing 'old_text' for replace")?;
-                let existing = std::fs::read_to_string(&abs_path)
-                    .with_context(|| format!("Failed to read {target}"))?;
-                let entries: Vec<&str> = split_entries(&existing);
-                let idx = entries
-                    .iter()
-                    .position(|e| e.contains(old_text))
-                    .with_context(|| {
-                        format!("No entry containing {:?} found in {target}", old_text)
-                    })?;
-                let mut new_entries = entries.clone();
-                new_entries[idx] = content;
-                let joined = join_entries(&new_entries);
-                lock(&self.state)
-                    .write_file(rel_path, &joined)
-                    .with_context(|| format!("Failed to write {target}"))?;
-                Ok(format!("Replaced entry in {target}"))
-            }
-
-            "remove" => {
-                let old_text = input["old_text"]
-                    .as_str()
-                    .context("missing 'old_text' for remove")?;
-                let existing = std::fs::read_to_string(&abs_path)
-                    .with_context(|| format!("Failed to read {target}"))?;
-                let entries: Vec<&str> = split_entries(&existing);
-                let idx = entries
-                    .iter()
-                    .position(|e| e.contains(old_text))
-                    .with_context(|| {
-                        format!("No entry containing {:?} found in {target}", old_text)
-                    })?;
-                let new_entries: Vec<&str> = entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != idx)
-                    .map(|(_, e)| *e)
-                    .collect();
-                let joined = join_entries(&new_entries);
-                lock(&self.state)
-                    .write_file(rel_path, &joined)
-                    .with_context(|| format!("Failed to write {target}"))?;
-                Ok(format!("Removed entry from {target}"))
-            }
-
-            other => anyhow::bail!("Unknown action: {other}"),
+        let category = input["category"].as_str().context("missing 'category'")?;
+        let slug = input["slug"].as_str().context("missing 'slug'")?;
+        let content = input["content"].as_str().context("missing 'content'")?;
+        let (rel, abs) = memory_entry_path(&self.state, category, slug)?;
+        if abs.exists() {
+            anyhow::bail!("{rel} already exists; use memory_update to overwrite");
         }
+        let now = Utc::now();
+        let meta = MemoryMeta {
+            created_at: Some(now),
+            updated_at: Some(now),
+            last_read_at: None,
+            read_count: 0,
+        };
+        let serialized = serialize_memory_file(&meta, content)?;
+        lock(&self.state)
+            .write_file(Path::new(&rel), &serialized)
+            .with_context(|| format!("Failed to write {rel}"))?;
+        Ok(format!("Created {rel}"))
+    }
+}
+
+// -- memory_update -----------------------------------------------------------
+
+/// Overwrite an existing memory entry.
+pub struct MemoryUpdateTool {
+    state: Arc<Mutex<WorkspaceState>>,
+    spec: ToolSpec,
+}
+
+impl MemoryUpdateTool {
+    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+        Self {
+            state,
+            spec: ToolSpec {
+                name: "memory_update",
+                description: "Overwrite an existing memory entry at \
+                    memory/<category>/<slug>.md. Fails if the file does not exist \
+                    (use memory_add to create it).",
+                input_schema: memory_entry_schema(true),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for MemoryUpdateTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let category = input["category"].as_str().context("missing 'category'")?;
+        let slug = input["slug"].as_str().context("missing 'slug'")?;
+        let content = input["content"].as_str().context("missing 'content'")?;
+        let (rel, abs) = memory_entry_path(&self.state, category, slug)?;
+        if !abs.exists() {
+            anyhow::bail!("{rel} does not exist; use memory_add to create it");
+        }
+        let raw = std::fs::read_to_string(&abs)
+            .with_context(|| format!("Failed to read {rel}"))?;
+        let (mut meta, _old_body) = parse_memory_file(&raw);
+        let now = Utc::now();
+        meta.updated_at = Some(now);
+        if meta.created_at.is_none() {
+            meta.created_at = Some(now);
+        }
+        let serialized = serialize_memory_file(&meta, content)?;
+        lock(&self.state)
+            .write_file(Path::new(&rel), &serialized)
+            .with_context(|| format!("Failed to write {rel}"))?;
+        Ok(format!("Updated {rel}"))
+    }
+}
+
+// -- memory_append -----------------------------------------------------------
+
+/// Append to a memory entry, creating it if missing.
+pub struct MemoryAppendTool {
+    state: Arc<Mutex<WorkspaceState>>,
+    spec: ToolSpec,
+}
+
+impl MemoryAppendTool {
+    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+        Self {
+            state,
+            spec: ToolSpec {
+                name: "memory_append",
+                description: "Append content to the end of a memory entry at \
+                    memory/<category>/<slug>.md, creating the file if it does \
+                    not exist. Cheaper than memory_read + memory_update when you \
+                    just want to tack a new observation onto an existing note. \
+                    A blank line is inserted between the existing body and the \
+                    new content; add your own Markdown heading if you want a \
+                    section break. Frontmatter counters (updated_at) are \
+                    maintained automatically.",
+                input_schema: memory_entry_schema(true),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for MemoryAppendTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let category = input["category"].as_str().context("missing 'category'")?;
+        let slug = input["slug"].as_str().context("missing 'slug'")?;
+        let content = input["content"].as_str().context("missing 'content'")?;
+        let (rel, abs) = memory_entry_path(&self.state, category, slug)?;
+        let now = Utc::now();
+
+        let (meta, new_body, created) = if abs.exists() {
+            let raw = std::fs::read_to_string(&abs)
+                .with_context(|| format!("Failed to read {rel}"))?;
+            let (mut meta, old_body) = parse_memory_file(&raw);
+            meta.updated_at = Some(now);
+            if meta.created_at.is_none() {
+                meta.created_at = Some(now);
+            }
+            let trimmed = old_body.trim_end_matches(|c: char| c == '\n' || c == '\r');
+            let new_body = if trimmed.is_empty() {
+                content.to_string()
+            } else {
+                format!("{trimmed}\n\n{content}")
+            };
+            (meta, new_body, false)
+        } else {
+            let meta = MemoryMeta {
+                created_at: Some(now),
+                updated_at: Some(now),
+                last_read_at: None,
+                read_count: 0,
+            };
+            (meta, content.to_string(), true)
+        };
+
+        let serialized = serialize_memory_file(&meta, &new_body)?;
+        lock(&self.state)
+            .write_file(Path::new(&rel), &serialized)
+            .with_context(|| format!("Failed to write {rel}"))?;
+        Ok(if created {
+            format!("Created {rel}")
+        } else {
+            format!("Appended to {rel}")
+        })
+    }
+}
+
+// -- memory_read -------------------------------------------------------------
+
+/// Read a memory entry and bump its access counters.
+pub struct MemoryReadTool {
+    state: Arc<Mutex<WorkspaceState>>,
+    spec: ToolSpec,
+}
+
+impl MemoryReadTool {
+    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+        Self {
+            state,
+            spec: ToolSpec {
+                name: "memory_read",
+                description: "Read a memory entry at memory/<category>/<slug>.md \
+                    and return its body. Side effect: updates the file's \
+                    frontmatter (last_read_at = now, read_count += 1) so that \
+                    recency and frequency can inform future weighting. \
+                    Use workspace_read instead for a non-tracking read.",
+                input_schema: memory_entry_schema(false),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for MemoryReadTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let category = input["category"].as_str().context("missing 'category'")?;
+        let slug = input["slug"].as_str().context("missing 'slug'")?;
+        let (rel, abs) = memory_entry_path(&self.state, category, slug)?;
+        if !abs.exists() {
+            anyhow::bail!("{rel} does not exist");
+        }
+        let raw = std::fs::read_to_string(&abs)
+            .with_context(|| format!("Failed to read {rel}"))?;
+        let (mut meta, body) = parse_memory_file(&raw);
+        meta.last_read_at = Some(Utc::now());
+        meta.read_count = meta.read_count.saturating_add(1);
+        let serialized = serialize_memory_file(&meta, &body)?;
+        if let Err(e) = lock(&self.state).write_file(Path::new(&rel), &serialized) {
+            tracing::warn!("memory_read: failed to persist counters for {rel}: {e:#}");
+        }
+        Ok(body)
+    }
+}
+
+// -- memory_remove -----------------------------------------------------------
+
+/// Delete a memory entry.
+pub struct MemoryRemoveTool {
+    state: Arc<Mutex<WorkspaceState>>,
+    spec: ToolSpec,
+}
+
+impl MemoryRemoveTool {
+    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+        Self {
+            state,
+            spec: ToolSpec {
+                name: "memory_remove",
+                description: "Delete a memory entry at memory/<category>/<slug>.md.",
+                input_schema: memory_entry_schema(false),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for MemoryRemoveTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let category = input["category"].as_str().context("missing 'category'")?;
+        let slug = input["slug"].as_str().context("missing 'slug'")?;
+        let (rel, abs) = memory_entry_path(&self.state, category, slug)?;
+        if !abs.exists() {
+            anyhow::bail!("{rel} does not exist");
+        }
+        std::fs::remove_file(&abs).with_context(|| format!("Failed to remove {rel}"))?;
+        Ok(format!("Removed {rel}"))
     }
 }
 
