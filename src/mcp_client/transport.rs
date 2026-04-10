@@ -19,6 +19,10 @@ use tracing::{debug, warn};
 /// returns the JSON-RPC response object to send back.
 pub type ServerRequestHandler = Arc<dyn Fn(&str, &Value) -> Value + Send + Sync>;
 
+/// Callback invoked when the server sends a JSON-RPC notification (no `id`,
+/// has `method`).  Used to detect `notifications/tools/list_changed` etc.
+pub type NotificationHandler = Arc<dyn Fn(&str, &Value) + Send + Sync>;
+
 #[async_trait]
 pub trait McpTransport: Send + Sync {
     /// Send a JSON-RPC request and receive the final response.
@@ -30,10 +34,13 @@ pub trait McpTransport: Send + Sync {
     /// `on_server_request` is called for any server-initiated request that
     /// arrives before the final response.  The returned value is sent back to
     /// the server.
+    ///
+    /// `on_notification` is called for any notification (no `id`, has `method`).
     async fn request(
         &self,
         body: &Value,
         on_server_request: &ServerRequestHandler,
+        on_notification: &NotificationHandler,
     ) -> Result<Value>;
 
     /// Gracefully shut down the transport (close connection / kill child).
@@ -112,6 +119,7 @@ impl McpTransport for HttpTransport {
         &self,
         body: &Value,
         on_server_request: &ServerRequestHandler,
+        on_notification: &NotificationHandler,
     ) -> Result<Value> {
         let session_id = self.session_id.lock().await.clone();
         let resp = self
@@ -189,8 +197,13 @@ impl McpTransport for HttpTransport {
                                 return Ok(data);
                             }
 
-                            // Notification (no id) — log and skip.
-                            debug!("SSE notification: {data}");
+                            // Notification (no id) — dispatch to handler.
+                            if let Some(method) = data.get("method").and_then(|m| m.as_str()) {
+                                let params = data.get("params").cloned().unwrap_or(Value::Null);
+                                on_notification(method, &params);
+                            } else {
+                                debug!("SSE notification (unrecognized): {data}");
+                            }
                         }
                     }
                 }
@@ -258,6 +271,7 @@ impl McpTransport for StdioTransport {
         &self,
         body: &Value,
         on_server_request: &ServerRequestHandler,
+        on_notification: &NotificationHandler,
     ) -> Result<Value> {
         let req_id = body.get("id").cloned().unwrap_or(Value::Null);
 
@@ -329,8 +343,13 @@ impl McpTransport for StdioTransport {
                 return Ok(data);
             }
 
-            // Notification — log and skip.
-            debug!("stdio notification: {data}");
+            // Notification — dispatch to handler.
+            if let Some(method) = data.get("method").and_then(|m| m.as_str()) {
+                let params = data.get("params").cloned().unwrap_or(Value::Null);
+                on_notification(method, &params);
+            } else {
+                debug!("stdio message (unrecognized): {data}");
+            }
         }
     }
 

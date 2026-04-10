@@ -474,8 +474,9 @@ async fn run_turn(
         warn!("Failed to persist user message: {e}");
     }
 
-    // 5. Tool-calling loop
-    let tool_specs = state.tools.specs().to_vec();
+    // 5. Tool-calling loop — refresh MCP tools if any server signalled a change.
+    state.tools.refresh_if_needed().await;
+    let tool_specs = state.tools.specs().await;
     let mut accumulated_text: Vec<String> = Vec::new();
     let final_text = loop {
         let round = history

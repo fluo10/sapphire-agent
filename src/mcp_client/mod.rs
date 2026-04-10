@@ -13,9 +13,12 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
-use transport::{HttpTransport, McpTransport, ServerRequestHandler, StdioTransport};
+use tracing::{debug, info, warn};
+use transport::{
+    HttpTransport, McpTransport, NotificationHandler, ServerRequestHandler, StdioTransport,
+};
 
 // ---------------------------------------------------------------------------
 // Remote tool metadata
@@ -38,6 +41,8 @@ pub struct McpClient {
     transport: Box<dyn McpTransport>,
     workspace_root: String,
     request_id: Mutex<u64>,
+    /// Set to `true` when the server sends `notifications/tools/list_changed`.
+    tools_changed: Arc<AtomicBool>,
 }
 
 impl McpClient {
@@ -57,7 +62,19 @@ impl McpClient {
             transport,
             workspace_root: workspace_root.to_string(),
             request_id: Mutex::new(1),
+            tools_changed: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// The server name (used as the tool namespace prefix).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Check and clear the `tools_changed` flag.
+    /// Returns `true` if the tool list has changed since the last check.
+    pub fn take_tools_changed(&self) -> bool {
+        self.tools_changed.swap(false, Ordering::Relaxed)
     }
 
     /// Get the next request ID.
@@ -85,7 +102,6 @@ impl McpClient {
                     })
                 }
                 "elicitation/create" => {
-                    // Auto-accept with the message echoed back.
                     let message = params
                         .get("message")
                         .and_then(|v| v.as_str())
@@ -117,6 +133,19 @@ impl McpClient {
         })
     }
 
+    /// Build the notification handler that watches for `tools/list_changed`.
+    fn notification_handler(&self) -> NotificationHandler {
+        let tools_changed = Arc::clone(&self.tools_changed);
+        let name = self.name.clone();
+        Arc::new(move |method: &str, _params: &Value| {
+            debug!("MCP '{name}': notification: {method}");
+            if method == "notifications/tools/list_changed" {
+                info!("MCP '{name}': tool list changed, will refresh");
+                tools_changed.store(true, Ordering::Relaxed);
+            }
+        })
+    }
+
     /// Send a JSON-RPC request through the transport.
     async fn send(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id().await;
@@ -127,8 +156,12 @@ impl McpClient {
             "params": params,
         });
 
-        let handler = self.server_request_handler();
-        let response = self.transport.request(&body, &handler).await?;
+        let req_handler = self.server_request_handler();
+        let notif_handler = self.notification_handler();
+        let response = self
+            .transport
+            .request(&body, &req_handler, &notif_handler)
+            .await?;
 
         if let Some(err) = response.get("error") {
             let msg = err["message"].as_str().unwrap_or("unknown error");
@@ -165,14 +198,16 @@ impl McpClient {
         );
 
         // Send initialized notification (no id, no response expected).
-        // For stdio, we write directly; for HTTP we send as a POST.
         let notification = json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
         });
-        // Best-effort notification — ignore errors.
-        let handler = self.server_request_handler();
-        let _ = self.transport.request(&notification, &handler).await;
+        let req_handler = self.server_request_handler();
+        let notif_handler = self.notification_handler();
+        let _ = self
+            .transport
+            .request(&notification, &req_handler, &notif_handler)
+            .await;
 
         Ok(())
     }
@@ -267,16 +302,38 @@ impl Tool for McpTool {
 }
 
 // ---------------------------------------------------------------------------
-// Factory: connect to configured MCP servers and collect their tools
+// Factory helpers
 // ---------------------------------------------------------------------------
 
-/// Connect to all configured MCP servers and return their tools wrapped as
-/// local `Tool` implementations.
+/// Build `McpTool` instances from a connected client's tool list.
+pub fn build_tools_for_client(client: &Arc<McpClient>, remote_tools: Vec<RemoteToolSpec>) -> Vec<Box<dyn Tool>> {
+    remote_tools
+        .into_iter()
+        .map(|rt| {
+            let tool_name = format!("mcp__{}__{}", client.name(), rt.name);
+            Box::new(McpTool {
+                client: Arc::clone(client),
+                spec: ToolSpec {
+                    name: Cow::Owned(tool_name),
+                    description: Cow::Owned(rt.description),
+                    input_schema: rt.input_schema,
+                },
+                remote_tool_name: rt.name,
+            }) as Box<dyn Tool>
+        })
+        .collect()
+}
+
+/// Connect to all configured MCP servers.  Returns `(tools, clients)`.
+///
+/// The clients are needed later to check `tools_changed` and refresh the
+/// tool set dynamically via `ToolSet::refresh_if_needed`.
 pub async fn create_mcp_tools(
     configs: &[McpServerConfig],
     workspace_root: &str,
-) -> Vec<Box<dyn Tool>> {
+) -> (Vec<Box<dyn Tool>>, Vec<Arc<McpClient>>) {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+    let mut clients: Vec<Arc<McpClient>> = Vec::new();
 
     for config in configs {
         let client = match McpClient::new(config, workspace_root).await {
@@ -294,24 +351,15 @@ pub async fn create_mcp_tools(
 
         match client.list_tools().await {
             Ok(remote_tools) => {
-                for rt in remote_tools {
-                    let tool_name = format!("mcp__{}__{}", config.name, rt.name);
-                    tools.push(Box::new(McpTool {
-                        client: Arc::clone(&client),
-                        spec: ToolSpec {
-                            name: Cow::Owned(tool_name),
-                            description: Cow::Owned(rt.description),
-                            input_schema: rt.input_schema,
-                        },
-                        remote_tool_name: rt.name,
-                    }));
-                }
+                tools.extend(build_tools_for_client(&client, remote_tools));
             }
             Err(e) => {
                 warn!("MCP '{}': failed to list tools: {e:#}", config.name);
             }
         }
+
+        clients.push(client);
     }
 
-    tools
+    (tools, clients)
 }
