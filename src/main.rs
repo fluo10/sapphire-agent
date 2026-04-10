@@ -164,8 +164,13 @@ async fn main() -> Result<()> {
             let sw_workspace = SwWorkspace::resolve(&APP_CTX, Some(&workspace_dir))
                 .context("Failed to resolve sapphire-workspace")?;
             // Load the workspace config so we can read sync_interval_minutes.
-            let ws_config =
+            // Workspace config provides shared defaults; the per-user agent
+            // config [sync] section takes precedence when present.
+            let mut ws_config =
                 WorkspaceConfig::load_from(&sw_workspace.config_path()).unwrap_or_default();
+            if let Some(agent_sync) = &config.sync {
+                ws_config.sync = agent_sync.clone();
+            }
             let ws_sync_interval = ws_config.sync.sync_interval();
             let ws_state =
                 WorkspaceState::open(sw_workspace).context("Failed to open WorkspaceState")?;
