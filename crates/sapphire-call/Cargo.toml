@@ -14,7 +14,7 @@ path = "src/main.rs"
 sapphire-agent-api = { path = "../sapphire-agent-api" }
 
 # Async runtime
-tokio = { version = "1.50", default-features = false, features = [
+tokio = { version = "1.51", default-features = false, features = [
     "rt-multi-thread",
     "macros",
 ] }
