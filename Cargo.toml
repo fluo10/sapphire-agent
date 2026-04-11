@@ -61,7 +61,7 @@ toml = "1.0"
 serde_yaml = "0.9"
 
 # Cron expression parsing (heartbeat schedules)
-cron = "0.12"
+cron = "0.16"
 
 # Error handling
 anyhow = "1.0"
