@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-04-12
+
+### Added
+
+- **MCP client** — built-in MCP client for integrating external tool servers,
+  with support for `notifications/tools/list_changed` to dynamically refresh
+  the tool list at runtime.
+- **Context compression** — automatically compresses the conversation when the
+  session approaches the context window limit, keeping sessions alive longer.
+- **Heartbeat config** — `heartbeat_enabled` and `standby_mode` options in the
+  agent config to pause or suspend background heartbeat tasks without
+  restarting.
+- **Crate split** — `sapphire-agent-api` (shared types + SSE client) and
+  `sapphire-call` (standalone CLI client) extracted into their own workspace
+  crates so they can be published and used independently.
+- **Dependabot** — automated dependency update PRs with grouped Cargo patch
+  updates on Fridays and auto-merge for patch-level bumps.
+
+### Changed
+
+- **`sapphire-workspace` 0.5.0 → 0.8.0** — picks up upstream improvements to
+  file indexing, vector search, and git sync.
+- **`reedline` upgraded to 0.47** — handles the new non-exhaustive `Signal`
+  enum without warnings.
+- **Memory tools** — `MemoryTool` redesigned into per-file entry tools with
+  frontmatter tracking for finer-grained read/write control.
+
+### Fixed
+
+- `[sync]` config is now read from the agent config file rather than only from
+  the workspace config, so sync settings specified in `config.toml` are
+  actually honoured.
+
 ## [0.1.0] - 2026-04-09
 
 Initial release of `sapphire-agent` — a personal AI assistant built around the
@@ -38,4 +71,5 @@ an HTTP/MCP server mode.
   and workspace-aware writes.
 - **Logging** — `tracing` with env-filter and ANSI output.
 
+[0.2.0]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.2.0
 [0.1.0]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.1.0
