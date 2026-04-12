@@ -19,8 +19,10 @@ name = "sapphire-agent"
 path = "src/main.rs"
 
 [features]
-default = ["lancedb-store"]
+default = ["lancedb-store", "fastembed-embed", "git-sync"]
 lancedb-store = ["sapphire-workspace/lancedb-store"]
+fastembed-embed = ["sapphire-workspace/fastembed-embed"]
+git-sync = ["sapphire-workspace/git-sync"]
 
 [dependencies]
 # Async runtime
@@ -97,7 +99,7 @@ uuid = { version = "1", features = ["v7"] }
 
 # Workspace: file indexing, FTS, vector search, git sync
 # lancedb-store is gated behind the "lancedb-store" feature (default on)
-sapphire-workspace = { version = "0.5.0", default-features = false, features = ["git-sync"] }
+sapphire-workspace = { version = "0.8.0", default-features = false }
 
 # Human-readable session IDs for API sessions
 grain-id = { version = "0.14", features = ["serde"] }

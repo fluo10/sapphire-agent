@@ -22,7 +22,7 @@ use config::Config;
 use daily_log::catchup_pending_logs;
 use heartbeat::Heartbeat;
 use provider::anthropic::AnthropicProvider;
-use sapphire_workspace::{AppContext, Workspace as SwWorkspace, WorkspaceConfig, WorkspaceState};
+use sapphire_workspace::{AppContext, Workspace as SwWorkspace, WorkspaceState};
 
 static APP_CTX: AppContext = AppContext::new("sapphire-agent");
 use session::SessionStore;
@@ -163,18 +163,14 @@ async fn main() -> Result<()> {
             // ── sapphire-workspace (search, file ops, git sync) ─────────────
             let sw_workspace = SwWorkspace::resolve(&APP_CTX, Some(&workspace_dir))
                 .context("Failed to resolve sapphire-workspace")?;
-            // Load the workspace config so we can read sync_interval_minutes.
-            // Workspace config provides shared defaults; the per-user agent
-            // config [sync] section takes precedence when present.
-            let mut ws_config =
-                WorkspaceConfig::load_from(&sw_workspace.config_path()).unwrap_or_default();
-            if let Some(agent_sync) = &config.sync {
-                ws_config.sync = agent_sync.clone();
-            }
-            let ws_sync_interval = ws_config.sync.sync_interval();
-            let ws_state =
-                WorkspaceState::open(sw_workspace).context("Failed to open WorkspaceState")?;
-            if let Err(e) = ws_state.sync() {
+            // Use the [sync] section from the agent config directly.
+            // WorkspaceConfig was removed in sapphire-workspace 0.8.0;
+            // open_configured now takes &SyncConfig.
+            let sync_config = config.sync.clone().unwrap_or_default();
+            let ws_sync_interval = sync_config.sync_interval();
+            let ws_state = WorkspaceState::open_configured(sw_workspace, &sync_config)
+                .context("Failed to open WorkspaceState")?;
+            if let Err(e) = ws_state.periodic_sync() {
                 tracing::warn!("Initial workspace sync failed: {e}");
             }
             let ws_state = Arc::new(Mutex::new(ws_state));
@@ -189,16 +185,11 @@ async fn main() -> Result<()> {
                     loop {
                         tick.tick().await;
                         let state = ws.lock().expect("ws_state mutex poisoned");
-                        match state.sync() {
+                        match state.periodic_sync() {
                             Ok((u, r)) => {
                                 tracing::info!("Periodic ws sync: {u} upserted, {r} removed");
-                                if let Some(backend) = state.sync_backend() {
-                                    if let Err(e) = backend.sync() {
-                                        tracing::warn!("Periodic ws git sync failed: {e:#}");
-                                    }
-                                }
                             }
-                            Err(e) => tracing::warn!("Periodic ws index sync failed: {e:#}"),
+                            Err(e) => tracing::warn!("Periodic ws sync failed: {e:#}"),
                         }
                     }
                 });
