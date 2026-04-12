@@ -115,6 +115,7 @@ pub async fn run(
         let line = match line_editor.read_line(&prompt) {
             Ok(Signal::Success(buf)) => buf,
             Ok(Signal::CtrlC) | Ok(Signal::CtrlD) => break,
+            Ok(_) => continue,
             Err(e) => {
                 eprintln!("Error reading input: {e}");
                 break;
