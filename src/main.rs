@@ -2,6 +2,7 @@ mod agent;
 mod call;
 mod channel;
 mod config;
+mod context_compression;
 mod daily_log;
 mod heartbeat;
 mod heartbeat_config;

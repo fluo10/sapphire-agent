@@ -6,6 +6,7 @@
 //! Session management follows the MCP standard: `Mcp-Session-Id` request header.
 
 use crate::config::Config;
+use crate::context_compression::maybe_compress;
 use crate::provider::{ChatMessage, ContentPart, Provider};
 use crate::session::{ConversationKey, SessionStore};
 use crate::tools::ToolSet;
@@ -477,6 +478,7 @@ async fn run_turn(
     // 5. Tool-calling loop — refresh MCP tools if any server signalled a change.
     state.tools.refresh_if_needed().await;
     let tool_specs = state.tools.specs().await;
+    let compression_config = &state.config.compression;
     let mut accumulated_text: Vec<String> = Vec::new();
     let final_text = loop {
         let round = history
@@ -491,6 +493,24 @@ async fn run_turn(
         if round >= MAX_TOOL_ROUNDS {
             warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS})");
             break None;
+        }
+
+        // Check if context compression is needed
+        match maybe_compress(
+            &*state.provider,
+            system.as_deref(),
+            &history,
+            &compression_config,
+        )
+        .await
+        {
+            Ok(Some(compressed)) => {
+                history = compressed;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("Context compression failed, continuing with full history: {e}");
+            }
         }
 
         let response = state

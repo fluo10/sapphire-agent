@@ -1,5 +1,6 @@
 use crate::channel::{Channel, OutgoingMessage};
 use crate::config::Config;
+use crate::context_compression::maybe_compress;
 use crate::provider::{ChatMessage, ContentPart, Provider, ToolCall};
 use crate::session::{ConversationKey, SessionStore, local_date_for_timestamp};
 use crate::tools::ToolSet;
@@ -297,6 +298,9 @@ impl Agent {
             None => None,
         };
 
+        // Context compression config
+        let compression_config = &self.config.compression;
+
         // Tool-calling loop
         let mut accumulated_text: Vec<String> = Vec::new();
         let final_text = loop {
@@ -322,6 +326,32 @@ impl Agent {
                 warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS}), stopping");
                 break Some(accumulated_text.join("\n\n"));
             }
+
+            // Check if context compression is needed
+            let messages = match maybe_compress(
+                &*self.provider,
+                system_with_context.as_deref(),
+                &messages,
+                &compression_config,
+            )
+            .await
+            {
+                Ok(Some(compressed)) => {
+                    // Replace in-memory history with compressed version
+                    *self
+                        .history
+                        .lock()
+                        .await
+                        .entry(key.clone())
+                        .or_default() = compressed.clone();
+                    compressed
+                }
+                Ok(None) => messages,
+                Err(e) => {
+                    warn!("Context compression failed, continuing with full history: {e}");
+                    messages
+                }
+            };
 
             let response = self
                 .provider

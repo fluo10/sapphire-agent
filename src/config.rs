@@ -12,6 +12,9 @@ pub struct Config {
     #[serde(default)]
     pub discord: Option<DiscordConfig>,
     pub anthropic: AnthropicConfig,
+    /// Context compression configuration.
+    #[serde(default)]
+    pub compression: CompressionConfig,
     /// Tool configuration (search APIs, etc.).
     #[serde(default)]
     pub tools: ToolsConfig,
@@ -175,12 +178,54 @@ pub struct AnthropicConfig {
     pub system_prompt: Option<String>,
 }
 
+/// Context compression configuration (provider-agnostic).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CompressionConfig {
+    /// Whether context compression is enabled. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Context window size in tokens. Defaults to 200,000.
+    #[serde(default = "default_context_window")]
+    pub context_window: usize,
+    /// Fraction of context window at which compression triggers (0.0–1.0).
+    /// Defaults to 0.80.
+    #[serde(default = "default_compression_threshold")]
+    pub threshold: f64,
+    /// Number of recent messages to preserve verbatim during compression.
+    /// Defaults to 20.
+    #[serde(default = "default_preserve_recent")]
+    pub preserve_recent: usize,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            context_window: default_context_window(),
+            threshold: default_compression_threshold(),
+            preserve_recent: default_preserve_recent(),
+        }
+    }
+}
+
 fn default_model() -> String {
     "claude-opus-4-6".to_string()
 }
 
 fn default_max_tokens() -> u32 {
     8192
+}
+
+fn default_context_window() -> usize {
+    200_000
+}
+
+fn default_compression_threshold() -> f64 {
+    0.80
+}
+
+fn default_preserve_recent() -> usize {
+    20
 }
 
 impl Config {
