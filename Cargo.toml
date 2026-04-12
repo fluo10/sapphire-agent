@@ -97,7 +97,7 @@ uuid = { version = "1", features = ["v7"] }
 
 # Workspace: file indexing, FTS, vector search, git sync
 # lancedb-store is gated behind the "lancedb-store" feature (default on)
-sapphire-workspace = { version = "0.5.0", default-features = false, features = ["git-sync"] }
+sapphire-workspace = { version = "0.7.0", default-features = false, features = ["git-sync"] }
 
 # Human-readable session IDs for API sessions
 grain-id = { version = "0.14", features = ["serde"] }

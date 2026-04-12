@@ -6108,9 +6108,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-retrieve"
-version = "0.5.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e82f1e21211d82badee2194ed69145e020a45af973a8f86e73f9b7af7c600a25"
+checksum = "a7a73119c26f532184fe1a657d56359e1045e9efa45670b35776416e1b3d36b5"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -6125,20 +6125,21 @@ dependencies = [
 
 [[package]]
 name = "sapphire-sync"
-version = "0.5.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0633ecb2091bde4afd8e33c0b5caeb0e52653e65f1b3e3762b3de49f2a593975"
+checksum = "0b819ab1b4ee28b10adeba7985fd92a15c33ac2cbc50a1dc0cb3c73dec3287d4"
 dependencies = [
  "git2",
  "serde",
  "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
 name = "sapphire-workspace"
-version = "0.5.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1c8e03c0c6cf85c1ad43f1bd6f2563235359ef21d3a8ed8c9d7c30ff57f8c11"
+checksum = "38202db94f30cd9cc69cd101cb968066576d313e692f31b5402206110c747185"
 dependencies = [
  "dirs 5.0.1",
  "indexmap 2.14.0",
