@@ -3,7 +3,7 @@ use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sapphire_workspace::{RetrieveDb, WorkspaceState};
+use sapphire_workspace::{dedup_chunk_results, WorkspaceState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
@@ -592,7 +592,7 @@ impl Tool for WorkspaceSearchTool {
                     .retrieve_db()
                     .search_similar(&query_vec, limit * 3)
                     .context("Vector similarity search failed")?;
-                let results = RetrieveDb::dedup_chunk_results(chunk_results, limit);
+                let results = dedup_chunk_results(chunk_results, limit);
 
                 if results.is_empty() {
                     return Ok("No results found.".to_string());
@@ -664,18 +664,9 @@ impl Tool for WorkspaceSyncTool {
     async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
         let state = lock(&self.state);
 
-        let (upserted, removed) = state.sync().context("Failed to sync workspace index")?;
-
-        if let Some(backend) = state.sync_backend() {
-            backend.sync().context("Git sync failed")?;
-            Ok(format!(
-                "Synced: {upserted} files indexed, {removed} removed, git commit+push done."
-            ))
-        } else {
-            Ok(format!(
-                "Indexed: {upserted} files upserted, {removed} removed. \
-                 No git remote configured."
-            ))
-        }
+        let (upserted, removed) = state.periodic_sync().context("Failed to sync workspace")?;
+        Ok(format!(
+            "Synced: {upserted} files indexed, {removed} removed."
+        ))
     }
 }
