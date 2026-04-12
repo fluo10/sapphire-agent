@@ -3,7 +3,7 @@ members = [".", "crates/sapphire-agent-api", "crates/sapphire-call"]
 
 [package]
 name = "sapphire-agent"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A personal AI assistant agent with Matrix/Discord channels, Anthropic backend, and a sapphire-workspace memory layer"
 license = "MIT OR Apache-2.0"
@@ -105,7 +105,7 @@ sapphire-workspace = { version = "0.8.0", default-features = false }
 grain-id = { version = "0.14", features = ["serde"] }
 
 # Client library (shared with sapphire-call)
-sapphire-agent-api = { path = "crates/sapphire-agent-api" }
+sapphire-agent-api = { path = "crates/sapphire-agent-api", version = "0.2.0" }
 
 # HTTP server (serve command)
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
