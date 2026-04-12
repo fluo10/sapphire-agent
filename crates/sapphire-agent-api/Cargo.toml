@@ -24,4 +24,4 @@ anyhow = "1.0"
 futures-util = "0.3"
 
 # Readline for the REPL (CJK-safe input, history, cursor movement)
-reedline = "0.39"
+reedline = "0.47"
