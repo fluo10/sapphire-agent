@@ -3,7 +3,7 @@ members = [".", "crates/sapphire-agent-api", "crates/sapphire-call"]
 
 [package]
 name = "sapphire-agent"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "A personal AI assistant agent with Matrix/Discord channels, Anthropic backend, and a sapphire-workspace memory layer"
 license = "MIT OR Apache-2.0"
@@ -99,7 +99,7 @@ uuid = { version = "1", features = ["v7"] }
 
 # Workspace: file indexing, FTS, vector search, git sync
 # lancedb-store is gated behind the "lancedb-store" feature (default on)
-sapphire-workspace = { version = "0.8.0", default-features = false }
+sapphire-workspace = { version = "0.8.1", default-features = false }
 
 # Human-readable session IDs for API sessions
 grain-id = { version = "0.14", features = ["serde"] }
