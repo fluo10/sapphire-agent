@@ -1,13 +1,39 @@
 [workspace]
 members = [".", "crates/sapphire-agent-api", "crates/sapphire-call"]
 
-[package]
-name = "sapphire-agent"
+[workspace.dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "stream",
+] }
+serde_json = "1.0"
+tokio = { version = "1.50", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "ansi",
+    "env-filter",
+] }
+
+[workspace.package]
 version = "0.2.1"
 edition = "2024"
-description = "A personal AI assistant agent with Matrix/Discord channels, Anthropic backend, and a sapphire-workspace memory layer"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fluo10/sapphire-agent"
+
+[package]
+name = "sapphire-agent"
+version.workspace = true
+edition.workspace = true
+description = "A personal AI assistant agent with Matrix/Discord channels, Anthropic backend, and a sapphire-workspace memory layer"
+license.workspace = true
+repository.workspace = true
 homepage = "https://github.com/fluo10/sapphire-agent"
 keywords = ["ai", "agent", "anthropic", "matrix", "discord"]
 categories = ["command-line-utilities"]
@@ -26,9 +52,7 @@ git-sync = ["sapphire-workspace/git-sync"]
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.50", default-features = false, features = [
-    "rt-multi-thread",
-    "macros",
+tokio = { workspace = true, features = [
     "time",
     "sync",
     "fs",
@@ -37,12 +61,7 @@ tokio = { version = "1.50", default-features = false, features = [
 ] }
 
 # HTTP client (Anthropic API + tool HTTP calls)
-reqwest = { version = "0.12", default-features = false, features = [
-    "json",
-    "rustls-tls",
-    "stream",
-    "blocking",
-] }
+reqwest = { workspace = true, features = ["blocking"] }
 
 # Matrix client + E2EE
 matrix-sdk = { version = "0.16", default-features = false, features = [
@@ -54,7 +73,7 @@ matrix-sdk = { version = "0.16", default-features = false, features = [
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json.workspace = true
 
 # Config (TOML)
 toml = "1.0"
@@ -66,24 +85,20 @@ serde_yaml = "0.9"
 cron = "0.16"
 
 # Error handling
-anyhow = "1.0"
+anyhow.workspace = true
 
 # Async traits
 async-trait = "0.1"
 
 # Futures utilities (SSE streaming)
-futures-util = "0.3"
+futures-util.workspace = true
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = [
-    "fmt",
-    "ansi",
-    "env-filter",
-] }
+tracing-subscriber.workspace = true
 
 # CLI
-clap = { version = "4.5", features = ["derive"] }
+clap.workspace = true
 
 # XDG directories for config/data paths
 directories = "6.0"
@@ -105,7 +120,7 @@ sapphire-workspace = { version = "0.8.1", default-features = false }
 grain-id = { version = "0.14", features = ["serde"] }
 
 # Client library (shared with sapphire-call)
-sapphire-agent-api = { path = "crates/sapphire-agent-api", version = "0.2.0" }
+sapphire-agent-api = { path = "crates/sapphire-agent-api", version = "0.2.1" }
 
 # HTTP server (serve command)
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
