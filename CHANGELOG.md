@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-04-13
+
+### Fixed
+
+- **`sapphire-workspace` 0.8.0 → 0.8.1** — fixes git sync push not working
+  due to a bug in `sapphire-sync` where the push step was silently skipped.
+
 ## [0.2.0] - 2026-04-12
 
 ### Added
