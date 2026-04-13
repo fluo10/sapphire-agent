@@ -46,6 +46,9 @@ jobs:
           - os: ubuntu-24.04-arm
             binary: sapphire-agent
             asset_name: sapphire-agent-linux-aarch64
+          - os: windows-latest
+            binary: sapphire-agent.exe
+            asset_name: sapphire-agent-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -84,7 +87,7 @@ jobs:
           files: artifacts/*
 
   publish:
-    needs: [prepare, release]
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -95,5 +98,5 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
-      - name: Publish sapphire-agent to crates.io
-        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish workspace crates to crates.io
+        run: cargo publish --workspace --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

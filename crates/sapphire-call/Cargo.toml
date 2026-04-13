@@ -1,10 +1,10 @@
 [package]
 name = "sapphire-call"
-version = "0.2.1"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Standalone CLI client for sapphire-agent"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/fluo10/sapphire-agent"
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "sapphire-call"
@@ -14,20 +14,13 @@ path = "src/main.rs"
 sapphire-agent-api = { path = "../sapphire-agent-api", version = "0.2.1" }
 
 # Async runtime
-tokio = { version = "1.50", default-features = false, features = [
-    "rt-multi-thread",
-    "macros",
-] }
+tokio.workspace = true
 
 # CLI
-clap = { version = "4.5", features = ["derive"] }
+clap.workspace = true
 
 # Error handling
-anyhow = "1.0"
+anyhow.workspace = true
 
 # Logging
-tracing-subscriber = { version = "0.3", default-features = false, features = [
-    "fmt",
-    "ansi",
-    "env-filter",
-] }
+tracing-subscriber.workspace = true
