@@ -95,6 +95,14 @@ impl Agent {
     /// whose prior run did not produce a `SummaryLine` (e.g. crash). Each
     /// generated summary is appended to the JSONL file and placed into
     /// `restart_summaries` for the next turn.
+    ///
+    /// Only sessions whose room_id is in the configured room/channel list are
+    /// processed. Sessions from unconfigured rooms (e.g. test rooms that share
+    /// the same sessions directory) are left as-is so a production restart
+    /// never triggers LLM calls for rooms this instance doesn't own.
+    /// Exception: if no room IDs are configured (Discord with channel_ids = []),
+    /// all sessions are processed (preserving the "listen to all channels"
+    /// semantics).
     pub async fn bootstrap(self: &Arc<Self>) {
         let pending: Vec<(ConversationKey, Vec<ChatMessage>)> = {
             let mut map = self.pending_fallback.lock().await;
@@ -105,12 +113,49 @@ impl Agent {
             return;
         }
 
+        // Build the set of room/channel IDs this instance is configured to
+        // handle.  An empty set means "no restriction" (e.g. Discord with
+        // channel_ids = []) and falls back to processing everything.
+        let allowed: std::collections::HashSet<String> = {
+            let mut set = std::collections::HashSet::new();
+            if let Some(m) = &self.config.matrix {
+                set.extend(m.room_ids.iter().cloned());
+            }
+            if let Some(d) = &self.config.discord {
+                set.extend(d.channel_ids.iter().cloned());
+            }
+            set
+        };
+
+        let (to_process, skipped): (Vec<(ConversationKey, Vec<ChatMessage>)>, usize) =
+            if allowed.is_empty() {
+                // No restriction configured (e.g. Discord with channel_ids=[])
+                // — process all sessions.
+                (pending, 0)
+            } else {
+                let (yes, no): (Vec<_>, Vec<_>) = pending
+                    .into_iter()
+                    .partition(|(key, _)| allowed.contains(&key.0));
+                let skipped = no.len();
+                (yes, skipped)
+            };
+
+        if skipped > 0 {
+            info!(
+                "Bootstrap: skipping {} session(s) in unconfigured rooms",
+                skipped
+            );
+        }
+        if to_process.is_empty() {
+            return;
+        }
+
         info!(
             "Bootstrap: synthesizing summaries for {} session(s) without a SummaryLine",
-            pending.len()
+            to_process.len()
         );
 
-        for (key, messages) in pending {
+        for (key, messages) in to_process {
             if messages.len() < 2 {
                 continue;
             }
