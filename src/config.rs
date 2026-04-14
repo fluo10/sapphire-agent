@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use sapphire_workspace::SyncConfig;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -31,6 +32,13 @@ pub struct Config {
     /// Used for session resets and daily log generation. Default: 0 (midnight).
     #[serde(default)]
     pub day_boundary_hour: u8,
+    /// Default session policy applied at the day boundary. Can be overridden
+    /// per room via `[rooms."<id>"]`. Default: `reset` (back-compat).
+    #[serde(default)]
+    pub session_policy: SessionPolicy,
+    /// Per-room overrides keyed by `room_id`.
+    #[serde(default)]
+    pub rooms: HashMap<String, RoomConfig>,
     /// Whether to generate a daily log at the day boundary. Default: true.
     #[serde(default = "default_true")]
     pub daily_log_enabled: bool,
@@ -58,6 +66,31 @@ pub struct Config {
 
 fn default_true() -> bool {
     true
+}
+
+/// Action taken at the day boundary for a given conversation.
+///
+/// - `Reset`: close the session and clear in-memory caches (legacy behavior).
+///   The next message starts a fresh session; prior-run summary is injected via
+///   `restart_summaries`.
+/// - `Compact`: keep the same session alive, but force-summarize the current
+///   in-memory history and replace it with a summary stub. The SummaryLine is
+///   appended to the session JSONL. Session continuity is preserved.
+/// - `None`: no day-boundary action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionPolicy {
+    #[default]
+    Reset,
+    Compact,
+    None,
+}
+
+/// Per-room configuration overrides.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct RoomConfig {
+    /// Override the day-boundary session policy for this room.
+    pub session_policy: Option<SessionPolicy>,
 }
 
 /// Configuration for the HTTP API server (serve command).
@@ -131,7 +164,11 @@ pub struct MatrixConfig {
     pub access_token: String,
     pub user_id: String,
     pub device_id: String,
-    pub room_id: String,
+    /// Rooms the bot listens to. Accepts either a TOML array
+    /// (`room_ids = ["!a:srv", "!b:srv"]`) or — for backward compatibility —
+    /// a single string key named `room_id`.
+    #[serde(default, alias = "room_id", deserialize_with = "deserialize_room_ids")]
+    pub room_ids: Vec<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
     /// E2EE recovery key (optional)
@@ -141,7 +178,31 @@ pub struct MatrixConfig {
     pub state_dir: Option<String>,
 }
 
+/// Accept either `"!a:srv"` (legacy single string) or `["!a:srv", "!b:srv"]`
+/// for the `room_ids` / legacy `room_id` field.
+fn deserialize_room_ids<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => Ok(vec![s]),
+        OneOrMany::Many(v) => Ok(v),
+    }
+}
+
 impl MatrixConfig {
+    /// Primary room — first configured room. Used as the default target for
+    /// heartbeat tasks that don't name a specific room.
+    pub fn primary_room_id(&self) -> Option<&str> {
+        self.room_ids.first().map(|s| s.as_str())
+    }
+
     pub fn resolved_state_dir(&self) -> PathBuf {
         if let Some(dir) = &self.state_dir {
             PathBuf::from(shellexpand::tilde(dir).as_ref())
@@ -258,6 +319,15 @@ impl Config {
         } else {
             workspace_dir.join("sessions")
         }
+    }
+
+    /// Resolve the session policy for a given `room_id`, falling back to the
+    /// global default when no room-specific override is set.
+    pub fn session_policy_for(&self, room_id: &str) -> SessionPolicy {
+        self.rooms
+            .get(room_id)
+            .and_then(|r| r.session_policy)
+            .unwrap_or(self.session_policy)
     }
 
     /// Resolve the default config path: `~/.config/sapphire-agent/config.toml`

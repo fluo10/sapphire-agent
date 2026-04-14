@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
                 println!("  Channel           : matrix");
                 println!("  Matrix homeserver : {}", m.homeserver);
                 println!("  Matrix user_id    : {}", m.user_id);
-                println!("  Matrix room_id    : {}", m.room_id);
+                println!("  Matrix rooms      : {:?}", m.room_ids);
             } else if let Some(d) = &config.discord {
                 println!("  Channel           : discord");
                 println!("  Discord channels  : {:?}", d.channel_ids);
@@ -270,17 +270,16 @@ async fn main() -> Result<()> {
                 agent.bootstrap().await;
 
                 // ── Heartbeat (day-boundary + cron loops) ───────────────────
-                let default_room_id =
-                    config
-                        .matrix
-                        .as_ref()
-                        .map(|m| m.room_id.clone())
-                        .or_else(|| {
-                            config
-                                .discord
-                                .as_ref()
-                                .and_then(|d| d.channel_ids.first().cloned())
-                        });
+                let default_room_id = config
+                    .matrix
+                    .as_ref()
+                    .and_then(|m| m.primary_room_id().map(str::to_string))
+                    .or_else(|| {
+                        config
+                            .discord
+                            .as_ref()
+                            .and_then(|d| d.channel_ids.first().cloned())
+                    });
                 let heartbeat = Heartbeat {
                     workspace_dir: workspace_dir.clone(),
                     day_boundary_hour: config.day_boundary_hour,

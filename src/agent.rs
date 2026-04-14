@@ -1,7 +1,7 @@
 use crate::channel::{Channel, OutgoingMessage};
-use crate::config::Config;
+use crate::config::{Config, SessionPolicy};
 use crate::context_compression::{generate_summary, maybe_compress};
-use crate::provider::{ChatMessage, ContentPart, Provider, ToolCall};
+use crate::provider::{ChatMessage, ContentPart, Provider, Role, ToolCall};
 use crate::session::{ConversationKey, SessionStore, local_date_for_timestamp};
 use crate::tools::ToolSet;
 use crate::workspace::Workspace;
@@ -52,6 +52,10 @@ pub struct Agent {
     /// summary from these raw messages and moves the result into
     /// `restart_summaries`.
     pending_fallback: Mutex<HashMap<ConversationKey, Vec<ChatMessage>>>,
+    /// Local date on which the last day-boundary action fired for each key.
+    /// Prevents re-firing within the same day for policies that don't rotate
+    /// the session file (Compact, None).
+    boundary_handled: Mutex<HashMap<ConversationKey, NaiveDate>>,
 }
 
 impl Agent {
@@ -83,6 +87,7 @@ impl Agent {
             prefetch_cache: Mutex::new(HashMap::new()),
             restart_summaries: Mutex::new(summaries),
             pending_fallback: Mutex::new(fallback),
+            boundary_handled: Mutex::new(HashMap::new()),
         }
     }
 
@@ -293,11 +298,17 @@ impl Agent {
         }
     }
 
-    /// If the active session for `key` started on a different local day,
-    /// close it and clear the in-memory state so a new session is created.
-    async fn maybe_reset_session(&self, key: &ConversationKey) {
+    /// Dispatch the configured day-boundary action for `key` when the local
+    /// date on the active session file is older than today. Each policy is
+    /// idempotent within a day via `boundary_handled`.
+    async fn maybe_handle_day_boundary(&self, key: &ConversationKey) {
         let boundary = self.config.day_boundary_hour;
         let today = local_date_for_timestamp(Local::now(), boundary);
+        let policy = self.config.session_policy_for(&key.0);
+
+        if policy == SessionPolicy::None {
+            return;
+        }
 
         let session_id = {
             let sessions = self.active_sessions.lock().await;
@@ -312,18 +323,98 @@ impl Agent {
             .sessions_dir
             .join(format!("{session_id}.jsonl"));
 
-        if read_session_date(&session_path, boundary) < today {
-            info!("Day boundary crossed for {key:?}; resetting session");
-
-            if let Err(e) = self.session_store.close_session(&session_id) {
-                warn!("Failed to close session {session_id}: {e}");
-            }
-
-            self.history.lock().await.remove(key);
-            self.active_sessions.lock().await.remove(key);
-            self.snapshots.lock().await.remove(key);
-            self.prefetch_cache.lock().await.remove(key);
+        if read_session_date(&session_path, boundary) >= today {
+            return;
         }
+
+        // Idempotence: don't re-fire within the same local day if we already
+        // handled it (only relevant for policies that don't rotate the file).
+        {
+            let handled = self.boundary_handled.lock().await;
+            if handled.get(key).copied() == Some(today) {
+                return;
+            }
+        }
+
+        match policy {
+            SessionPolicy::Reset => {
+                info!("Day boundary crossed for {key:?}; resetting session");
+
+                if let Err(e) = self.session_store.close_session(&session_id) {
+                    warn!("Failed to close session {session_id}: {e}");
+                }
+
+                self.history.lock().await.remove(key);
+                self.active_sessions.lock().await.remove(key);
+                self.snapshots.lock().await.remove(key);
+                self.prefetch_cache.lock().await.remove(key);
+                // Reset rotates the session file, so no need to mark handled;
+                // the new session will have today's created_at.
+            }
+            SessionPolicy::Compact => {
+                self.compact_at_boundary(key, &session_id).await;
+                self.boundary_handled
+                    .lock()
+                    .await
+                    .insert(key.clone(), today);
+            }
+            SessionPolicy::None => unreachable!(),
+        }
+    }
+
+    /// Force-summarize the current in-memory history for `key` and replace
+    /// it with a summary stub so the session can keep growing into the new
+    /// day without re-sending stale context to the model.
+    async fn compact_at_boundary(&self, key: &ConversationKey, session_id: &str) {
+        let messages = {
+            let history = self.history.lock().await;
+            history.get(key).cloned().unwrap_or_default()
+        };
+
+        // Nothing to compact if history is empty or already just a stub.
+        let has_real_content = messages.iter().any(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::Text(t) if !t.is_empty()))
+        });
+        if messages.len() < 2 || !has_real_content {
+            return;
+        }
+
+        info!("Day boundary crossed for {key:?}; compacting session {session_id}");
+
+        let summary = match generate_summary(&*self.provider, &messages).await {
+            Ok(s) if !s.trim().is_empty() => s,
+            Ok(_) => {
+                warn!("Boundary summary for {session_id} was empty; skipping");
+                return;
+            }
+            Err(e) => {
+                warn!("Boundary summary generation failed for {session_id}: {e:#}");
+                return;
+            }
+        };
+
+        if let Err(e) = self.session_store.append_summary(session_id, &summary) {
+            warn!("Failed to persist boundary summary for {session_id}: {e}");
+        }
+
+        let stub = vec![
+            ChatMessage {
+                role: Role::User,
+                parts: vec![ContentPart::Text(format!(
+                    "[Context Summary — prior-day messages were compacted]\n\n{summary}"
+                ))],
+            },
+            ChatMessage::assistant(
+                "Understood. I have the context from the prior day's conversation.",
+            ),
+        ];
+
+        self.history.lock().await.insert(key.clone(), stub);
+        // Refresh the system prompt snapshot so it rebuilds with today's date.
+        self.snapshots.lock().await.remove(key);
+        self.prefetch_cache.lock().await.remove(key);
     }
 
     // -----------------------------------------------------------------------
@@ -380,8 +471,8 @@ impl Agent {
 
         let key: ConversationKey = (incoming.room_id.clone(), incoming.thread_id.clone());
 
-        // Check for day boundary → maybe reset session + snapshot
-        self.maybe_reset_session(&key).await;
+        // Check for day boundary → dispatch configured session policy
+        self.maybe_handle_day_boundary(&key).await;
 
         let session_id = self.get_or_create_session(&key).await;
 
