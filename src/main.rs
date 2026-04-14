@@ -267,6 +267,7 @@ async fn main() -> Result<()> {
                     Some(Arc::clone(&tool_set)),
                     Arc::clone(&channel_session_store),
                 ));
+                agent.bootstrap().await;
 
                 // ── Heartbeat (day-boundary + cron loops) ───────────────────
                 let default_room_id =
