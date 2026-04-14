@@ -54,16 +54,23 @@ fn estimate_message_tokens(msg: &ChatMessage) -> usize {
         .sum()
 }
 
+/// Outcome of a compression attempt.
+pub struct CompressionResult {
+    pub compressed: Vec<ChatMessage>,
+    pub summary: String,
+}
+
 /// Check whether compression is needed and, if so, compress the history.
 ///
 /// Returns `Ok(None)` if no compression was needed.
-/// Returns `Ok(Some(compressed))` with the new message history if compressed.
+/// Returns `Ok(Some(CompressionResult))` with the new message history and the
+/// raw summary text (to be persisted as a `SummaryLine`) if compressed.
 pub async fn maybe_compress(
     provider: &dyn Provider,
     system: Option<&str>,
     messages: &[ChatMessage],
     config: &CompressionConfig,
-) -> anyhow::Result<Option<Vec<ChatMessage>>> {
+) -> anyhow::Result<Option<CompressionResult>> {
     if !config.enabled {
         return Ok(None);
     }
@@ -81,19 +88,15 @@ pub async fn maybe_compress(
         config.context_window
     );
 
-    // Find the split point: keep the most recent `preserve_recent` messages,
-    // but ensure we don't split in the middle of a tool-call/result pair.
     let split = find_safe_split_point(messages, config.preserve_recent);
 
     if split == 0 {
-        // Nothing to compress — all messages are in the "recent" window
         return Ok(None);
     }
 
     let to_summarize = &messages[..split];
     let to_keep = &messages[split..];
 
-    // Generate a summary of the older messages
     let summary = generate_summary(provider, to_summarize).await?;
 
     info!(
@@ -103,7 +106,6 @@ pub async fn maybe_compress(
         estimate_tokens(&summary),
     );
 
-    // Build the compressed history: summary message + recent messages
     let mut compressed = Vec::with_capacity(1 + to_keep.len());
     compressed.push(ChatMessage {
         role: Role::User,
@@ -111,14 +113,15 @@ pub async fn maybe_compress(
             "[Context Summary — earlier messages were compressed]\n\n{summary}"
         ))],
     });
-    // Insert a placeholder assistant acknowledgment so that the message
-    // sequence alternates correctly (user → assistant → user → …).
     compressed.push(ChatMessage::assistant(
         "Understood. I have the context from our earlier conversation.",
     ));
     compressed.extend_from_slice(to_keep);
 
-    Ok(Some(compressed))
+    Ok(Some(CompressionResult {
+        compressed,
+        summary,
+    }))
 }
 
 /// Find a safe split point that doesn't break tool-call/result pairs.
@@ -169,7 +172,11 @@ fn find_safe_split_point(messages: &[ChatMessage], preserve_recent: usize) -> us
 }
 
 /// Generate a concise summary of a sequence of messages using the LLM.
-async fn generate_summary(
+///
+/// Tool-call and tool-result parts are rendered as plain-text placeholders,
+/// so the input need not be tool-paired — safe to call on raw, potentially
+/// incomplete history loaded from disk at startup.
+pub async fn generate_summary(
     provider: &dyn Provider,
     messages: &[ChatMessage],
 ) -> anyhow::Result<String> {

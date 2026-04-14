@@ -6,7 +6,7 @@
 //! Session management follows the MCP standard: `Mcp-Session-Id` request header.
 
 use crate::config::Config;
-use crate::context_compression::maybe_compress;
+use crate::context_compression::{generate_summary, maybe_compress};
 use crate::provider::{ChatMessage, ContentPart, Provider};
 use crate::session::{ConversationKey, SessionStore};
 use crate::tools::ToolSet;
@@ -122,19 +122,52 @@ pub async fn run(
     let app = Router::new()
         .route("/mcp", post(mcp_post).get(mcp_get))
         .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(state);
+        .with_state(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("sapphire-agent: API server listening on http://{addr}");
+    let shutdown_state = Arc::clone(&state);
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             if let Err(e) = tokio::signal::ctrl_c().await {
                 error!("Failed to install Ctrl-C handler: {e}");
             }
             info!("HTTP server shutting down...");
         })
         .await?;
+    summarize_all_sessions(&shutdown_state).await;
     Ok(())
+}
+
+/// Summarize every in-memory API session and append a `SummaryLine` so the
+/// next process can recover context without replaying raw history.
+async fn summarize_all_sessions(state: &Arc<ServeState>) {
+    let snapshot: Vec<(String, Vec<ChatMessage>)> = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .iter()
+            .filter(|(_, msgs)| msgs.len() >= 2)
+            .map(|(sid, msgs)| (sid.clone(), msgs.clone()))
+            .collect()
+    };
+    if snapshot.is_empty() {
+        return;
+    }
+    info!(
+        "Graceful shutdown: summarizing {} API session(s)",
+        snapshot.len()
+    );
+    for (session_id, messages) in snapshot {
+        match generate_summary(&*state.provider, &messages).await {
+            Ok(summary) if !summary.trim().is_empty() => {
+                if let Err(e) = state.api_session_store.append_summary(&session_id, &summary) {
+                    warn!("Failed to persist shutdown summary for {session_id}: {e}");
+                }
+            }
+            Ok(_) => warn!("Shutdown summary for {session_id} was empty; skipping"),
+            Err(e) => warn!("Shutdown summary generation failed for {session_id}: {e:#}"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -504,8 +537,14 @@ async fn run_turn(
         )
         .await
         {
-            Ok(Some(compressed)) => {
-                history = compressed;
+            Ok(Some(result)) => {
+                history = result.compressed;
+                if let Err(e) = state
+                    .api_session_store
+                    .append_summary(&session_id, &result.summary)
+                {
+                    warn!("Failed to persist compaction summary: {e}");
+                }
             }
             Ok(None) => {}
             Err(e) => {
@@ -543,9 +582,10 @@ async fn run_turn(
                 }
                 let msg = ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
                 history.push(msg.clone());
-                if let Err(e) = state.api_session_store.append(&session_id, &msg) {
-                    warn!("Failed to persist tool-call message: {e}");
-                }
+                // Tool_use messages are intentionally not persisted: they
+                // can be arbitrarily large and we never reload raw tool
+                // history across restarts anyway (compaction summaries cover
+                // the semantic context).
 
                 // Notify client of each tool starting
                 for call in &tool_calls {
@@ -582,9 +622,8 @@ async fn run_turn(
 
                 let result_msg = ChatMessage::tool_results(results);
                 history.push(result_msg.clone());
-                if let Err(e) = state.api_session_store.append(&session_id, &result_msg) {
-                    warn!("Failed to persist tool results: {e}");
-                }
+                // Tool_result payloads are not persisted — see the matching
+                // tool_use branch above for rationale.
             }
         }
     };

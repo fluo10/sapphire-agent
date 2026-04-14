@@ -91,6 +91,18 @@ struct TitleLine {
     session_title: String,
 }
 
+/// Compacted recap of a session, appended whenever an in-memory compression
+/// fires and on graceful shutdown. Restart uses the latest `SummaryLine` to
+/// inject context into the system prompt without replaying the raw (and
+/// potentially tool-unpaired) message history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryLine {
+    pub summary_at: DateTime<Utc>,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_to_timestamp: Option<DateTime<Utc>>,
+}
+
 // ---------------------------------------------------------------------------
 // SessionStore
 // ---------------------------------------------------------------------------
@@ -208,6 +220,21 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Append a compaction summary to the session file.
+    pub fn append_summary(&self, session_id: &str, summary: &str) -> anyhow::Result<()> {
+        let line = serde_json::to_string(&SummaryLine {
+            summary_at: Utc::now(),
+            summary: summary.to_string(),
+            up_to_timestamp: None,
+        })?;
+        let path = self.session_path(session_id);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(file, "{line}")?;
+        drop(file);
+        self.notify_updated(&path);
+        Ok(())
+    }
+
     /// Close a session by appending a `closed_at` marker.
     /// The session becomes inactive; future messages create a new session.
     pub fn close_session(&self, session_id: &str) -> anyhow::Result<()> {
@@ -227,19 +254,35 @@ impl SessionStore {
     /// For each `ConversationKey`, picks the latest ULID-ordered session that
     /// does **not** have a `closed_at` marker (i.e. is still active).
     ///
-    /// Returns `(history, active_session_ids)`.
+    /// Raw message history is intentionally NOT reconstructed into in-memory
+    /// history: Anthropic's API requires paired tool_use/tool_result, and we
+    /// skip persisting tool messages to disk, so reloading would break that
+    /// invariant. Instead, callers get:
+    ///
+    /// - `active`: which session file is current per conversation
+    /// - `summaries`: the latest `SummaryLine` per conversation (when present)
+    /// - `fallback_messages`: raw `ChatMessage` list for active sessions that
+    ///   have NO summary yet — Agent bootstrap uses these to synthesize a
+    ///   summary on startup (e.g. after a crash that skipped graceful shutdown)
     pub fn load_all(
         &self,
     ) -> (
-        HashMap<ConversationKey, Vec<ChatMessage>>,
         HashMap<ConversationKey, String>,
+        HashMap<ConversationKey, String>,
+        HashMap<ConversationKey, Vec<ChatMessage>>,
     ) {
-        type SessionEntry = (String, ConversationKey, Vec<StoredMessage>, bool);
+        type SessionEntry = (
+            String,
+            ConversationKey,
+            Vec<StoredMessage>,
+            bool,
+            Option<String>,
+        );
         let mut entries: Vec<SessionEntry> = Vec::new();
 
         let dir = match fs::read_dir(&self.sessions_dir) {
             Ok(d) => d,
-            Err(_) => return (HashMap::new(), HashMap::new()),
+            Err(_) => return (HashMap::new(), HashMap::new(), HashMap::new()),
         };
 
         for entry in dir.flatten() {
@@ -252,30 +295,43 @@ impl SessionStore {
                 None => continue,
             };
 
-            if let Some((meta, messages, is_closed)) = load_session_file(&path) {
+            if let Some((meta, messages, is_closed, summary)) = load_session_file(&path) {
                 let key: ConversationKey = (meta.room_id.clone(), meta.thread_id.clone());
-                entries.push((stem, key, messages, is_closed));
+                entries.push((stem, key, messages, is_closed, summary.map(|s| s.summary)));
             }
         }
 
-        // Sort by session_id (ULID ⟹ time-ordered, lexicographic)
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let mut history: HashMap<ConversationKey, Vec<ChatMessage>> = HashMap::new();
         let mut active: HashMap<ConversationKey, String> = HashMap::new();
+        let mut summaries: HashMap<ConversationKey, String> = HashMap::new();
+        let mut fallback: HashMap<ConversationKey, Vec<ChatMessage>> = HashMap::new();
 
-        for (session_id, key, messages, is_closed) in entries {
+        for (session_id, key, messages, is_closed, summary) in entries {
             if !is_closed {
-                let chat_messages = messages
-                    .into_iter()
-                    .map(|m| m.into_chat_message())
-                    .collect();
-                history.insert(key.clone(), chat_messages);
-                active.insert(key, session_id);
+                active.insert(key.clone(), session_id);
+                match summary {
+                    Some(s) => {
+                        summaries.insert(key.clone(), s);
+                        fallback.remove(&key);
+                    }
+                    None => {
+                        summaries.remove(&key);
+                        if !messages.is_empty() {
+                            let chat_messages: Vec<ChatMessage> = messages
+                                .into_iter()
+                                .map(|m| m.into_chat_message())
+                                .collect();
+                            fallback.insert(key, chat_messages);
+                        } else {
+                            fallback.remove(&key);
+                        }
+                    }
+                }
             }
         }
 
-        (history, active)
+        (active, summaries, fallback)
     }
 
     /// List metadata for all sessions in this store (used by API for session listing).
@@ -287,7 +343,7 @@ impl SessionStore {
         let mut metas: Vec<SessionMeta> = dir
             .flatten()
             .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
-            .filter_map(|e| load_session_file(&e.path()).map(|(meta, _, _)| meta))
+            .filter_map(|e| load_session_file(&e.path()).map(|(meta, _, _, _)| meta))
             .collect();
         metas.sort_by_key(|m| m.created_at);
         metas
@@ -297,7 +353,7 @@ impl SessionStore {
     /// Returns None if the file doesn't exist or is malformed.
     pub fn load_session(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
         let path = self.session_path(session_id);
-        let (_, messages, _) = load_session_file(&path)?;
+        let (_, messages, _, _) = load_session_file(&path)?;
         Some(
             messages
                 .into_iter()
@@ -323,7 +379,7 @@ impl SessionStore {
         let path = self.session_path(session_id);
         if path.exists() {
             // Return existing public_id if the file already existed
-            let pub_id = load_session_file(&path).and_then(|(meta, _, _)| meta.public_id);
+            let pub_id = load_session_file(&path).and_then(|(meta, _, _, _)| meta.public_id);
             return Ok(pub_id);
         }
         let public_id = if channel == "api" {
@@ -370,7 +426,7 @@ impl SessionStore {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Some((meta, _, _)) = load_session_file(&path) {
+            if let Some((meta, _, _, _)) = load_session_file(&path) {
                 if meta.public_id.as_deref() == Some(public_id) {
                     return Some(meta.session_id);
                 }
@@ -413,7 +469,7 @@ impl SessionStore {
                 }
             }
 
-            if let Some((meta, messages, _)) = load_session_file(&path) {
+            if let Some((meta, messages, _, _)) = load_session_file(&path) {
                 let day_messages: Vec<StoredMessage> = messages
                     .into_iter()
                     .filter(|m| m.timestamp >= day_start && m.timestamp < day_end)
@@ -446,7 +502,7 @@ impl SessionStore {
                 continue;
             }
 
-            if let Some((_, messages, _)) = load_session_file(&path) {
+            if let Some((_, messages, _, _)) = load_session_file(&path) {
                 for msg in messages {
                     let local_ts = msg.timestamp.with_timezone(&Local);
                     let date = local_date_for_timestamp(local_ts, boundary_hour);
@@ -509,21 +565,21 @@ pub fn local_date_for_timestamp(local_ts: DateTime<Local>, boundary_hour: u8) ->
 
 /// Parse a single session `.jsonl` file.
 ///
-/// Returns `(meta, messages, is_closed)` or `None` if the file is unreadable
-/// or has a malformed first line.
-///
-/// Messages are returned as `StoredMessage` (with timestamps preserved).
-fn load_session_file(path: &Path) -> Option<(SessionMeta, Vec<StoredMessage>, bool)> {
+/// Returns `(meta, messages, is_closed, latest_summary)` or `None` if the
+/// file is unreadable or has a malformed first line.
+fn load_session_file(
+    path: &Path,
+) -> Option<(SessionMeta, Vec<StoredMessage>, bool, Option<SummaryLine>)> {
     let file = fs::File::open(path).ok()?;
     let mut lines = BufReader::new(file).lines();
 
-    // First line must be the meta object
     let first = lines.next()?.ok()?;
     let meta_line: MetaLine = serde_json::from_str(first.trim()).ok()?;
     let mut meta = meta_line.meta;
 
     let mut messages = Vec::new();
     let mut is_closed = false;
+    let mut latest_summary: Option<SummaryLine> = None;
 
     for raw in lines.flatten() {
         let raw = raw.trim().to_string();
@@ -543,6 +599,13 @@ fn load_session_file(path: &Path) -> Option<(SessionMeta, Vec<StoredMessage>, bo
             is_closed = true;
         } else if let Some(title) = value.get("session_title").and_then(|v| v.as_str()) {
             meta.title = Some(title.to_string());
+        } else if value.get("summary_at").is_some() {
+            match serde_json::from_value::<SummaryLine>(value) {
+                Ok(s) => latest_summary = Some(s),
+                Err(e) => {
+                    warn!("Skipping malformed summary in {}: {e}", path.display());
+                }
+            }
         } else if value.get("timestamp").is_some() {
             match serde_json::from_value::<StoredMessage>(value) {
                 Ok(stored) => messages.push(stored),
@@ -553,5 +616,5 @@ fn load_session_file(path: &Path) -> Option<(SessionMeta, Vec<StoredMessage>, bo
         }
     }
 
-    Some((meta, messages, is_closed))
+    Some((meta, messages, is_closed, latest_summary))
 }
