@@ -191,12 +191,29 @@ impl Channel for MatrixChannel {
         });
 
         info!("Starting Matrix sync loop...");
-        client
-            .sync(SyncSettings::default().timeout(std::time::Duration::from_secs(30)))
-            .await
-            .context("Matrix sync loop exited with error")?;
-
-        Ok(())
+        let sync_settings = SyncSettings::default().timeout(std::time::Duration::from_secs(30));
+        let min_backoff = std::time::Duration::from_secs(1);
+        let max_backoff = std::time::Duration::from_secs(300);
+        let stable_threshold = std::time::Duration::from_secs(60);
+        let mut backoff = min_backoff;
+        loop {
+            let started = std::time::Instant::now();
+            match client.sync(sync_settings.clone()).await {
+                Ok(()) => {
+                    warn!("Matrix sync loop exited without error; reconnecting in {backoff:?}");
+                }
+                Err(e) => {
+                    warn!("Matrix sync loop exited with error: {e}; reconnecting in {backoff:?}");
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            if started.elapsed() >= stable_threshold {
+                backoff = min_backoff;
+            } else {
+                backoff = (backoff * 2).min(max_backoff);
+            }
+            info!("Reconnecting Matrix sync loop...");
+        }
     }
 
     async fn start_typing(&self, room_id: &str) -> Result<()> {
