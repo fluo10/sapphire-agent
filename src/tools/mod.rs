@@ -70,36 +70,58 @@ impl ToolSet {
             if !client.take_tools_changed() {
                 continue;
             }
-
-            info!("MCP '{}': refreshing tool list", client.name());
-            match client.list_tools().await {
-                Ok(remote_tools) => {
-                    let new_tools = build_tools_for_client(client, remote_tools);
-                    let prefix = format!("mcp__{}__", client.name());
-
-                    let mut inner = self.inner.write().await;
-
-                    // Remove old tools for this server.
-                    inner.tools.retain(|t| !t.spec().name.starts_with(&prefix));
-                    inner.specs.retain(|s| !s.name.starts_with(&prefix));
-
-                    // Add refreshed tools.
-                    for tool in new_tools {
-                        inner.specs.push(tool.spec().clone());
-                        inner.tools.push(tool);
-                    }
-
-                    info!(
-                        "MCP '{}': tool list refreshed ({} total tools)",
-                        client.name(),
-                        inner.tools.len()
-                    );
-                }
-                Err(e) => {
-                    warn!("MCP '{}': failed to refresh tools: {e:#}", client.name());
-                }
+            if let Err(e) = self.refresh_client_tools(client).await {
+                warn!("MCP '{}': failed to refresh tools: {e:#}", client.name());
             }
         }
+    }
+
+    /// Re-list a client's tools and swap them into the ToolSet.
+    async fn refresh_client_tools(&self, client: &Arc<McpClient>) -> Result<()> {
+        info!("MCP '{}': refreshing tool list", client.name());
+        let remote_tools = client.list_tools().await?;
+        let new_tools = build_tools_for_client(client, remote_tools);
+        let prefix = format!("mcp__{}__", client.name());
+
+        let mut inner = self.inner.write().await;
+        inner.tools.retain(|t| !t.spec().name.starts_with(&prefix));
+        inner.specs.retain(|s| !s.name.starts_with(&prefix));
+        for tool in new_tools {
+            inner.specs.push(tool.spec().clone());
+            inner.tools.push(tool);
+        }
+        info!(
+            "MCP '{}': tool list refreshed ({} total tools)",
+            client.name(),
+            inner.tools.len()
+        );
+        Ok(())
+    }
+
+    /// Names of configured MCP servers (for tool discovery / error messages).
+    pub fn mcp_server_names(&self) -> Vec<String> {
+        self.mcp_clients.iter().map(|c| c.name().to_string()).collect()
+    }
+
+    /// Reconnect one MCP server by name and refresh its tool list.
+    /// Returns a human-readable status summary.
+    pub async fn reconnect_mcp_server(&self, name: &str) -> Result<String> {
+        let client = self
+            .mcp_clients
+            .iter()
+            .find(|c| c.name() == name)
+            .ok_or_else(|| anyhow::anyhow!("unknown MCP server: {name}"))?;
+
+        client.reconnect().await?;
+        self.refresh_client_tools(client).await?;
+        Ok(format!("Reconnected MCP server '{name}' and refreshed its tools."))
+    }
+
+    /// Register an additional tool after construction.
+    pub async fn register_tool(&self, tool: Box<dyn Tool>) {
+        let mut inner = self.inner.write().await;
+        inner.specs.push(tool.spec().clone());
+        inner.tools.push(tool);
     }
 }
 
@@ -112,7 +134,7 @@ pub async fn default_tool_set(
     state: Arc<Mutex<sapphire_workspace::WorkspaceState>>,
     tavily_api_key: Option<String>,
     mcp_servers: &[McpServerConfig],
-) -> ToolSet {
+) -> Arc<ToolSet> {
     use builtin_tools::*;
     use workspace_tools::*;
 
@@ -153,5 +175,13 @@ pub async fn default_tool_set(
         mcp_clients = clients;
     }
 
-    ToolSet::new(tools, mcp_clients)
+    let tool_set = Arc::new(ToolSet::new(tools, mcp_clients));
+
+    // Register the reconnect tool only if at least one MCP server is configured.
+    if !mcp_servers.is_empty() {
+        let reconnect = Box::new(builtin_tools::McpReconnectTool::new(Arc::downgrade(&tool_set)));
+        tool_set.register_tool(reconnect).await;
+    }
+
+    tool_set
 }

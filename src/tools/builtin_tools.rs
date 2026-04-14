@@ -1,11 +1,11 @@
 use crate::provider::ToolSpec;
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolSet};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sapphire_workspace::WorkspaceState;
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -505,5 +505,70 @@ impl Tool for WebSearchTool {
             .collect();
 
         Ok(lines.join("\n\n"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mcp_reconnect — tear down and re-establish an MCP server connection
+// ---------------------------------------------------------------------------
+
+pub struct McpReconnectTool {
+    spec: ToolSpec,
+    tool_set: Weak<ToolSet>,
+}
+
+impl McpReconnectTool {
+    pub fn new(tool_set: Weak<ToolSet>) -> Self {
+        Self {
+            spec: ToolSpec {
+                name: "mcp_reconnect".into(),
+                description:
+                    "Reconnect to a configured MCP server (stdio or HTTP) and refresh its tool list. \
+                     Use this when an MCP server has crashed, disconnected, or is being restarted \
+                     during testing — tools registered under `mcp__<server>__*` become usable again \
+                     without restarting the agent."
+                        .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "server": {
+                            "type": "string",
+                            "description": "Name of the MCP server to reconnect (as configured in tools.mcp_servers)."
+                        }
+                    },
+                    "required": ["server"]
+                }),
+            },
+            tool_set,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for McpReconnectTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let server = input
+            .get("server")
+            .and_then(|v| v.as_str())
+            .context("Missing required field: server")?;
+
+        let tool_set = self
+            .tool_set
+            .upgrade()
+            .context("ToolSet has been dropped; cannot reconnect")?;
+
+        let known = tool_set.mcp_server_names();
+        if !known.iter().any(|n| n == server) {
+            anyhow::bail!(
+                "unknown MCP server '{server}'. Configured servers: [{}]",
+                known.join(", ")
+            );
+        }
+
+        tool_set.reconnect_mcp_server(server).await
     }
 }

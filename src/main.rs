@@ -197,14 +197,12 @@ async fn main() -> Result<()> {
             }
 
             // ── Tools ───────────────────────────────────────────────────────
-            let tool_set = Arc::new(
-                tools::default_tool_set(
-                    Arc::clone(&ws_state),
-                    config.tools.tavily_api_key.clone(),
-                    &config.tools.mcp_servers,
-                )
-                .await,
-            );
+            let tool_set = tools::default_tool_set(
+                Arc::clone(&ws_state),
+                config.tools.tavily_api_key.clone(),
+                &config.tools.mcp_servers,
+            )
+            .await;
 
             // ── Session store base directory ────────────────────────────────
             let sessions_base = config.resolved_sessions_dir(&workspace_dir);
