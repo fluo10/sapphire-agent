@@ -25,7 +25,7 @@ pub struct MatrixChannel {
     access_token: String,
     user_id: String,
     device_id: String,
-    room_id: String,
+    room_ids: HashSet<String>,
     allowed_users: HashSet<String>,
     recovery_key: Option<String>,
     state_dir: PathBuf,
@@ -37,7 +37,7 @@ impl std::fmt::Debug for MatrixChannel {
         f.debug_struct("MatrixChannel")
             .field("homeserver", &self.homeserver)
             .field("user_id", &self.user_id)
-            .field("room_id", &self.room_id)
+            .field("room_ids", &self.room_ids)
             .finish_non_exhaustive()
     }
 }
@@ -49,7 +49,7 @@ impl MatrixChannel {
             access_token: cfg.access_token.clone(),
             user_id: cfg.user_id.clone(),
             device_id: cfg.device_id.clone(),
-            room_id: cfg.room_id.clone(),
+            room_ids: cfg.room_ids.iter().cloned().collect(),
             allowed_users: cfg.allowed_users.iter().cloned().collect(),
             recovery_key: cfg.recovery_key.clone(),
             state_dir: cfg.resolved_state_dir(),
@@ -138,7 +138,7 @@ impl Channel for MatrixChannel {
 
     async fn listen(&self, tx: mpsc::Sender<IncomingMessage>) -> Result<()> {
         let client = self.get_or_init_client().await?;
-        let room_id_str = self.room_id.clone();
+        let allowed_rooms = self.room_ids.clone();
         let allowed_users = self.allowed_users.clone();
         let bot_user_id = self.user_id.clone();
 
@@ -146,12 +146,13 @@ impl Channel for MatrixChannel {
             let tx = tx.clone();
             move |event: OriginalSyncRoomMessageEvent, room: matrix_sdk::Room| {
                 let tx = tx.clone();
-                let room_id_str = room_id_str.clone();
+                let allowed_rooms = allowed_rooms.clone();
                 let allowed_users = allowed_users.clone();
                 let bot_user_id = bot_user_id.clone();
 
                 async move {
-                    if room.room_id().as_str() != room_id_str {
+                    let room_id_str = room.room_id().as_str().to_string();
+                    if !allowed_rooms.contains(&room_id_str) {
                         return;
                     }
                     if event.sender.as_str() == bot_user_id {

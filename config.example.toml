@@ -3,7 +3,9 @@ homeserver = "https://matrix.example.com"
 access_token = "syt_..."
 user_id = "@bot:example.com"
 device_id = "DEVICEID"
-room_id = "!roomid:example.com"
+# Rooms to listen in. Accepts either an array (preferred) or a single string
+# via the legacy `room_id` key.
+room_ids = ["!roomid:example.com"]
 # Messages from users not in this list are silently ignored.
 # Leave empty ([]) to allow all users.
 allowed_users = ["@you:example.com"]
@@ -25,6 +27,16 @@ recovery_key = "EsT... "
 # Directory containing AGENT.md and MEMORY.md.
 # Defaults to the same directory as this config file.
 # workspace_dir = "~/.config/sapphire-agent"
+
+# Day-boundary session policy. One of:
+#   "reset"   — close the session; next message starts a new one (legacy default)
+#   "compact" — keep the session; force-summarize prior-day history into a stub
+#   "none"    — no day-boundary action
+# session_policy = "compact"
+
+# Per-room overrides. Keys are room_ids; values may set session_policy.
+# [rooms."!roomid:example.com"]
+# session_policy = "reset"
 
 [anthropic]
 api_key = "sk-ant-..."
