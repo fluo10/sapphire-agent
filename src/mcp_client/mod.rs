@@ -38,7 +38,8 @@ pub struct RemoteToolSpec {
 /// Client for a single external MCP server.
 pub struct McpClient {
     name: String,
-    transport: Box<dyn McpTransport>,
+    config: McpServerConfig,
+    transport: tokio::sync::RwLock<Arc<dyn McpTransport>>,
     workspace_root: String,
     request_id: Mutex<u64>,
     /// Set to `true` when the server sends `notifications/tools/list_changed`.
@@ -48,22 +49,57 @@ pub struct McpClient {
 impl McpClient {
     /// Create a new client and establish the transport.
     pub async fn new(config: &McpServerConfig, workspace_root: &str) -> Result<Self> {
-        let transport: Box<dyn McpTransport> = match &config.transport {
-            McpTransportConfig::Http { url, api_key } => {
-                Box::new(HttpTransport::new(url.clone(), api_key.clone()))
-            }
-            McpTransportConfig::Stdio { command, args, env } => {
-                Box::new(StdioTransport::new(command, args, env).await?)
-            }
-        };
+        let transport = Self::build_transport(&config.transport).await?;
 
         Ok(Self {
             name: config.name.clone(),
-            transport,
+            config: config.clone(),
+            transport: tokio::sync::RwLock::new(transport),
             workspace_root: workspace_root.to_string(),
             request_id: Mutex::new(1),
             tools_changed: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Build a new transport instance from the config.
+    async fn build_transport(
+        transport: &McpTransportConfig,
+    ) -> Result<Arc<dyn McpTransport>> {
+        Ok(match transport {
+            McpTransportConfig::Http { url, api_key } => {
+                Arc::new(HttpTransport::new(url.clone(), api_key.clone()))
+            }
+            McpTransportConfig::Stdio { command, args, env } => {
+                Arc::new(StdioTransport::new(command, args, env).await?)
+            }
+        })
+    }
+
+    /// Tear down the existing transport and establish a fresh one.
+    ///
+    /// The request-id counter resets to 1 (the new session starts fresh).
+    /// On failure the old transport is already gone; the caller may retry.
+    pub async fn reconnect(&self) -> Result<()> {
+        info!("MCP '{}': reconnecting", self.name);
+
+        // Shut down the old transport first so we don't leak a child process
+        // if the new transport fails to spawn.
+        {
+            let old = self.transport.read().await.clone();
+            if let Err(e) = old.shutdown().await {
+                warn!("MCP '{}': shutdown during reconnect failed: {e:#}", self.name);
+            }
+        }
+
+        let new_transport = Self::build_transport(&self.config.transport)
+            .await
+            .with_context(|| format!("MCP '{}': failed to build new transport", self.name))?;
+        *self.transport.write().await = new_transport;
+        *self.request_id.lock().await = 1;
+        self.tools_changed.store(false, Ordering::Relaxed);
+
+        self.connect().await?;
+        Ok(())
     }
 
     /// The server name (used as the tool namespace prefix).
@@ -158,8 +194,8 @@ impl McpClient {
 
         let req_handler = self.server_request_handler();
         let notif_handler = self.notification_handler();
-        let response = self
-            .transport
+        let transport = self.transport.read().await.clone();
+        let response = transport
             .request(&body, &req_handler, &notif_handler)
             .await?;
 
@@ -204,8 +240,8 @@ impl McpClient {
         });
         let req_handler = self.server_request_handler();
         let notif_handler = self.notification_handler();
-        let _ = self
-            .transport
+        let transport = self.transport.read().await.clone();
+        let _ = transport
             .request(&notification, &req_handler, &notif_handler)
             .await;
 
@@ -254,7 +290,8 @@ impl McpClient {
 
     /// Shut down the transport.
     pub async fn shutdown(&self) -> Result<()> {
-        self.transport.shutdown().await
+        let transport = self.transport.read().await.clone();
+        transport.shutdown().await
     }
 }
 
