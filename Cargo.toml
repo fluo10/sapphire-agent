@@ -68,6 +68,7 @@ matrix-sdk = { version = "0.16", default-features = false, features = [
     "e2e-encryption",
     "rustls-tls",
     "sqlite",
+    "bundled-sqlite",
     "markdown",
 ] }
 

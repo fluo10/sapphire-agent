@@ -34,21 +34,27 @@ jobs:
 
   build:
     needs: prepare
+    continue-on-error: ${{ matrix.continue-on-error }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             binary: sapphire-agent
             asset_name: sapphire-agent-linux-x86_64
-          - os: macos-latest
-            binary: sapphire-agent
-            asset_name: sapphire-agent-macos-aarch64
+            continue-on-error: false
           - os: ubuntu-24.04-arm
             binary: sapphire-agent
             asset_name: sapphire-agent-linux-aarch64
+            continue-on-error: false
+          - os: macos-latest
+            binary: sapphire-agent
+            asset_name: sapphire-agent-macos-aarch64
+            continue-on-error: true
           - os: windows-latest
             binary: sapphire-agent.exe
             asset_name: sapphire-agent-windows-x86_64.exe
+            continue-on-error: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
