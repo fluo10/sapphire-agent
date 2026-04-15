@@ -93,7 +93,8 @@ impl Workspace {
     /// Build the full system prompt:
     /// 1. Base system_prompt from config (if any)
     /// 2. Each workspace file that exists, in openclaw order
-    pub async fn build_system_prompt(&self, base: Option<&str>) -> String {
+    /// 3. Previous day's daily log (if it exists)
+    pub async fn build_system_prompt(&self, base: Option<&str>, boundary_hour: u8) -> String {
         let mut parts: Vec<String> = Vec::new();
 
         if let Some(b) = base.filter(|s| !s.is_empty()) {
@@ -113,6 +114,24 @@ impl Workspace {
             if let Some((filename, content)) = self.read_first_existing(def.candidates).await {
                 debug!("Injecting workspace file: {filename}");
                 parts.push(format!("{}\n\n{content}", def.heading));
+            }
+        }
+
+        // Inject the previous day's daily log (if it exists) so the agent has
+        // awareness of yesterday's topics, decisions, and unresolved items.
+        let today = crate::session::local_date_for_timestamp(now_local, boundary_hour);
+        if let Some(yesterday) = today.pred_opt() {
+            let log_path = self
+                .dir
+                .join("memory")
+                .join("daily")
+                .join(format!("{yesterday}.md"));
+            if let Ok(content) = std::fs::read_to_string(&log_path) {
+                if !content.trim().is_empty() {
+                    let truncated = truncate_chars(&content, MAX_FILE_CHARS);
+                    debug!("Injecting yesterday's daily log: {yesterday}");
+                    parts.push(format!("# Yesterday's Log\n\n{truncated}"));
+                }
             }
         }
 

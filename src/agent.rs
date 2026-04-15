@@ -486,7 +486,10 @@ impl Agent {
 
         let system_prompt = self
             .workspace
-            .build_system_prompt(self.config.anthropic.system_prompt.as_deref())
+            .build_system_prompt(
+                self.config.anthropic.system_prompt.as_deref(),
+                self.config.day_boundary_hour,
+            )
             .await;
 
         self.snapshots.lock().await.insert(
