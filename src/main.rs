@@ -224,9 +224,7 @@ async fn main() -> Result<()> {
             }
 
             // ── Channel + Agent (Matrix or Discord, if configured) ──────────
-            if !config.standby_mode
-                && (config.matrix.is_some() || config.discord.is_some())
-            {
+            if !config.standby_mode && (config.matrix.is_some() || config.discord.is_some()) {
                 let channel_name = if config.discord.is_some() {
                     "discord"
                 } else {

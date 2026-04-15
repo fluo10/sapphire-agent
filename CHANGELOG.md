@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-04-15
+
+### Added
+
+- **Daily log injection** — previous day's daily log is now injected into the
+  system prompt at session start, giving the agent continuity from yesterday's
+  activity without loading raw history.
+- **MCP manual reconnect** — new `mcp_reconnect` built-in tool lets the agent
+  manually reconnect to an MCP server that has dropped without restarting the
+  whole process.
+- **Configurable day-boundary policy** — `session.day_boundary` option controls
+  whether and how a new session is opened at midnight; defaults to the previous
+  rolling behavior.
+- **Matrix multi-room** — multiple Matrix rooms can now be configured with
+  independent session state.
+- **Install scripts** — `install.sh` (Unix) and `install.ps1` (Windows) added
+  for installing pre-built binaries without Cargo.
+
+### Changed
+
+- **Session context on restart** — sessions now carry a generated summary into
+  the next session rather than replaying raw message history, keeping the
+  context window usage predictable after long-running sessions.
+- **Workspace config consolidation** — workspace-level settings are now merged
+  from the agent `config.toml` so a separate workspace config file is no longer
+  required.
+- **Release workflow** — GitHub Actions release workflow improved for more
+  reliable artifact publishing.
+
+### Fixed
+
+- **Matrix sync reconnect** — the Matrix sync loop now auto-reconnects on
+  network disconnect instead of silently stopping.
+- **Bootstrap room filter** — fallback summarization is skipped for rooms that
+  have no agent config, preventing spurious errors on startup.
+
 ## [0.2.1] - 2026-04-13
 
 ### Fixed
@@ -78,5 +114,7 @@ an HTTP/MCP server mode.
   and workspace-aware writes.
 - **Logging** — `tracing` with env-filter and ANSI output.
 
+[0.3.0]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.3.0
+[0.2.1]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.2.1
 [0.2.0]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.2.0
 [0.1.0]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.1.0

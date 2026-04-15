@@ -47,10 +47,12 @@ impl ReadFileTool {
         Self {
             spec: ToolSpec {
                 name: "read_file".into(),
-                description: "Read a file from the filesystem with optional line-based pagination. \
+                description:
+                    "Read a file from the filesystem with optional line-based pagination. \
                     Returns lines prefixed with their 1-indexed line number in 'N|content' format. \
                     Use offset and limit for large files. \
-                    Cannot read binary files or device paths (/dev/, /proc/).".into(),
+                    Cannot read binary files or device paths (/dev/, /proc/)."
+                        .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -325,7 +327,8 @@ impl TerminalTool {
                     Returns stdout, stderr, and exit code. \
                     The default working directory is the workspace root. \
                     Use the timeout parameter for long-running commands (default 60 s, max 600 s). \
-                    Not suitable for interactive commands or persistent daemons.".into(),
+                    Not suitable for interactive commands or persistent daemons."
+                    .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -427,7 +430,8 @@ impl WebSearchTool {
             spec: ToolSpec {
                 name: "web_search".into(),
                 description: "Search the web for up-to-date information using Tavily. \
-                    Returns titles, URLs, and short content excerpts for the top results.".into(),
+                    Returns titles, URLs, and short content excerpts for the top results."
+                    .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

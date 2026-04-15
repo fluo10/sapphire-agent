@@ -231,7 +231,10 @@ pub async fn generate_summary(
         Some(text) if !text.is_empty() => Ok(text),
         _ => {
             warn!("Summary generation returned empty response");
-            Ok("(Earlier conversation context was compressed but summary generation failed.)".into())
+            Ok(
+                "(Earlier conversation context was compressed but summary generation failed.)"
+                    .into(),
+            )
         }
     }
 }
@@ -277,10 +280,7 @@ mod tests {
 
     #[test]
     fn test_find_safe_split_preserves_all_when_few() {
-        let messages = vec![
-            ChatMessage::user("msg1"),
-            ChatMessage::assistant("msg2"),
-        ];
+        let messages = vec![ChatMessage::user("msg1"), ChatMessage::assistant("msg2")];
         let split = find_safe_split_point(&messages, 5);
         assert_eq!(split, 0);
     }
@@ -308,6 +308,9 @@ mod tests {
         // preserve_recent=2 would normally split at index 4 (tool result),
         // but it should move back to not break the tool pair.
         let split = find_safe_split_point(&messages, 2);
-        assert!(split <= 3, "split should be at or before the tool-use message");
+        assert!(
+            split <= 3,
+            "split should be at or before the tool-use message"
+        );
     }
 }

@@ -86,11 +86,7 @@ impl HttpTransport {
     }
 
     /// Send a JSON-RPC response back to the server (for server-initiated requests).
-    async fn send_response(
-        &self,
-        response: &Value,
-        session_id: &Option<String>,
-    ) -> Result<()> {
+    async fn send_response(&self, response: &Value, session_id: &Option<String>) -> Result<()> {
         let mut req = self
             .http
             .post(&self.url)
@@ -169,21 +165,15 @@ impl McpTransport for HttpTransport {
                                 && data.get("result").is_none()
                             {
                                 let method = data["method"].as_str().unwrap_or("");
-                                let params =
-                                    data.get("params").cloned().unwrap_or(Value::Null);
+                                let params = data.get("params").cloned().unwrap_or(Value::Null);
                                 let mut response = on_server_request(method, &params);
                                 // Attach the request id.
                                 if let Value::Object(ref mut map) = response {
-                                    map.insert(
-                                        "id".to_string(),
-                                        data["id"].clone(),
-                                    );
+                                    map.insert("id".to_string(), data["id"].clone());
                                     map.entry("jsonrpc".to_string())
                                         .or_insert_with(|| json!("2.0"));
                                 }
-                                if let Err(e) =
-                                    self.send_response(&response, &current_sid).await
-                                {
+                                if let Err(e) = self.send_response(&response, &current_sid).await {
                                     warn!("Failed to send server-request response: {e}");
                                 }
                                 continue;
@@ -191,8 +181,7 @@ impl McpTransport for HttpTransport {
 
                             // Final result or error for our request.
                             if data.get("id") == Some(&req_id)
-                                && (data.get("result").is_some()
-                                    || data.get("error").is_some())
+                                && (data.get("result").is_some() || data.get("error").is_some())
                             {
                                 return Ok(data);
                             }
@@ -244,9 +233,9 @@ impl StdioTransport {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
 
-        let mut child = cmd.spawn().with_context(|| {
-            format!("Failed to spawn MCP server process: {command}")
-        })?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn MCP server process: {command}"))?;
 
         let stdin = child
             .stdin

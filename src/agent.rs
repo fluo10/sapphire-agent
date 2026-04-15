@@ -171,10 +171,7 @@ impl Agent {
                     if let Err(e) = self.session_store.append_summary(&session_id, &summary) {
                         warn!("Failed to persist fallback summary for {session_id}: {e}");
                     }
-                    self.restart_summaries
-                        .lock()
-                        .await
-                        .insert(key, summary);
+                    self.restart_summaries.lock().await.insert(key, summary);
                 }
                 Ok(_) => warn!("Fallback summary for {session_id} was empty; skipping"),
                 Err(e) => warn!("Fallback summary generation failed for {session_id}: {e:#}"),
@@ -618,12 +615,8 @@ impl Agent {
             {
                 Ok(Some(result)) => {
                     // Replace in-memory history with compressed version
-                    *self
-                        .history
-                        .lock()
-                        .await
-                        .entry(key.clone())
-                        .or_default() = result.compressed.clone();
+                    *self.history.lock().await.entry(key.clone()).or_default() =
+                        result.compressed.clone();
                     if let Err(e) = self
                         .session_store
                         .append_summary(&session_id, &result.summary)

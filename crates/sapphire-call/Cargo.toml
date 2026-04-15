@@ -11,7 +11,7 @@ name = "sapphire-call"
 path = "src/main.rs"
 
 [dependencies]
-sapphire-agent-api = { path = "../sapphire-agent-api", version = "0.2.1" }
+sapphire-agent-api = { path = "../sapphire-agent-api", version = "0.3.0" }
 
 # Async runtime
 tokio.workspace = true
