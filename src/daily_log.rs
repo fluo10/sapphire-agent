@@ -6,7 +6,9 @@
 use crate::provider::{ChatMessage, ContentPart, Provider, Role};
 use crate::session::{SessionMeta, SessionStore, StoredMessage};
 use chrono::{Local, NaiveDate};
+use sapphire_workspace::WorkspaceState;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
@@ -32,7 +34,7 @@ pub fn pending_log_dates(
 pub async fn generate_daily_log(
     session_store: &SessionStore,
     provider: &dyn Provider,
-    workspace_dir: &Path,
+    ws_state: &Arc<Mutex<WorkspaceState>>,
     date: NaiveDate,
     boundary_hour: u8,
 ) -> anyhow::Result<()> {
@@ -57,15 +59,14 @@ pub async fn generate_daily_log(
         .text
         .unwrap_or_else(|| "(no summary generated)".to_string());
 
-    let log_path = daily_log_path(workspace_dir, date);
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
+    let rel = daily_log_rel_path(date);
     let content = format!("# Daily Log: {date}\n\n{summary}\n");
-    std::fs::write(&log_path, &content)?;
+    ws_state
+        .lock()
+        .expect("WorkspaceState mutex poisoned")
+        .write_file(&rel, &content)?;
 
-    info!("Daily log written: {}", log_path.display());
+    info!("Daily log written: {}", rel.display());
     Ok(())
 }
 
@@ -74,8 +75,11 @@ pub async fn generate_daily_log(
 // ---------------------------------------------------------------------------
 
 pub fn daily_log_path(workspace_dir: &Path, date: NaiveDate) -> PathBuf {
-    workspace_dir
-        .join("memory")
+    workspace_dir.join(daily_log_rel_path(date))
+}
+
+fn daily_log_rel_path(date: NaiveDate) -> PathBuf {
+    Path::new("memory")
         .join("daily")
         .join(format!("{date}.md"))
 }
@@ -137,6 +141,7 @@ fn format_sessions(sessions: &[(SessionMeta, Vec<StoredMessage>)], date: NaiveDa
 pub async fn catchup_pending_logs(
     session_store: &SessionStore,
     provider: &dyn Provider,
+    ws_state: &Arc<Mutex<WorkspaceState>>,
     workspace_dir: &Path,
     boundary_hour: u8,
 ) {
@@ -147,7 +152,7 @@ pub async fn catchup_pending_logs(
     info!("Generating {} pending daily log(s)…", pending.len());
     for date in pending {
         if let Err(e) =
-            generate_daily_log(session_store, provider, workspace_dir, date, boundary_hour).await
+            generate_daily_log(session_store, provider, ws_state, date, boundary_hour).await
         {
             warn!("Failed to generate daily log for {date}: {e:#}");
         }
