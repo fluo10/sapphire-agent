@@ -9,7 +9,7 @@ use chrono::{Local, NaiveDate};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Maximum number of tool-call rounds per message to prevent infinite loops.
 const MAX_TOOL_ROUNDS: usize = 10;
@@ -496,6 +496,12 @@ impl Agent {
                 self.config.day_boundary_hour,
             )
             .await;
+
+        info!(
+            "Rebuilt system-prompt snapshot for {key:?} (date={today}, {} chars)",
+            system_prompt.len()
+        );
+        debug!("System-prompt snapshot for {key:?}:\n{system_prompt}");
 
         self.snapshots.lock().await.insert(
             key.clone(),
