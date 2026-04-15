@@ -14,13 +14,15 @@ use crate::memory_compaction::compact_memory;
 use crate::provider::Provider;
 use crate::session::SessionStore;
 use chrono::{Duration, Local, NaiveTime, Timelike};
+use sapphire_workspace::WorkspaceState;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 use tracing::{info, warn};
 
 pub struct Heartbeat {
     pub workspace_dir: PathBuf,
+    pub ws_state: Arc<Mutex<WorkspaceState>>,
     pub day_boundary_hour: u8,
     pub daily_log_enabled: bool,
     pub memory_compaction_enabled: bool,
@@ -60,7 +62,7 @@ impl Heartbeat {
                 if let Err(e) = generate_daily_log(
                     &self.session_store,
                     self.provider.as_ref(),
-                    &self.workspace_dir,
+                    &self.ws_state,
                     yesterday,
                     self.day_boundary_hour,
                 )

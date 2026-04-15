@@ -249,6 +249,7 @@ async fn main() -> Result<()> {
                 catchup_pending_logs(
                     &channel_session_store,
                     provider.as_ref(),
+                    &ws_state,
                     &workspace_dir,
                     config.day_boundary_hour,
                 )
@@ -278,6 +279,7 @@ async fn main() -> Result<()> {
                     });
                 let heartbeat = Heartbeat {
                     workspace_dir: workspace_dir.clone(),
+                    ws_state: Arc::clone(&ws_state),
                     day_boundary_hour: config.day_boundary_hour,
                     daily_log_enabled: config.daily_log_enabled,
                     memory_compaction_enabled: config.memory_compaction_enabled,
