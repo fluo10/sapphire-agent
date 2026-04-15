@@ -4556,6 +4556,7 @@ version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -6954,7 +6955,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6985,7 +6986,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent-api"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -6996,7 +6997,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-call"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
