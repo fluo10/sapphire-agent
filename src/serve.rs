@@ -496,7 +496,10 @@ async fn run_turn(
     let system = {
         let sp = state
             .workspace
-            .build_system_prompt(state.config.anthropic.system_prompt.as_deref())
+            .build_system_prompt(
+                state.config.anthropic.system_prompt.as_deref(),
+                state.config.day_boundary_hour,
+            )
             .await;
         if sp.is_empty() { None } else { Some(sp) }
     };
