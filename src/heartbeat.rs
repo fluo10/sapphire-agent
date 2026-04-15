@@ -8,7 +8,7 @@
 //!    triggers on the agent according to each task's cron schedule.
 
 use crate::agent::Agent;
-use crate::daily_log::generate_daily_log;
+use crate::daily_log::{catchup_pending_logs, generate_daily_log};
 use crate::heartbeat_config::{load_heartbeat_dir, next_due};
 use crate::memory_compaction::compact_memory;
 use crate::provider::Provider;
@@ -19,6 +19,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 use tracing::{info, warn};
+
+/// How often the catchup loop scans for missing daily logs.
+const CATCHUP_INTERVAL: StdDuration = StdDuration::from_secs(60 * 60);
 
 pub struct Heartbeat {
     pub workspace_dir: PathBuf,
@@ -33,13 +36,37 @@ pub struct Heartbeat {
 }
 
 impl Heartbeat {
-    /// Spawn the day-boundary and cron loops as independent tasks.
+    /// Spawn the day-boundary, cron, and catchup loops as independent tasks.
     pub fn spawn(self) {
         let me = Arc::new(self);
         let a = Arc::clone(&me);
         tokio::spawn(async move { a.run_day_boundary().await });
         let b = Arc::clone(&me);
         tokio::spawn(async move { b.run_cron().await });
+        if me.daily_log_enabled {
+            let c = Arc::clone(&me);
+            tokio::spawn(async move { c.run_catchup().await });
+        }
+    }
+
+    /// Periodically scan for past dates that have session messages but no
+    /// daily log file, and generate any that are missing. Recovers from
+    /// transient failures during the day-boundary fire (e.g. network blip
+    /// during the LLM call) without waiting for the next process restart.
+    async fn run_catchup(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(CATCHUP_INTERVAL);
+        tick.tick().await; // skip immediate fire — startup catchup already ran in main
+        loop {
+            tick.tick().await;
+            catchup_pending_logs(
+                &self.session_store,
+                self.provider.as_ref(),
+                &self.ws_state,
+                &self.workspace_dir,
+                self.day_boundary_hour,
+            )
+            .await;
+        }
     }
 
     async fn run_day_boundary(self: Arc<Self>) {
