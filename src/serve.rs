@@ -160,7 +160,10 @@ async fn summarize_all_sessions(state: &Arc<ServeState>) {
     for (session_id, messages) in snapshot {
         match generate_summary(&*state.provider, &messages).await {
             Ok(summary) if !summary.trim().is_empty() => {
-                if let Err(e) = state.api_session_store.append_summary(&session_id, &summary) {
+                if let Err(e) = state
+                    .api_session_store
+                    .append_summary(&session_id, &summary)
+                {
                     warn!("Failed to persist shutdown summary for {session_id}: {e}");
                 }
             }

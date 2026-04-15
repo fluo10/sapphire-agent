@@ -3,7 +3,7 @@ use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sapphire_workspace::{dedup_chunk_results, WorkspaceState};
+use sapphire_workspace::{WorkspaceState, dedup_chunk_results};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
@@ -39,14 +39,17 @@ fn validate_segment(kind: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-const MEMORY_CATEGORY_GUIDE: &str =
-    "Category is mandatory and free-form, but prefer these conventions: \
+const MEMORY_CATEGORY_GUIDE: &str = "Category is mandatory and free-form, but prefer these conventions: \
      'daily' (date-stamped daily logs, slug = YYYY-MM-DD), \
      'dictionary' (short term/definition lookups for names, acronyms, jargon), \
      'knowledge' (longer-form facts, procedures, decisions, learnings — default when unsure). \
      Other categories (e.g. 'recipe', 'project') may be introduced freely.";
 
-fn memory_entry_path(state: &Mutex<WorkspaceState>, category: &str, slug: &str) -> Result<(String, std::path::PathBuf)> {
+fn memory_entry_path(
+    state: &Mutex<WorkspaceState>,
+    category: &str,
+    slug: &str,
+) -> Result<(String, std::path::PathBuf)> {
     validate_segment("category", category)?;
     validate_segment("slug", slug)?;
     let rel = format!("memory/{category}/{slug}.md");
@@ -213,7 +216,8 @@ impl MemoryUpdateTool {
                 name: "memory_update".into(),
                 description: "Overwrite an existing memory entry at \
                     memory/<category>/<slug>.md. Fails if the file does not exist \
-                    (use memory_add to create it).".into(),
+                    (use memory_add to create it)."
+                    .into(),
                 input_schema: memory_entry_schema(true),
             },
         }
@@ -234,8 +238,7 @@ impl Tool for MemoryUpdateTool {
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist; use memory_add to create it");
         }
-        let raw = std::fs::read_to_string(&abs)
-            .with_context(|| format!("Failed to read {rel}"))?;
+        let raw = std::fs::read_to_string(&abs).with_context(|| format!("Failed to read {rel}"))?;
         let (mut meta, _old_body) = parse_memory_file(&raw);
         let now = Utc::now();
         meta.updated_at = Some(now);
@@ -271,7 +274,8 @@ impl MemoryAppendTool {
                     A blank line is inserted between the existing body and the \
                     new content; add your own Markdown heading if you want a \
                     section break. Frontmatter counters (updated_at) are \
-                    maintained automatically.".into(),
+                    maintained automatically."
+                    .into(),
                 input_schema: memory_entry_schema(true),
             },
         }
@@ -292,8 +296,8 @@ impl Tool for MemoryAppendTool {
         let now = Utc::now();
 
         let (meta, new_body, created) = if abs.exists() {
-            let raw = std::fs::read_to_string(&abs)
-                .with_context(|| format!("Failed to read {rel}"))?;
+            let raw =
+                std::fs::read_to_string(&abs).with_context(|| format!("Failed to read {rel}"))?;
             let (mut meta, old_body) = parse_memory_file(&raw);
             meta.updated_at = Some(now);
             if meta.created_at.is_none() {
@@ -346,7 +350,8 @@ impl MemoryReadTool {
                     and return its body. Side effect: updates the file's \
                     frontmatter (last_read_at = now, read_count += 1) so that \
                     recency and frequency can inform future weighting. \
-                    Use workspace_read instead for a non-tracking read.".into(),
+                    Use workspace_read instead for a non-tracking read."
+                    .into(),
                 input_schema: memory_entry_schema(false),
             },
         }
@@ -366,8 +371,7 @@ impl Tool for MemoryReadTool {
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist");
         }
-        let raw = std::fs::read_to_string(&abs)
-            .with_context(|| format!("Failed to read {rel}"))?;
+        let raw = std::fs::read_to_string(&abs).with_context(|| format!("Failed to read {rel}"))?;
         let (mut meta, body) = parse_memory_file(&raw);
         meta.last_read_at = Some(Utc::now());
         meta.read_count = meta.read_count.saturating_add(1);
@@ -435,7 +439,8 @@ impl WorkspaceReadTool {
             spec: ToolSpec {
                 name: "workspace_read".into(),
                 description: "Read the contents of a file in the workspace \
-                    (path relative to workspace root, e.g. \"notes/2025-01.md\").".into(),
+                    (path relative to workspace root, e.g. \"notes/2025-01.md\")."
+                    .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -482,7 +487,8 @@ impl WorkspaceWriteTool {
             spec: ToolSpec {
                 name: "workspace_write".into(),
                 description: "Write content to a file in the workspace \
-                    (creates or overwrites). Path is relative to workspace root.".into(),
+                    (creates or overwrites). Path is relative to workspace root."
+                    .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -645,7 +651,8 @@ impl WorkspaceSyncTool {
             spec: ToolSpec {
                 name: "workspace_sync".into(),
                 description: "Sync the workspace: index all files and, if a git \
-                    remote is configured, commit and push changes.".into(),
+                    remote is configured, commit and push changes."
+                    .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {}

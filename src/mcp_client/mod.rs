@@ -62,9 +62,7 @@ impl McpClient {
     }
 
     /// Build a new transport instance from the config.
-    async fn build_transport(
-        transport: &McpTransportConfig,
-    ) -> Result<Arc<dyn McpTransport>> {
+    async fn build_transport(transport: &McpTransportConfig) -> Result<Arc<dyn McpTransport>> {
         Ok(match transport {
             McpTransportConfig::Http { url, api_key } => {
                 Arc::new(HttpTransport::new(url.clone(), api_key.clone()))
@@ -87,7 +85,10 @@ impl McpClient {
         {
             let old = self.transport.read().await.clone();
             if let Err(e) = old.shutdown().await {
-                warn!("MCP '{}': shutdown during reconnect failed: {e:#}", self.name);
+                warn!(
+                    "MCP '{}': shutdown during reconnect failed: {e:#}",
+                    self.name
+                );
             }
         }
 
@@ -138,10 +139,7 @@ impl McpClient {
                     })
                 }
                 "elicitation/create" => {
-                    let message = params
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let message = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
                     json!({
                         "result": {
                             "action": "accept",
@@ -343,7 +341,10 @@ impl Tool for McpTool {
 // ---------------------------------------------------------------------------
 
 /// Build `McpTool` instances from a connected client's tool list.
-pub fn build_tools_for_client(client: &Arc<McpClient>, remote_tools: Vec<RemoteToolSpec>) -> Vec<Box<dyn Tool>> {
+pub fn build_tools_for_client(
+    client: &Arc<McpClient>,
+    remote_tools: Vec<RemoteToolSpec>,
+) -> Vec<Box<dyn Tool>> {
     remote_tools
         .into_iter()
         .map(|rt| {

@@ -100,7 +100,10 @@ impl ToolSet {
 
     /// Names of configured MCP servers (for tool discovery / error messages).
     pub fn mcp_server_names(&self) -> Vec<String> {
-        self.mcp_clients.iter().map(|c| c.name().to_string()).collect()
+        self.mcp_clients
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect()
     }
 
     /// Reconnect one MCP server by name and refresh its tool list.
@@ -114,7 +117,9 @@ impl ToolSet {
 
         client.reconnect().await?;
         self.refresh_client_tools(client).await?;
-        Ok(format!("Reconnected MCP server '{name}' and refreshed its tools."))
+        Ok(format!(
+            "Reconnected MCP server '{name}' and refreshed its tools."
+        ))
     }
 
     /// Register an additional tool after construction.
@@ -179,7 +184,9 @@ pub async fn default_tool_set(
 
     // Register the reconnect tool only if at least one MCP server is configured.
     if !mcp_servers.is_empty() {
-        let reconnect = Box::new(builtin_tools::McpReconnectTool::new(Arc::downgrade(&tool_set)));
+        let reconnect = Box::new(builtin_tools::McpReconnectTool::new(Arc::downgrade(
+            &tool_set,
+        )));
         tool_set.register_tool(reconnect).await;
     }
 
