@@ -30,19 +30,20 @@ pub fn pending_log_dates(
 }
 
 /// Generate a daily log for `date` and write it to `memory/daily/YYYY-MM-DD.md`.
-/// No-op if there are no sessions for that day.
+/// Returns `Ok(true)` if a log was written, `Ok(false)` if there were no
+/// sessions for that day (no-op).
 pub async fn generate_daily_log(
     session_store: &SessionStore,
     provider: &dyn Provider,
     ws_state: &Arc<Mutex<WorkspaceState>>,
     date: NaiveDate,
     boundary_hour: u8,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let sessions = session_store.sessions_for_day(date, boundary_hour);
 
     if sessions.is_empty() {
         info!("No sessions found for {date}, skipping daily log");
-        return Ok(());
+        return Ok(false);
     }
 
     let transcript = format_sessions(&sessions, date);
@@ -67,7 +68,7 @@ pub async fn generate_daily_log(
         .write_file(&rel, &content)?;
 
     info!("Daily log written: {}", rel.display());
-    Ok(())
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -138,23 +139,27 @@ fn format_sessions(sessions: &[(SessionMeta, Vec<StoredMessage>)], date: NaiveDa
 
 /// Generate all pending daily logs (e.g. from days the agent was offline).
 /// Errors are logged but not propagated so startup is not blocked.
+/// Returns the number of logs successfully generated, so callers can decide
+/// whether to invalidate downstream caches (e.g. system-prompt snapshots).
 pub async fn catchup_pending_logs(
     session_store: &SessionStore,
     provider: &dyn Provider,
     ws_state: &Arc<Mutex<WorkspaceState>>,
     workspace_dir: &Path,
     boundary_hour: u8,
-) {
+) -> usize {
     let pending = pending_log_dates(session_store, workspace_dir, boundary_hour);
     if pending.is_empty() {
-        return;
+        return 0;
     }
     info!("Generating {} pending daily log(s)…", pending.len());
+    let mut generated = 0;
     for date in pending {
-        if let Err(e) =
-            generate_daily_log(session_store, provider, ws_state, date, boundary_hour).await
-        {
-            warn!("Failed to generate daily log for {date}: {e:#}");
+        match generate_daily_log(session_store, provider, ws_state, date, boundary_hour).await {
+            Ok(true) => generated += 1,
+            Ok(false) => {}
+            Err(e) => warn!("Failed to generate daily log for {date}: {e:#}"),
         }
     }
+    generated
 }

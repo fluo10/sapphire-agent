@@ -223,6 +223,14 @@ impl Agent {
         }
     }
 
+    /// Drop all cached system-prompt snapshots so the next message rebuilds
+    /// from disk. Call this after writing any file that `build_system_prompt`
+    /// reads (e.g. a freshly generated daily log) so the change is visible to
+    /// the model without waiting for the next day-boundary cache miss.
+    pub async fn invalidate_system_prompts(&self) {
+        self.snapshots.lock().await.clear();
+    }
+
     /// Heartbeat trigger: inject a system-style prompt as if it were an
     /// incoming message, so the agent runs through the normal handle_message
     /// pipeline (history, tool loop, channel send) without faking a user

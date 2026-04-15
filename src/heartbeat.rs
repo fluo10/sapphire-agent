@@ -58,7 +58,7 @@ impl Heartbeat {
         tick.tick().await; // skip immediate fire — startup catchup already ran in main
         loop {
             tick.tick().await;
-            catchup_pending_logs(
+            let generated = catchup_pending_logs(
                 &self.session_store,
                 self.provider.as_ref(),
                 &self.ws_state,
@@ -66,6 +66,9 @@ impl Heartbeat {
                 self.day_boundary_hour,
             )
             .await;
+            if generated > 0 {
+                self.agent.invalidate_system_prompts().await;
+            }
         }
     }
 
@@ -86,7 +89,7 @@ impl Heartbeat {
 
             if self.daily_log_enabled {
                 info!("Heartbeat: generating daily log for {yesterday}");
-                if let Err(e) = generate_daily_log(
+                match generate_daily_log(
                     &self.session_store,
                     self.provider.as_ref(),
                     &self.ws_state,
@@ -95,7 +98,11 @@ impl Heartbeat {
                 )
                 .await
                 {
-                    warn!("Heartbeat: failed to generate daily log for {yesterday}: {e:#}");
+                    Ok(true) => self.agent.invalidate_system_prompts().await,
+                    Ok(false) => {}
+                    Err(e) => warn!(
+                        "Heartbeat: failed to generate daily log for {yesterday}: {e:#}"
+                    ),
                 }
             }
 
