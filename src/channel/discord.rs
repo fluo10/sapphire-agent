@@ -149,7 +149,7 @@ impl Channel for DiscordChannel {
     }
 
     /// Long-running: connects to the Discord gateway and forwards incoming
-    /// messages through `tx`. Returns only on fatal error.
+    /// messages through `tx`. Reconnects with exponential backoff on disconnect.
     async fn listen(&self, tx: mpsc::Sender<IncomingMessage>) -> Result<()> {
         // MESSAGE_CONTENT is a privileged intent — enable it in Discord Developer Portal
         // (Bot → Privileged Gateway Intents → Message Content Intent).
@@ -157,27 +157,44 @@ impl Channel for DiscordChannel {
             | GatewayIntents::DIRECT_MESSAGES
             | GatewayIntents::MESSAGE_CONTENT;
 
-        let handler = DiscordHandler {
-            tx,
-            allowed_channel_ids: self.channel_ids.clone(),
-            allowed_user_ids: self.allowed_user_ids.clone(),
-        };
+        let min_backoff = std::time::Duration::from_secs(1);
+        let max_backoff = std::time::Duration::from_secs(300);
+        let stable_threshold = std::time::Duration::from_secs(60);
+        let mut backoff = min_backoff;
 
-        let mut client = Client::builder(&self.token, intents)
-            .event_handler(handler)
-            .await
-            .context("Failed to build Discord client")?;
+        loop {
+            let handler = DiscordHandler {
+                tx: tx.clone(),
+                allowed_channel_ids: self.channel_ids.clone(),
+                allowed_user_ids: self.allowed_user_ids.clone(),
+            };
 
-        // Share the HTTP client so send() can use it immediately.
-        let _ = self.http.set(Arc::clone(&client.http));
+            let mut client = Client::builder(&self.token, intents)
+                .event_handler(handler)
+                .await
+                .context("Failed to build Discord client")?;
 
-        info!("Starting Discord gateway...");
-        client
-            .start()
-            .await
-            .context("Discord gateway exited with error")?;
+            // Share the HTTP client so send() can use it immediately.
+            let _ = self.http.set(Arc::clone(&client.http));
 
-        Ok(())
+            info!("Starting Discord gateway...");
+            let started = std::time::Instant::now();
+            match client.start().await {
+                Ok(()) => {
+                    warn!("Discord gateway exited without error; reconnecting in {backoff:?}");
+                }
+                Err(e) => {
+                    warn!("Discord gateway exited with error: {e}; reconnecting in {backoff:?}");
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            if started.elapsed() >= stable_threshold {
+                backoff = min_backoff;
+            } else {
+                backoff = (backoff * 2).min(max_backoff);
+            }
+            info!("Reconnecting Discord gateway...");
+        }
     }
 
     async fn start_typing(&self, room_id: &str) -> Result<()> {
