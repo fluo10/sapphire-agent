@@ -119,6 +119,35 @@ pub fn days_of_iso_week(iso_year: i32, iso_week: u32) -> Vec<NaiveDate> {
         .collect()
 }
 
+/// Monthly stems for every completed month of `today`'s calendar year
+/// (`{year}-01` .. `{year}-(today.month-1)`). Empty in January.
+pub fn month_stems_in_year_before(today: NaiveDate) -> Vec<String> {
+    let year = today.year();
+    (1..today.month())
+        .map(|m| monthly_stem(year, m))
+        .collect()
+}
+
+/// Stems of every file in `memory/yearly/*.md`, sorted ascending.
+pub fn existing_yearly_stems(workspace_dir: &Path) -> Vec<String> {
+    let dir = workspace_dir.join("memory").join("yearly");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                return None;
+            }
+            path.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// Every local date in the given calendar month.
 pub fn days_of_month(year: i32, month: u32) -> Vec<NaiveDate> {
     let Some(start) = NaiveDate::from_ymd_opt(year, month, 1) else {
@@ -311,6 +340,46 @@ pub async fn generate_monthly_log(
         provider,
         ws_state,
         LogKind::Monthly,
+        &stem,
+        &description,
+        &input,
+    )
+    .await?;
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Yearly log generation
+// ---------------------------------------------------------------------------
+
+/// Generate the yearly log for `year` from the 12 monthly bodies of that
+/// calendar year. Calendar month boundaries align with calendar year
+/// boundaries, so this chain is clean. Returns `Ok(false)` if no monthly
+/// logs exist for the target year.
+pub async fn generate_yearly_log(
+    provider: &dyn Provider,
+    ws_state: &Arc<Mutex<WorkspaceState>>,
+    workspace_dir: &Path,
+    year: i32,
+) -> anyhow::Result<bool> {
+    let stem = yearly_stem(year);
+    let mut sections = Vec::new();
+    for month in 1..=12 {
+        let m_stem = monthly_stem(year, month);
+        if let Some(body) = read_body(workspace_dir, LogKind::Monthly, &m_stem) {
+            sections.push(body);
+        }
+    }
+    if sections.is_empty() {
+        info!("No monthly logs found for year {stem}, skipping yearly log");
+        return Ok(false);
+    }
+    let input = sections.join("\n\n---\n\n");
+    let description = format!("monthly logs for {stem}");
+    write_log_with_digest(
+        provider,
+        ws_state,
+        LogKind::Yearly,
         &stem,
         &description,
         &input,
@@ -962,6 +1031,30 @@ mod tests {
         let fri = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
         let stems = week_stems_in_month_before(fri);
         assert_eq!(stems, vec!["2026-W19", "2026-W20", "2026-W21", "2026-W22"]);
+    }
+
+    #[test]
+    fn month_stems_in_year_before_april() {
+        let apr = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        assert_eq!(
+            month_stems_in_year_before(apr),
+            vec!["2026-01", "2026-02", "2026-03"]
+        );
+    }
+
+    #[test]
+    fn month_stems_in_year_before_january_is_empty() {
+        let jan = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        assert!(month_stems_in_year_before(jan).is_empty());
+    }
+
+    #[test]
+    fn month_stems_in_year_before_december() {
+        let dec = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        let stems = month_stems_in_year_before(dec);
+        assert_eq!(stems.len(), 11);
+        assert_eq!(stems.first().map(String::as_str), Some("2026-01"));
+        assert_eq!(stems.last().map(String::as_str), Some("2026-11"));
     }
 
     #[test]

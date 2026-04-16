@@ -175,6 +175,34 @@ impl Workspace {
                 parts.push(b);
             }
         }
+
+        // "This Year's Digests" — monthly files Jan..(current month - 1).
+        if self.digest_cfg.monthly_items > 0 {
+            let stems = periodic_log::month_stems_in_year_before(today);
+            if let Some(b) = build_digest_block(
+                "# This Year's Digests",
+                &self.dir,
+                LogKind::Monthly,
+                &stems,
+                self.digest_cfg.monthly_items,
+            ) {
+                parts.push(b);
+            }
+        }
+
+        // "Past Years' Digests" — every yearly file on disk.
+        if self.digest_cfg.yearly_items > 0 {
+            let stems = periodic_log::existing_yearly_stems(&self.dir);
+            if let Some(b) = build_digest_block(
+                "# Past Years' Digests",
+                &self.dir,
+                LogKind::Yearly,
+                &stems,
+                self.digest_cfg.yearly_items,
+            ) {
+                parts.push(b);
+            }
+        }
     }
 
     /// Try each candidate filename in order; return the first one found.
