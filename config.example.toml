@@ -38,6 +38,19 @@ recovery_key = "EsT... "
 # [rooms."!roomid:example.com"]
 # session_policy = "reset"
 
+# Periodic log digests. The agent summarises weekly/monthly/yearly activity
+# into short importance-ordered bullet lists, stored as YAML frontmatter in
+# memory/{weekly,monthly,yearly}/. The top-N items per kind are injected
+# into the system prompt so the agent retains long-horizon context.
+# [digest]
+# daily_items     = 3   # top-N per daily (injected as "This Week's Digests")
+# weekly_items    = 3   # top-N per weekly (injected as "This Month's Digests")
+# monthly_items   = 5   # top-N per monthly (injected as "This Year's Digests")
+# yearly_items    = 5   # top-N per yearly (injected as "Past Years' Digests")
+# weekly_enabled  = true
+# monthly_enabled = true
+# yearly_enabled  = true
+
 [anthropic]
 api_key = "sk-ant-..."
 # Model to use. Defaults to claude-opus-4-6.

@@ -62,6 +62,9 @@ pub struct Config {
     /// takes precedence — allowing each user to override the workspace defaults.
     #[serde(default)]
     pub sync: Option<SyncConfig>,
+    /// Periodic log digest configuration (weekly / monthly / yearly).
+    #[serde(default)]
+    pub digest: DigestConfig,
 }
 
 fn default_true() -> bool {
@@ -287,6 +290,73 @@ fn default_compression_threshold() -> f64 {
 
 fn default_preserve_recent() -> usize {
     20
+}
+
+// ---------------------------------------------------------------------------
+// Digest config
+// ---------------------------------------------------------------------------
+
+/// Frontmatter-digest injection & generation config.
+///
+/// At each day boundary the agent generates weekly, monthly, and yearly log
+/// files under `memory/{weekly,monthly,yearly}/`. Each file carries a YAML
+/// `digest:` array of importance-ordered bullets. The top-N items per file
+/// are injected into the system prompt so the agent retains long-horizon
+/// context without paying full-body token cost.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DigestConfig {
+    /// Top-N digest items injected per daily log (used for "This Week's
+    /// Digests" — days before yesterday within the current ISO week).
+    #[serde(default = "default_digest_daily_items")]
+    pub daily_items: usize,
+    /// Top-N items injected per weekly log (used for "This Month's Digests").
+    #[serde(default = "default_digest_weekly_items")]
+    pub weekly_items: usize,
+    /// Top-N items injected per monthly log (used for "This Year's Digests").
+    #[serde(default = "default_digest_monthly_items")]
+    pub monthly_items: usize,
+    /// Top-N items injected per yearly log (used for "Past Years' Digests").
+    #[serde(default = "default_digest_yearly_items")]
+    pub yearly_items: usize,
+    /// Generate a weekly log at each Monday day-boundary. Default: true.
+    #[serde(default = "default_true")]
+    pub weekly_enabled: bool,
+    /// Generate a monthly log on the 1st of each month. Default: true.
+    #[serde(default = "default_true")]
+    pub monthly_enabled: bool,
+    /// Generate a yearly log on Jan 1. Default: true.
+    #[serde(default = "default_true")]
+    pub yearly_enabled: bool,
+}
+
+impl Default for DigestConfig {
+    fn default() -> Self {
+        Self {
+            daily_items: default_digest_daily_items(),
+            weekly_items: default_digest_weekly_items(),
+            monthly_items: default_digest_monthly_items(),
+            yearly_items: default_digest_yearly_items(),
+            weekly_enabled: true,
+            monthly_enabled: true,
+            yearly_enabled: true,
+        }
+    }
+}
+
+fn default_digest_daily_items() -> usize {
+    3
+}
+
+fn default_digest_weekly_items() -> usize {
+    3
+}
+
+fn default_digest_monthly_items() -> usize {
+    5
+}
+
+fn default_digest_yearly_items() -> usize {
+    5
 }
 
 impl Config {
