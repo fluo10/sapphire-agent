@@ -9,7 +9,7 @@ use chrono::{Local, NaiveDate};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Maximum number of tool-call rounds per message to prevent infinite loops.
 const MAX_TOOL_ROUNDS: usize = 10;
@@ -221,6 +221,14 @@ impl Agent {
                 Err(e) => warn!("Shutdown summary generation failed for {session_id}: {e:#}"),
             }
         }
+    }
+
+    /// Drop all cached system-prompt snapshots so the next message rebuilds
+    /// from disk. Call this after writing any file that `build_system_prompt`
+    /// reads (e.g. a freshly generated daily log) so the change is visible to
+    /// the model without waiting for the next day-boundary cache miss.
+    pub async fn invalidate_system_prompts(&self) {
+        self.snapshots.lock().await.clear();
     }
 
     /// Heartbeat trigger: inject a system-style prompt as if it were an
@@ -488,6 +496,12 @@ impl Agent {
                 self.config.day_boundary_hour,
             )
             .await;
+
+        info!(
+            "Rebuilt system-prompt snapshot for {key:?} (date={today}, {} chars)",
+            system_prompt.len()
+        );
+        debug!("System-prompt snapshot for {key:?}:\n{system_prompt}");
 
         self.snapshots.lock().await.insert(
             key.clone(),
