@@ -21,7 +21,7 @@ use channel::discord::DiscordChannel;
 use channel::matrix::MatrixChannel;
 use clap::{Parser, Subcommand};
 use config::Config;
-use periodic_log::catchup_pending_daily_logs;
+use periodic_log::{catchup_missing_daily_digests, catchup_pending_daily_logs};
 use heartbeat::Heartbeat;
 use provider::anthropic::AnthropicProvider;
 use sapphire_workspace::{AppContext, Workspace as SwWorkspace, WorkspaceState};
@@ -261,6 +261,10 @@ async fn main() -> Result<()> {
                     config.day_boundary_hour,
                 )
                 .await;
+
+                // ── Back-fill digest frontmatter on existing dailies ────────
+                catchup_missing_daily_digests(provider.as_ref(), &ws_state, &workspace_dir)
+                    .await;
 
                 // ── Agent ───────────────────────────────────────────────────
                 let agent = Arc::new(Agent::new(

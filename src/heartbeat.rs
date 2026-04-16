@@ -8,7 +8,9 @@
 //!    triggers on the agent according to each task's cron schedule.
 
 use crate::agent::Agent;
-use crate::periodic_log::{catchup_pending_daily_logs, generate_daily_log};
+use crate::periodic_log::{
+    catchup_missing_daily_digests, catchup_pending_daily_logs, generate_daily_log,
+};
 use crate::heartbeat_config::{load_heartbeat_dir, next_due};
 use crate::memory_compaction::compact_memory;
 use crate::provider::Provider;
@@ -58,7 +60,7 @@ impl Heartbeat {
         tick.tick().await; // skip immediate fire — startup catchup already ran in main
         loop {
             tick.tick().await;
-            let generated = catchup_pending_daily_logs(
+            let logs = catchup_pending_daily_logs(
                 &self.session_store,
                 self.provider.as_ref(),
                 &self.ws_state,
@@ -66,7 +68,13 @@ impl Heartbeat {
                 self.day_boundary_hour,
             )
             .await;
-            if generated > 0 {
+            let digests = catchup_missing_daily_digests(
+                self.provider.as_ref(),
+                &self.ws_state,
+                &self.workspace_dir,
+            )
+            .await;
+            if logs + digests > 0 {
                 self.agent.invalidate_system_prompts().await;
             }
         }

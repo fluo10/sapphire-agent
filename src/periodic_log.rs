@@ -341,6 +341,167 @@ fn format_sessions(sessions: &[(SessionMeta, Vec<StoredMessage>)], date: NaiveDa
 }
 
 // ---------------------------------------------------------------------------
+// Digest catch-up (back-fill existing dailies that lack a `digest:` array)
+// ---------------------------------------------------------------------------
+
+/// True if the file either has no frontmatter or is missing a non-empty
+/// `digest:` sequence. Used by `catchup_missing_daily_digests` to decide
+/// which existing dailies need an LLM-driven back-fill pass.
+fn needs_digest_catchup(raw: &str) -> bool {
+    match crate::frontmatter::split(raw) {
+        None => true,
+        Some((fm, _)) => {
+            let mapping = crate::frontmatter::parse_mapping(fm);
+            match mapping.get("digest").and_then(|v| v.as_sequence()) {
+                Some(seq) => seq.is_empty(),
+                None => true,
+            }
+        }
+    }
+}
+
+/// Insert/replace the `digest:` key on a file's frontmatter while preserving
+/// every other key and the body. If the file has no frontmatter at all,
+/// synthesise one wrapping the existing content.
+fn upsert_digest(raw: &str, digest: &[String]) -> anyhow::Result<String> {
+    let (mut mapping, body) = match crate::frontmatter::split(raw) {
+        Some((fm, body)) => (
+            crate::frontmatter::parse_mapping(fm),
+            body.trim_start_matches('\n').to_string(),
+        ),
+        None => (serde_yaml::Mapping::new(), raw.to_string()),
+    };
+    let seq = digest
+        .iter()
+        .map(|s| serde_yaml::Value::String(s.clone()))
+        .collect::<Vec<_>>();
+    mapping.insert(
+        serde_yaml::Value::String("digest".to_string()),
+        serde_yaml::Value::Sequence(seq),
+    );
+    crate::frontmatter::serialize(&mapping, &body)
+}
+
+/// Ask the LLM to emit a `digest:` frontmatter block for an existing log
+/// body. Returns the parsed bullet list (empty `Vec` if parsing failed).
+async fn extract_digest_from_body(
+    provider: &dyn Provider,
+    kind: LogKind,
+    body: &str,
+) -> anyhow::Result<Vec<String>> {
+    let label = kind.heading_label();
+    let system = format!(
+        "You are extracting a concise digest from an existing {label} entry.
+
+Output ONLY a YAML frontmatter block, exactly:
+
+---
+digest:
+  - …
+  - …
+---
+
+The `digest` array contains 5–10 importance-ordered bullet points (strings).
+Each bullet is a single short sentence capturing a key decision, topic,
+task completed, or unresolved item. Most important first. Write in the
+same language as the source. Do NOT emit any text outside the frontmatter
+block."
+    );
+    let user = ChatMessage::user(body);
+    let resp = provider.chat(Some(&system), &[user], None).await?;
+    let raw = resp.text.unwrap_or_default();
+    let (items, _) = parse_digest_response(&raw);
+    Ok(items)
+}
+
+/// Strip any leading frontmatter from `raw` and return the body. Used as
+/// LLM input during digest back-fill so the model sees only the summary.
+fn body_without_frontmatter(raw: &str) -> String {
+    match crate::frontmatter::split(raw) {
+        Some((_, body)) => body.trim_start_matches('\n').to_string(),
+        None => raw.to_string(),
+    }
+}
+
+/// Scan `memory/daily/*.md` and, for every file that lacks a non-empty
+/// `digest:` array, call the LLM to produce one and merge it into the
+/// file's frontmatter (preserving every other key — crucial for the
+/// memory tool's `last_read_at` / `read_count` keys).
+///
+/// Errors are logged per-file, not propagated, so a single bad file does
+/// not stall the pass. Returns the number of files successfully updated.
+pub async fn catchup_missing_daily_digests(
+    provider: &dyn Provider,
+    ws_state: &Arc<Mutex<WorkspaceState>>,
+    workspace_dir: &Path,
+) -> usize {
+    let dir = workspace_dir.join("memory").join("daily");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+
+    let mut pending = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if needs_digest_catchup(&raw) {
+            pending.push((path, raw));
+        }
+    }
+
+    if pending.is_empty() {
+        return 0;
+    }
+    info!("Back-filling digest for {} daily log(s)…", pending.len());
+
+    let mut filled = 0;
+    for (path, raw) in pending {
+        let display_path = path.display().to_string();
+        let body = body_without_frontmatter(&raw);
+        let items = match extract_digest_from_body(provider, LogKind::Daily, &body).await {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => {
+                warn!("Empty digest extracted from {display_path} — skipping");
+                continue;
+            }
+            Err(e) => {
+                warn!("Failed to extract digest from {display_path}: {e:#}");
+                continue;
+            }
+        };
+        let new_raw = match upsert_digest(&raw, &items) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to merge digest for {display_path}: {e:#}");
+                continue;
+            }
+        };
+        let rel = path
+            .strip_prefix(workspace_dir)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| path.clone());
+        match ws_state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .write_file(&rel, &new_raw)
+        {
+            Ok(()) => {
+                filled += 1;
+                info!("Digest added: {}", rel.display());
+            }
+            Err(e) => warn!("Failed to write digest for {display_path}: {e:#}"),
+        }
+    }
+    filled
+}
+
+// ---------------------------------------------------------------------------
 // Startup catch-up
 // ---------------------------------------------------------------------------
 
@@ -451,5 +612,75 @@ mod tests {
         assert!(out.contains("- b"));
         assert!(out.contains("# H"));
         assert!(out.contains("body"));
+    }
+
+    #[test]
+    fn needs_digest_catchup_cases() {
+        assert!(needs_digest_catchup("# body only\n"));
+        assert!(needs_digest_catchup(
+            "---\nother: 1\n---\n# body\n"
+        ));
+        assert!(needs_digest_catchup(
+            "---\ndigest: []\n---\n# body\n"
+        ));
+        assert!(!needs_digest_catchup(
+            "---\ndigest:\n  - one\n---\n# body\n"
+        ));
+    }
+
+    #[test]
+    fn upsert_digest_preserves_unrelated_keys() {
+        let raw = "---\nlast_read_at: 2026-04-15T21:57:41.312Z\nread_count: 3\n---\n\n# Daily Log: 2026-04-15\n\nbody\n";
+        let new = upsert_digest(raw, &["one".into(), "two".into()]).unwrap();
+        let (fm, body) = crate::frontmatter::split(&new).unwrap();
+        let mapping = crate::frontmatter::parse_mapping(fm);
+        assert!(mapping.get("last_read_at").is_some());
+        assert_eq!(mapping.get("read_count").and_then(|v| v.as_u64()), Some(3));
+        let digest: Vec<String> = mapping
+            .get("digest")
+            .and_then(|v| v.as_sequence())
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(digest, vec!["one", "two"]);
+        assert!(body.contains("# Daily Log: 2026-04-15"));
+        assert!(body.contains("body"));
+    }
+
+    #[test]
+    fn upsert_digest_synthesises_frontmatter_when_missing() {
+        let raw = "# Daily Log: 2026-04-15\n\nbody\n";
+        let new = upsert_digest(raw, &["only".into()]).unwrap();
+        assert!(new.starts_with("---\n"));
+        let (fm, body) = crate::frontmatter::split(&new).unwrap();
+        let mapping = crate::frontmatter::parse_mapping(fm);
+        let digest: Vec<String> = mapping
+            .get("digest")
+            .and_then(|v| v.as_sequence())
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(digest, vec!["only"]);
+        assert!(body.contains("# Daily Log: 2026-04-15"));
+        assert!(body.contains("body"));
+    }
+
+    #[test]
+    fn upsert_digest_replaces_existing_digest() {
+        let raw = "---\ndigest:\n  - stale\nother: keep\n---\n\nbody\n";
+        let new = upsert_digest(raw, &["fresh".into()]).unwrap();
+        let (fm, _) = crate::frontmatter::split(&new).unwrap();
+        let mapping = crate::frontmatter::parse_mapping(fm);
+        assert_eq!(mapping.get("other").and_then(|v| v.as_str()), Some("keep"));
+        let digest: Vec<String> = mapping
+            .get("digest")
+            .and_then(|v| v.as_sequence())
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(digest, vec!["fresh"]);
     }
 }
