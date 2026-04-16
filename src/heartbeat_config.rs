@@ -120,27 +120,8 @@ pub fn load_heartbeat_dir(dir: &Path) -> Vec<HeartbeatTask> {
     tasks
 }
 
-/// Split a Markdown file with YAML frontmatter into (frontmatter, body).
-fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
-    let rest = raw
-        .strip_prefix("---\n")
-        .or_else(|| raw.strip_prefix("---\r\n"))?;
-    // Find the closing `---` on its own line.
-    let mut idx = 0;
-    for line in rest.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(|c| c == '\n' || c == '\r');
-        if trimmed == "---" {
-            let fm = &rest[..idx];
-            let body_start = idx + line.len();
-            return Some((fm, &rest[body_start..]));
-        }
-        idx += line.len();
-    }
-    None
-}
-
 fn parse_task(name: String, raw: &str) -> Option<HeartbeatTask> {
-    let (fm, body) = split_frontmatter(raw)?;
+    let (fm, body) = crate::frontmatter::split(raw)?;
     let meta: HeartbeatTaskMeta = match serde_yaml::from_str(fm) {
         Ok(m) => m,
         Err(e) => {

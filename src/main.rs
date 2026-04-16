@@ -4,6 +4,7 @@ mod channel;
 mod config;
 mod context_compression;
 mod daily_log;
+mod frontmatter;
 mod heartbeat;
 mod heartbeat_config;
 mod mcp_client;
