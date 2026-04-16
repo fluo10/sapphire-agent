@@ -430,6 +430,10 @@ async fn handle_get_session(
                 .iter()
                 .map(|p| match p {
                     ContentPart::Text(t) => json!({ "type": "text", "text": t }),
+                    ContentPart::Image { media_type, .. } => {
+                        // Image bytes are not exposed via the API listing; surface a marker only.
+                        json!({ "type": "image", "media_type": media_type })
+                    }
                     ContentPart::ToolUse { id, name, input } => {
                         json!({ "type": "tool_use", "id": id, "name": name, "input": input })
                     }

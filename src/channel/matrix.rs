@@ -1,4 +1,4 @@
-use crate::channel::{Channel, IncomingMessage, OutgoingMessage};
+use crate::channel::{Attachment, Channel, IncomingMessage, MAX_ATTACHMENT_BYTES, OutgoingMessage};
 use crate::config::MatrixConfig;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -6,11 +6,13 @@ use matrix_sdk::{
     Client, SessionMeta, SessionTokens,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
+    media::{MediaFormat, MediaRequestParameters},
     ruma::{
         OwnedEventId, OwnedRoomId, OwnedUserId,
         events::relation::Thread,
         events::room::message::{
-            MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
+            ImageMessageEventContent, MessageType, OriginalSyncRoomMessageEvent, Relation,
+            RoomMessageEventContent,
         },
     },
 };
@@ -113,6 +115,60 @@ impl MatrixChannel {
     }
 }
 
+/// Download the bytes for a Matrix `m.image` event via the SDK's authenticated
+/// media endpoint. Returns `None` (with a warning log) if the file is over the
+/// 5 MB budget or the download fails — the caller should drop the event in
+/// that case.
+async fn download_matrix_image(
+    client: &Client,
+    image: &ImageMessageEventContent,
+) -> Option<Attachment> {
+    let mime = image
+        .info
+        .as_ref()
+        .and_then(|info| info.mimetype.clone())
+        .unwrap_or_else(|| "image/octet-stream".to_string());
+
+    if !mime.starts_with("image/") {
+        return None;
+    }
+
+    if let Some(size) = image.info.as_ref().and_then(|info| info.size) {
+        let size: u64 = size.into();
+        if size as usize > MAX_ATTACHMENT_BYTES {
+            warn!(
+                "Matrix image '{}' is {} bytes (>5MB); skipping",
+                image.body, size
+            );
+            return None;
+        }
+    }
+
+    let request = MediaRequestParameters {
+        source: image.source.clone(),
+        format: MediaFormat::File,
+    };
+
+    match client.media().get_media_content(&request, true).await {
+        Ok(bytes) if bytes.len() <= MAX_ATTACHMENT_BYTES => Some(Attachment {
+            media_type: mime,
+            data: bytes,
+        }),
+        Ok(bytes) => {
+            warn!(
+                "Matrix image '{}' decoded to {} bytes (>5MB); skipping",
+                image.body,
+                bytes.len()
+            );
+            None
+        }
+        Err(e) => {
+            warn!("Failed to download Matrix image '{}': {e}", image.body);
+            None
+        }
+    }
+}
+
 #[async_trait]
 impl Channel for MatrixChannel {
     fn name(&self) -> &str {
@@ -163,8 +219,24 @@ impl Channel for MatrixChannel {
                         return;
                     }
 
-                    let MessageType::Text(ref text_content) = event.content.msgtype else {
-                        return;
+                    let (content, attachments) = match &event.content.msgtype {
+                        MessageType::Text(text_content) => {
+                            (text_content.body.clone(), Vec::new())
+                        }
+                        MessageType::Image(image_content) => {
+                            let attachment =
+                                download_matrix_image(&room.client(), image_content).await;
+                            // Use the body as a caption fallback (filename or user-supplied text).
+                            let caption = image_content
+                                .caption()
+                                .map(str::to_string)
+                                .unwrap_or_default();
+                            match attachment {
+                                Some(att) => (caption, vec![att]),
+                                None => return,
+                            }
+                        }
+                        _ => return,
                     };
 
                     let thread_id = event.content.relates_to.as_ref().and_then(|rel| {
@@ -178,10 +250,11 @@ impl Channel for MatrixChannel {
                     let msg = IncomingMessage {
                         id: event.event_id.to_string(),
                         sender: event.sender.to_string(),
-                        content: text_content.body.clone(),
+                        content,
                         room_id: room_id_str,
                         timestamp: 0,
                         thread_id,
+                        attachments,
                     };
 
                     if let Err(e) = tx.send(msg).await {

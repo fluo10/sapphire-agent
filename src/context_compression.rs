@@ -46,6 +46,8 @@ fn estimate_message_tokens(msg: &ChatMessage) -> usize {
         .iter()
         .map(|p| match p {
             ContentPart::Text(t) => estimate_tokens(t),
+            // Anthropic charges per ~750x750 image tile; rough flat approximation.
+            ContentPart::Image { .. } => 1600,
             ContentPart::ToolUse { name, input, .. } => {
                 estimate_tokens(name) + estimate_tokens(&input.to_string())
             }
@@ -191,6 +193,9 @@ pub async fn generate_summary(
             match part {
                 ContentPart::Text(t) => {
                     transcript.push_str(&format!("{role_label}: {t}\n\n"));
+                }
+                ContentPart::Image { media_type, .. } => {
+                    transcript.push_str(&format!("{role_label}: [image: {media_type}]\n\n"));
                 }
                 ContentPart::ToolUse { name, .. } => {
                     transcript.push_str(&format!("{role_label}: [Called tool: {name}]\n\n"));

@@ -40,6 +40,11 @@ pub enum Role {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ContentPart {
     Text(String),
+    /// Inline image, base64-encoded. `media_type` is the MIME type (e.g. `image/png`).
+    Image {
+        media_type: String,
+        data_base64: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -63,6 +68,30 @@ impl ChatMessage {
         Self {
             role: Role::User,
             parts: vec![ContentPart::Text(text.into())],
+        }
+    }
+
+    /// User message with text plus inline images. Images are placed before the
+    /// text part — Anthropic recommends this ordering for best comprehension.
+    /// An empty `text` is omitted so the API never sees an empty text block.
+    pub fn user_with_images(
+        text: impl Into<String>,
+        images: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        let mut parts: Vec<ContentPart> = images
+            .into_iter()
+            .map(|(media_type, data_base64)| ContentPart::Image {
+                media_type,
+                data_base64,
+            })
+            .collect();
+        let text = text.into();
+        if !text.is_empty() {
+            parts.push(ContentPart::Text(text));
+        }
+        Self {
+            role: Role::User,
+            parts,
         }
     }
 

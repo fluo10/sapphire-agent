@@ -145,6 +145,9 @@ enum ApiPart {
     Text {
         text: String,
     },
+    Image {
+        source: ApiImageSource,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -153,6 +156,15 @@ enum ApiPart {
     ToolResult {
         tool_use_id: String,
         content: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ApiImageSource {
+    Base64 {
+        media_type: String,
+        data: String,
     },
 }
 
@@ -259,6 +271,15 @@ fn chat_message_to_api(msg: &ChatMessage) -> ApiMessage {
         .iter()
         .map(|p| match p {
             ContentPart::Text(t) => ApiPart::Text { text: t.clone() },
+            ContentPart::Image {
+                media_type,
+                data_base64,
+            } => ApiPart::Image {
+                source: ApiImageSource::Base64 {
+                    media_type: media_type.clone(),
+                    data: data_base64.clone(),
+                },
+            },
             ContentPart::ToolUse { id, name, input } => ApiPart::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
