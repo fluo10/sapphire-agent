@@ -1,3 +1,5 @@
+use crate::config::DigestConfig;
+use crate::periodic_log::{self, LogKind};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tokio::sync::Mutex;
@@ -78,14 +80,16 @@ struct CachedFile {
 /// message without restarting the agent.
 pub struct Workspace {
     dir: PathBuf,
+    digest_cfg: DigestConfig,
     cache: Mutex<std::collections::HashMap<PathBuf, CachedFile>>,
 }
 
 impl Workspace {
-    pub fn new(dir: PathBuf) -> Self {
+    pub fn new(dir: PathBuf, digest_cfg: DigestConfig) -> Self {
         info!("Workspace dir: {}", dir.display());
         Self {
             dir,
+            digest_cfg,
             cache: Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -117,25 +121,47 @@ impl Workspace {
             }
         }
 
-        // Inject the previous day's daily log (if it exists) so the agent has
-        // awareness of yesterday's topics, decisions, and unresolved items.
+        // Inject periodic logs (yesterday's full body + digest blocks for
+        // this week / month / year / past years).
         let today = crate::session::local_date_for_timestamp(now_local, boundary_hour);
+        self.inject_periodic_logs(&mut parts, today);
+
+        parts.join("\n\n---\n\n")
+    }
+
+    /// Append log injection blocks to `parts`:
+    /// 1. `# Yesterday's Log` — full body (existing behaviour from #39).
+    /// 2. `# This Week's Digests` — top-N digest items from each daily in
+    ///    the current ISO week that is strictly before yesterday.
+    /// Additional blocks (month/year/past years) are appended in later commits.
+    fn inject_periodic_logs(&self, parts: &mut Vec<String>, today: chrono::NaiveDate) {
+        // Yesterday's full body (kept verbatim from pre-#42 behaviour).
         if let Some(yesterday) = today.pred_opt() {
-            let log_path = self
-                .dir
-                .join("memory")
-                .join("daily")
-                .join(format!("{yesterday}.md"));
-            if let Ok(content) = std::fs::read_to_string(&log_path) {
-                if !content.trim().is_empty() {
-                    let truncated = truncate_chars(&content, MAX_FILE_CHARS);
+            let stem = periodic_log::daily_stem(yesterday);
+            if let Some(body) = periodic_log::read_body(&self.dir, LogKind::Daily, &stem) {
+                if !body.trim().is_empty() {
+                    let truncated = truncate_chars(&body, MAX_FILE_CHARS);
                     debug!("Injecting yesterday's daily log: {yesterday}");
                     parts.push(format!("# Yesterday's Log\n\n{truncated}"));
                 }
             }
         }
 
-        parts.join("\n\n---\n\n")
+        // "This Week's Digests" — daily files in `[iso_week_start, yesterday)`.
+        let n = self.digest_cfg.daily_items;
+        if n > 0 {
+            let stems = periodic_log::daily_stems_in_current_iso_week_before(today);
+            let block = build_digest_block(
+                "# This Week's Digests",
+                &self.dir,
+                LogKind::Daily,
+                &stems,
+                n,
+            );
+            if let Some(b) = block {
+                parts.push(b);
+            }
+        }
     }
 
     /// Try each candidate filename in order; return the first one found.
@@ -201,6 +227,35 @@ impl Workspace {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Assemble a heading + per-stem bulleted subsections of top-N digest items.
+/// Each subsection is introduced by `## {stem}` followed by the top-N items
+/// as Markdown bullets. Stems with no digest or an empty digest are skipped.
+/// Returns `None` if every stem was skipped.
+fn build_digest_block(
+    heading: &str,
+    workspace_dir: &Path,
+    kind: LogKind,
+    stems: &[String],
+    n: usize,
+) -> Option<String> {
+    let mut subsections = Vec::new();
+    for stem in stems {
+        let items = periodic_log::read_digest_top_n(workspace_dir, kind, stem, n)
+            .unwrap_or_default();
+        if items.is_empty() {
+            continue;
+        }
+        let bullets: Vec<String> = items.into_iter().map(|i| format!("- {i}")).collect();
+        subsections.push(format!("## {stem}\n\n{}", bullets.join("\n")));
+    }
+    if subsections.is_empty() {
+        None
+    } else {
+        debug!("Injecting {heading} ({} subsection(s))", subsections.len());
+        Some(format!("{heading}\n\n{}", subsections.join("\n\n")))
+    }
+}
 
 /// Truncate `s` to at most `max_chars` Unicode scalar values.
 fn truncate_chars(s: &str, max_chars: usize) -> String {

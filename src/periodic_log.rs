@@ -18,7 +18,7 @@
 
 use crate::provider::{ChatMessage, ContentPart, Provider, Role};
 use crate::session::{SessionMeta, SessionStore, StoredMessage};
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
 use sapphire_workspace::WorkspaceState;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -104,6 +104,48 @@ pub fn weekly_stem_from_date(date: NaiveDate) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Date-range helpers (used for weekly/monthly inputs and injection ranges)
+// ---------------------------------------------------------------------------
+
+/// The 7 consecutive local dates of ISO week `(iso_year, iso_week)`,
+/// ordered Monday → Sunday. Returns an empty vec if the (year, week) pair
+/// is not a valid ISO date (e.g. week 53 in a short year).
+pub fn days_of_iso_week(iso_year: i32, iso_week: u32) -> Vec<NaiveDate> {
+    let Some(monday) = NaiveDate::from_isoywd_opt(iso_year, iso_week, Weekday::Mon) else {
+        return Vec::new();
+    };
+    (0..7)
+        .map(|offset| monday + Duration::days(offset))
+        .collect()
+}
+
+/// Daily stems within the *current* ISO week of `today` but strictly before
+/// `today` itself. Used for the "This Week's Digests" injection block —
+/// yesterday (which is `today - 1`) is intentionally excluded because its
+/// full body is injected separately as the "Yesterday's Log" block.
+///
+/// Note: the range excludes `today`, so the caller passes `today` (the
+/// current local date), not `yesterday`. On Monday the range collapses to
+/// empty (only Monday itself is in the current ISO week, and it's excluded).
+pub fn daily_stems_in_current_iso_week_before(today: NaiveDate) -> Vec<String> {
+    let iso = today.iso_week();
+    let Some(monday) = NaiveDate::from_isoywd_opt(iso.year(), iso.week(), Weekday::Mon) else {
+        return Vec::new();
+    };
+    // yesterday is today - 1; we want [monday, yesterday) which equals
+    // [monday, today - 1). On Monday, today-1 = Sunday of last week, which
+    // isn't in the current ISO week — so we clamp to <= today-1.
+    let yesterday = today - Duration::days(1);
+    let mut out = Vec::new();
+    let mut d = monday;
+    while d < yesterday && d.iso_week() == iso {
+        out.push(daily_stem(d));
+        d += Duration::days(1);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Daily log generation (moved from daily_log.rs)
 // ---------------------------------------------------------------------------
 
@@ -152,6 +194,82 @@ pub async fn generate_daily_log(
     .await?;
 
     Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Weekly log generation
+// ---------------------------------------------------------------------------
+
+/// Generate the weekly log for ISO week `(iso_year, iso_week)` from the 7
+/// daily bodies of that week. Returns `Ok(false)` if none of the dailies
+/// exist (no work to do).
+pub async fn generate_weekly_log(
+    provider: &dyn Provider,
+    ws_state: &Arc<Mutex<WorkspaceState>>,
+    workspace_dir: &Path,
+    iso_year: i32,
+    iso_week: u32,
+) -> anyhow::Result<bool> {
+    let stem = weekly_stem(iso_year, iso_week);
+    let days = days_of_iso_week(iso_year, iso_week);
+    let mut sections = Vec::new();
+    for day in &days {
+        if let Some(body) = read_body(workspace_dir, LogKind::Daily, &daily_stem(*day)) {
+            sections.push(body);
+        }
+    }
+    if sections.is_empty() {
+        info!("No daily logs found for ISO week {stem}, skipping weekly log");
+        return Ok(false);
+    }
+    let input = sections.join("\n\n---\n\n");
+    let description = format!("daily logs for ISO week {stem}");
+    write_log_with_digest(
+        provider,
+        ws_state,
+        LogKind::Weekly,
+        &stem,
+        &description,
+        &input,
+    )
+    .await?;
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Read helpers (used both for upper-level log inputs and injection)
+// ---------------------------------------------------------------------------
+
+/// Return the Markdown body of `memory/{kind}/{stem}.md` with any YAML
+/// frontmatter stripped. Returns `None` when the file does not exist or
+/// cannot be read.
+pub fn read_body(workspace_dir: &Path, kind: LogKind, stem: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(log_abs_path(workspace_dir, kind, stem)).ok()?;
+    Some(match crate::frontmatter::split(&raw) {
+        Some((_, body)) => body.trim_start_matches('\n').to_string(),
+        None => raw,
+    })
+}
+
+/// Return the first `n` items of the `digest:` array in
+/// `memory/{kind}/{stem}.md`. Returns `None` when the file or digest is
+/// missing; returns `Some(vec![])` when `digest: []` is explicitly empty.
+pub fn read_digest_top_n(
+    workspace_dir: &Path,
+    kind: LogKind,
+    stem: &str,
+    n: usize,
+) -> Option<Vec<String>> {
+    let raw = std::fs::read_to_string(log_abs_path(workspace_dir, kind, stem)).ok()?;
+    let (fm, _) = crate::frontmatter::split(&raw)?;
+    let mapping = crate::frontmatter::parse_mapping(fm);
+    let seq = mapping.get("digest")?.as_sequence()?;
+    Some(
+        seq.iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .take(n)
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -665,6 +783,61 @@ mod tests {
         assert_eq!(digest, vec!["only"]);
         assert!(body.contains("# Daily Log: 2026-04-15"));
         assert!(body.contains("body"));
+    }
+
+    #[test]
+    fn days_of_iso_week_returns_seven_ordered_days() {
+        // 2026-W16: Monday 2026-04-13 .. Sunday 2026-04-19.
+        let days = days_of_iso_week(2026, 16);
+        assert_eq!(days.len(), 7);
+        assert_eq!(days[0], NaiveDate::from_ymd_opt(2026, 4, 13).unwrap());
+        assert_eq!(days[6], NaiveDate::from_ymd_opt(2026, 4, 19).unwrap());
+        assert_eq!(days[0].weekday(), Weekday::Mon);
+        assert_eq!(days[6].weekday(), Weekday::Sun);
+    }
+
+    #[test]
+    fn daily_stems_this_week_on_thursday() {
+        // Today = Thursday 2026-04-16; yesterday = Wed 2026-04-15.
+        // Current ISO week starts Mon 2026-04-13.
+        // Expected range [Mon, Wed) = [Mon, Tue].
+        let thu = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let stems = daily_stems_in_current_iso_week_before(thu);
+        assert_eq!(stems, vec!["2026-04-13", "2026-04-14"]);
+    }
+
+    #[test]
+    fn daily_stems_this_week_on_monday_is_empty() {
+        // Today = Mon 2026-04-13; yesterday = Sun of *last* ISO week.
+        // The current ISO week has nothing before "yesterday".
+        let mon = NaiveDate::from_ymd_opt(2026, 4, 13).unwrap();
+        assert!(daily_stems_in_current_iso_week_before(mon).is_empty());
+    }
+
+    #[test]
+    fn daily_stems_this_week_on_tuesday_is_empty() {
+        // Today = Tue 2026-04-14; yesterday = Mon 2026-04-13 (same week).
+        // Range [Mon, Mon) is empty.
+        let tue = NaiveDate::from_ymd_opt(2026, 4, 14).unwrap();
+        assert!(daily_stems_in_current_iso_week_before(tue).is_empty());
+    }
+
+    #[test]
+    fn daily_stems_this_week_on_sunday_gives_four_days() {
+        // Today = Sun 2026-04-19; yesterday = Sat 2026-04-18.
+        // Range [Mon 2026-04-13, Sat 2026-04-18) = Mon..Fri = 5 days.
+        let sun = NaiveDate::from_ymd_opt(2026, 4, 19).unwrap();
+        let stems = daily_stems_in_current_iso_week_before(sun);
+        assert_eq!(
+            stems,
+            vec![
+                "2026-04-13",
+                "2026-04-14",
+                "2026-04-15",
+                "2026-04-16",
+                "2026-04-17"
+            ]
+        );
     }
 
     #[test]

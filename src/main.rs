@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
 
             // ── Bootstrap file loader (AGENTS.md, SOUL.md, MEMORY.md …) ────
-            let workspace = Arc::new(Workspace::new(workspace_dir.clone()));
+            let workspace = Arc::new(Workspace::new(workspace_dir.clone(), config.digest.clone()));
 
             // ── sapphire-workspace (search, file ops, git sync) ─────────────
             let sw_workspace = SwWorkspace::resolve(&APP_CTX, Some(&workspace_dir))
@@ -294,6 +294,7 @@ async fn main() -> Result<()> {
                     day_boundary_hour: config.day_boundary_hour,
                     daily_log_enabled: config.daily_log_enabled,
                     memory_compaction_enabled: config.memory_compaction_enabled,
+                    digest_cfg: config.digest.clone(),
                     session_store: Arc::clone(&channel_session_store),
                     provider: Arc::clone(&provider),
                     agent: Arc::clone(&agent),

@@ -8,14 +8,16 @@
 //!    triggers on the agent according to each task's cron schedule.
 
 use crate::agent::Agent;
-use crate::periodic_log::{
-    catchup_missing_daily_digests, catchup_pending_daily_logs, generate_daily_log,
-};
+use crate::config::DigestConfig;
 use crate::heartbeat_config::{load_heartbeat_dir, next_due};
 use crate::memory_compaction::compact_memory;
+use crate::periodic_log::{
+    catchup_missing_daily_digests, catchup_pending_daily_logs, generate_daily_log,
+    generate_weekly_log,
+};
 use crate::provider::Provider;
 use crate::session::SessionStore;
-use chrono::{Duration, Local, NaiveTime, Timelike};
+use chrono::{Datelike, Duration, Local, NaiveTime, Timelike, Weekday};
 use sapphire_workspace::WorkspaceState;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -31,6 +33,7 @@ pub struct Heartbeat {
     pub day_boundary_hour: u8,
     pub daily_log_enabled: bool,
     pub memory_compaction_enabled: bool,
+    pub digest_cfg: DigestConfig,
     pub session_store: Arc<SessionStore>,
     pub provider: Arc<dyn Provider>,
     pub agent: Arc<Agent>,
@@ -97,6 +100,7 @@ impl Heartbeat {
 
             if self.daily_log_enabled {
                 info!("Heartbeat: generating daily log for {yesterday}");
+                let mut any_generated = false;
                 match generate_daily_log(
                     &self.session_store,
                     self.provider.as_ref(),
@@ -106,11 +110,39 @@ impl Heartbeat {
                 )
                 .await
                 {
-                    Ok(true) => self.agent.invalidate_system_prompts().await,
+                    Ok(true) => any_generated = true,
                     Ok(false) => {}
                     Err(e) => warn!(
                         "Heartbeat: failed to generate daily log for {yesterday}: {e:#}"
                     ),
+                }
+
+                // Weekly: today is Monday → last ISO week closed yesterday.
+                let today = yesterday + Duration::days(1);
+                if self.digest_cfg.weekly_enabled && today.weekday() == Weekday::Mon {
+                    let iso = yesterday.iso_week();
+                    info!(
+                        "Heartbeat: generating weekly log for {}-W{:02}",
+                        iso.year(),
+                        iso.week()
+                    );
+                    match generate_weekly_log(
+                        self.provider.as_ref(),
+                        &self.ws_state,
+                        &self.workspace_dir,
+                        iso.year(),
+                        iso.week(),
+                    )
+                    .await
+                    {
+                        Ok(true) => any_generated = true,
+                        Ok(false) => {}
+                        Err(e) => warn!("Heartbeat: failed to generate weekly log: {e:#}"),
+                    }
+                }
+
+                if any_generated {
+                    self.agent.invalidate_system_prompts().await;
                 }
             }
 
