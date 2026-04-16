@@ -132,6 +132,9 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # CORS middleware
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 
+# Base64 encoding (image attachments → Anthropic API)
+base64 = "0.22"
+
 # Discord bot (gateway + HTTP, rustls TLS)
 # Requires MESSAGE_CONTENT privileged intent enabled in Discord Developer Portal
 serenity = { version = "0.12", default-features = false, features = [

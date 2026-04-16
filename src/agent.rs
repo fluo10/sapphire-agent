@@ -1,4 +1,4 @@
-use crate::channel::{Channel, OutgoingMessage};
+use crate::channel::{Attachment, Channel, OutgoingMessage};
 use crate::config::{Config, SessionPolicy};
 use crate::context_compression::{generate_summary, maybe_compress};
 use crate::provider::{ChatMessage, ContentPart, Provider, Role, ToolCall};
@@ -252,6 +252,7 @@ impl Agent {
             room_id: room_id.to_string(),
             timestamp: now_ms,
             thread_id: None,
+            attachments: Vec::new(),
         };
         Arc::clone(self).handle_message(incoming).await
     }
@@ -330,6 +331,11 @@ impl Agent {
     /// skipped: tool payloads can be arbitrarily large (file contents, etc.)
     /// and we never reload raw history across restarts, so persisting them
     /// would only bloat the JSONL. Context survives via compaction summaries.
+    ///
+    /// Messages with `Image` parts are persisted with the raw image data
+    /// stripped (replaced with a `[image: <media_type>]` text marker) so the
+    /// JSONL stays small while daily logs / summaries can still see that an
+    /// image was sent.
     fn persist(&self, session_id: &str, msg: &ChatMessage) {
         if session_id.is_empty() {
             return;
@@ -343,7 +349,9 @@ impl Agent {
         if has_tool_parts {
             return;
         }
-        if let Err(e) = self.session_store.append(session_id, msg) {
+        let scrubbed = strip_image_data(msg);
+        let to_write = scrubbed.as_ref().unwrap_or(msg);
+        if let Err(e) = self.session_store.append(session_id, to_write) {
             warn!("Failed to persist message: {e}");
         }
     }
@@ -568,7 +576,7 @@ impl Agent {
 
         // Append user message
         {
-            let msg = ChatMessage::user(&incoming.content);
+            let msg = build_user_message(&incoming.content, &incoming.attachments);
             self.history
                 .lock()
                 .await
@@ -773,6 +781,48 @@ impl Agent {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build a user `ChatMessage` from incoming text + binary attachments.
+/// Attachments are base64-encoded and emitted as `ContentPart::Image` parts.
+fn build_user_message(text: &str, attachments: &[Attachment]) -> ChatMessage {
+    if attachments.is_empty() {
+        return ChatMessage::user(text);
+    }
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let images = attachments.iter().map(|a| {
+        (
+            a.media_type.clone(),
+            STANDARD.encode(&a.data),
+        )
+    });
+    ChatMessage::user_with_images(text, images)
+}
+
+/// Return a copy of `msg` with every `Image` part replaced by a small text
+/// marker, or `None` if the message has no `Image` parts (avoids cloning).
+fn strip_image_data(msg: &ChatMessage) -> Option<ChatMessage> {
+    if !msg
+        .parts
+        .iter()
+        .any(|p| matches!(p, ContentPart::Image { .. }))
+    {
+        return None;
+    }
+    let parts = msg
+        .parts
+        .iter()
+        .map(|p| match p {
+            ContentPart::Image { media_type, .. } => {
+                ContentPart::Text(format!("[image: {media_type}]"))
+            }
+            other => other.clone(),
+        })
+        .collect();
+    Some(ChatMessage {
+        role: msg.role.clone(),
+        parts,
+    })
+}
 
 /// Read the created_at date of a session file and convert to the local day.
 fn read_session_date(path: &std::path::Path, boundary_hour: u8) -> NaiveDate {

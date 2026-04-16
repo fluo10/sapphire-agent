@@ -3,6 +3,20 @@ pub mod matrix;
 
 use async_trait::async_trait;
 
+/// Maximum size of a single image attachment forwarded to the LLM.
+/// Anthropic's documented limit is 5 MB per image; oversized attachments are
+/// dropped with a warning (the conversation continues without them).
+pub const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
+
+/// A binary attachment fetched from a channel (currently images only).
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    /// MIME type, e.g. `image/png`, `image/jpeg`.
+    pub media_type: String,
+    /// Raw bytes.
+    pub data: Vec<u8>,
+}
+
 /// A message received from a channel.
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {
@@ -18,6 +32,8 @@ pub struct IncomingMessage {
     pub timestamp: u64,
     /// Thread identifier for threaded replies, if applicable.
     pub thread_id: Option<String>,
+    /// Image attachments accompanying the message.
+    pub attachments: Vec<Attachment>,
 }
 
 /// A message to send through a channel.

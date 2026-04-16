@@ -1,4 +1,4 @@
-use crate::channel::{Channel, IncomingMessage, OutgoingMessage};
+use crate::channel::{Attachment, Channel, IncomingMessage, MAX_ATTACHMENT_BYTES, OutgoingMessage};
 use crate::config::DiscordConfig;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -47,7 +47,10 @@ impl EventHandler for DiscordHandler {
         }
 
         let content = msg.content.trim().to_string();
-        if content.is_empty() {
+        let attachments = download_image_attachments(&msg).await;
+
+        // Skip messages that have neither text nor any usable image attachment.
+        if content.is_empty() && attachments.is_empty() {
             return;
         }
 
@@ -58,6 +61,7 @@ impl EventHandler for DiscordHandler {
             room_id: msg.channel_id.to_string(),
             timestamp: msg.timestamp.unix_timestamp() as u64 * 1000,
             thread_id: None,
+            attachments,
         };
 
         if let Err(e) = self.tx.send(incoming).await {
@@ -214,6 +218,43 @@ impl Channel for DiscordChannel {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Download every `image/*` attachment on `msg`. Oversized attachments
+/// (>5 MB) and non-image attachments are skipped with a warning so the
+/// conversation continues without them.
+async fn download_image_attachments(msg: &Message) -> Vec<Attachment> {
+    let mut out = Vec::new();
+    for att in &msg.attachments {
+        let Some(ct) = att.content_type.as_deref() else {
+            continue;
+        };
+        if !ct.starts_with("image/") {
+            continue;
+        }
+        if (att.size as usize) > MAX_ATTACHMENT_BYTES {
+            warn!(
+                "Discord image '{}' is {} bytes (>5MB); skipping",
+                att.filename, att.size
+            );
+            continue;
+        }
+        match att.download().await {
+            Ok(bytes) if bytes.len() <= MAX_ATTACHMENT_BYTES => {
+                out.push(Attachment {
+                    media_type: ct.to_string(),
+                    data: bytes,
+                });
+            }
+            Ok(bytes) => warn!(
+                "Discord image '{}' decoded to {} bytes (>5MB); skipping",
+                att.filename,
+                bytes.len()
+            ),
+            Err(e) => warn!("Failed to download Discord attachment '{}': {e}", att.filename),
+        }
+    }
+    out
+}
 
 /// Split content into chunks that fit within Discord's 2000-character limit.
 fn split_for_discord(content: &str) -> Vec<String> {
