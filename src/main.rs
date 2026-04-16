@@ -9,6 +9,7 @@ mod heartbeat;
 mod heartbeat_config;
 mod mcp_client;
 mod memory_compaction;
+mod periodic_log;
 mod provider;
 mod serve;
 mod session;
