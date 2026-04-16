@@ -148,17 +148,30 @@ impl Workspace {
         }
 
         // "This Week's Digests" — daily files in `[iso_week_start, yesterday)`.
-        let n = self.digest_cfg.daily_items;
-        if n > 0 {
+        if self.digest_cfg.daily_items > 0 {
             let stems = periodic_log::daily_stems_in_current_iso_week_before(today);
-            let block = build_digest_block(
+            if let Some(b) = build_digest_block(
                 "# This Week's Digests",
                 &self.dir,
                 LogKind::Daily,
                 &stems,
-                n,
-            );
-            if let Some(b) = block {
+                self.digest_cfg.daily_items,
+            ) {
+                parts.push(b);
+            }
+        }
+
+        // "This Month's Digests" — weekly files whose Monday is in this
+        // calendar month, excluding the current ISO week.
+        if self.digest_cfg.weekly_items > 0 {
+            let stems = periodic_log::week_stems_in_month_before(today);
+            if let Some(b) = build_digest_block(
+                "# This Month's Digests",
+                &self.dir,
+                LogKind::Weekly,
+                &stems,
+                self.digest_cfg.weekly_items,
+            ) {
                 parts.push(b);
             }
         }

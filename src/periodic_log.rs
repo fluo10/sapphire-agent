@@ -119,6 +119,47 @@ pub fn days_of_iso_week(iso_year: i32, iso_week: u32) -> Vec<NaiveDate> {
         .collect()
 }
 
+/// Every local date in the given calendar month.
+pub fn days_of_month(year: i32, month: u32) -> Vec<NaiveDate> {
+    let Some(start) = NaiveDate::from_ymd_opt(year, month, 1) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut d = start;
+    while d.month() == month {
+        out.push(d);
+        d += Duration::days(1);
+    }
+    out
+}
+
+/// ISO-week stems whose Monday falls in the calendar month of `today`,
+/// excluding `today`'s own ISO week. Used for the "This Month's Digests"
+/// injection block.
+///
+/// A week is included only when its Monday lies inside this month — this
+/// way ISO weeks that straddle month boundaries aren't double-counted
+/// across "# This Month's Digests" and the previous month's block.
+pub fn week_stems_in_month_before(today: NaiveDate) -> Vec<String> {
+    let current_iso = today.iso_week();
+    let month = today.month();
+    let Some(start) = NaiveDate::from_ymd_opt(today.year(), month, 1) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut d = start;
+    while d.month() == month {
+        if d.weekday() == Weekday::Mon {
+            let iso = d.iso_week();
+            if iso.year() != current_iso.year() || iso.week() != current_iso.week() {
+                out.push(weekly_stem(iso.year(), iso.week()));
+            }
+        }
+        d += Duration::days(1);
+    }
+    out
+}
+
 /// Daily stems within the *current* ISO week of `today` but strictly before
 /// `today` itself. Used for the "This Week's Digests" injection block —
 /// yesterday (which is `today - 1`) is intentionally excluded because its
@@ -228,6 +269,48 @@ pub async fn generate_weekly_log(
         provider,
         ws_state,
         LogKind::Weekly,
+        &stem,
+        &description,
+        &input,
+    )
+    .await?;
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Monthly log generation
+// ---------------------------------------------------------------------------
+
+/// Generate the monthly log for `(year, month)` from *all* daily bodies in
+/// that calendar month. Monthlies deliberately read dailies directly rather
+/// than chaining through weeklies — ISO weeks straddle month boundaries,
+/// so a weekly-based chain would leak days across the boundary. Returns
+/// `Ok(false)` if no dailies exist for that month.
+pub async fn generate_monthly_log(
+    provider: &dyn Provider,
+    ws_state: &Arc<Mutex<WorkspaceState>>,
+    workspace_dir: &Path,
+    year: i32,
+    month: u32,
+) -> anyhow::Result<bool> {
+    let stem = monthly_stem(year, month);
+    let days = days_of_month(year, month);
+    let mut sections = Vec::new();
+    for day in &days {
+        if let Some(body) = read_body(workspace_dir, LogKind::Daily, &daily_stem(*day)) {
+            sections.push(body);
+        }
+    }
+    if sections.is_empty() {
+        info!("No daily logs found for month {stem}, skipping monthly log");
+        return Ok(false);
+    }
+    let input = sections.join("\n\n---\n\n");
+    let description = format!("daily logs for {stem}");
+    write_log_with_digest(
+        provider,
+        ws_state,
+        LogKind::Monthly,
         &stem,
         &description,
         &input,
@@ -838,6 +921,47 @@ mod tests {
                 "2026-04-17"
             ]
         );
+    }
+
+    #[test]
+    fn days_of_month_april_2026_is_30_days() {
+        let days = days_of_month(2026, 4);
+        assert_eq!(days.len(), 30);
+        assert_eq!(days[0], NaiveDate::from_ymd_opt(2026, 4, 1).unwrap());
+        assert_eq!(days[29], NaiveDate::from_ymd_opt(2026, 4, 30).unwrap());
+    }
+
+    #[test]
+    fn days_of_month_december_is_31_days() {
+        assert_eq!(days_of_month(2026, 12).len(), 31);
+    }
+
+    #[test]
+    fn days_of_month_february_leap_year() {
+        assert_eq!(days_of_month(2024, 2).len(), 29);
+        assert_eq!(days_of_month(2025, 2).len(), 28);
+    }
+
+    #[test]
+    fn week_stems_in_month_before_april_16_2026() {
+        // April 2026 has Mondays on 6, 13, 20, 27. Today is Thu 04-16 (ISO
+        // week 16). Exclude week 16; include weeks with Mondays 04-06, 04-20,
+        // 04-27 — but only Mondays that are _before_ today shouldn't matter
+        // for this helper: it returns every in-month Monday except the
+        // current ISO week. So expected: 15, 17, 18.
+        let thu = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let stems = week_stems_in_month_before(thu);
+        assert_eq!(stems, vec!["2026-W15", "2026-W17", "2026-W18"]);
+    }
+
+    #[test]
+    fn week_stems_in_month_before_may_1_2026() {
+        // May 1 2026 is a Friday in ISO week 18 (whose Monday Apr 27 is in
+        // April, not May — so no May Monday is in the current ISO week).
+        // May's Mondays: 4, 11, 18, 25 → weeks 19, 20, 21, 22.
+        let fri = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+        let stems = week_stems_in_month_before(fri);
+        assert_eq!(stems, vec!["2026-W19", "2026-W20", "2026-W21", "2026-W22"]);
     }
 
     #[test]

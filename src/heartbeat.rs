@@ -13,7 +13,7 @@ use crate::heartbeat_config::{load_heartbeat_dir, next_due};
 use crate::memory_compaction::compact_memory;
 use crate::periodic_log::{
     catchup_missing_daily_digests, catchup_pending_daily_logs, generate_daily_log,
-    generate_weekly_log,
+    generate_monthly_log, generate_weekly_log,
 };
 use crate::provider::Provider;
 use crate::session::SessionStore;
@@ -138,6 +138,25 @@ impl Heartbeat {
                         Ok(true) => any_generated = true,
                         Ok(false) => {}
                         Err(e) => warn!("Heartbeat: failed to generate weekly log: {e:#}"),
+                    }
+                }
+
+                // Monthly: today is day 1 → last calendar month ended yesterday.
+                if self.digest_cfg.monthly_enabled && today.day() == 1 {
+                    let (year, month) = (yesterday.year(), yesterday.month());
+                    info!("Heartbeat: generating monthly log for {year:04}-{month:02}");
+                    match generate_monthly_log(
+                        self.provider.as_ref(),
+                        &self.ws_state,
+                        &self.workspace_dir,
+                        year,
+                        month,
+                    )
+                    .await
+                    {
+                        Ok(true) => any_generated = true,
+                        Ok(false) => {}
+                        Err(e) => warn!("Heartbeat: failed to generate monthly log: {e:#}"),
                     }
                 }
 
