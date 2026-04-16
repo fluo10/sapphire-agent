@@ -14,7 +14,7 @@ pub fn split(raw: &str) -> Option<(&str, &str)> {
         .or_else(|| raw.strip_prefix("---\r\n"))?;
     let mut idx = 0;
     for line in rest.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(|c| c == '\n' || c == '\r');
+        let trimmed = line.trim_end_matches(['\n', '\r']);
         if trimmed == "---" {
             let fm = &rest[..idx];
             let body_start = idx + line.len();
@@ -36,7 +36,7 @@ pub fn parse_mapping(fm: &str) -> serde_yaml::Mapping {
 /// to guarantee exactly one blank line after the closing `---`.
 pub fn serialize(meta: &serde_yaml::Mapping, body: &str) -> Result<String> {
     let fm = serde_yaml::to_string(meta).context("failed to serialize frontmatter")?;
-    let body_trimmed = body.trim_start_matches(|c: char| c == '\n' || c == '\r');
+    let body_trimmed = body.trim_start_matches(['\n', '\r']);
     Ok(format!("---\n{fm}---\n\n{body_trimmed}"))
 }
 

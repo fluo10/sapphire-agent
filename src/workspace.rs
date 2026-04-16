@@ -129,22 +129,21 @@ impl Workspace {
         parts.join("\n\n---\n\n")
     }
 
-    /// Append log injection blocks to `parts`:
-    /// 1. `# Yesterday's Log` — full body (existing behaviour from #39).
-    /// 2. `# This Week's Digests` — top-N digest items from each daily in
-    ///    the current ISO week that is strictly before yesterday.
-    /// Additional blocks (month/year/past years) are appended in later commits.
+    /// Append log injection blocks to `parts`: yesterday's full body, then
+    /// top-N digest blocks for this week / month / year / past years.
     fn inject_periodic_logs(&self, parts: &mut Vec<String>, today: chrono::NaiveDate) {
         // Yesterday's full body (kept verbatim from pre-#42 behaviour).
-        if let Some(yesterday) = today.pred_opt() {
-            let stem = periodic_log::daily_stem(yesterday);
-            if let Some(body) = periodic_log::read_body(&self.dir, LogKind::Daily, &stem) {
-                if !body.trim().is_empty() {
-                    let truncated = truncate_chars(&body, MAX_FILE_CHARS);
-                    debug!("Injecting yesterday's daily log: {yesterday}");
-                    parts.push(format!("# Yesterday's Log\n\n{truncated}"));
-                }
-            }
+        if let Some(yesterday) = today.pred_opt()
+            && let Some(body) = periodic_log::read_body(
+                &self.dir,
+                LogKind::Daily,
+                &periodic_log::daily_stem(yesterday),
+            )
+            && !body.trim().is_empty()
+        {
+            let truncated = truncate_chars(&body, MAX_FILE_CHARS);
+            debug!("Injecting yesterday's daily log: {yesterday}");
+            parts.push(format!("# Yesterday's Log\n\n{truncated}"));
         }
 
         // "This Week's Digests" — daily files in `[iso_week_start, yesterday)`.

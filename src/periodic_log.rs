@@ -95,14 +95,6 @@ pub fn yearly_stem(year: i32) -> String {
     format!("{year:04}")
 }
 
-/// Convenience: derive the weekly stem from a date that falls within the
-/// target ISO week. Uses `NaiveDate::iso_week()` to get the correct ISO
-/// year (not the calendar year).
-pub fn weekly_stem_from_date(date: NaiveDate) -> String {
-    let iso = date.iso_week();
-    weekly_stem(iso.year(), iso.week())
-}
-
 // ---------------------------------------------------------------------------
 // Date-range helpers (used for weekly/monthly inputs and injection ranges)
 // ---------------------------------------------------------------------------
@@ -822,10 +814,12 @@ mod tests {
     fn weekly_stem_iso_year_may_differ_from_calendar_year() {
         // 2023-01-01 is Sunday → ISO week 52 of 2022.
         let d = NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
-        assert_eq!(weekly_stem_from_date(d), "2022-W52");
+        let iso = d.iso_week();
+        assert_eq!(weekly_stem(iso.year(), iso.week()), "2022-W52");
         // 2024-12-30 is Monday → ISO week 1 of 2025.
         let d = NaiveDate::from_ymd_opt(2024, 12, 30).unwrap();
-        assert_eq!(weekly_stem_from_date(d), "2025-W01");
+        let iso = d.iso_week();
+        assert_eq!(weekly_stem(iso.year(), iso.week()), "2025-W01");
     }
 
     #[test]
