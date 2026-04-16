@@ -223,6 +223,12 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // Captured below so main can await the agent's graceful shutdown
+            // (summarize_on_shutdown) before returning. Without this, the
+            // tokio runtime drops the spawned task the moment serve::run
+            // returns, cancelling any in-flight LLM call (#48).
+            let mut agent_handle: Option<tokio::task::JoinHandle<()>> = None;
+
             // ── Channel + Agent (Matrix or Discord, if configured) ──────────
             if !config.standby_mode && (config.matrix.is_some() || config.discord.is_some()) {
                 let channel_name = if config.discord.is_some() {
@@ -295,11 +301,11 @@ async fn main() -> Result<()> {
                 }
 
                 let agent_run = Arc::clone(&agent);
-                tokio::spawn(async move {
+                agent_handle = Some(tokio::spawn(async move {
                     if let Err(e) = agent_run.run().await {
                         tracing::error!("Agent error: {e:#}");
                     }
-                });
+                }));
             }
 
             if config.standby_mode {
@@ -330,6 +336,14 @@ async fn main() -> Result<()> {
                     api_session_store,
                 )
                 .await?;
+            }
+
+            // Wait for the agent task's graceful shutdown to finish so its
+            // summarize_on_shutdown LLM call isn't aborted by runtime drop.
+            if let Some(handle) = agent_handle {
+                if let Err(e) = handle.await {
+                    tracing::warn!("Agent task did not finish cleanly: {e}");
+                }
             }
         }
         Command::Call { .. } => unreachable!(),
