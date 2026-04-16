@@ -3,7 +3,6 @@ mod call;
 mod channel;
 mod config;
 mod context_compression;
-mod daily_log;
 mod frontmatter;
 mod heartbeat;
 mod heartbeat_config;
@@ -22,7 +21,7 @@ use channel::discord::DiscordChannel;
 use channel::matrix::MatrixChannel;
 use clap::{Parser, Subcommand};
 use config::Config;
-use daily_log::catchup_pending_logs;
+use periodic_log::catchup_pending_daily_logs;
 use heartbeat::Heartbeat;
 use provider::anthropic::AnthropicProvider;
 use sapphire_workspace::{AppContext, Workspace as SwWorkspace, WorkspaceState};
@@ -254,7 +253,7 @@ async fn main() -> Result<()> {
                 };
 
                 // ── Catch up on any pending daily logs ──────────────────────
-                catchup_pending_logs(
+                catchup_pending_daily_logs(
                     &channel_session_store,
                     provider.as_ref(),
                     &ws_state,
