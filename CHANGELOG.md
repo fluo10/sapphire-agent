@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Weekly / monthly / yearly log auto-generation** — heartbeat now writes
+  summarised logs under `memory/{weekly,monthly,yearly}/` at the appropriate
+  day boundaries (Monday / 1st / Jan 1). Each log carries a YAML frontmatter
+  `digest:` array of importance-ordered bullets produced by the same LLM call
+  that writes the body, so the agent no longer has to call the `memory` tool
+  to recall long-horizon context.
+- **Periodic digest injection** — the system prompt gains four new blocks
+  after "Yesterday's Log": "This Week's Digests", "This Month's Digests",
+  "This Year's Digests", and "Past Years' Digests". Each block pulls the
+  top-N items of the relevant logs' digests (N per kind is configurable via
+  the new `[digest]` config section: `daily_items`, `weekly_items`,
+  `monthly_items`, `yearly_items`; defaults 3/3/5/5).
+- **Daily digest back-fill** — pre-existing daily logs that lack a `digest:`
+  frontmatter are upgraded in-place at startup and in the hourly catchup
+  loop. Unrelated frontmatter keys the memory tool writes (`last_read_at`,
+  `read_count`) are preserved.
+
+### Changed
+
+- **Daily log format** — newly generated dailies now carry YAML frontmatter
+  with a `digest:` array. The existing body format (`# Daily Log: YYYY-MM-DD`
+  + summary) is unchanged. Files can be hand-edited freely.
+
 ## [0.3.3] - 2026-04-16
 
 ### Added
