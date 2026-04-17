@@ -3,11 +3,12 @@ mod call;
 mod channel;
 mod config;
 mod context_compression;
-mod daily_log;
+mod frontmatter;
 mod heartbeat;
 mod heartbeat_config;
 mod mcp_client;
 mod memory_compaction;
+mod periodic_log;
 mod provider;
 mod serve;
 mod session;
@@ -20,7 +21,7 @@ use channel::discord::DiscordChannel;
 use channel::matrix::MatrixChannel;
 use clap::{Parser, Subcommand};
 use config::Config;
-use daily_log::catchup_pending_logs;
+use periodic_log::{catchup_missing_daily_digests, catchup_pending_daily_logs};
 use heartbeat::Heartbeat;
 use provider::anthropic::AnthropicProvider;
 use sapphire_workspace::{AppContext, Workspace as SwWorkspace, WorkspaceState};
@@ -159,7 +160,7 @@ async fn main() -> Result<()> {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
 
             // ── Bootstrap file loader (AGENTS.md, SOUL.md, MEMORY.md …) ────
-            let workspace = Arc::new(Workspace::new(workspace_dir.clone()));
+            let workspace = Arc::new(Workspace::new(workspace_dir.clone(), config.digest.clone()));
 
             // ── sapphire-workspace (search, file ops, git sync) ─────────────
             let sw_workspace = SwWorkspace::resolve(&APP_CTX, Some(&workspace_dir))
@@ -252,7 +253,7 @@ async fn main() -> Result<()> {
                 };
 
                 // ── Catch up on any pending daily logs ──────────────────────
-                catchup_pending_logs(
+                catchup_pending_daily_logs(
                     &channel_session_store,
                     provider.as_ref(),
                     &ws_state,
@@ -260,6 +261,10 @@ async fn main() -> Result<()> {
                     config.day_boundary_hour,
                 )
                 .await;
+
+                // ── Back-fill digest frontmatter on existing dailies ────────
+                catchup_missing_daily_digests(provider.as_ref(), &ws_state, &workspace_dir)
+                    .await;
 
                 // ── Agent ───────────────────────────────────────────────────
                 let agent = Arc::new(Agent::new(
@@ -289,6 +294,7 @@ async fn main() -> Result<()> {
                     day_boundary_hour: config.day_boundary_hour,
                     daily_log_enabled: config.daily_log_enabled,
                     memory_compaction_enabled: config.memory_compaction_enabled,
+                    digest_cfg: config.digest.clone(),
                     session_store: Arc::clone(&channel_session_store),
                     provider: Arc::clone(&provider),
                     agent: Arc::clone(&agent),

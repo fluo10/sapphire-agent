@@ -70,29 +70,11 @@ struct MemoryMeta {
     read_count: u64,
 }
 
-/// Split `---\n…\n---\n` YAML frontmatter off the front of a Markdown file.
-fn split_memory_frontmatter(raw: &str) -> Option<(&str, &str)> {
-    let rest = raw
-        .strip_prefix("---\n")
-        .or_else(|| raw.strip_prefix("---\r\n"))?;
-    let mut idx = 0;
-    for line in rest.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(|c| c == '\n' || c == '\r');
-        if trimmed == "---" {
-            let fm = &rest[..idx];
-            let body_start = idx + line.len();
-            return Some((fm, &rest[body_start..]));
-        }
-        idx += line.len();
-    }
-    None
-}
-
 /// Parse a memory file into `(meta, body)`. Files without frontmatter yield
 /// a default `MemoryMeta` and the full raw content as body (enables seamless
 /// migration of pre-existing files).
 fn parse_memory_file(raw: &str) -> (MemoryMeta, String) {
-    match split_memory_frontmatter(raw) {
+    match crate::frontmatter::split(raw) {
         Some((fm, body)) => {
             let meta: MemoryMeta = serde_yaml::from_str(fm).unwrap_or_default();
             let body = body

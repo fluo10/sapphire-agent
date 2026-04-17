@@ -8,12 +8,16 @@
 //!    triggers on the agent according to each task's cron schedule.
 
 use crate::agent::Agent;
-use crate::daily_log::{catchup_pending_logs, generate_daily_log};
+use crate::config::DigestConfig;
 use crate::heartbeat_config::{load_heartbeat_dir, next_due};
 use crate::memory_compaction::compact_memory;
+use crate::periodic_log::{
+    catchup_missing_daily_digests, catchup_pending_daily_logs, generate_daily_log,
+    generate_monthly_log, generate_weekly_log, generate_yearly_log,
+};
 use crate::provider::Provider;
 use crate::session::SessionStore;
-use chrono::{Duration, Local, NaiveTime, Timelike};
+use chrono::{Datelike, Duration, Local, NaiveTime, Timelike, Weekday};
 use sapphire_workspace::WorkspaceState;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -29,6 +33,7 @@ pub struct Heartbeat {
     pub day_boundary_hour: u8,
     pub daily_log_enabled: bool,
     pub memory_compaction_enabled: bool,
+    pub digest_cfg: DigestConfig,
     pub session_store: Arc<SessionStore>,
     pub provider: Arc<dyn Provider>,
     pub agent: Arc<Agent>,
@@ -58,7 +63,7 @@ impl Heartbeat {
         tick.tick().await; // skip immediate fire — startup catchup already ran in main
         loop {
             tick.tick().await;
-            let generated = catchup_pending_logs(
+            let logs = catchup_pending_daily_logs(
                 &self.session_store,
                 self.provider.as_ref(),
                 &self.ws_state,
@@ -66,7 +71,13 @@ impl Heartbeat {
                 self.day_boundary_hour,
             )
             .await;
-            if generated > 0 {
+            let digests = catchup_missing_daily_digests(
+                self.provider.as_ref(),
+                &self.ws_state,
+                &self.workspace_dir,
+            )
+            .await;
+            if logs + digests > 0 {
                 self.agent.invalidate_system_prompts().await;
             }
         }
@@ -89,6 +100,7 @@ impl Heartbeat {
 
             if self.daily_log_enabled {
                 info!("Heartbeat: generating daily log for {yesterday}");
+                let mut any_generated = false;
                 match generate_daily_log(
                     &self.session_store,
                     self.provider.as_ref(),
@@ -98,11 +110,80 @@ impl Heartbeat {
                 )
                 .await
                 {
-                    Ok(true) => self.agent.invalidate_system_prompts().await,
+                    Ok(true) => any_generated = true,
                     Ok(false) => {}
                     Err(e) => warn!(
                         "Heartbeat: failed to generate daily log for {yesterday}: {e:#}"
                     ),
+                }
+
+                // Weekly: today is Monday → last ISO week closed yesterday.
+                let today = yesterday + Duration::days(1);
+                if self.digest_cfg.weekly_enabled && today.weekday() == Weekday::Mon {
+                    let iso = yesterday.iso_week();
+                    info!(
+                        "Heartbeat: generating weekly log for {}-W{:02}",
+                        iso.year(),
+                        iso.week()
+                    );
+                    match generate_weekly_log(
+                        self.provider.as_ref(),
+                        &self.ws_state,
+                        &self.workspace_dir,
+                        iso.year(),
+                        iso.week(),
+                    )
+                    .await
+                    {
+                        Ok(true) => any_generated = true,
+                        Ok(false) => {}
+                        Err(e) => warn!("Heartbeat: failed to generate weekly log: {e:#}"),
+                    }
+                }
+
+                // Monthly: today is day 1 → last calendar month ended yesterday.
+                if self.digest_cfg.monthly_enabled && today.day() == 1 {
+                    let (year, month) = (yesterday.year(), yesterday.month());
+                    info!("Heartbeat: generating monthly log for {year:04}-{month:02}");
+                    match generate_monthly_log(
+                        self.provider.as_ref(),
+                        &self.ws_state,
+                        &self.workspace_dir,
+                        year,
+                        month,
+                    )
+                    .await
+                    {
+                        Ok(true) => any_generated = true,
+                        Ok(false) => {}
+                        Err(e) => warn!("Heartbeat: failed to generate monthly log: {e:#}"),
+                    }
+                }
+
+                // Yearly: today is Jan 1 → last calendar year ended yesterday.
+                // Runs after monthly so December's monthly is available as input.
+                if self.digest_cfg.yearly_enabled
+                    && today.day() == 1
+                    && today.month() == 1
+                {
+                    let year = yesterday.year();
+                    info!("Heartbeat: generating yearly log for {year:04}");
+                    match generate_yearly_log(
+                        self.provider.as_ref(),
+                        &self.ws_state,
+                        &self.workspace_dir,
+                        year,
+                    )
+                    .await
+                    {
+                        Ok(true) => any_generated = true,
+                        Ok(false) => {}
+                        Err(e) => warn!("Heartbeat: failed to generate yearly log: {e:#}"),
+                    }
+                }
+
+                if any_generated {
+                    self.agent.invalidate_system_prompts().await;
                 }
             }
 
