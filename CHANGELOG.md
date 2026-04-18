@@ -7,16 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`file_append`, `dir_list`, `dir_walk` tools** — round out the filesystem
+  toolset: append text to a file (creating it if missing), list direct children
+  of a directory, and recursively walk a tree bounded by `max_depth` /
+  `max_entries`. All three share the same path semantics as `file_read` /
+  `file_write` (absolute, `~/...`, or workspace-relative) and update the
+  retrieve index + git sync for internal paths.
+
 ### Changed
 
-- **Unified file-operation tools** — `read_file`, `write_file`, and `delete_file`
-  now route all paths through `WorkspaceState`, so a single tool handles both
-  workspace-internal and external paths. Paths may be absolute, `~/...`, or
-  relative to the workspace root; internal paths still update the search index
-  and git sync automatically, external paths fall through to plain `std::fs`.
-  The redundant `workspace_read` and `workspace_write` tools are removed — the
-  generic `read_file` / `write_file` replace them. Enabled by
-  `AppContext::allow_external_paths()` (new in sapphire-workspace 0.9).
+- **Tool naming — `<namespace>_<operation>`** — the three file tools are
+  renamed from `read_file` / `write_file` / `delete_file` to `file_read` /
+  `file_write` / `file_delete`, matching the convention used by every other
+  tool in the agent (`memory_*`, `workspace_*`, `web_search`, `mcp_reconnect`).
+  Callers that hard-coded the old names must update.
+- **Unified file-operation tools** — `file_read`, `file_write`, and
+  `file_delete` now route all paths through `WorkspaceState`, so a single tool
+  handles both workspace-internal and external paths. Paths may be absolute,
+  `~/...`, or relative to the workspace root; internal paths still update the
+  search index and git sync automatically, external paths fall through to
+  plain `std::fs`. The redundant `workspace_read` and `workspace_write` tools
+  are removed — the generic `file_read` / `file_write` replace them. Enabled
+  by `AppContext::allow_external_paths()` (new in sapphire-workspace 0.9).
 - **sapphire-workspace 0.9** — upgraded the workspace dependency from 0.8.1
   to 0.9.0. The retrieve store's search API now takes typed `FtsQuery` /
   `VectorQuery` builders and `search_similar` embeds the query internally

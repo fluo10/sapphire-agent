@@ -332,7 +332,7 @@ impl MemoryReadTool {
                     and return its body. Side effect: updates the file's \
                     frontmatter (last_read_at = now, read_count += 1) so that \
                     recency and frequency can inform future weighting. \
-                    Use workspace_read instead for a non-tracking read."
+                    Use file_read instead for a non-tracking read."
                     .into(),
                 input_schema: memory_entry_schema(false),
             },

@@ -158,9 +158,12 @@ pub async fn default_tool_set(
         Box::new(MemoryRemoveTool::new(Arc::clone(&state))),
         Box::new(WorkspaceSearchTool::new(Arc::clone(&state))),
         Box::new(WorkspaceSyncTool::new(Arc::clone(&state))),
-        Box::new(ReadFileTool::new(Arc::clone(&state))),
-        Box::new(WriteFileTool::new(Arc::clone(&state))),
-        Box::new(DeleteFileTool::new(Arc::clone(&state))),
+        Box::new(FileReadTool::new(Arc::clone(&state))),
+        Box::new(FileWriteTool::new(Arc::clone(&state))),
+        Box::new(FileAppendTool::new(Arc::clone(&state))),
+        Box::new(FileDeleteTool::new(Arc::clone(&state))),
+        Box::new(DirListTool::new(Arc::clone(&state))),
+        Box::new(DirWalkTool::new(Arc::clone(&state))),
         Box::new(TerminalTool::new(workspace_root.clone())),
     ];
 
