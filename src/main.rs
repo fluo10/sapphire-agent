@@ -26,7 +26,7 @@ use heartbeat::Heartbeat;
 use provider::anthropic::AnthropicProvider;
 use sapphire_workspace::{AppContext, Workspace as SwWorkspace, WorkspaceState};
 
-static APP_CTX: AppContext = AppContext::new("sapphire-agent");
+static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
 use session::SessionStore;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

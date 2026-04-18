@@ -39,16 +39,20 @@ fn truncate_output(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 pub struct ReadFileTool {
+    state: Arc<Mutex<WorkspaceState>>,
     spec: ToolSpec,
 }
 
 impl ReadFileTool {
-    pub fn new() -> Self {
+    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
         Self {
+            state,
             spec: ToolSpec {
                 name: "read_file".into(),
                 description:
-                    "Read a file from the filesystem with optional line-based pagination. \
+                    "Read a file with optional line-based pagination. \
+                    Accepts absolute paths, ~/... paths, or workspace-relative paths \
+                    (resolved against the workspace root). \
                     Returns lines prefixed with their 1-indexed line number in 'N|content' format. \
                     Use offset and limit for large files. \
                     Cannot read binary files or device paths (/dev/, /proc/)."
@@ -58,7 +62,7 @@ impl ReadFileTool {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Absolute path or ~/... path to the file."
+                            "description": "File path — absolute, ~/..., or relative to the workspace root."
                         },
                         "offset": {
                             "type": "integer",
@@ -98,7 +102,11 @@ impl Tool for ReadFileTool {
             anyhow::bail!("Reading device or proc paths is not allowed.");
         }
 
-        let content = std::fs::read_to_string(&path)
+        let content = self
+            .state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .read_file(&path)
             .with_context(|| format!("Failed to read '{}'", path.display()))?;
 
         let lines: Vec<&str> = content.lines().collect();
@@ -163,15 +171,18 @@ impl WriteFileTool {
             spec: ToolSpec {
                 name: "write_file".into(),
                 description: "Write content to a file, completely replacing its existing content. \
+                    Accepts absolute paths, ~/... paths, or workspace-relative paths \
+                    (resolved against the workspace root). \
                     Creates the file and any missing parent directories automatically. \
-                    When the target file is inside the workspace, the search index is updated automatically. \
+                    When the target file is inside the workspace, the search index and git sync \
+                    are updated automatically. \
                     Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.).".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Absolute path or ~/... path to the file."
+                            "description": "File path — absolute, ~/..., or relative to the workspace root."
                         },
                         "content": {
                             "type": "string",
@@ -207,32 +218,11 @@ impl Tool for WriteFileTool {
             }
         }
 
-        let ws_root = self
-            .state
+        self.state
             .lock()
             .expect("WorkspaceState mutex poisoned")
-            .workspace
-            .root
-            .clone();
-
-        if let Ok(relative) = path.strip_prefix(&ws_root) {
-            self.state
-                .lock()
-                .expect("WorkspaceState mutex poisoned")
-                .write_file(relative, content)
-                .with_context(|| format!("Failed to write '{}' via workspace", path.display()))?;
-        } else {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!(
-                        "Failed to create parent directories for '{}'",
-                        path.display()
-                    )
-                })?;
-            }
-            std::fs::write(&path, content)
-                .with_context(|| format!("Failed to write '{}'", path.display()))?;
-        }
+            .write_file(&path, content)
+            .with_context(|| format!("Failed to write '{}'", path.display()))?;
 
         Ok(format!(
             "Written: {} ({} bytes)",
@@ -258,14 +248,17 @@ impl DeleteFileTool {
             spec: ToolSpec {
                 name: "delete_file".into(),
                 description: "Delete a file from the filesystem. \
-                    When the file is inside the workspace, it is also removed from the search index automatically. \
+                    Accepts absolute paths, ~/... paths, or workspace-relative paths \
+                    (resolved against the workspace root). \
+                    When the file is inside the workspace, it is also removed from the search index and git sync \
+                    automatically. \
                     Cannot delete directories.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Absolute path or ~/... path to the file to delete."
+                            "description": "File path — absolute, ~/..., or relative to the workspace root."
                         }
                     },
                     "required": ["path"]
@@ -285,24 +278,11 @@ impl Tool for DeleteFileTool {
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let path = expand_path(path_str);
 
-        let ws_root = self
-            .state
+        self.state
             .lock()
             .expect("WorkspaceState mutex poisoned")
-            .workspace
-            .root
-            .clone();
-
-        if let Ok(relative) = path.strip_prefix(&ws_root) {
-            self.state
-                .lock()
-                .expect("WorkspaceState mutex poisoned")
-                .delete_file(relative)
-                .with_context(|| format!("Failed to delete '{}' via workspace", path.display()))?;
-        } else {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("Failed to delete '{}'", path.display()))?;
-        }
+            .delete_file(&path)
+            .with_context(|| format!("Failed to delete '{}'", path.display()))?;
 
         Ok(format!("Deleted: {}", path.display()))
     }
