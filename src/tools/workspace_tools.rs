@@ -3,7 +3,7 @@ use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sapphire_workspace::{WorkspaceState, dedup_chunk_results};
+use sapphire_workspace::{FtsQuery, VectorQuery, WorkspaceState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
@@ -332,7 +332,7 @@ impl MemoryReadTool {
                     and return its body. Side effect: updates the file's \
                     frontmatter (last_read_at = now, read_count += 1) so that \
                     recency and frequency can inform future weighting. \
-                    Use workspace_read instead for a non-tracking read."
+                    Use file_read instead for a non-tracking read."
                     .into(),
                 input_schema: memory_entry_schema(false),
             },
@@ -405,109 +405,6 @@ impl Tool for MemoryRemoveTool {
 }
 
 // ---------------------------------------------------------------------------
-// workspace_read
-// ---------------------------------------------------------------------------
-
-/// Read a file from the workspace.
-pub struct WorkspaceReadTool {
-    state: Arc<Mutex<WorkspaceState>>,
-    spec: ToolSpec,
-}
-
-impl WorkspaceReadTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
-        Self {
-            state,
-            spec: ToolSpec {
-                name: "workspace_read".into(),
-                description: "Read the contents of a file in the workspace \
-                    (path relative to workspace root, e.g. \"notes/2025-01.md\")."
-                    .into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Relative file path within the workspace."
-                        }
-                    },
-                    "required": ["path"]
-                }),
-            },
-        }
-    }
-}
-
-#[async_trait]
-impl Tool for WorkspaceReadTool {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
-    }
-
-    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
-        let rel = input["path"].as_str().context("missing 'path'")?;
-        let state = lock(&self.state);
-        let abs = state.workspace.root.join(rel);
-        std::fs::read_to_string(&abs).with_context(|| format!("Failed to read {rel}"))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// workspace_write
-// ---------------------------------------------------------------------------
-
-/// Write a file in the workspace (create or overwrite).
-pub struct WorkspaceWriteTool {
-    state: Arc<Mutex<WorkspaceState>>,
-    spec: ToolSpec,
-}
-
-impl WorkspaceWriteTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
-        Self {
-            state,
-            spec: ToolSpec {
-                name: "workspace_write".into(),
-                description: "Write content to a file in the workspace \
-                    (creates or overwrites). Path is relative to workspace root."
-                    .into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Relative file path."
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Content to write."
-                        }
-                    },
-                    "required": ["path", "content"]
-                }),
-            },
-        }
-    }
-}
-
-#[async_trait]
-impl Tool for WorkspaceWriteTool {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
-    }
-
-    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
-        let rel = input["path"].as_str().context("missing 'path'")?;
-        let content = input["content"].as_str().context("missing 'content'")?;
-        let state = lock(&self.state);
-        state
-            .write_file(Path::new(rel), content)
-            .with_context(|| format!("Failed to write {rel}"))?;
-        Ok(format!("Written: {rel}"))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // workspace_search
 // ---------------------------------------------------------------------------
 
@@ -569,34 +466,28 @@ impl Tool for WorkspaceSearchTool {
 
         if mode == "semantic" {
             if let Some(embedder) = state.embedder() {
-                let vecs = embedder
-                    .embed_texts(&[query])
-                    .context("Failed to embed query")?;
-                let query_vec: Vec<f32> = vecs
-                    .into_iter()
-                    .next()
-                    .context("Embedder returned no vectors")?;
-                let chunk_results = state
+                let vq = VectorQuery::new(query, embedder).limit(limit);
+                let results = state
                     .retrieve_db()
-                    .search_similar(&query_vec, limit * 3)
+                    .search_similar(&vq)
                     .context("Vector similarity search failed")?;
-                let results = dedup_chunk_results(chunk_results, limit);
 
                 if results.is_empty() {
                     return Ok("No results found.".to_string());
                 }
                 let lines: Vec<String> = results
                     .iter()
-                    .map(|r| format!("- {} ({}) [score: {:.4}]", r.title, r.path, r.score))
+                    .map(|r| format!("- {} [score: {:.4}]", r.path, r.score))
                     .collect();
                 return Ok(format!("[semantic]\n{}", lines.join("\n")));
             }
         }
 
         // FTS (default or fallback)
+        let fq = FtsQuery::new(query).limit(limit);
         let results = state
             .retrieve_db()
-            .search_fts(query, limit)
+            .search_fts(&fq)
             .context("FTS search failed")?;
 
         if results.is_empty() {
@@ -610,7 +501,7 @@ impl Tool for WorkspaceSearchTool {
         };
         let lines: Vec<String> = results
             .iter()
-            .map(|r| format!("- {} ({})", r.title, r.path))
+            .map(|r| format!("- {}", r.path))
             .collect();
         Ok(format!("{}{}", header, lines.join("\n")))
     }

@@ -35,20 +35,24 @@ fn truncate_output(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// read_file
+// file_read
 // ---------------------------------------------------------------------------
 
-pub struct ReadFileTool {
+pub struct FileReadTool {
+    state: Arc<Mutex<WorkspaceState>>,
     spec: ToolSpec,
 }
 
-impl ReadFileTool {
-    pub fn new() -> Self {
+impl FileReadTool {
+    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
         Self {
+            state,
             spec: ToolSpec {
-                name: "read_file".into(),
+                name: "file_read".into(),
                 description:
-                    "Read a file from the filesystem with optional line-based pagination. \
+                    "Read a file with optional line-based pagination. \
+                    Accepts absolute paths, ~/... paths, or workspace-relative paths \
+                    (resolved against the workspace root). \
                     Returns lines prefixed with their 1-indexed line number in 'N|content' format. \
                     Use offset and limit for large files. \
                     Cannot read binary files or device paths (/dev/, /proc/)."
@@ -58,7 +62,7 @@ impl ReadFileTool {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Absolute path or ~/... path to the file."
+                            "description": "File path — absolute, ~/..., or relative to the workspace root."
                         },
                         "offset": {
                             "type": "integer",
@@ -81,7 +85,7 @@ impl ReadFileTool {
 }
 
 #[async_trait]
-impl Tool for ReadFileTool {
+impl Tool for FileReadTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -98,7 +102,11 @@ impl Tool for ReadFileTool {
             anyhow::bail!("Reading device or proc paths is not allowed.");
         }
 
-        let content = std::fs::read_to_string(&path)
+        let content = self
+            .state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .read_file(&path)
             .with_context(|| format!("Failed to read '{}'", path.display()))?;
 
         let lines: Vec<&str> = content.lines().collect();
@@ -134,7 +142,7 @@ impl Tool for ReadFileTool {
 }
 
 // ---------------------------------------------------------------------------
-// write_file
+// file_write
 // ---------------------------------------------------------------------------
 
 static SENSITIVE_PREFIXES: &[&str] = &[
@@ -151,27 +159,30 @@ static SENSITIVE_PREFIXES: &[&str] = &[
     "/var/run/docker.sock",
 ];
 
-pub struct WriteFileTool {
+pub struct FileWriteTool {
     state: Arc<Mutex<WorkspaceState>>,
     spec: ToolSpec,
 }
 
-impl WriteFileTool {
+impl FileWriteTool {
     pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
         Self {
             state,
             spec: ToolSpec {
-                name: "write_file".into(),
+                name: "file_write".into(),
                 description: "Write content to a file, completely replacing its existing content. \
+                    Accepts absolute paths, ~/... paths, or workspace-relative paths \
+                    (resolved against the workspace root). \
                     Creates the file and any missing parent directories automatically. \
-                    When the target file is inside the workspace, the search index is updated automatically. \
+                    When the target file is inside the workspace, the search index and git sync \
+                    are updated automatically. \
                     Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.).".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Absolute path or ~/... path to the file."
+                            "description": "File path — absolute, ~/..., or relative to the workspace root."
                         },
                         "content": {
                             "type": "string",
@@ -186,7 +197,7 @@ impl WriteFileTool {
 }
 
 #[async_trait]
-impl Tool for WriteFileTool {
+impl Tool for FileWriteTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -207,32 +218,11 @@ impl Tool for WriteFileTool {
             }
         }
 
-        let ws_root = self
-            .state
+        self.state
             .lock()
             .expect("WorkspaceState mutex poisoned")
-            .workspace
-            .root
-            .clone();
-
-        if let Ok(relative) = path.strip_prefix(&ws_root) {
-            self.state
-                .lock()
-                .expect("WorkspaceState mutex poisoned")
-                .write_file(relative, content)
-                .with_context(|| format!("Failed to write '{}' via workspace", path.display()))?;
-        } else {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!(
-                        "Failed to create parent directories for '{}'",
-                        path.display()
-                    )
-                })?;
-            }
-            std::fs::write(&path, content)
-                .with_context(|| format!("Failed to write '{}'", path.display()))?;
-        }
+            .write_file(&path, content)
+            .with_context(|| format!("Failed to write '{}'", path.display()))?;
 
         Ok(format!(
             "Written: {} ({} bytes)",
@@ -243,29 +233,32 @@ impl Tool for WriteFileTool {
 }
 
 // ---------------------------------------------------------------------------
-// delete_file
+// file_delete
 // ---------------------------------------------------------------------------
 
-pub struct DeleteFileTool {
+pub struct FileDeleteTool {
     state: Arc<Mutex<WorkspaceState>>,
     spec: ToolSpec,
 }
 
-impl DeleteFileTool {
+impl FileDeleteTool {
     pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
         Self {
             state,
             spec: ToolSpec {
-                name: "delete_file".into(),
+                name: "file_delete".into(),
                 description: "Delete a file from the filesystem. \
-                    When the file is inside the workspace, it is also removed from the search index automatically. \
+                    Accepts absolute paths, ~/... paths, or workspace-relative paths \
+                    (resolved against the workspace root). \
+                    When the file is inside the workspace, it is also removed from the search index and git sync \
+                    automatically. \
                     Cannot delete directories.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Absolute path or ~/... path to the file to delete."
+                            "description": "File path — absolute, ~/..., or relative to the workspace root."
                         }
                     },
                     "required": ["path"]
@@ -276,7 +269,7 @@ impl DeleteFileTool {
 }
 
 #[async_trait]
-impl Tool for DeleteFileTool {
+impl Tool for FileDeleteTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -285,26 +278,301 @@ impl Tool for DeleteFileTool {
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let path = expand_path(path_str);
 
-        let ws_root = self
+        self.state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .delete_file(&path)
+            .with_context(|| format!("Failed to delete '{}'", path.display()))?;
+
+        Ok(format!("Deleted: {}", path.display()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// file_append
+// ---------------------------------------------------------------------------
+
+pub struct FileAppendTool {
+    state: Arc<Mutex<WorkspaceState>>,
+    spec: ToolSpec,
+}
+
+impl FileAppendTool {
+    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+        Self {
+            state,
+            spec: ToolSpec {
+                name: "file_append".into(),
+                description: "Append content to the end of a file, creating it if missing. \
+                    Accepts absolute paths, ~/... paths, or workspace-relative paths \
+                    (resolved against the workspace root). \
+                    Creates any missing parent directories automatically. \
+                    When the target file is inside the workspace, the search index and git sync \
+                    are updated automatically. \
+                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.).".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path — absolute, ~/..., or relative to the workspace root."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Content to append to the end of the file."
+                        }
+                    },
+                    "required": ["path", "content"]
+                }),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for FileAppendTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let path_str = input["path"].as_str().context("missing 'path'")?;
+        let content = input["content"].as_str().context("missing 'content'")?;
+
+        let path = expand_path(path_str);
+        let path_abs = path.to_string_lossy().to_string();
+
+        for prefix in SENSITIVE_PREFIXES {
+            if path_abs.starts_with(prefix) || &path_abs == prefix {
+                anyhow::bail!(
+                    "Writing to '{}' is not allowed (sensitive system path).",
+                    path_abs
+                );
+            }
+        }
+
+        self.state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .append_file(&path, content)
+            .with_context(|| format!("Failed to append to '{}'", path.display()))?;
+
+        Ok(format!(
+            "Appended: {} (+{} bytes)",
+            path.display(),
+            content.len()
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dir_list
+// ---------------------------------------------------------------------------
+
+pub struct DirListTool {
+    state: Arc<Mutex<WorkspaceState>>,
+    spec: ToolSpec,
+}
+
+impl DirListTool {
+    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+        Self {
+            state,
+            spec: ToolSpec {
+                name: "dir_list".into(),
+                description: "List the direct children of a directory (non-recursive). \
+                    Accepts absolute paths, ~/... paths, or workspace-relative paths. \
+                    Entries are sorted alphabetically. Directories are shown with a \
+                    trailing slash. For deeper exploration, use dir_walk."
+                    .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory path — absolute, ~/..., or relative to the workspace root."
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for DirListTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let path_str = input["path"].as_str().context("missing 'path'")?;
+        let path = expand_path(path_str);
+
+        let entries = self
             .state
             .lock()
             .expect("WorkspaceState mutex poisoned")
-            .workspace
-            .root
-            .clone();
+            .list_dir(&path)
+            .with_context(|| format!("Failed to list '{}'", path.display()))?;
 
-        if let Ok(relative) = path.strip_prefix(&ws_root) {
-            self.state
-                .lock()
-                .expect("WorkspaceState mutex poisoned")
-                .delete_file(relative)
-                .with_context(|| format!("Failed to delete '{}' via workspace", path.display()))?;
-        } else {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("Failed to delete '{}'", path.display()))?;
+        if entries.is_empty() {
+            return Ok(format!("(empty) {}", path.display()));
         }
 
-        Ok(format!("Deleted: {}", path.display()))
+        let lines: Vec<String> = entries
+            .iter()
+            .map(|(p, is_dir)| {
+                if *is_dir {
+                    format!("{}/", p.display())
+                } else {
+                    p.display().to_string()
+                }
+            })
+            .collect();
+        Ok(lines.join("\n"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dir_walk
+// ---------------------------------------------------------------------------
+
+pub struct DirWalkTool {
+    state: Arc<Mutex<WorkspaceState>>,
+    spec: ToolSpec,
+}
+
+impl DirWalkTool {
+    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+        Self {
+            state,
+            spec: ToolSpec {
+                name: "dir_walk".into(),
+                description: "Recursively list all files and directories under a path. \
+                    Accepts absolute paths, ~/... paths, or workspace-relative paths. \
+                    Output is a sorted flat list; directories carry a trailing slash. \
+                    Bounded by max_depth (default 5) and max_entries (default 500) to \
+                    avoid runaway walks into large trees."
+                    .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory path — absolute, ~/..., or relative to the workspace root."
+                        },
+                        "max_depth": {
+                            "type": "integer",
+                            "description": "Maximum recursion depth (default 5, max 20). 0 = only direct children.",
+                            "default": 5,
+                            "minimum": 0,
+                            "maximum": 20
+                        },
+                        "max_entries": {
+                            "type": "integer",
+                            "description": "Maximum number of entries to return before truncating (default 500, max 5000).",
+                            "default": 500,
+                            "minimum": 1,
+                            "maximum": 5000
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        }
+    }
+}
+
+fn walk_recurse(
+    state: &WorkspaceState,
+    workspace_root: &std::path::Path,
+    abs_path: &std::path::Path,
+    depth: usize,
+    max_depth: usize,
+    max_entries: usize,
+    results: &mut Vec<(PathBuf, bool)>,
+) -> Result<bool> {
+    let entries = state.list_dir(abs_path)?;
+    for (entry_path, is_dir) in entries {
+        if results.len() >= max_entries {
+            return Ok(true);
+        }
+        results.push((entry_path.clone(), is_dir));
+        if is_dir && depth < max_depth {
+            let abs_next = if entry_path.is_absolute() {
+                entry_path
+            } else {
+                workspace_root.join(&entry_path)
+            };
+            if walk_recurse(
+                state,
+                workspace_root,
+                &abs_next,
+                depth + 1,
+                max_depth,
+                max_entries,
+                results,
+            )? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[async_trait]
+impl Tool for DirWalkTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let path_str = input["path"].as_str().context("missing 'path'")?;
+        let max_depth = input["max_depth"].as_u64().unwrap_or(5).min(20) as usize;
+        let max_entries = input["max_entries"]
+            .as_u64()
+            .unwrap_or(500)
+            .clamp(1, 5000) as usize;
+
+        let path = expand_path(path_str);
+
+        let state = self.state.lock().expect("WorkspaceState mutex poisoned");
+        let workspace_root = state.workspace.root.clone();
+        let mut results: Vec<(PathBuf, bool)> = Vec::new();
+        let truncated = walk_recurse(
+            &state,
+            &workspace_root,
+            &path,
+            0,
+            max_depth,
+            max_entries,
+            &mut results,
+        )
+        .with_context(|| format!("Failed to walk '{}'", path.display()))?;
+        drop(state);
+
+        if results.is_empty() {
+            return Ok(format!("(empty) {}", path.display()));
+        }
+
+        let mut out: Vec<String> = results
+            .iter()
+            .map(|(p, is_dir)| {
+                if *is_dir {
+                    format!("{}/", p.display())
+                } else {
+                    p.display().to_string()
+                }
+            })
+            .collect();
+        if truncated {
+            out.push(format!(
+                "[truncated — more than {max_entries} entries; raise max_entries or narrow path]"
+            ));
+        }
+        Ok(out.join("\n"))
     }
 }
 
