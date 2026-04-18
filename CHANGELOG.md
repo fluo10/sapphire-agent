@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **sapphire-workspace 0.9** — upgraded the workspace dependency from 0.8.1
+  to 0.9.0. The retrieve store's search API now takes typed `FtsQuery` /
+  `VectorQuery` builders and `search_similar` embeds the query internally
+  (no pre-computed vector needed), so the `workspace_search` tool no longer
+  needs to manually call the embedder or dedup chunk results. Semantic search
+  output drops the per-result title (the new `FileSearchResult` is already
+  file-level with `id`, `path`, `score`, `chunks`); results now render as
+  `- {path} [score]`.
+
 ### Added
 
 - **Weekly / monthly / yearly log auto-generation** — heartbeat now writes

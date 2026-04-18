@@ -3,7 +3,7 @@ use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sapphire_workspace::{WorkspaceState, dedup_chunk_results};
+use sapphire_workspace::{FtsQuery, VectorQuery, WorkspaceState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
@@ -569,34 +569,28 @@ impl Tool for WorkspaceSearchTool {
 
         if mode == "semantic" {
             if let Some(embedder) = state.embedder() {
-                let vecs = embedder
-                    .embed_texts(&[query])
-                    .context("Failed to embed query")?;
-                let query_vec: Vec<f32> = vecs
-                    .into_iter()
-                    .next()
-                    .context("Embedder returned no vectors")?;
-                let chunk_results = state
+                let vq = VectorQuery::new(query, embedder).limit(limit);
+                let results = state
                     .retrieve_db()
-                    .search_similar(&query_vec, limit * 3)
+                    .search_similar(&vq)
                     .context("Vector similarity search failed")?;
-                let results = dedup_chunk_results(chunk_results, limit);
 
                 if results.is_empty() {
                     return Ok("No results found.".to_string());
                 }
                 let lines: Vec<String> = results
                     .iter()
-                    .map(|r| format!("- {} ({}) [score: {:.4}]", r.title, r.path, r.score))
+                    .map(|r| format!("- {} [score: {:.4}]", r.path, r.score))
                     .collect();
                 return Ok(format!("[semantic]\n{}", lines.join("\n")));
             }
         }
 
         // FTS (default or fallback)
+        let fq = FtsQuery::new(query).limit(limit);
         let results = state
             .retrieve_db()
-            .search_fts(query, limit)
+            .search_fts(&fq)
             .context("FTS search failed")?;
 
         if results.is_empty() {
@@ -610,7 +604,7 @@ impl Tool for WorkspaceSearchTool {
         };
         let lines: Vec<String> = results
             .iter()
-            .map(|r| format!("- {} ({})", r.title, r.path))
+            .map(|r| format!("- {}", r.path))
             .collect();
         Ok(format!("{}{}", header, lines.join("\n")))
     }
