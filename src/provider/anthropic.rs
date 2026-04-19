@@ -162,10 +162,7 @@ enum ApiPart {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ApiImageSource {
-    Base64 {
-        media_type: String,
-        data: String,
-    },
+    Base64 { media_type: String, data: String },
 }
 
 // ---------------------------------------------------------------------------

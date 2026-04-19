@@ -789,12 +789,9 @@ fn build_user_message(text: &str, attachments: &[Attachment]) -> ChatMessage {
         return ChatMessage::user(text);
     }
     use base64::{Engine, engine::general_purpose::STANDARD};
-    let images = attachments.iter().map(|a| {
-        (
-            a.media_type.clone(),
-            STANDARD.encode(&a.data),
-        )
-    });
+    let images = attachments
+        .iter()
+        .map(|a| (a.media_type.clone(), STANDARD.encode(&a.data)));
     ChatMessage::user_with_images(text, images)
 }
 

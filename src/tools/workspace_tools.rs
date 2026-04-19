@@ -499,10 +499,7 @@ impl Tool for WorkspaceSearchTool {
         } else {
             "[fts]\n"
         };
-        let lines: Vec<String> = results
-            .iter()
-            .map(|r| format!("- {}", r.path))
-            .collect();
+        let lines: Vec<String> = results.iter().map(|r| format!("- {}", r.path)).collect();
         Ok(format!("{}{}", header, lines.join("\n")))
     }
 }

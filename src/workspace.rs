@@ -281,8 +281,8 @@ fn build_digest_block(
 ) -> Option<String> {
     let mut subsections = Vec::new();
     for stem in stems {
-        let items = periodic_log::read_digest_top_n(workspace_dir, kind, stem, n)
-            .unwrap_or_default();
+        let items =
+            periodic_log::read_digest_top_n(workspace_dir, kind, stem, n).unwrap_or_default();
         if items.is_empty() {
             continue;
         }
