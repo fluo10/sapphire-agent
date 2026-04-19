@@ -577,23 +577,30 @@ impl Tool for DirWalkTool {
 }
 
 // ---------------------------------------------------------------------------
-// terminal
+// shell
 // ---------------------------------------------------------------------------
 
-pub struct TerminalTool {
+/// Default shell used when neither the `shell` parameter nor `$SHELL` is set.
+const FALLBACK_SHELL: &str = "/bin/sh";
+
+pub struct ShellTool {
     workspace_root: PathBuf,
     spec: ToolSpec,
 }
 
-impl TerminalTool {
+impl ShellTool {
     pub fn new(workspace_root: PathBuf) -> Self {
         Self {
             workspace_root,
             spec: ToolSpec {
-                name: "terminal".into(),
+                name: "shell".into(),
                 description: "Execute a shell command and return its output. \
                     Returns stdout, stderr, and exit code. \
                     The default working directory is the workspace root. \
+                    By default the command runs under the shell named by the \
+                    `$SHELL` environment variable (falling back to `/bin/sh`); \
+                    override per call with the `shell` parameter (e.g. `bash`, \
+                    `zsh`, `fish`, or an absolute path). \
                     Use the timeout parameter for long-running commands (default 60 s, max 600 s). \
                     Not suitable for interactive commands or persistent daemons."
                     .into(),
@@ -602,7 +609,11 @@ impl TerminalTool {
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "The shell command to execute (run via `sh -c`)."
+                            "description": "The shell command to execute (run via `<shell> -c`)."
+                        },
+                        "shell": {
+                            "type": "string",
+                            "description": "Shell executable to run the command with — a name resolved via PATH (e.g. `bash`, `zsh`, `fish`) or an absolute path. Defaults to `$SHELL`, or `/bin/sh` if unset."
                         },
                         "timeout": {
                             "type": "integer",
@@ -624,7 +635,7 @@ impl TerminalTool {
 }
 
 #[async_trait]
-impl Tool for TerminalTool {
+impl Tool for ShellTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -640,14 +651,23 @@ impl Tool for TerminalTool {
             .map(expand_path)
             .unwrap_or_else(|| self.workspace_root.clone());
 
-        let mut cmd = Command::new("sh");
+        let shell = input["shell"]
+            .as_str()
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("SHELL").ok())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| FALLBACK_SHELL.to_string());
+
+        let mut cmd = Command::new(&shell);
         cmd.arg("-c")
             .arg(command)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .current_dir(&workdir);
 
-        let child = cmd.spawn().context("Failed to spawn command")?;
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn shell '{shell}'"))?;
         let pid = child.id();
 
         let result =
@@ -679,6 +699,280 @@ impl Tool for TerminalTool {
                 ))
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// weather  (Open-Meteo — no API key required)
+// ---------------------------------------------------------------------------
+
+pub struct WeatherTool {
+    spec: ToolSpec,
+}
+
+impl WeatherTool {
+    pub fn new() -> Self {
+        Self {
+            spec: ToolSpec {
+                name: "weather".into(),
+                description: "Fetch a weather forecast via the Open-Meteo API \
+                    (no API key required). Resolve a place by passing `location` \
+                    (e.g. \"Tokyo\", \"渋谷\", \"Paris, FR\") — it is geocoded \
+                    into coordinates — or specify `latitude` and `longitude` \
+                    directly to skip geocoding. Returns the current conditions \
+                    and a daily forecast (min/max temperature, precipitation, \
+                    weather code) for the next `days` days (default 3, max 7). \
+                    Temperatures are in Celsius; timezone auto-detected from \
+                    the resolved coordinates."
+                    .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "Place name to geocode (e.g. \"Tokyo\", \"New York\"). Ignored if latitude and longitude are provided."
+                        },
+                        "latitude": {
+                            "type": "number",
+                            "description": "Latitude in decimal degrees (-90..90). If set, longitude is required and location is ignored."
+                        },
+                        "longitude": {
+                            "type": "number",
+                            "description": "Longitude in decimal degrees (-180..180). If set, latitude is required and location is ignored."
+                        },
+                        "days": {
+                            "type": "integer",
+                            "description": "Number of forecast days to return, starting today (default 3, max 7).",
+                            "default": 3,
+                            "minimum": 1,
+                            "maximum": 7
+                        }
+                    }
+                }),
+            },
+        }
+    }
+}
+
+impl Default for WeatherTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Translate a WMO weather interpretation code into a short description.
+/// Reference: https://open-meteo.com/en/docs (WMO Weather interpretation codes).
+fn wmo_code_description(code: i64) -> &'static str {
+    match code {
+        0 => "clear sky",
+        1 => "mainly clear",
+        2 => "partly cloudy",
+        3 => "overcast",
+        45 => "fog",
+        48 => "depositing rime fog",
+        51 => "light drizzle",
+        53 => "moderate drizzle",
+        55 => "dense drizzle",
+        56 => "light freezing drizzle",
+        57 => "dense freezing drizzle",
+        61 => "slight rain",
+        63 => "moderate rain",
+        65 => "heavy rain",
+        66 => "light freezing rain",
+        67 => "heavy freezing rain",
+        71 => "slight snow fall",
+        73 => "moderate snow fall",
+        75 => "heavy snow fall",
+        77 => "snow grains",
+        80 => "slight rain showers",
+        81 => "moderate rain showers",
+        82 => "violent rain showers",
+        85 => "slight snow showers",
+        86 => "heavy snow showers",
+        95 => "thunderstorm",
+        96 => "thunderstorm with slight hail",
+        99 => "thunderstorm with heavy hail",
+        _ => "unknown conditions",
+    }
+}
+
+#[async_trait]
+impl Tool for WeatherTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let client = reqwest::Client::new();
+        let days = input["days"].as_u64().unwrap_or(3).clamp(1, 7);
+
+        // Resolve coordinates. Explicit lat/lon wins; otherwise geocode `location`.
+        let (latitude, longitude, resolved_name) = match (
+            input["latitude"].as_f64(),
+            input["longitude"].as_f64(),
+        ) {
+            (Some(lat), Some(lon)) => {
+                if !(-90.0..=90.0).contains(&lat) {
+                    anyhow::bail!("latitude {lat} out of range (-90..90)");
+                }
+                if !(-180.0..=180.0).contains(&lon) {
+                    anyhow::bail!("longitude {lon} out of range (-180..180)");
+                }
+                (lat, lon, format!("{lat:.4}, {lon:.4}"))
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!("latitude and longitude must be provided together");
+            }
+            (None, None) => {
+                let location = input["location"]
+                    .as_str()
+                    .context("provide either 'location' or both 'latitude' and 'longitude'")?;
+
+                let geo_resp = client
+                    .get("https://geocoding-api.open-meteo.com/v1/search")
+                    .query(&[
+                        ("name", location),
+                        ("count", "1"),
+                        ("language", "en"),
+                        ("format", "json"),
+                    ])
+                    .send()
+                    .await
+                    .context("Open-Meteo geocoding request failed")?;
+
+                if !geo_resp.status().is_success() {
+                    let status = geo_resp.status();
+                    let body = geo_resp.text().await.unwrap_or_default();
+                    anyhow::bail!("Open-Meteo geocoding error {status}: {body}");
+                }
+
+                let geo: serde_json::Value = geo_resp
+                    .json()
+                    .await
+                    .context("Failed to parse Open-Meteo geocoding response")?;
+
+                let result = geo["results"]
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .with_context(|| format!("No matches for location '{location}'"))?;
+
+                let lat = result["latitude"]
+                    .as_f64()
+                    .context("geocoding result missing 'latitude'")?;
+                let lon = result["longitude"]
+                    .as_f64()
+                    .context("geocoding result missing 'longitude'")?;
+                let name = result["name"].as_str().unwrap_or(location);
+                let admin = result["admin1"].as_str().unwrap_or("");
+                let country = result["country"].as_str().unwrap_or("");
+                let pretty = [name, admin, country]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (lat, lon, pretty)
+            }
+        };
+
+        let lat_s = latitude.to_string();
+        let lon_s = longitude.to_string();
+        let days_s = days.to_string();
+
+        let forecast_resp = client
+            .get("https://api.open-meteo.com/v1/forecast")
+            .query(&[
+                ("latitude", lat_s.as_str()),
+                ("longitude", lon_s.as_str()),
+                ("current", "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m"),
+                (
+                    "daily",
+                    "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max",
+                ),
+                ("timezone", "auto"),
+                ("forecast_days", days_s.as_str()),
+            ])
+            .send()
+            .await
+            .context("Open-Meteo forecast request failed")?;
+
+        if !forecast_resp.status().is_success() {
+            let status = forecast_resp.status();
+            let body = forecast_resp.text().await.unwrap_or_default();
+            anyhow::bail!("Open-Meteo forecast error {status}: {body}");
+        }
+
+        let data: serde_json::Value = forecast_resp
+            .json()
+            .await
+            .context("Failed to parse Open-Meteo forecast response")?;
+
+        let timezone = data["timezone"].as_str().unwrap_or("UTC");
+
+        let mut out = format!("Weather for {resolved_name} ({timezone})\n");
+
+        if let Some(current) = data.get("current") {
+            let temp = current["temperature_2m"].as_f64();
+            let feels = current["apparent_temperature"].as_f64();
+            let humidity = current["relative_humidity_2m"].as_f64();
+            let precip = current["precipitation"].as_f64();
+            let wind = current["wind_speed_10m"].as_f64();
+            let code = current["weather_code"].as_i64().unwrap_or(-1);
+            let time = current["time"].as_str().unwrap_or("");
+            out.push_str(&format!("\nCurrent ({time}): {}\n", wmo_code_description(code)));
+            if let Some(t) = temp {
+                out.push_str(&format!("  temp: {t:.1}°C"));
+                if let Some(f) = feels {
+                    out.push_str(&format!(" (feels {f:.1}°C)"));
+                }
+                out.push('\n');
+            }
+            if let Some(h) = humidity {
+                out.push_str(&format!("  humidity: {h:.0}%\n"));
+            }
+            if let Some(p) = precip {
+                out.push_str(&format!("  precipitation: {p:.1} mm\n"));
+            }
+            if let Some(w) = wind {
+                out.push_str(&format!("  wind: {w:.1} km/h\n"));
+            }
+        }
+
+        if let Some(daily) = data.get("daily") {
+            let dates = daily["time"].as_array();
+            let codes = daily["weather_code"].as_array();
+            let tmax = daily["temperature_2m_max"].as_array();
+            let tmin = daily["temperature_2m_min"].as_array();
+            let psum = daily["precipitation_sum"].as_array();
+            let pprob = daily["precipitation_probability_max"].as_array();
+            if let Some(dates) = dates {
+                out.push_str("\nForecast:\n");
+                for (i, date) in dates.iter().enumerate() {
+                    let date = date.as_str().unwrap_or("");
+                    let code = codes
+                        .and_then(|a| a.get(i))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(-1);
+                    let hi = tmax.and_then(|a| a.get(i)).and_then(|v| v.as_f64());
+                    let lo = tmin.and_then(|a| a.get(i)).and_then(|v| v.as_f64());
+                    let pp = psum.and_then(|a| a.get(i)).and_then(|v| v.as_f64());
+                    let pr = pprob.and_then(|a| a.get(i)).and_then(|v| v.as_f64());
+                    out.push_str(&format!("  {date}: {}", wmo_code_description(code)));
+                    if let (Some(hi), Some(lo)) = (hi, lo) {
+                        out.push_str(&format!(", {lo:.1}°C / {hi:.1}°C"));
+                    }
+                    if let Some(pp) = pp {
+                        out.push_str(&format!(", precip {pp:.1} mm"));
+                    }
+                    if let Some(pr) = pr {
+                        out.push_str(&format!(" ({pr:.0}%)"));
+                    }
+                    out.push('\n');
+                }
+            }
+        }
+
+        Ok(out)
     }
 }
 

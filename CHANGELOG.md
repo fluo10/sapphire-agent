@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`weather` tool** — fetches a short-term weather forecast via the Open-Meteo
+  API (no API key required). Accepts either a `location` name (geocoded
+  internally) or explicit `latitude` / `longitude`, plus an optional `days`
+  (1–7, default 3). Returns current conditions and a daily min/max /
+  precipitation / weather-code summary.
 - **`file_append`, `dir_list`, `dir_walk` tools** — round out the filesystem
   toolset: append text to a file (creating it if missing), list direct children
   of a directory, and recursively walk a tree bounded by `max_depth` /
@@ -18,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`terminal` → `shell`** — the shell-execution tool is renamed for clarity
+  and now honours `$SHELL` by default (falling back to `/bin/sh`) instead of
+  hard-coding `sh`. An optional `shell` parameter lets the agent pick a
+  specific interpreter (e.g. `bash`, `zsh`, `fish`, or an absolute path) per
+  call. Callers that hard-coded the old `terminal` name must update.
 - **Tool naming — `<namespace>_<operation>`** — the three file tools are
   renamed from `read_file` / `write_file` / `delete_file` to `file_read` /
   `file_write` / `file_delete`, matching the convention used by every other
