@@ -125,10 +125,7 @@ fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
         Some("image/png")
     } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         Some("image/gif")
-    } else if bytes.len() >= 12
-        && bytes.starts_with(b"RIFF")
-        && &bytes[8..12] == b"WEBP"
-    {
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         Some("image/webp")
     } else {
         None
@@ -148,10 +145,7 @@ enum ImageDownload {
 
 /// Download the bytes for a Matrix `m.image` event via the SDK's authenticated
 /// media endpoint.
-async fn download_matrix_image(
-    client: &Client,
-    image: &ImageMessageEventContent,
-) -> ImageDownload {
+async fn download_matrix_image(client: &Client, image: &ImageMessageEventContent) -> ImageDownload {
     if let Some(size) = image.info.as_ref().and_then(|info| info.size) {
         let size: u64 = size.into();
         if size as usize > MAX_ATTACHMENT_BYTES {
