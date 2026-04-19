@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-19
+
 ### Added
 
 - **`weather` tool** — fetches a short-term weather forecast via the Open-Meteo
@@ -20,6 +22,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_entries`. All three share the same path semantics as `file_read` /
   `file_write` (absolute, `~/...`, or workspace-relative) and update the
   retrieve index + git sync for internal paths.
+- **Weekly / monthly / yearly log auto-generation** — heartbeat now writes
+  summarised logs under `memory/{weekly,monthly,yearly}/` at the appropriate
+  day boundaries (Monday / 1st / Jan 1). Each log carries a YAML frontmatter
+  `digest:` array of importance-ordered bullets produced by the same LLM call
+  that writes the body, so the agent no longer has to call the `memory` tool
+  to recall long-horizon context.
+- **Periodic digest injection** — the system prompt gains four new blocks
+  after "Yesterday's Log": "This Week's Digests", "This Month's Digests",
+  "This Year's Digests", and "Past Years' Digests". Each block pulls the
+  top-N items of the relevant logs' digests (N per kind is configurable via
+  the new `[digest]` config section: `daily_items`, `weekly_items`,
+  `monthly_items`, `yearly_items`; defaults 3/3/5/5).
+- **Daily digest back-fill** — pre-existing daily logs that lack a `digest:`
+  frontmatter are upgraded in-place at startup and in the hourly catchup
+  loop. Unrelated frontmatter keys the memory tool writes (`last_read_at`,
+  `read_count`) are preserved.
 
 ### Changed
 
@@ -49,28 +67,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output drops the per-result title (the new `FileSearchResult` is already
   file-level with `id`, `path`, `score`, `chunks`); results now render as
   `- {path} [score]`.
-
-### Added
-
-- **Weekly / monthly / yearly log auto-generation** — heartbeat now writes
-  summarised logs under `memory/{weekly,monthly,yearly}/` at the appropriate
-  day boundaries (Monday / 1st / Jan 1). Each log carries a YAML frontmatter
-  `digest:` array of importance-ordered bullets produced by the same LLM call
-  that writes the body, so the agent no longer has to call the `memory` tool
-  to recall long-horizon context.
-- **Periodic digest injection** — the system prompt gains four new blocks
-  after "Yesterday's Log": "This Week's Digests", "This Month's Digests",
-  "This Year's Digests", and "Past Years' Digests". Each block pulls the
-  top-N items of the relevant logs' digests (N per kind is configurable via
-  the new `[digest]` config section: `daily_items`, `weekly_items`,
-  `monthly_items`, `yearly_items`; defaults 3/3/5/5).
-- **Daily digest back-fill** — pre-existing daily logs that lack a `digest:`
-  frontmatter are upgraded in-place at startup and in the hourly catchup
-  loop. Unrelated frontmatter keys the memory tool writes (`last_read_at`,
-  `read_count`) are preserved.
-
-### Changed
-
 - **Daily log format** — newly generated dailies now carry YAML frontmatter
   with a `digest:` array. The existing body format (`# Daily Log: YYYY-MM-DD`
   + summary) is unchanged. Files can be hand-edited freely.
@@ -229,6 +225,7 @@ an HTTP/MCP server mode.
   and workspace-aware writes.
 - **Logging** — `tracing` with env-filter and ANSI output.
 
+[0.4.0]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.4.0
 [0.3.3]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.3.3
 [0.3.2]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.3.2
 [0.3.1]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.3.1
