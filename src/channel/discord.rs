@@ -228,7 +228,12 @@ async fn download_image_attachments(msg: &Message) -> Vec<Attachment> {
         let Some(ct) = att.content_type.as_deref() else {
             continue;
         };
-        if !ct.starts_with("image/") {
+        const SUPPORTED: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
+        if !SUPPORTED.contains(&ct) {
+            warn!(
+                "Discord image '{}' has unsupported MIME type '{}'; skipping",
+                att.filename, ct
+            );
             continue;
         }
         if (att.size as usize) > MAX_ATTACHMENT_BYTES {
