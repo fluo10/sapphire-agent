@@ -112,9 +112,9 @@ impl Heartbeat {
                 {
                     Ok(true) => any_generated = true,
                     Ok(false) => {}
-                    Err(e) => warn!(
-                        "Heartbeat: failed to generate daily log for {yesterday}: {e:#}"
-                    ),
+                    Err(e) => {
+                        warn!("Heartbeat: failed to generate daily log for {yesterday}: {e:#}")
+                    }
                 }
 
                 // Weekly: today is Monday → last ISO week closed yesterday.
@@ -162,10 +162,7 @@ impl Heartbeat {
 
                 // Yearly: today is Jan 1 → last calendar year ended yesterday.
                 // Runs after monthly so December's monthly is available as input.
-                if self.digest_cfg.yearly_enabled
-                    && today.day() == 1
-                    && today.month() == 1
-                {
+                if self.digest_cfg.yearly_enabled && today.day() == 1 && today.month() == 1 {
                     let year = yesterday.year();
                     info!("Heartbeat: generating yearly log for {year:04}");
                     match generate_yearly_log(

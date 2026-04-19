@@ -115,9 +115,7 @@ pub fn days_of_iso_week(iso_year: i32, iso_week: u32) -> Vec<NaiveDate> {
 /// (`{year}-01` .. `{year}-(today.month-1)`). Empty in January.
 pub fn month_stems_in_year_before(today: NaiveDate) -> Vec<String> {
     let year = today.year();
-    (1..today.month())
-        .map(|m| monthly_stem(year, m))
-        .collect()
+    (1..today.month()).map(|m| monthly_stem(year, m)).collect()
 }
 
 /// Stems of every file in `memory/yearly/*.md`, sorted ascending.
@@ -133,7 +131,9 @@ pub fn existing_yearly_stems(workspace_dir: &Path) -> Vec<String> {
             if path.extension().and_then(|s| s.to_str()) != Some("md") {
                 return None;
             }
-            path.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
         })
         .collect();
     out.sort();
@@ -220,7 +220,9 @@ pub fn pending_daily_dates(
 ) -> Vec<NaiveDate> {
     let today = crate::session::local_date_for_timestamp(Local::now(), boundary_hour);
     let mut dates = session_store.all_session_dates(boundary_hour);
-    dates.retain(|&date| date < today && !log_abs_path(workspace_dir, LogKind::Daily, &daily_stem(date)).exists());
+    dates.retain(|&date| {
+        date < today && !log_abs_path(workspace_dir, LogKind::Daily, &daily_stem(date)).exists()
+    });
     dates
 }
 
@@ -513,7 +515,9 @@ fn strip_code_fence(raw: &str) -> String {
     let open_tags: &[&str] = &["```markdown\n", "```md\n", "```\n"];
     for tag in open_tags {
         if let Some(rest) = trimmed.strip_prefix(tag)
-            && let Some(inner) = rest.strip_suffix("```").or_else(|| rest.strip_suffix("```\n"))
+            && let Some(inner) = rest
+                .strip_suffix("```")
+                .or_else(|| rest.strip_suffix("```\n"))
         {
             return inner.trim_end().to_string();
         }
@@ -881,12 +885,8 @@ mod tests {
     #[test]
     fn needs_digest_catchup_cases() {
         assert!(needs_digest_catchup("# body only\n"));
-        assert!(needs_digest_catchup(
-            "---\nother: 1\n---\n# body\n"
-        ));
-        assert!(needs_digest_catchup(
-            "---\ndigest: []\n---\n# body\n"
-        ));
+        assert!(needs_digest_catchup("---\nother: 1\n---\n# body\n"));
+        assert!(needs_digest_catchup("---\ndigest: []\n---\n# body\n"));
         assert!(!needs_digest_catchup(
             "---\ndigest:\n  - one\n---\n# body\n"
         ));

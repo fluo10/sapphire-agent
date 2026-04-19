@@ -250,7 +250,10 @@ async fn download_image_attachments(msg: &Message) -> Vec<Attachment> {
                 att.filename,
                 bytes.len()
             ),
-            Err(e) => warn!("Failed to download Discord attachment '{}': {e}", att.filename),
+            Err(e) => warn!(
+                "Failed to download Discord attachment '{}': {e}",
+                att.filename
+            ),
         }
     }
     out

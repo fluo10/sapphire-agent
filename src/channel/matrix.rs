@@ -220,9 +220,7 @@ impl Channel for MatrixChannel {
                     }
 
                     let (content, attachments) = match &event.content.msgtype {
-                        MessageType::Text(text_content) => {
-                            (text_content.body.clone(), Vec::new())
-                        }
+                        MessageType::Text(text_content) => (text_content.body.clone(), Vec::new()),
                         MessageType::Image(image_content) => {
                             let attachment =
                                 download_matrix_image(&room.client(), image_content).await;

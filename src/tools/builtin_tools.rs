@@ -49,14 +49,13 @@ impl FileReadTool {
             state,
             spec: ToolSpec {
                 name: "file_read".into(),
-                description:
-                    "Read a file with optional line-based pagination. \
+                description: "Read a file with optional line-based pagination. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
                     (resolved against the workspace root). \
                     Returns lines prefixed with their 1-indexed line number in 'N|content' format. \
                     Use offset and limit for large files. \
                     Cannot read binary files or device paths (/dev/, /proc/)."
-                        .into(),
+                    .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -176,7 +175,8 @@ impl FileWriteTool {
                     Creates the file and any missing parent directories automatically. \
                     When the target file is inside the workspace, the search index and git sync \
                     are updated automatically. \
-                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.).".into(),
+                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.)."
+                    .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -309,7 +309,8 @@ impl FileAppendTool {
                     Creates any missing parent directories automatically. \
                     When the target file is inside the workspace, the search index and git sync \
                     are updated automatically. \
-                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.).".into(),
+                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.)."
+                    .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -531,10 +532,7 @@ impl Tool for DirWalkTool {
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let max_depth = input["max_depth"].as_u64().unwrap_or(5).min(20) as usize;
-        let max_entries = input["max_entries"]
-            .as_u64()
-            .unwrap_or(500)
-            .clamp(1, 5000) as usize;
+        let max_entries = input["max_entries"].as_u64().unwrap_or(500).clamp(1, 5000) as usize;
 
         let path = expand_path(path_str);
 
@@ -807,73 +805,71 @@ impl Tool for WeatherTool {
         let days = input["days"].as_u64().unwrap_or(3).clamp(1, 7);
 
         // Resolve coordinates. Explicit lat/lon wins; otherwise geocode `location`.
-        let (latitude, longitude, resolved_name) = match (
-            input["latitude"].as_f64(),
-            input["longitude"].as_f64(),
-        ) {
-            (Some(lat), Some(lon)) => {
-                if !(-90.0..=90.0).contains(&lat) {
-                    anyhow::bail!("latitude {lat} out of range (-90..90)");
+        let (latitude, longitude, resolved_name) =
+            match (input["latitude"].as_f64(), input["longitude"].as_f64()) {
+                (Some(lat), Some(lon)) => {
+                    if !(-90.0..=90.0).contains(&lat) {
+                        anyhow::bail!("latitude {lat} out of range (-90..90)");
+                    }
+                    if !(-180.0..=180.0).contains(&lon) {
+                        anyhow::bail!("longitude {lon} out of range (-180..180)");
+                    }
+                    (lat, lon, format!("{lat:.4}, {lon:.4}"))
                 }
-                if !(-180.0..=180.0).contains(&lon) {
-                    anyhow::bail!("longitude {lon} out of range (-180..180)");
+                (Some(_), None) | (None, Some(_)) => {
+                    anyhow::bail!("latitude and longitude must be provided together");
                 }
-                (lat, lon, format!("{lat:.4}, {lon:.4}"))
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                anyhow::bail!("latitude and longitude must be provided together");
-            }
-            (None, None) => {
-                let location = input["location"]
-                    .as_str()
-                    .context("provide either 'location' or both 'latitude' and 'longitude'")?;
+                (None, None) => {
+                    let location = input["location"]
+                        .as_str()
+                        .context("provide either 'location' or both 'latitude' and 'longitude'")?;
 
-                let geo_resp = client
-                    .get("https://geocoding-api.open-meteo.com/v1/search")
-                    .query(&[
-                        ("name", location),
-                        ("count", "1"),
-                        ("language", "en"),
-                        ("format", "json"),
-                    ])
-                    .send()
-                    .await
-                    .context("Open-Meteo geocoding request failed")?;
+                    let geo_resp = client
+                        .get("https://geocoding-api.open-meteo.com/v1/search")
+                        .query(&[
+                            ("name", location),
+                            ("count", "1"),
+                            ("language", "en"),
+                            ("format", "json"),
+                        ])
+                        .send()
+                        .await
+                        .context("Open-Meteo geocoding request failed")?;
 
-                if !geo_resp.status().is_success() {
-                    let status = geo_resp.status();
-                    let body = geo_resp.text().await.unwrap_or_default();
-                    anyhow::bail!("Open-Meteo geocoding error {status}: {body}");
+                    if !geo_resp.status().is_success() {
+                        let status = geo_resp.status();
+                        let body = geo_resp.text().await.unwrap_or_default();
+                        anyhow::bail!("Open-Meteo geocoding error {status}: {body}");
+                    }
+
+                    let geo: serde_json::Value = geo_resp
+                        .json()
+                        .await
+                        .context("Failed to parse Open-Meteo geocoding response")?;
+
+                    let result = geo["results"]
+                        .as_array()
+                        .and_then(|arr| arr.first())
+                        .with_context(|| format!("No matches for location '{location}'"))?;
+
+                    let lat = result["latitude"]
+                        .as_f64()
+                        .context("geocoding result missing 'latitude'")?;
+                    let lon = result["longitude"]
+                        .as_f64()
+                        .context("geocoding result missing 'longitude'")?;
+                    let name = result["name"].as_str().unwrap_or(location);
+                    let admin = result["admin1"].as_str().unwrap_or("");
+                    let country = result["country"].as_str().unwrap_or("");
+                    let pretty = [name, admin, country]
+                        .iter()
+                        .filter(|s| !s.is_empty())
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (lat, lon, pretty)
                 }
-
-                let geo: serde_json::Value = geo_resp
-                    .json()
-                    .await
-                    .context("Failed to parse Open-Meteo geocoding response")?;
-
-                let result = geo["results"]
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .with_context(|| format!("No matches for location '{location}'"))?;
-
-                let lat = result["latitude"]
-                    .as_f64()
-                    .context("geocoding result missing 'latitude'")?;
-                let lon = result["longitude"]
-                    .as_f64()
-                    .context("geocoding result missing 'longitude'")?;
-                let name = result["name"].as_str().unwrap_or(location);
-                let admin = result["admin1"].as_str().unwrap_or("");
-                let country = result["country"].as_str().unwrap_or("");
-                let pretty = [name, admin, country]
-                    .iter()
-                    .filter(|s| !s.is_empty())
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                (lat, lon, pretty)
-            }
-        };
+            };
 
         let lat_s = latitude.to_string();
         let lon_s = longitude.to_string();
@@ -919,7 +915,10 @@ impl Tool for WeatherTool {
             let wind = current["wind_speed_10m"].as_f64();
             let code = current["weather_code"].as_i64().unwrap_or(-1);
             let time = current["time"].as_str().unwrap_or("");
-            out.push_str(&format!("\nCurrent ({time}): {}\n", wmo_code_description(code)));
+            out.push_str(&format!(
+                "\nCurrent ({time}): {}\n",
+                wmo_code_description(code)
+            ));
             if let Some(t) = temp {
                 out.push_str(&format!("  temp: {t:.1}°C"));
                 if let Some(f) = feels {
