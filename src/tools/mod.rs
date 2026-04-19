@@ -164,7 +164,8 @@ pub async fn default_tool_set(
         Box::new(FileDeleteTool::new(Arc::clone(&state))),
         Box::new(DirListTool::new(Arc::clone(&state))),
         Box::new(DirWalkTool::new(Arc::clone(&state))),
-        Box::new(TerminalTool::new(workspace_root.clone())),
+        Box::new(ShellTool::new(workspace_root.clone())),
+        Box::new(WeatherTool::new()),
     ];
 
     if let Some(key) = tavily_api_key {
