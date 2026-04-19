@@ -135,14 +135,23 @@ fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Result of attempting to download a Matrix image attachment.
+enum ImageDownload {
+    /// Successfully downloaded and format is supported.
+    Ok(Attachment),
+    /// Format could not be identified as one the Anthropic API supports.
+    /// The user should be notified so they can resend in a supported format.
+    UnsupportedFormat,
+    /// Silently skipped (too large, download failure, etc.).
+    Skipped,
+}
+
 /// Download the bytes for a Matrix `m.image` event via the SDK's authenticated
-/// media endpoint. Returns `None` (with a warning log) if the file is over the
-/// 5 MB budget, the format is unsupported, or the download fails — the caller
-/// should drop the event in that case.
+/// media endpoint.
 async fn download_matrix_image(
     client: &Client,
     image: &ImageMessageEventContent,
-) -> Option<Attachment> {
+) -> ImageDownload {
     if let Some(size) = image.info.as_ref().and_then(|info| info.size) {
         let size: u64 = size.into();
         if size as usize > MAX_ATTACHMENT_BYTES {
@@ -150,7 +159,7 @@ async fn download_matrix_image(
                 "Matrix image '{}' is {} bytes (>5MB); skipping",
                 image.body, size
             );
-            return None;
+            return ImageDownload::Skipped;
         }
     }
 
@@ -188,14 +197,14 @@ async fn download_matrix_image(
                     }
                     None => {
                         warn!(
-                            "Matrix image '{}' has unrecognised format (declared: {:?}); skipping",
+                            "Matrix image '{}' has unrecognised format (declared: {:?})",
                             image.body, declared
                         );
-                        return None;
+                        return ImageDownload::UnsupportedFormat;
                     }
                 }
             };
-            Some(Attachment {
+            ImageDownload::Ok(Attachment {
                 media_type,
                 data: bytes,
             })
@@ -206,11 +215,11 @@ async fn download_matrix_image(
                 image.body,
                 bytes.len()
             );
-            None
+            ImageDownload::Skipped
         }
         Err(e) => {
             warn!("Failed to download Matrix image '{}': {e}", image.body);
-            None
+            ImageDownload::Skipped
         }
     }
 }
@@ -265,24 +274,8 @@ impl Channel for MatrixChannel {
                         return;
                     }
 
-                    let (content, attachments) = match &event.content.msgtype {
-                        MessageType::Text(text_content) => (text_content.body.clone(), Vec::new()),
-                        MessageType::Image(image_content) => {
-                            let attachment =
-                                download_matrix_image(&room.client(), image_content).await;
-                            // Use the body as a caption fallback (filename or user-supplied text).
-                            let caption = image_content
-                                .caption()
-                                .map(str::to_string)
-                                .unwrap_or_default();
-                            match attachment {
-                                Some(att) => (caption, vec![att]),
-                                None => return,
-                            }
-                        }
-                        _ => return,
-                    };
-
+                    // Resolve thread context early — needed both for routing and
+                    // for attaching a thread relation to any error replies.
                     let thread_id = event.content.relates_to.as_ref().and_then(|rel| {
                         if let Relation::Thread(thread) = rel {
                             Some(thread.event_id.to_string())
@@ -290,6 +283,45 @@ impl Channel for MatrixChannel {
                             None
                         }
                     });
+
+                    let (content, attachments) = match &event.content.msgtype {
+                        MessageType::Text(text_content) => (text_content.body.clone(), Vec::new()),
+                        MessageType::Image(image_content) => {
+                            let result =
+                                download_matrix_image(&room.client(), image_content).await;
+                            // Use the body as a caption fallback (filename or user-supplied text).
+                            let caption = image_content
+                                .caption()
+                                .map(str::to_string)
+                                .unwrap_or_default();
+                            match result {
+                                ImageDownload::Ok(att) => (caption, vec![att]),
+                                ImageDownload::UnsupportedFormat => {
+                                    // Forward a synthetic prompt to the agent so it generates
+                                    // a natural-language reply asking the user to resend in a
+                                    // supported format (JPEG / PNG / GIF / WebP).
+                                    let msg = IncomingMessage {
+                                        id: event.event_id.to_string(),
+                                        sender: event.sender.to_string(),
+                                        content: "[system] An image was received in an unsupported format. \
+                                                  Please inform the user and ask them to resend it \
+                                                  as JPEG, PNG, GIF, or WebP."
+                                            .to_string(),
+                                        room_id: room_id_str,
+                                        timestamp: 0,
+                                        thread_id,
+                                        attachments: Vec::new(),
+                                    };
+                                    if let Err(e) = tx.send(msg).await {
+                                        warn!("Failed to forward unsupported-format event: {e}");
+                                    }
+                                    return;
+                                }
+                                ImageDownload::Skipped => return,
+                            }
+                        }
+                        _ => return,
+                    };
 
                     let msg = IncomingMessage {
                         id: event.event_id.to_string(),
