@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-04-20
+
+### Added
+
+- **Unsupported image format notification** — when a Matrix message contains an
+  image whose MIME type is not on Anthropic's allowlist, the agent now sends an
+  explicit reply informing the user that the format is not supported, instead of
+  silently dropping the attachment.
+
+### Fixed
+
+- **Image MIME type validation** — image attachments in Matrix messages are now
+  validated against Anthropic's supported media-type allowlist
+  (`image/jpeg`, `image/png`, `image/gif`, `image/webp`) before being forwarded
+  to the API, preventing request errors caused by unsupported formats.
+
 ## [0.4.0] - 2026-04-19
 
 ### Added
@@ -225,6 +241,7 @@ an HTTP/MCP server mode.
   and workspace-aware writes.
 - **Logging** — `tracing` with env-filter and ANSI output.
 
+[0.4.1]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.4.1
 [0.4.0]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.4.0
 [0.3.3]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.3.3
 [0.3.2]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.3.2
