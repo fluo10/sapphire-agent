@@ -6966,7 +6966,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6999,7 +6999,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent-api"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -7010,7 +7010,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-call"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
