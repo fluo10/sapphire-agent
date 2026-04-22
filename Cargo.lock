@@ -3231,6 +3231,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec9d92d097f4749b64e8cc33d924d9f40a2d4eb91402b458014b781f5733d60f"
 
 [[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-link",
+]
+
+[[package]]
 name = "html5ever"
 version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6967,6 +6978,7 @@ dependencies = [
  "directories",
  "futures-util",
  "grain-id",
+ "hostname",
  "matrix-sdk",
  "reqwest",
  "sapphire-agent-api",
@@ -7009,9 +7021,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-retrieve"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ad4bad23eedba96b695a389bd325b030a9452330c9ab54cf50db5adbeb8b636"
+checksum = "6e666070eb7fda63c1e72d044854adbc8efeada2ab070581008a6916fc62749d"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -7027,13 +7039,15 @@ dependencies = [
 
 [[package]]
 name = "sapphire-sync"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14262216508f61acf2a9c387065be8ad633068cea469d8ac390bafc77ccc7565"
+checksum = "30f97e19d9cde77fb01389798481b3d4d1210cf8b94b87e996819f9ce91512c8"
 dependencies = [
+ "chrono",
  "dirs 5.0.1",
  "git2",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tracing",
  "uuid",
@@ -7041,11 +7055,11 @@ dependencies = [
 
 [[package]]
 name = "sapphire-workspace"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d65ac73122bbaa09fba44072d37a6e510e2d63ecd1c266903aecf5f70e626a2"
+checksum = "5cbce87834133a783f55622d16558bfecaa721c6c584cc109d257273d47517d7"
 dependencies = [
- "dirs 5.0.1",
+ "chrono",
  "indexmap 2.14.0",
  "md-5",
  "sapphire-retrieve",
@@ -7054,6 +7068,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
+ "tracing",
  "uuid",
  "walkdir",
 ]

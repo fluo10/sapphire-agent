@@ -24,9 +24,42 @@ use config::Config;
 use heartbeat::Heartbeat;
 use periodic_log::{catchup_missing_daily_digests, catchup_pending_daily_logs};
 use provider::anthropic::AnthropicProvider;
-use sapphire_workspace::{AppContext, Workspace as SwWorkspace, WorkspaceState};
+use sapphire_workspace::{AppContext, DeviceDefaults, Workspace as SwWorkspace, WorkspaceState};
 
 static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
+
+/// Inject host-platform paths and device facts into [`APP_CTX`] before any
+/// code touches a [`SwWorkspace`]. The sapphire-workspace library deliberately
+/// does not depend on `dirs` / `hostname`, so each host app has to wire these
+/// up itself at startup. Missing this made `APP_CTX.device()` panic the first
+/// time the git sync backend tried to record device info.
+fn init_app_ctx() {
+    let base = directories::BaseDirs::new();
+    let cache_dir = base
+        .as_ref()
+        .map(|b| b.cache_dir().to_path_buf())
+        .unwrap_or_else(std::env::temp_dir)
+        .join(env!("CARGO_PKG_NAME"));
+    let data_dir = base
+        .as_ref()
+        .map(|b| b.data_dir().to_path_buf())
+        .unwrap_or_else(std::env::temp_dir)
+        .join(env!("CARGO_PKG_NAME"));
+    APP_CTX.set_cache_dir(cache_dir);
+    APP_CTX.set_data_dir(data_dir);
+
+    let hostname = hostname::get()
+        .ok()
+        .and_then(|s| s.into_string().ok())
+        .unwrap_or_default();
+    APP_CTX.set_device_defaults(DeviceDefaults {
+        hostname,
+        app_id: env!("CARGO_PKG_NAME").to_owned(),
+        app_version: env!("CARGO_PKG_VERSION").to_owned(),
+        platform: std::env::consts::OS.to_owned(),
+        arch: std::env::consts::ARCH.to_owned(),
+    });
+}
 use session::SessionStore;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -90,6 +123,8 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    init_app_ctx();
 
     let cli = Cli::parse();
 
@@ -167,9 +202,17 @@ async fn main() -> Result<()> {
                 .context("Failed to resolve sapphire-workspace")?;
             // Use the [sync] section from the agent config directly.
             // WorkspaceConfig was removed in sapphire-workspace 0.8.0;
-            // open_configured now takes &SyncConfig.
+            // open_configured now takes &SyncConfig. In 0.10 the periodic
+            // cadence moved out of SyncConfig because it drives both
+            // sapphire-sync and sapphire-retrieve — keeping one knob
+            // avoids a duplicate `[retrieve]` cadence. It now lives at
+            // the agent config root as `sync_interval_minutes`, and each
+            // `periodic_sync()` call refreshes the retrieve cache too.
             let sync_config = config.sync.clone().unwrap_or_default();
-            let ws_sync_interval = sync_config.sync_interval();
+            let ws_sync_interval = config
+                .sync_interval_minutes
+                .filter(|&m| m > 0)
+                .map(|m| std::time::Duration::from_secs(m as u64 * 60));
             let ws_state = WorkspaceState::open_configured(sw_workspace, &sync_config)
                 .context("Failed to open WorkspaceState")?;
             if let Err(e) = ws_state.periodic_sync() {
