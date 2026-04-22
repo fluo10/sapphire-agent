@@ -62,6 +62,19 @@ pub struct Config {
     /// takes precedence — allowing each user to override the workspace defaults.
     #[serde(default)]
     pub sync: Option<SyncConfig>,
+    /// How often the agent runs the periodic workspace sync cycle, in
+    /// minutes. Unset or `0` disables periodic sync entirely. Each tick
+    /// runs `WorkspaceState::periodic_sync`, which does a git sync **and**
+    /// an mtime-based refresh of the retrieve cache — one cadence drives
+    /// both.
+    ///
+    /// Lives at the config root (not inside `[sync]`) because the cadence
+    /// spans both `sapphire-sync` and `sapphire-retrieve`; nesting it
+    /// under `[sync]` would have implied a sync-only knob and forced a
+    /// duplicate for the retrieve side. Upstream relocated it out of
+    /// `SyncConfig` for the same reason in sapphire-workspace 0.10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_interval_minutes: Option<u32>,
     /// Periodic log digest configuration (weekly / monthly / yearly).
     #[serde(default)]
     pub digest: DigestConfig,

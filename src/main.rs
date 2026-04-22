@@ -167,9 +167,17 @@ async fn main() -> Result<()> {
                 .context("Failed to resolve sapphire-workspace")?;
             // Use the [sync] section from the agent config directly.
             // WorkspaceConfig was removed in sapphire-workspace 0.8.0;
-            // open_configured now takes &SyncConfig.
+            // open_configured now takes &SyncConfig. In 0.10 the periodic
+            // cadence moved out of SyncConfig because it drives both
+            // sapphire-sync and sapphire-retrieve — keeping one knob
+            // avoids a duplicate `[retrieve]` cadence. It now lives at
+            // the agent config root as `sync_interval_minutes`, and each
+            // `periodic_sync()` call refreshes the retrieve cache too.
             let sync_config = config.sync.clone().unwrap_or_default();
-            let ws_sync_interval = sync_config.sync_interval();
+            let ws_sync_interval = config
+                .sync_interval_minutes
+                .filter(|&m| m > 0)
+                .map(|m| std::time::Duration::from_secs(m as u64 * 60));
             let ws_state = WorkspaceState::open_configured(sw_workspace, &sync_config)
                 .context("Failed to open WorkspaceState")?;
             if let Err(e) = ws_state.periodic_sync() {
