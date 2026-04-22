@@ -104,6 +104,9 @@ clap.workspace = true
 # XDG directories for config/data paths
 directories = "6.0"
 
+# System hostname lookup for the sapphire-workspace DeviceDefaults init
+hostname = "0.4"
+
 # Shell path expansion (~/)
 shellexpand = "3.1"
 
