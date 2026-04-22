@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-22
+
+### Changed
+
+- **`sapphire-workspace` 0.9 → 0.10.1** — the workspace crate now requires
+  each host app to supply cache/data directories and host-detected device
+  facts before any workspace is opened. `main` wires this up via a new
+  `init_app_ctx()` call at startup (using `directories` for paths and a new
+  `hostname` direct dependency), so the git sync backend can record device
+  info without panicking in `APP_CTX.device()`.
+
+### Fixed
+
+- **`file_write` / `memory_add` on non-existent files** — picked up via the
+  workspace 0.10.1 bump, which fixes `canonicalize_or_parent` returning a
+  path with a trailing separator. Previously every new daily log and every
+  new `memory_add` call failed with EISDIR until the target file already
+  existed on disk. See fluo10/sapphire-workspace#48.
+
+### Breaking
+
+- **`sync_interval_minutes` moved out of `[sync]`** — the cadence drives
+  both `sapphire-sync` and `sapphire-retrieve`, so nesting it under `[sync]`
+  was misleading. The field is now read from the agent config root. Users
+  whose `config.toml` had `sync_interval_minutes` inside `[sync]` must move
+  it to the top level.
+
 ## [0.4.1] - 2026-04-20
 
 ### Added
@@ -241,6 +268,7 @@ an HTTP/MCP server mode.
   and workspace-aware writes.
 - **Logging** — `tracing` with env-filter and ANSI output.
 
+[0.5.0]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.5.0
 [0.4.1]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.4.1
 [0.4.0]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.4.0
 [0.3.3]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.3.3

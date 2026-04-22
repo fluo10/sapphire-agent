@@ -22,7 +22,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fluo10/sapphire-agent"
@@ -124,7 +124,7 @@ sapphire-workspace = { version = "0.10.1", default-features = false }
 grain-id = { version = "0.14", features = ["serde"] }
 
 # Client library (shared with sapphire-call)
-sapphire-agent-api = { path = "crates/sapphire-agent-api", version = "0.4.1" }
+sapphire-agent-api = { path = "crates/sapphire-agent-api", version = "0.5.0" }
 
 # HTTP server (serve command)
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
