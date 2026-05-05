@@ -116,6 +116,11 @@ enum Command {
         /// and --message; ignored in REPL mode.
         #[arg(long)]
         json: bool,
+        /// Profile name to bind to a newly created session. Must match a
+        /// `[profiles.<name>]` entry on the server side. Ignored when
+        /// resuming an existing session via --session.
+        #[arg(long)]
+        profile: Option<String>,
     },
 }
 
@@ -139,9 +144,10 @@ async fn main() -> Result<()> {
         message,
         history,
         json,
+        profile,
     }) = cli.command
     {
-        return call::run(server, session, list, message, history, json).await;
+        return call::run(server, session, list, message, history, json, profile).await;
     }
 
     let config_path = cli.config.unwrap_or_else(Config::default_path);
@@ -427,7 +433,7 @@ async fn main() -> Result<()> {
                 serve::run(
                     addr,
                     config,
-                    provider,
+                    Arc::clone(&registry),
                     workspace,
                     tool_set,
                     api_session_store,

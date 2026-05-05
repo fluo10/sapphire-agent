@@ -62,20 +62,21 @@ pub async fn run(
     message: Option<String>,
     history: bool,
     json: bool,
+    profile: Option<String>,
 ) -> Result<()> {
     let base = server.trim_end_matches('/').to_string();
     let client = reqwest::Client::new();
 
     // -- --list mode ----------------------------------------------------------
     if list {
-        let (mcp_session_id, _, _) = initialize_session(&client, &base, session).await?;
+        let (mcp_session_id, _, _) = initialize_session(&client, &base, session, None).await?;
         list_sessions(&client, &base, &mcp_session_id, json).await?;
         return Ok(());
     }
 
     // -- Initialize session ---------------------------------------------------
     let (mut mcp_session_id, actual_session_id, is_new) =
-        initialize_session(&client, &base, session).await?;
+        initialize_session(&client, &base, session, profile.as_deref()).await?;
 
     // -- --history dump-only mode ---------------------------------------------
     if history {
@@ -131,7 +132,7 @@ pub async fn run(
                 continue;
             }
             "/clear" => {
-                match initialize_session(&client, &base, None).await {
+                match initialize_session(&client, &base, None, profile.as_deref()).await {
                     Ok((new_mcp_id, new_session_id, _)) => {
                         mcp_session_id = new_mcp_id;
                         println!("[new session: {new_session_id}]");
@@ -161,13 +162,18 @@ async fn initialize_session(
     client: &reqwest::Client,
     base: &str,
     session: Option<String>,
+    profile: Option<&str>,
 ) -> Result<(String, String, bool)> {
     let session_id_req = session.as_deref().unwrap_or("new");
+    let mut params = json!({ "session_id": session_id_req });
+    if let Some(p) = profile {
+        params["profile"] = json!(p);
+    }
     let body = json!({
         "jsonrpc": "2.0",
         "id": next_id(),
         "method": "initialize",
-        "params": { "session_id": session_id_req },
+        "params": params,
     });
 
     let resp = client

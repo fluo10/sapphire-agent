@@ -7,6 +7,7 @@
 
 use crate::config::Config;
 use crate::context_compression::{generate_summary, maybe_compress};
+use crate::provider::registry::ProviderRegistry;
 use crate::provider::{ChatMessage, ContentPart, Provider};
 use crate::session::{ConversationKey, SessionStore};
 use crate::tools::ToolSet;
@@ -34,7 +35,7 @@ const MAX_TOOL_ROUNDS: usize = 10;
 
 pub struct ServeState {
     config: Config,
-    provider: Arc<dyn Provider>,
+    registry: Arc<ProviderRegistry>,
     workspace: Arc<Workspace>,
     tools: Arc<ToolSet>,
     api_session_store: Arc<SessionStore>,
@@ -46,6 +47,28 @@ pub struct ServeState {
     /// that quitting without sending anything leaves no empty file behind.
     /// Maps internal UUID → reserved public_id (grain-id).
     pending_sessions: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Per-session profile assignment from `initialize`. Sessions absent from
+    /// this map fall through to the background provider. Not persisted across
+    /// restarts — clients must re-pass `profile` on resume.
+    session_profiles: tokio::sync::Mutex<HashMap<String, String>>,
+}
+
+impl ServeState {
+    /// Provider that should serve the given session: the profile-bound
+    /// primary (with optional refusal fallback) when the client picked a
+    /// profile at initialize-time, otherwise the background provider.
+    async fn provider_for_session(&self, session_id: &str) -> Arc<dyn Provider> {
+        let profile = self
+            .session_profiles
+            .lock()
+            .await
+            .get(session_id)
+            .cloned();
+        match profile {
+            Some(name) => self.registry.for_profile(&self.config, &name),
+            None => self.registry.background_provider(&self.config),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,19 +127,20 @@ fn error_event(id: &Value, code: i32, message: &str) -> Event {
 pub async fn run(
     addr: String,
     config: Config,
-    provider: Arc<dyn Provider>,
+    registry: Arc<ProviderRegistry>,
     workspace: Arc<Workspace>,
     tools: Arc<ToolSet>,
     api_session_store: Arc<SessionStore>,
 ) -> anyhow::Result<()> {
     let state = Arc::new(ServeState {
         config,
-        provider,
+        registry,
         workspace,
         tools,
         api_session_store,
         sessions: tokio::sync::Mutex::new(HashMap::new()),
         pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
+        session_profiles: tokio::sync::Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -158,7 +182,8 @@ async fn summarize_all_sessions(state: &Arc<ServeState>) {
         snapshot.len()
     );
     for (session_id, messages) in snapshot {
-        match generate_summary(&*state.provider, &messages).await {
+        let provider = state.provider_for_session(&session_id).await;
+        match generate_summary(&*provider, &messages).await {
             Ok(summary) if !summary.trim().is_empty() => {
                 if let Err(e) = state
                     .api_session_store
@@ -222,6 +247,20 @@ async fn handle_initialize(
     params: Option<Value>,
     existing_header_session: Option<String>,
 ) -> axum::response::Response {
+    // Optional `params.profile` — must reference a defined `[profiles.*]`
+    // entry. Rejected eagerly so misspellings surface at session start
+    // rather than as a silent fallback to the background provider.
+    let requested_profile: Option<String> = params
+        .as_ref()
+        .and_then(|p| p["profile"].as_str())
+        .map(|s| s.to_string());
+    if let Some(name) = &requested_profile {
+        if !state.config.profiles.contains_key(name) {
+            let body = error_response(req_id, -32602, &format!("Unknown profile '{name}'"));
+            return body.into_response();
+        }
+    }
+
     // Resolve to an internal UUID session_id.
     // - Mcp-Session-Id header: already a UUID (internal), use directly.
     // - params.session_id: must be a 7-char grain-id (public) or "new"/absent.
@@ -292,12 +331,23 @@ async fn handle_initialize(
             .and_then(|m| m.public_id)
     };
 
+    if let Some(name) = requested_profile {
+        state
+            .session_profiles
+            .lock()
+            .await
+            .insert(session_id.clone(), name);
+    }
+
     let mut result = json!({
         "session_id": session_id,
         "is_new": is_new,
     });
     if let Some(ref pub_id) = public_id {
         result["public_id"] = json!(pub_id);
+    }
+    if let Some(name) = state.session_profiles.lock().await.get(&session_id) {
+        result["profile"] = json!(name);
     }
 
     let body = json!({
@@ -499,7 +549,11 @@ async fn run_turn(
         warn!("Failed to ensure session file: {e}");
     }
 
-    // 3. System prompt (rebuilt fresh per request)
+    // 3. Resolve provider once per turn — sessions can pin a profile at
+    //    initialize-time; absent that, the background provider is used.
+    let provider = state.provider_for_session(&session_id).await;
+
+    // 3a. System prompt (rebuilt fresh per request)
     let system = {
         let sp = state
             .workspace
@@ -540,7 +594,7 @@ async fn run_turn(
 
         // Check if context compression is needed
         match maybe_compress(
-            &*state.provider,
+            &*provider,
             system.as_deref(),
             &history,
             &compression_config,
@@ -562,8 +616,7 @@ async fn run_turn(
             }
         }
 
-        let response = state
-            .provider
+        let response = provider
             .chat(system.as_deref(), &history, Some(&tool_specs))
             .await;
 
@@ -662,9 +715,8 @@ async fn run_turn(
             let sid = session_id.clone();
             let user_msg = user_message.clone();
             tokio::spawn(async move {
-                if let Some(title) =
-                    generate_session_title(&*state2.provider, &user_msg, &text).await
-                {
+                let p = state2.provider_for_session(&sid).await;
+                if let Some(title) = generate_session_title(&*p, &user_msg, &text).await {
                     if let Err(e) = state2.api_session_store.set_title(&sid, &title) {
                         warn!("Failed to store session title: {e}");
                     }
