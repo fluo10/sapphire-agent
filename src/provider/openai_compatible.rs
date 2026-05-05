@@ -169,6 +169,10 @@ struct StreamChunk {
 struct StreamChoice {
     #[serde(default)]
     delta: StreamDelta,
+    /// Populated on the final chunk: `"stop"`, `"length"`,
+    /// `"content_filter"`, `"tool_calls"`, etc.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -398,6 +402,7 @@ impl Provider for OpenAICompatibleProvider {
         let mut buffer = String::new();
         let mut text_acc = String::new();
         let mut tool_acc: BTreeMap<usize, ToolCallAccum> = BTreeMap::new();
+        let mut stop_reason: Option<String> = None;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("Error reading SSE stream")?;
@@ -423,6 +428,9 @@ impl Provider for OpenAICompatibleProvider {
                         }
                     };
                     for choice in parsed.choices {
+                        if let Some(reason) = choice.finish_reason {
+                            stop_reason = Some(reason);
+                        }
                         if let Some(t) = choice.delta.content {
                             text_acc.push_str(&t);
                         }
@@ -474,7 +482,11 @@ impl Provider for OpenAICompatibleProvider {
             Some(text_acc)
         };
 
-        Ok(ChatResponse { text, tool_calls })
+        Ok(ChatResponse {
+            text,
+            tool_calls,
+            stop_reason,
+        })
     }
 }
 

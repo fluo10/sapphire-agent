@@ -5,9 +5,12 @@
 //! provider is always present under the name [`ANTHROPIC_PROVIDER_NAME`];
 //! additional providers come from `[providers.<name>]` config entries.
 
-use crate::config::{ANTHROPIC_PROVIDER_NAME, Config, ProviderConfig};
+use crate::config::{
+    ANTHROPIC_PROVIDER_NAME, BACKGROUND_PROFILE_NAME, Config, ProviderConfig,
+};
 use crate::provider::Provider;
 use crate::provider::anthropic::AnthropicProvider;
+use crate::provider::fallback::FallbackProvider;
 use crate::provider::openai_compatible::OpenAICompatibleProvider;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -77,12 +80,45 @@ impl ProviderRegistry {
     /// Falls back to the Anthropic provider if (a) no profile is configured
     /// for the room, (b) the resolved profile names a provider that isn't
     /// registered (validation should have caught this — defensive only).
+    /// When the profile defines a `fallback_provider`, the result is
+    /// wrapped in a `FallbackProvider` so refusals or errors transparently
+    /// retry on the secondary.
     pub fn for_room(&self, config: &Config, room_id: &str) -> Arc<dyn Provider> {
-        let provider_name = config
-            .profile_for(room_id)
-            .and_then(|p| config.provider_for_profile(p))
-            .unwrap_or(ANTHROPIC_PROVIDER_NAME);
-        self.get(provider_name).unwrap_or_else(|| self.anthropic())
+        let Some(profile_name) = config.profile_for(room_id) else {
+            return self.anthropic();
+        };
+        self.for_profile(config, profile_name)
+    }
+
+    /// Resolve the provider for a named profile, honouring its primary +
+    /// optional fallback. Falls back to the Anthropic provider if the
+    /// profile isn't defined or names an unknown provider.
+    pub fn for_profile(&self, config: &Config, profile_name: &str) -> Arc<dyn Provider> {
+        let Some(profile) = config.profiles.get(profile_name) else {
+            return self.anthropic();
+        };
+        let primary = self
+            .get(&profile.provider)
+            .unwrap_or_else(|| self.anthropic());
+        match profile
+            .fallback_provider
+            .as_deref()
+            .and_then(|n| self.get(n))
+        {
+            Some(fallback) => Arc::new(FallbackProvider::new(primary, fallback)),
+            None => primary,
+        }
+    }
+
+    /// Provider used by background tasks (daily-log, memory compaction,
+    /// digests). Resolves the conventional `[profiles.background]`; falls
+    /// back to plain Anthropic when that profile isn't defined.
+    pub fn background_provider(&self, config: &Config) -> Arc<dyn Provider> {
+        if config.profiles.contains_key(BACKGROUND_PROFILE_NAME) {
+            self.for_profile(config, BACKGROUND_PROFILE_NAME)
+        } else {
+            self.anthropic()
+        }
     }
 }
 
@@ -170,6 +206,79 @@ api_key = "test"
         let reg = ProviderRegistry::from_config(&cfg).unwrap();
         let p = reg.for_room(&cfg, "!any:srv");
         assert_eq!(p.name(), "anthropic");
+    }
+
+    #[test]
+    fn for_room_wraps_in_fallback_when_profile_defines_one() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[providers.local]
+type = "openai_compatible"
+base_url = "http://127.0.0.1:8080/v1"
+model = "gemma-4-31b-it"
+
+[profiles.default]
+provider          = "anthropic"
+fallback_provider = "local"
+"#,
+        );
+        let reg = ProviderRegistry::from_config(&cfg).unwrap();
+        // FallbackProvider::name() forwards to the primary, so the name
+        // alone doesn't prove wrapping. Two registry pointers differ in
+        // identity, though: the wrapped Arc is freshly allocated.
+        let raw_anthropic = reg.anthropic();
+        let routed = reg.for_room(&cfg, "!any:srv");
+        assert_eq!(routed.name(), "anthropic");
+        assert!(
+            !Arc::ptr_eq(&raw_anthropic, &routed),
+            "expected a wrapped FallbackProvider, got the bare anthropic Arc"
+        );
+    }
+
+    #[test]
+    fn background_provider_uses_background_profile_when_present() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[providers.local]
+type = "openai_compatible"
+base_url = "http://127.0.0.1:8080/v1"
+model = "gemma-4-31b-it"
+
+[profiles.background]
+provider          = "anthropic"
+fallback_provider = "local"
+"#,
+        );
+        let reg = ProviderRegistry::from_config(&cfg).unwrap();
+        let raw_anthropic = reg.anthropic();
+        let bg = reg.background_provider(&cfg);
+        assert!(
+            !Arc::ptr_eq(&raw_anthropic, &bg),
+            "background provider should be wrapped when profile has fallback"
+        );
+    }
+
+    #[test]
+    fn background_provider_defaults_to_anthropic_when_not_configured() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+"#,
+        );
+        let reg = ProviderRegistry::from_config(&cfg).unwrap();
+        let raw_anthropic = reg.anthropic();
+        let bg = reg.background_provider(&cfg);
+        assert!(
+            Arc::ptr_eq(&raw_anthropic, &bg),
+            "without [profiles.background], background should be plain anthropic"
+        );
     }
 
     #[test]

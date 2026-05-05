@@ -83,13 +83,23 @@ system_prompt = "You are a helpful personal assistant."
 # is used by rooms that don't pick one explicitly. Profiles that name an
 # unknown provider cause startup to fail.
 #
-# `fallback_provider` is reserved for the upcoming refusal-fallback layer
-# (e.g. when the primary refuses NSFW content); it is parsed today but not
-# yet wired into the chat path.
+# `fallback_provider` is consulted at runtime: when the primary refuses
+# (Anthropic `stop_reason = "refusal"`, OpenAI `finish_reason =
+# "content_filter"`, or a recognised apology pattern) or errors out, the
+# call is replayed against the named fallback provider.
+#
+# The conventional `background` profile is what the daily-log generator,
+# memory compaction, and periodic digests run under. Defining it lets a
+# session that mixes safe-for-Anthropic and refused content still produce
+# its end-of-day summary by handing off the refused parts to a permissive
+# local model.
 #
 # [profiles.default]
 # provider = "anthropic"
 #
 # [profiles.nsfw]
-# provider          = "local"
-# fallback_provider = "anthropic"   # not yet active; see release notes
+# provider = "local"
+#
+# [profiles.background]
+# provider          = "anthropic"
+# fallback_provider = "local"

@@ -156,6 +156,13 @@ pub const ANTHROPIC_PROVIDER_NAME: &str = "anthropic";
 /// Conventional name of the default profile.
 pub const DEFAULT_PROFILE_NAME: &str = "default";
 
+/// Conventional name of the profile used by background tasks (daily-log,
+/// memory compaction, periodic digests). When this profile is defined the
+/// background tasks honour its `provider` and `fallback_provider`; when
+/// it isn't, those tasks run on the built-in Anthropic provider with no
+/// fallback.
+pub const BACKGROUND_PROFILE_NAME: &str = "background";
+
 /// Configuration for the HTTP API server (serve command).
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ServeConfig {

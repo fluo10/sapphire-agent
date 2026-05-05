@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod fallback;
 pub mod openai_compatible;
 pub mod registry;
 
@@ -168,6 +169,12 @@ impl ChatMessage {
 pub struct ChatResponse {
     pub text: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Provider-reported stop / finish reason. Captured verbatim so that
+    /// higher-level wrappers (notably the refusal-fallback layer) can
+    /// inspect it. Anthropic emits values like `"end_turn"`, `"refusal"`,
+    /// `"max_tokens"`; OpenAI-compatible servers emit `"stop"`,
+    /// `"content_filter"`, `"length"`, etc.
+    pub stop_reason: Option<String>,
 }
 
 impl ChatResponse {
@@ -175,6 +182,7 @@ impl ChatResponse {
         Self {
             text: Some(text),
             tool_calls: vec![],
+            stop_reason: None,
         }
     }
 

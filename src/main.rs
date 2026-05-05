@@ -263,10 +263,10 @@ async fn main() -> Result<()> {
                 ProviderRegistry::from_config(&config)
                     .context("Failed to build provider registry")?,
             );
-            // Heartbeat / serve / daily-log use a single provider directly.
-            // Until per-room routing is plumbed through those code paths
-            // (see C3/C4), they keep using the Anthropic default.
-            let provider: Arc<dyn provider::Provider> = registry.anthropic();
+            // Heartbeat / serve / daily-log run on the "background" profile
+            // when defined (with optional refusal fallback) and on plain
+            // Anthropic otherwise.
+            let provider: Arc<dyn provider::Provider> = registry.background_provider(&config);
 
             // ── API session store (sessions/api/) ───────────────────────────
             let api_session_store = Arc::new(SessionStore::with_workspace(
