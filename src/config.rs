@@ -647,6 +647,20 @@ profile = "missing"
     }
 
     #[test]
+    fn shipped_example_parses() {
+        // Sanity check: the example file we ship in the repo must parse
+        // and validate without errors so first-time users aren't greeted
+        // with a confusing TOML error.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let cfg = Config::load(&path).expect("config.example.toml should parse");
+        assert!(
+            cfg.validate_profiles().is_empty(),
+            "validation errors: {:?}",
+            cfg.validate_profiles()
+        );
+    }
+
+    #[test]
     fn provider_config_parses_openai_compatible() {
         let cfg = parse(
             r#"

@@ -34,9 +34,11 @@ recovery_key = "EsT... "
 #   "none"    — no day-boundary action
 # session_policy = "compact"
 
-# Per-room overrides. Keys are room_ids; values may set session_policy.
+# Per-room overrides. Keys are room_ids; values may set session_policy
+# and/or pick a named profile (see [profiles] below).
 # [rooms."!roomid:example.com"]
 # session_policy = "reset"
+# profile        = "nsfw"
 
 # Periodic log digests. The agent summarises weekly/monthly/yearly activity
 # into short importance-ordered bullet lists, stored as YAML frontmatter in
@@ -59,3 +61,35 @@ model = "claude-opus-4-6"
 max_tokens = 8192
 # System prompt sent at the beginning of every conversation.
 system_prompt = "You are a helpful personal assistant."
+
+# ── Additional providers ────────────────────────────────────────────────
+# Beyond the built-in Anthropic provider above, you can declare any number
+# of OpenAI-compatible endpoints — llama.cpp's `llama-server`, Ollama,
+# vLLM, or the OpenAI API itself. Each entry is keyed by a name you choose
+# and must specify `type = "openai_compatible"`. The reserved name
+# `anthropic` cannot be reused here.
+#
+# [providers.local]
+# type     = "openai_compatible"
+# base_url = "http://127.0.0.1:8080/v1"  # llama-server, no trailing /chat/completions
+# model    = "gemma-4-31b-it"
+# api_key  = ""                          # optional; llama.cpp does not need one
+# max_tokens = 4096
+
+# ── Profiles ────────────────────────────────────────────────────────────
+# A profile binds a use-case to a provider. Rooms select a profile via
+# `profile = "..."` in their `[rooms."<id>"]` block; the API may also pass
+# `profile` per request. The conventional `default` profile, when defined,
+# is used by rooms that don't pick one explicitly. Profiles that name an
+# unknown provider cause startup to fail.
+#
+# `fallback_provider` is reserved for the upcoming refusal-fallback layer
+# (e.g. when the primary refuses NSFW content); it is parsed today but not
+# yet wired into the chat path.
+#
+# [profiles.default]
+# provider = "anthropic"
+#
+# [profiles.nsfw]
+# provider          = "local"
+# fallback_provider = "anthropic"   # not yet active; see release notes
