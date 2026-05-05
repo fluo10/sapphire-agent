@@ -12,7 +12,8 @@ use crate::config::DigestConfig;
 use crate::heartbeat_config::{load_heartbeat_dir, next_due};
 use crate::memory_compaction::compact_memory;
 use crate::periodic_log::{
-    catchup_missing_daily_digests, catchup_pending_daily_logs, generate_daily_log,
+    catchup_missing_daily_digests, catchup_pending_daily_logs, catchup_pending_monthly_logs,
+    catchup_pending_weekly_logs, catchup_pending_yearly_logs, generate_daily_log,
     generate_monthly_log, generate_weekly_log, generate_yearly_log,
 };
 use crate::provider::Provider;
@@ -77,7 +78,44 @@ impl Heartbeat {
                 &self.workspace_dir,
             )
             .await;
-            if logs + digests > 0 {
+            let today_local = crate::session::local_date_for_timestamp(
+                Local::now(),
+                self.day_boundary_hour,
+            );
+            let weekly = if self.digest_cfg.weekly_enabled {
+                catchup_pending_weekly_logs(
+                    self.provider.as_ref(),
+                    &self.ws_state,
+                    &self.workspace_dir,
+                    today_local,
+                )
+                .await
+            } else {
+                0
+            };
+            let monthly = if self.digest_cfg.monthly_enabled {
+                catchup_pending_monthly_logs(
+                    self.provider.as_ref(),
+                    &self.ws_state,
+                    &self.workspace_dir,
+                    today_local,
+                )
+                .await
+            } else {
+                0
+            };
+            let yearly = if self.digest_cfg.yearly_enabled {
+                catchup_pending_yearly_logs(
+                    self.provider.as_ref(),
+                    &self.ws_state,
+                    &self.workspace_dir,
+                    today_local,
+                )
+                .await
+            } else {
+                0
+            };
+            if logs + digests + weekly + monthly + yearly > 0 {
                 self.agent.invalidate_system_prompts().await;
             }
         }
@@ -105,6 +143,7 @@ impl Heartbeat {
                     &self.session_store,
                     self.provider.as_ref(),
                     &self.ws_state,
+                    &self.workspace_dir,
                     yesterday,
                     self.day_boundary_hour,
                 )

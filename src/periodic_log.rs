@@ -228,7 +228,7 @@ pub fn pending_daily_dates(
 
 /// Generate a daily log for `date` and write it to `memory/daily/YYYY-MM-DD.md`.
 /// Returns `Ok(true)` if a log was written, `Ok(false)` if there were no
-/// sessions for that day (no-op).
+/// sessions for that day *and* no pre-existing draft at the target path.
 ///
 /// Writes a YAML frontmatter `digest:` array (top-10 importance-ordered
 /// bullets) alongside the Markdown summary body.
@@ -236,20 +236,28 @@ pub async fn generate_daily_log(
     session_store: &SessionStore,
     provider: &dyn Provider,
     ws_state: &Arc<Mutex<WorkspaceState>>,
+    workspace_dir: &Path,
     date: NaiveDate,
     boundary_hour: u8,
 ) -> anyhow::Result<bool> {
     let sessions = session_store.sessions_for_day(date, boundary_hour);
-    if sessions.is_empty() {
+    let stem = daily_stem(date);
+    let has_existing = read_body(workspace_dir, LogKind::Daily, &stem)
+        .is_some_and(|b| !b.trim().is_empty());
+    if sessions.is_empty() && !has_existing {
         info!("No sessions found for {date}, skipping daily log");
         return Ok(false);
     }
 
-    let transcript = format_sessions(&sessions, date);
-    let stem = daily_stem(date);
+    let transcript = if sessions.is_empty() {
+        String::new()
+    } else {
+        format_sessions(&sessions, date)
+    };
     write_log_with_digest(
         provider,
         ws_state,
+        workspace_dir,
         LogKind::Daily,
         &stem,
         "conversation transcripts",
@@ -291,6 +299,7 @@ pub async fn generate_weekly_log(
     write_log_with_digest(
         provider,
         ws_state,
+        workspace_dir,
         LogKind::Weekly,
         &stem,
         &description,
@@ -333,6 +342,7 @@ pub async fn generate_monthly_log(
     write_log_with_digest(
         provider,
         ws_state,
+        workspace_dir,
         LogKind::Monthly,
         &stem,
         &description,
@@ -373,6 +383,7 @@ pub async fn generate_yearly_log(
     write_log_with_digest(
         provider,
         ws_state,
+        workspace_dir,
         LogKind::Yearly,
         &stem,
         &description,
@@ -443,14 +454,42 @@ pub fn read_digest_top_n(
 async fn write_log_with_digest(
     provider: &dyn Provider,
     ws_state: &Arc<Mutex<WorkspaceState>>,
+    workspace_dir: &Path,
     kind: LogKind,
     stem: &str,
     input_description: &str,
     input_body: &str,
 ) -> anyhow::Result<()> {
     let label = kind.heading_label();
+
+    // Pre-existing draft at the target path — e.g. the agent pre-wrote
+    // today's daily log with plans, or sketched a weekly entry ahead of
+    // Monday. Feed it into the summariser so its facts aren't erased by
+    // the overwrite.
+    let existing_body =
+        read_body(workspace_dir, kind, stem).filter(|b| !b.trim().is_empty());
+    let has_existing = existing_body.is_some();
+
+    let combined_input = match &existing_body {
+        Some(existing) => format!(
+            "## Existing draft at `memory/{}/{}.md` — preserve its plans, commitments, and unresolved items\n\n{}\n\n---\n\n## New source material ({})\n\n{}",
+            kind.dir(),
+            stem,
+            existing.trim_end(),
+            input_description,
+            input_body,
+        ),
+        None => input_body.to_string(),
+    };
+
+    let merge_note = if has_existing {
+        "\n\nNote: the input begins with an existing draft of this log — content the user or agent pre-wrote (plans, appointments, notes). Merge its facts, commitments, and unresolved items into both the digest and the body. Do not drop draft content; only deduplicate when the new source material already covers the same point."
+    } else {
+        ""
+    };
+
     let system = format!(
-        "You are generating a concise {label} entry from {input_description}.
+        "You are generating a concise {label} entry from {input_description}.{merge_note}
 
 Output a Markdown file with this exact structure:
 
@@ -467,7 +506,7 @@ Write in the same language as the source material (Japanese if it is in
 Japanese). Emit raw Markdown, not a fenced code block."
     );
 
-    let user_msg = ChatMessage::user(input_body);
+    let user_msg = ChatMessage::user(combined_input);
     let response = provider.chat(Some(&system), &[user_msg], None).await?;
     let raw = response
         .text
@@ -789,10 +828,218 @@ pub async fn catchup_pending_daily_logs(
     info!("Generating {} pending daily log(s)…", pending.len());
     let mut generated = 0;
     for date in pending {
-        match generate_daily_log(session_store, provider, ws_state, date, boundary_hour).await {
+        match generate_daily_log(
+            session_store,
+            provider,
+            ws_state,
+            workspace_dir,
+            date,
+            boundary_hour,
+        )
+        .await
+        {
             Ok(true) => generated += 1,
             Ok(false) => {}
             Err(e) => warn!("Failed to generate daily log for {date}: {e:#}"),
+        }
+    }
+    generated
+}
+
+// ---------------------------------------------------------------------------
+// Weekly / monthly / yearly catch-up
+// ---------------------------------------------------------------------------
+
+/// Distinct daily log dates on disk (i.e. stems in `memory/daily/*.md` that
+/// parse as `YYYY-MM-DD`). Used as the seed for weekly/monthly catch-up.
+fn existing_daily_dates(workspace_dir: &Path) -> Vec<NaiveDate> {
+    let dir = workspace_dir.join("memory").join("daily");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Ok(date) = NaiveDate::parse_from_str(stem, "%Y-%m-%d") {
+            out.push(date);
+        }
+    }
+    out
+}
+
+/// Distinct monthly log stems on disk (i.e. files in `memory/monthly/*.md`
+/// that parse as `YYYY-MM`). Used as the seed for yearly catch-up.
+fn existing_monthly_year_months(workspace_dir: &Path) -> Vec<(i32, u32)> {
+    let dir = workspace_dir.join("memory").join("monthly");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let parts: Vec<&str> = stem.split('-').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        if let (Ok(y), Ok(m)) = (parts[0].parse::<i32>(), parts[1].parse::<u32>())
+            && (1..=12).contains(&m)
+        {
+            out.push((y, m));
+        }
+    }
+    out
+}
+
+/// Returns ISO (year, week) pairs that have at least one daily log on disk
+/// but no weekly log file yet, excluding `today`'s own ISO week. Sorted
+/// ascending by (year, week).
+pub fn pending_iso_weeks(workspace_dir: &Path, today: NaiveDate) -> Vec<(i32, u32)> {
+    use std::collections::BTreeSet;
+    let current_iso = today.iso_week();
+    let current_key = (current_iso.year(), current_iso.week());
+    let mut weeks: BTreeSet<(i32, u32)> = BTreeSet::new();
+    for date in existing_daily_dates(workspace_dir) {
+        let iso = date.iso_week();
+        let key = (iso.year(), iso.week());
+        if key >= current_key {
+            continue;
+        }
+        weeks.insert(key);
+    }
+    weeks
+        .into_iter()
+        .filter(|(y, w)| {
+            !log_abs_path(workspace_dir, LogKind::Weekly, &weekly_stem(*y, *w)).exists()
+        })
+        .collect()
+}
+
+/// Returns calendar (year, month) pairs that have at least one daily log on
+/// disk but no monthly log file yet, excluding `today`'s own month. Sorted
+/// ascending.
+pub fn pending_months(workspace_dir: &Path, today: NaiveDate) -> Vec<(i32, u32)> {
+    use std::collections::BTreeSet;
+    let current_key = (today.year(), today.month());
+    let mut months: BTreeSet<(i32, u32)> = BTreeSet::new();
+    for date in existing_daily_dates(workspace_dir) {
+        let key = (date.year(), date.month());
+        if key >= current_key {
+            continue;
+        }
+        months.insert(key);
+    }
+    months
+        .into_iter()
+        .filter(|(y, m)| {
+            !log_abs_path(workspace_dir, LogKind::Monthly, &monthly_stem(*y, *m)).exists()
+        })
+        .collect()
+}
+
+/// Returns calendar years that have at least one monthly log on disk but no
+/// yearly log file yet, excluding `today`'s own year. Sorted ascending.
+pub fn pending_years(workspace_dir: &Path, today: NaiveDate) -> Vec<i32> {
+    use std::collections::BTreeSet;
+    let current_year = today.year();
+    let mut years: BTreeSet<i32> = BTreeSet::new();
+    for (y, _m) in existing_monthly_year_months(workspace_dir) {
+        if y >= current_year {
+            continue;
+        }
+        years.insert(y);
+    }
+    years
+        .into_iter()
+        .filter(|y| !log_abs_path(workspace_dir, LogKind::Yearly, &yearly_stem(*y)).exists())
+        .collect()
+}
+
+/// Generate every weekly log that is "pending" — i.e. has dailies on disk but
+/// no weekly file, strictly before the current ISO week. Errors per stem are
+/// logged but not propagated. Returns the count successfully generated.
+pub async fn catchup_pending_weekly_logs(
+    provider: &dyn Provider,
+    ws_state: &Arc<Mutex<WorkspaceState>>,
+    workspace_dir: &Path,
+    today: NaiveDate,
+) -> usize {
+    let pending = pending_iso_weeks(workspace_dir, today);
+    if pending.is_empty() {
+        return 0;
+    }
+    info!("Generating {} pending weekly log(s)…", pending.len());
+    let mut generated = 0;
+    for (iso_year, iso_week) in pending {
+        match generate_weekly_log(provider, ws_state, workspace_dir, iso_year, iso_week).await {
+            Ok(true) => generated += 1,
+            Ok(false) => {}
+            Err(e) => warn!(
+                "Failed to generate weekly log for {}-W{:02}: {e:#}",
+                iso_year, iso_week
+            ),
+        }
+    }
+    generated
+}
+
+/// Generate every monthly log that is "pending" — i.e. has dailies on disk
+/// but no monthly file, strictly before the current calendar month.
+pub async fn catchup_pending_monthly_logs(
+    provider: &dyn Provider,
+    ws_state: &Arc<Mutex<WorkspaceState>>,
+    workspace_dir: &Path,
+    today: NaiveDate,
+) -> usize {
+    let pending = pending_months(workspace_dir, today);
+    if pending.is_empty() {
+        return 0;
+    }
+    info!("Generating {} pending monthly log(s)…", pending.len());
+    let mut generated = 0;
+    for (year, month) in pending {
+        match generate_monthly_log(provider, ws_state, workspace_dir, year, month).await {
+            Ok(true) => generated += 1,
+            Ok(false) => {}
+            Err(e) => warn!(
+                "Failed to generate monthly log for {:04}-{:02}: {e:#}",
+                year, month
+            ),
+        }
+    }
+    generated
+}
+
+/// Generate every yearly log that is "pending" — i.e. has monthlies on disk
+/// but no yearly file, strictly before the current calendar year.
+pub async fn catchup_pending_yearly_logs(
+    provider: &dyn Provider,
+    ws_state: &Arc<Mutex<WorkspaceState>>,
+    workspace_dir: &Path,
+    today: NaiveDate,
+) -> usize {
+    let pending = pending_years(workspace_dir, today);
+    if pending.is_empty() {
+        return 0;
+    }
+    info!("Generating {} pending yearly log(s)…", pending.len());
+    let mut generated = 0;
+    for year in pending {
+        match generate_yearly_log(provider, ws_state, workspace_dir, year).await {
+            Ok(true) => generated += 1,
+            Ok(false) => {}
+            Err(e) => warn!("Failed to generate yearly log for {year:04}: {e:#}"),
         }
     }
     generated
@@ -1049,6 +1296,99 @@ mod tests {
         assert_eq!(stems.len(), 11);
         assert_eq!(stems.first().map(String::as_str), Some("2026-01"));
         assert_eq!(stems.last().map(String::as_str), Some("2026-11"));
+    }
+
+    fn make_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    fn write_stub(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn pending_iso_weeks_excludes_current_week_and_existing_files() {
+        let td = make_tempdir();
+        let root = td.path();
+        // Daily logs across three ISO weeks: W15, W16 (current), W14.
+        // Today = Thursday 2026-04-16 (ISO week 16).
+        for d in [
+            "2026-04-06", // Mon W15
+            "2026-04-09", // Thu W15
+            "2026-04-13", // Mon W16 (current)
+            "2026-04-14", // Tue W16 (current)
+            "2026-03-30", // Mon W14
+        ] {
+            write_stub(
+                &root.join("memory/daily").join(format!("{d}.md")),
+                "# body\n",
+            );
+        }
+        // An existing weekly file for W14 — should be filtered out.
+        write_stub(
+            &root.join("memory/weekly/2026-W14.md"),
+            "---\ndigest: []\n---\nbody\n",
+        );
+
+        let today = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let pending = pending_iso_weeks(root, today);
+        assert_eq!(pending, vec![(2026, 15)]);
+    }
+
+    #[test]
+    fn pending_months_excludes_current_month_and_existing_files() {
+        let td = make_tempdir();
+        let root = td.path();
+        for d in [
+            "2026-02-01", "2026-02-15", // Feb
+            "2026-03-05",               // Mar
+            "2026-04-02", "2026-04-16", // Apr (current)
+        ] {
+            write_stub(
+                &root.join("memory/daily").join(format!("{d}.md")),
+                "# body\n",
+            );
+        }
+        write_stub(
+            &root.join("memory/monthly/2026-02.md"),
+            "---\ndigest: []\n---\nbody\n",
+        );
+
+        let today = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let pending = pending_months(root, today);
+        assert_eq!(pending, vec![(2026, 3)]);
+    }
+
+    #[test]
+    fn pending_years_from_existing_monthlies() {
+        let td = make_tempdir();
+        let root = td.path();
+        for stem in ["2024-06", "2024-12", "2025-01", "2026-03"] {
+            write_stub(
+                &root.join("memory/monthly").join(format!("{stem}.md")),
+                "# body\n",
+            );
+        }
+        // Existing yearly for 2024 — should be excluded.
+        write_stub(
+            &root.join("memory/yearly/2024.md"),
+            "---\ndigest: []\n---\nbody\n",
+        );
+
+        let today = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let pending = pending_years(root, today);
+        // 2024 exists → skipped. 2025 missing → pending. 2026 = current → skipped.
+        assert_eq!(pending, vec![2025]);
+    }
+
+    #[test]
+    fn pending_enumerations_handle_missing_directories() {
+        let td = make_tempdir();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        assert!(pending_iso_weeks(td.path(), today).is_empty());
+        assert!(pending_months(td.path(), today).is_empty());
+        assert!(pending_years(td.path(), today).is_empty());
     }
 
     #[test]

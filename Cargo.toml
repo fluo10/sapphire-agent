@@ -146,3 +146,6 @@ serenity = { version = "0.12", default-features = false, features = [
     "model",
     "rustls_backend",
 ] }
+
+[dev-dependencies]
+tempfile = "3"
