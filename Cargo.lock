@@ -6988,6 +6988,7 @@ dependencies = [
  "serde_yaml",
  "serenity",
  "shellexpand",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "toml 1.1.2+spec-1.1.0",

@@ -22,7 +22,10 @@ use channel::matrix::MatrixChannel;
 use clap::{Parser, Subcommand};
 use config::Config;
 use heartbeat::Heartbeat;
-use periodic_log::{catchup_missing_daily_digests, catchup_pending_daily_logs};
+use periodic_log::{
+    catchup_missing_daily_digests, catchup_pending_daily_logs, catchup_pending_monthly_logs,
+    catchup_pending_weekly_logs, catchup_pending_yearly_logs,
+};
 use provider::anthropic::AnthropicProvider;
 use sapphire_workspace::{AppContext, DeviceDefaults, Workspace as SwWorkspace, WorkspaceState};
 
@@ -307,6 +310,42 @@ async fn main() -> Result<()> {
 
                 // ── Back-fill digest frontmatter on existing dailies ────────
                 catchup_missing_daily_digests(provider.as_ref(), &ws_state, &workspace_dir).await;
+
+                // ── Catch up on pending weekly / monthly / yearly logs ──────
+                // Day-boundary fires only run on Mon / day-1 / Jan-1, so an
+                // offline or crashed agent at those moments would otherwise
+                // leave those logs permanently missing.
+                let today_local = session::local_date_for_timestamp(
+                    chrono::Local::now(),
+                    config.day_boundary_hour,
+                );
+                if config.digest.weekly_enabled {
+                    catchup_pending_weekly_logs(
+                        provider.as_ref(),
+                        &ws_state,
+                        &workspace_dir,
+                        today_local,
+                    )
+                    .await;
+                }
+                if config.digest.monthly_enabled {
+                    catchup_pending_monthly_logs(
+                        provider.as_ref(),
+                        &ws_state,
+                        &workspace_dir,
+                        today_local,
+                    )
+                    .await;
+                }
+                if config.digest.yearly_enabled {
+                    catchup_pending_yearly_logs(
+                        provider.as_ref(),
+                        &ws_state,
+                        &workspace_dir,
+                        today_local,
+                    )
+                    .await;
+                }
 
                 // ── Agent ───────────────────────────────────────────────────
                 let agent = Arc::new(Agent::new(
