@@ -26,7 +26,7 @@ use periodic_log::{
     catchup_missing_daily_digests, catchup_pending_daily_logs, catchup_pending_monthly_logs,
     catchup_pending_weekly_logs, catchup_pending_yearly_logs,
 };
-use provider::anthropic::AnthropicProvider;
+use provider::registry::ProviderRegistry;
 use sapphire_workspace::{AppContext, DeviceDefaults, Workspace as SwWorkspace, WorkspaceState};
 
 static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
@@ -254,9 +254,19 @@ async fn main() -> Result<()> {
             // ── Session store base directory ────────────────────────────────
             let sessions_base = config.resolved_sessions_dir(&workspace_dir);
 
-            // ── Provider ────────────────────────────────────────────────────
-            let provider: Arc<dyn provider::Provider> =
-                Arc::new(AnthropicProvider::new(&config.anthropic));
+            // ── Provider registry ────────────────────────────────────────────
+            // Builds the Anthropic provider plus any `[providers.<name>]`
+            // entries, then validates every profile/room reference. Failure
+            // here is fatal — better to refuse to start than to surprise the
+            // user mid-session with a misrouted request.
+            let registry = Arc::new(
+                ProviderRegistry::from_config(&config)
+                    .context("Failed to build provider registry")?,
+            );
+            // Heartbeat / serve / daily-log use a single provider directly.
+            // Until per-room routing is plumbed through those code paths
+            // (see C3/C4), they keep using the Anthropic default.
+            let provider: Arc<dyn provider::Provider> = registry.anthropic();
 
             // ── API session store (sessions/api/) ───────────────────────────
             let api_session_store = Arc::new(SessionStore::with_workspace(
@@ -351,7 +361,7 @@ async fn main() -> Result<()> {
                 let agent = Arc::new(Agent::new(
                     config.clone(),
                     channel,
-                    Arc::clone(&provider),
+                    Arc::clone(&registry),
                     Arc::clone(&workspace),
                     Some(Arc::clone(&tool_set)),
                     Arc::clone(&channel_session_store),

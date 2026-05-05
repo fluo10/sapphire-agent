@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod openai_compatible;
+pub mod registry;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
