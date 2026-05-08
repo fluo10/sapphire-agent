@@ -48,6 +48,17 @@ pub struct Config {
     /// the API can also pass a profile name on a per-request basis.
     #[serde(default)]
     pub profiles: HashMap<String, ProfileConfig>,
+    /// Memory namespaces. Each namespace owns its own subtree under
+    /// `memory/<namespace>/` (daily/weekly/monthly/yearly logs and
+    /// MEMORY.md). Profiles pin their writes to one namespace, and
+    /// rooms reading the system prompt also pull in the parent
+    /// namespaces declared via `include`.
+    ///
+    /// The `"default"` namespace is implicitly present (with `include = []`)
+    /// even when no `[memory_namespace.*]` block is configured, so that
+    /// every config has a valid root.
+    #[serde(default, rename = "memory_namespace")]
+    pub memory_namespaces: HashMap<String, MemoryNamespaceConfig>,
     /// Whether to generate a daily log at the day boundary. Default: true.
     #[serde(default = "default_true")]
     pub daily_log_enabled: bool,
@@ -148,6 +159,25 @@ pub struct ProfileConfig {
     /// (e.g. NSFW content). Wired up by the routing layer.
     #[serde(default)]
     pub fallback_provider: Option<String>,
+    /// Memory namespace this profile reads and writes. Defaults to
+    /// `"default"`. Must reference a defined `[memory_namespace.<name>]`
+    /// (or the implicit `"default"`).
+    #[serde(default)]
+    pub memory_namespace: Option<String>,
+}
+
+/// Definition of a memory namespace — a subtree under `memory/<name>/`
+/// that owns its own MEMORY.md and periodic logs. The `include` list
+/// names parent namespaces whose memory should also be visible to
+/// rooms using this namespace; reads chain through the include DAG,
+/// writes go only to the leaf namespace.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MemoryNamespaceConfig {
+    /// Names of parent namespaces whose memory should be merged in
+    /// when assembling the system prompt for this namespace. Forms a
+    /// DAG; cycles are rejected at startup.
+    #[serde(default)]
+    pub include: Vec<String>,
 }
 
 /// Built-in name of the Anthropic provider — referenced by profiles.
@@ -162,6 +192,11 @@ pub const DEFAULT_PROFILE_NAME: &str = "default";
 /// it isn't, those tasks run on the built-in Anthropic provider with no
 /// fallback.
 pub const BACKGROUND_PROFILE_NAME: &str = "background";
+
+/// Implicit name of the root memory namespace. Always present, even when
+/// no `[memory_namespace.*]` block is configured — backstop so every
+/// profile / room resolves to a valid namespace.
+pub const DEFAULT_NAMESPACE_NAME: &str = "default";
 
 /// Configuration for the HTTP API server (serve command).
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -527,7 +562,144 @@ impl Config {
                 }
             }
         }
+        // Memory namespace references on profiles.
+        for (pname, prof) in &self.profiles {
+            if let Some(ns) = &prof.memory_namespace {
+                if !self.namespace_is_defined(ns) {
+                    errors.push(format!(
+                        "profile '{pname}' references unknown memory_namespace '{ns}'"
+                    ));
+                }
+            }
+        }
+        // Memory namespace include references and cycle detection.
+        for (ns_name, ns_cfg) in &self.memory_namespaces {
+            for parent in &ns_cfg.include {
+                if !self.namespace_is_defined(parent) {
+                    errors.push(format!(
+                        "memory_namespace '{ns_name}' includes unknown namespace '{parent}'"
+                    ));
+                }
+            }
+        }
+        for ns_name in self.memory_namespaces.keys() {
+            if let Some(cycle) = self.namespace_cycle_starting_at(ns_name) {
+                errors.push(format!(
+                    "memory_namespace cycle detected: {}",
+                    cycle.join(" -> ")
+                ));
+            }
+        }
         errors
+    }
+
+    /// True if `name` is either the implicit `"default"` namespace or has a
+    /// `[memory_namespace.<name>]` block.
+    fn namespace_is_defined(&self, name: &str) -> bool {
+        name == DEFAULT_NAMESPACE_NAME || self.memory_namespaces.contains_key(name)
+    }
+
+    /// DFS from `start` looking for back-edges. Returns the cyclic path
+    /// (start -> ... -> start) on detection, otherwise `None`.
+    fn namespace_cycle_starting_at(&self, start: &str) -> Option<Vec<String>> {
+        let mut stack: Vec<String> = vec![start.to_string()];
+        let mut on_stack = std::collections::HashSet::new();
+        on_stack.insert(start.to_string());
+
+        fn dfs(
+            cfg: &Config,
+            node: &str,
+            stack: &mut Vec<String>,
+            on_stack: &mut std::collections::HashSet<String>,
+        ) -> Option<Vec<String>> {
+            let parents: Vec<String> = cfg
+                .memory_namespaces
+                .get(node)
+                .map(|c| c.include.clone())
+                .unwrap_or_default();
+            for parent in parents {
+                if on_stack.contains(&parent) {
+                    let mut cycle: Vec<String> = stack.iter().cloned().collect();
+                    cycle.push(parent);
+                    return Some(cycle);
+                }
+                stack.push(parent.clone());
+                on_stack.insert(parent.clone());
+                if let Some(c) = dfs(cfg, &parent, stack, on_stack) {
+                    return Some(c);
+                }
+                stack.pop();
+                on_stack.remove(&parent);
+            }
+            None
+        }
+
+        dfs(self, start, &mut stack, &mut on_stack)
+    }
+
+    /// Resolve `name` to its include-chain in DFS pre-order: the namespace
+    /// itself first, then each parent in include order, with parents'
+    /// parents flattened in. Duplicates are removed (first occurrence
+    /// wins). The implicit `"default"` namespace, when not configured,
+    /// resolves to a single-entry chain `["default"]`.
+    pub fn resolve_namespace_chain(&self, name: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        self.namespace_chain_walk(name, &mut out, &mut seen);
+        out
+    }
+
+    fn namespace_chain_walk(
+        &self,
+        name: &str,
+        out: &mut Vec<String>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        out.push(name.to_string());
+        if let Some(cfg) = self.memory_namespaces.get(name) {
+            for parent in &cfg.include {
+                self.namespace_chain_walk(parent, out, seen);
+            }
+        }
+    }
+
+    /// Resolve the memory namespace for a given profile.
+    ///
+    /// Order: explicit `profile.memory_namespace` > `"default"`.
+    pub fn namespace_for_profile(&self, profile_name: &str) -> &str {
+        self.profiles
+            .get(profile_name)
+            .and_then(|p| p.memory_namespace.as_deref())
+            .unwrap_or(DEFAULT_NAMESPACE_NAME)
+    }
+
+    /// Resolve the memory namespace for a given `room_id`. Combines
+    /// `profile_for` with `namespace_for_profile`; rooms without a profile
+    /// fall through to `"default"`.
+    pub fn namespace_for_room(&self, room_id: &str) -> &str {
+        match self.profile_for(room_id) {
+            Some(p) => self.namespace_for_profile(p),
+            None => DEFAULT_NAMESPACE_NAME,
+        }
+    }
+
+    /// Every memory namespace name relevant to this config: the implicit
+    /// `"default"`, every `[memory_namespace.<name>]` key, and every
+    /// namespace named by a profile. Used by background catch-up loops to
+    /// know what subtrees to enumerate.
+    pub fn all_memory_namespaces(&self) -> Vec<String> {
+        let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        out.insert(DEFAULT_NAMESPACE_NAME.to_string());
+        out.extend(self.memory_namespaces.keys().cloned());
+        for prof in self.profiles.values() {
+            if let Some(ns) = &prof.memory_namespace {
+                out.insert(ns.clone());
+            }
+        }
+        out.into_iter().collect()
     }
 
     /// Resolve the default config path: `~/.config/sapphire-agent/config.toml`
@@ -665,6 +837,171 @@ profile = "missing"
             "validation errors: {:?}",
             cfg.validate_profiles()
         );
+    }
+
+    #[test]
+    fn namespace_default_resolves_when_unconfigured() {
+        let cfg = parse(MINIMAL);
+        assert_eq!(
+            cfg.resolve_namespace_chain(DEFAULT_NAMESPACE_NAME),
+            vec!["default".to_string()]
+        );
+        assert_eq!(cfg.namespace_for_room("!any:srv"), "default");
+        assert!(cfg.validate_profiles().is_empty());
+    }
+
+    #[test]
+    fn namespace_chain_includes_parents_in_dfs_preorder() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[memory_namespace.user]
+include = ["default"]
+
+[memory_namespace.user_nsfw]
+include = ["user"]
+"#,
+        );
+        assert_eq!(
+            cfg.resolve_namespace_chain("user_nsfw"),
+            vec!["user_nsfw".to_string(), "user".to_string(), "default".to_string()]
+        );
+        assert_eq!(
+            cfg.resolve_namespace_chain("user"),
+            vec!["user".to_string(), "default".to_string()]
+        );
+    }
+
+    #[test]
+    fn namespace_chain_dedupes_diamond() {
+        // a includes b and c; b and c both include d. d should appear once.
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[memory_namespace.b]
+include = ["d"]
+
+[memory_namespace.c]
+include = ["d"]
+
+[memory_namespace.d]
+
+[memory_namespace.a]
+include = ["b", "c"]
+"#,
+        );
+        let chain = cfg.resolve_namespace_chain("a");
+        assert_eq!(chain.iter().filter(|n| *n == "d").count(), 1);
+        assert_eq!(chain[0], "a");
+    }
+
+    #[test]
+    fn namespace_cycle_is_rejected() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[memory_namespace.a]
+include = ["b"]
+
+[memory_namespace.b]
+include = ["a"]
+"#,
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("cycle")),
+            "expected cycle error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_unknown_include_is_rejected() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[memory_namespace.user]
+include = ["ghost"]
+"#,
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("ghost")),
+            "expected unknown-namespace error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn profile_memory_namespace_resolves() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[memory_namespace.user_nsfw]
+include = ["default"]
+
+[profiles.nsfw]
+provider         = "anthropic"
+memory_namespace = "user_nsfw"
+
+[rooms."!nsfw:srv"]
+profile = "nsfw"
+"#,
+        );
+        assert!(cfg.validate_profiles().is_empty());
+        assert_eq!(cfg.namespace_for_room("!nsfw:srv"), "user_nsfw");
+        assert_eq!(cfg.namespace_for_room("!other:srv"), "default");
+    }
+
+    #[test]
+    fn profile_unknown_memory_namespace_is_rejected() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.nsfw]
+provider         = "anthropic"
+memory_namespace = "ghost"
+"#,
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("ghost")),
+            "expected unknown-namespace error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn all_memory_namespaces_unions_sources() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[memory_namespace.user]
+include = ["default"]
+
+[profiles.nsfw]
+provider         = "anthropic"
+memory_namespace = "user_nsfw"
+
+[memory_namespace.user_nsfw]
+include = ["user"]
+"#,
+        );
+        let all = cfg.all_memory_namespaces();
+        assert!(all.contains(&"default".to_string()));
+        assert!(all.contains(&"user".to_string()));
+        assert!(all.contains(&"user_nsfw".to_string()));
     }
 
     #[test]
