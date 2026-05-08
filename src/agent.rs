@@ -1,6 +1,7 @@
 use crate::channel::{Attachment, Channel, OutgoingMessage};
 use crate::config::{Config, SessionPolicy};
 use crate::context_compression::{generate_summary, maybe_compress};
+use crate::provider::registry::ProviderRegistry;
 use crate::provider::{ChatMessage, ContentPart, Provider, Role, ToolCall};
 use crate::session::{ConversationKey, SessionStore, local_date_for_timestamp};
 use crate::tools::ToolSet;
@@ -13,6 +14,15 @@ use tracing::{debug, error, info, warn};
 
 /// Maximum number of tool-call rounds per message to prevent infinite loops.
 const MAX_TOOL_ROUNDS: usize = 10;
+
+impl Agent {
+    /// Resolve the provider that should serve `room_id`, honouring the
+    /// room → profile → provider mapping defined in `Config`. Falls back to
+    /// the Anthropic provider when no profile applies.
+    fn provider_for(&self, room_id: &str) -> Arc<dyn Provider> {
+        self.providers.for_room(&self.config, room_id)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // System prompt snapshot (frozen per ConversationKey, refreshed daily)
@@ -30,7 +40,7 @@ struct SystemSnapshot {
 pub struct Agent {
     config: Config,
     channel: Arc<dyn Channel>,
-    provider: Arc<dyn Provider>,
+    providers: Arc<ProviderRegistry>,
     workspace: Arc<Workspace>,
     tools: Option<Arc<ToolSet>>,
     session_store: Arc<SessionStore>,
@@ -62,7 +72,7 @@ impl Agent {
     pub fn new(
         config: Config,
         channel: Arc<dyn Channel>,
-        provider: Arc<dyn Provider>,
+        providers: Arc<ProviderRegistry>,
         workspace: Arc<Workspace>,
         tools: Option<Arc<ToolSet>>,
         session_store: Arc<SessionStore>,
@@ -77,7 +87,7 @@ impl Agent {
         Self {
             config,
             channel,
-            provider,
+            providers,
             workspace,
             tools,
             session_store,
@@ -166,7 +176,8 @@ impl Agent {
                     _ => continue,
                 }
             };
-            match generate_summary(&*self.provider, &messages).await {
+            let provider = self.provider_for(&key.0);
+            match generate_summary(&*provider, &messages).await {
                 Ok(summary) if !summary.trim().is_empty() => {
                     if let Err(e) = self.session_store.append_summary(&session_id, &summary) {
                         warn!("Failed to persist fallback summary for {session_id}: {e}");
@@ -210,8 +221,9 @@ impl Agent {
             snapshot.len()
         );
 
-        for (_key, session_id, messages) in snapshot {
-            match generate_summary(&*self.provider, &messages).await {
+        for (key, session_id, messages) in snapshot {
+            let provider = self.provider_for(&key.0);
+            match generate_summary(&*provider, &messages).await {
                 Ok(summary) if !summary.trim().is_empty() => {
                     if let Err(e) = self.session_store.append_summary(&session_id, &summary) {
                         warn!("Failed to persist shutdown summary for {session_id}: {e}");
@@ -441,7 +453,8 @@ impl Agent {
 
         info!("Day boundary crossed for {key:?}; compacting session {session_id}");
 
-        let summary = match generate_summary(&*self.provider, &messages).await {
+        let provider = self.provider_for(&key.0);
+        let summary = match generate_summary(&*provider, &messages).await {
             Ok(s) if !s.trim().is_empty() => s,
             Ok(_) => {
                 warn!("Boundary summary for {session_id} was empty; skipping");
@@ -627,8 +640,9 @@ impl Agent {
             }
 
             // Check if context compression is needed
+            let provider = self.provider_for(&incoming.room_id);
             let messages = match maybe_compress(
-                &*self.provider,
+                &*provider,
                 system_with_context.as_deref(),
                 &messages,
                 &compression_config,
@@ -654,8 +668,7 @@ impl Agent {
                 }
             };
 
-            let response = self
-                .provider
+            let response = provider
                 .chat(
                     system_with_context.as_deref(),
                     &messages,

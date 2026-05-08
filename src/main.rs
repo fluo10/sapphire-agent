@@ -26,7 +26,7 @@ use periodic_log::{
     catchup_missing_daily_digests, catchup_pending_daily_logs, catchup_pending_monthly_logs,
     catchup_pending_weekly_logs, catchup_pending_yearly_logs,
 };
-use provider::anthropic::AnthropicProvider;
+use provider::registry::ProviderRegistry;
 use sapphire_workspace::{AppContext, DeviceDefaults, Workspace as SwWorkspace, WorkspaceState};
 
 static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
@@ -116,6 +116,11 @@ enum Command {
         /// and --message; ignored in REPL mode.
         #[arg(long)]
         json: bool,
+        /// Profile name to bind to a newly created session. Must match a
+        /// `[profiles.<name>]` entry on the server side. Ignored when
+        /// resuming an existing session via --session.
+        #[arg(long)]
+        profile: Option<String>,
     },
 }
 
@@ -139,9 +144,10 @@ async fn main() -> Result<()> {
         message,
         history,
         json,
+        profile,
     }) = cli.command
     {
-        return call::run(server, session, list, message, history, json).await;
+        return call::run(server, session, list, message, history, json, profile).await;
     }
 
     let config_path = cli.config.unwrap_or_else(Config::default_path);
@@ -254,9 +260,19 @@ async fn main() -> Result<()> {
             // ── Session store base directory ────────────────────────────────
             let sessions_base = config.resolved_sessions_dir(&workspace_dir);
 
-            // ── Provider ────────────────────────────────────────────────────
-            let provider: Arc<dyn provider::Provider> =
-                Arc::new(AnthropicProvider::new(&config.anthropic));
+            // ── Provider registry ────────────────────────────────────────────
+            // Builds the Anthropic provider plus any `[providers.<name>]`
+            // entries, then validates every profile/room reference. Failure
+            // here is fatal — better to refuse to start than to surprise the
+            // user mid-session with a misrouted request.
+            let registry = Arc::new(
+                ProviderRegistry::from_config(&config)
+                    .context("Failed to build provider registry")?,
+            );
+            // Heartbeat / serve / daily-log run on the "background" profile
+            // when defined (with optional refusal fallback) and on plain
+            // Anthropic otherwise.
+            let provider: Arc<dyn provider::Provider> = registry.background_provider(&config);
 
             // ── API session store (sessions/api/) ───────────────────────────
             let api_session_store = Arc::new(SessionStore::with_workspace(
@@ -351,7 +367,7 @@ async fn main() -> Result<()> {
                 let agent = Arc::new(Agent::new(
                     config.clone(),
                     channel,
-                    Arc::clone(&provider),
+                    Arc::clone(&registry),
                     Arc::clone(&workspace),
                     Some(Arc::clone(&tool_set)),
                     Arc::clone(&channel_session_store),
@@ -417,7 +433,7 @@ async fn main() -> Result<()> {
                 serve::run(
                     addr,
                     config,
-                    provider,
+                    Arc::clone(&registry),
                     workspace,
                     tool_set,
                     api_session_store,

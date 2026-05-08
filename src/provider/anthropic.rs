@@ -218,7 +218,6 @@ enum Delta {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct MessageDeltaData {
     stop_reason: Option<String>,
 }
@@ -362,6 +361,7 @@ impl Provider for AnthropicProvider {
         let mut buffer = String::new();
         // BTreeMap preserves insertion order by index.
         let mut blocks: BTreeMap<usize, Block> = BTreeMap::new();
+        let mut stop_reason: Option<String> = None;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("Error reading SSE stream")?;
@@ -417,6 +417,11 @@ impl Provider for AnthropicProvider {
                                 }
                             }
                         },
+                        Ok(SseEvent::MessageDelta { delta }) => {
+                            if let Some(reason) = delta.stop_reason {
+                                stop_reason = Some(reason);
+                            }
+                        }
                         Ok(SseEvent::Error { error }) => {
                             bail!("Anthropic stream error: {}", error.message);
                         }
@@ -459,6 +464,10 @@ impl Provider for AnthropicProvider {
         } else {
             Some(text_parts.join(""))
         };
-        Ok(ChatResponse { text, tool_calls })
+        Ok(ChatResponse {
+            text,
+            tool_calls,
+            stop_reason,
+        })
     }
 }

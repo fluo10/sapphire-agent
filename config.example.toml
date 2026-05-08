@@ -34,9 +34,11 @@ recovery_key = "EsT... "
 #   "none"    — no day-boundary action
 # session_policy = "compact"
 
-# Per-room overrides. Keys are room_ids; values may set session_policy.
+# Per-room overrides. Keys are room_ids; values may set session_policy
+# and/or pick a named profile (see [profiles] below).
 # [rooms."!roomid:example.com"]
 # session_policy = "reset"
+# profile        = "nsfw"
 
 # Periodic log digests. The agent summarises weekly/monthly/yearly activity
 # into short importance-ordered bullet lists, stored as YAML frontmatter in
@@ -59,3 +61,45 @@ model = "claude-opus-4-6"
 max_tokens = 8192
 # System prompt sent at the beginning of every conversation.
 system_prompt = "You are a helpful personal assistant."
+
+# ── Additional providers ────────────────────────────────────────────────
+# Beyond the built-in Anthropic provider above, you can declare any number
+# of OpenAI-compatible endpoints — llama.cpp's `llama-server`, Ollama,
+# vLLM, or the OpenAI API itself. Each entry is keyed by a name you choose
+# and must specify `type = "openai_compatible"`. The reserved name
+# `anthropic` cannot be reused here.
+#
+# [providers.local]
+# type     = "openai_compatible"
+# base_url = "http://127.0.0.1:8080/v1"  # llama-server, no trailing /chat/completions
+# model    = "gemma-4-31b-it"
+# api_key  = ""                          # optional; llama.cpp does not need one
+# max_tokens = 4096
+
+# ── Profiles ────────────────────────────────────────────────────────────
+# A profile binds a use-case to a provider. Rooms select a profile via
+# `profile = "..."` in their `[rooms."<id>"]` block; the API may also pass
+# `profile` per request. The conventional `default` profile, when defined,
+# is used by rooms that don't pick one explicitly. Profiles that name an
+# unknown provider cause startup to fail.
+#
+# `fallback_provider` is consulted at runtime: when the primary refuses
+# (Anthropic `stop_reason = "refusal"`, OpenAI `finish_reason =
+# "content_filter"`, or a recognised apology pattern) or errors out, the
+# call is replayed against the named fallback provider.
+#
+# The conventional `background` profile is what the daily-log generator,
+# memory compaction, and periodic digests run under. Defining it lets a
+# session that mixes safe-for-Anthropic and refused content still produce
+# its end-of-day summary by handing off the refused parts to a permissive
+# local model.
+#
+# [profiles.default]
+# provider = "anthropic"
+#
+# [profiles.nsfw]
+# provider = "local"
+#
+# [profiles.background]
+# provider          = "anthropic"
+# fallback_provider = "local"

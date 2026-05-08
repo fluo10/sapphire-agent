@@ -34,6 +34,12 @@ struct Cli {
     /// and --message; ignored in REPL mode.
     #[arg(long)]
     json: bool,
+
+    /// Profile name to bind to a newly created session. Must match a
+    /// `[profiles.<name>]` entry on the server side. Ignored when
+    /// resuming an existing session via --session.
+    #[arg(long)]
+    profile: Option<String>,
 }
 
 #[tokio::main]
@@ -52,6 +58,7 @@ async fn main() -> Result<()> {
         cli.message,
         cli.history,
         cli.json,
+        cli.profile,
     )
     .await
 }
