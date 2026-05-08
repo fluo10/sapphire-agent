@@ -178,6 +178,19 @@ pub struct MemoryNamespaceConfig {
     /// DAG; cycles are rejected at startup.
     #[serde(default)]
     pub include: Vec<String>,
+    /// Profile used by background tasks (daily-log generation, periodic
+    /// digests, MEMORY.md compaction) when working under this
+    /// namespace. Lets a per-namespace policy pick a permissive local
+    /// model up front instead of relying on a refusal-fallback hop —
+    /// e.g. an NSFW namespace can route directly to its local provider
+    /// while the default namespace stays on Anthropic.
+    ///
+    /// Resolution order for a given namespace:
+    ///   1. `memory_namespace.<n>.background_profile` (this field)
+    ///   2. global `[profiles.background]` (back-compat with PR #68)
+    ///   3. plain Anthropic
+    #[serde(default)]
+    pub background_profile: Option<String>,
 }
 
 /// Built-in name of the Anthropic provider — referenced by profiles.
@@ -581,6 +594,13 @@ impl Config {
                     ));
                 }
             }
+            if let Some(prof) = &ns_cfg.background_profile {
+                if !self.profiles.contains_key(prof) {
+                    errors.push(format!(
+                        "memory_namespace '{ns_name}' references unknown background_profile '{prof}'"
+                    ));
+                }
+            }
         }
         for ns_name in self.memory_namespaces.keys() {
             if let Some(cycle) = self.namespace_cycle_starting_at(ns_name) {
@@ -664,6 +684,25 @@ impl Config {
                 self.namespace_chain_walk(parent, out, seen);
             }
         }
+    }
+
+    /// Profile name to use for background tasks (daily-log generation,
+    /// digests, memory compaction) under `namespace`. Returns `None` when
+    /// neither the namespace's own `background_profile` nor the global
+    /// `[profiles.background]` is configured — caller should then fall
+    /// back to the built-in Anthropic provider.
+    pub fn background_profile_for_namespace(&self, namespace: &str) -> Option<&str> {
+        if let Some(name) = self
+            .memory_namespaces
+            .get(namespace)
+            .and_then(|c| c.background_profile.as_deref())
+        {
+            return Some(name);
+        }
+        if self.profiles.contains_key(BACKGROUND_PROFILE_NAME) {
+            return Some(BACKGROUND_PROFILE_NAME);
+        }
+        None
     }
 
     /// Resolve the memory namespace for a given profile.
@@ -977,6 +1016,81 @@ memory_namespace = "ghost"
         assert!(
             errors.iter().any(|e| e.contains("ghost")),
             "expected unknown-namespace error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn background_profile_resolves_from_namespace_first() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.bg_global]
+provider = "anthropic"
+
+[profiles.bg_nsfw]
+provider = "anthropic"
+
+[profiles.background]
+provider = "anthropic"
+
+[memory_namespace.user_nsfw]
+include            = ["default"]
+background_profile = "bg_nsfw"
+"#,
+        );
+        assert!(cfg.validate_profiles().is_empty());
+        // Namespace-local override wins.
+        assert_eq!(
+            cfg.background_profile_for_namespace("user_nsfw"),
+            Some("bg_nsfw")
+        );
+        // No namespace override → falls back to [profiles.background].
+        assert_eq!(
+            cfg.background_profile_for_namespace("default"),
+            Some("background")
+        );
+    }
+
+    #[test]
+    fn background_profile_is_none_when_unconfigured() {
+        let cfg = parse(MINIMAL);
+        assert!(cfg.background_profile_for_namespace("default").is_none());
+    }
+
+    #[test]
+    fn background_profile_falls_back_to_global() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.background]
+provider = "anthropic"
+"#,
+        );
+        assert_eq!(
+            cfg.background_profile_for_namespace("anything"),
+            Some("background")
+        );
+    }
+
+    #[test]
+    fn unknown_background_profile_is_rejected() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[memory_namespace.user]
+background_profile = "ghost"
+"#,
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("ghost")),
+            "expected ghost error, got: {errors:?}"
         );
     }
 

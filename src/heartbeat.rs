@@ -17,6 +17,7 @@ use crate::periodic_log::{
     generate_monthly_log, generate_weekly_log, generate_yearly_log,
 };
 use crate::provider::Provider;
+use crate::provider::registry::ProviderRegistry;
 use crate::session::SessionStore;
 use chrono::{Datelike, Duration, Local, NaiveTime, Timelike, Weekday};
 use sapphire_workspace::WorkspaceState;
@@ -36,7 +37,11 @@ pub struct Heartbeat {
     pub memory_compaction_enabled: bool,
     pub digest_cfg: DigestConfig,
     pub session_store: Arc<SessionStore>,
-    pub provider: Arc<dyn Provider>,
+    /// Provider registry — every background LLM call resolves through
+    /// `registry.background_provider_for_namespace(&config, &ns)` so each
+    /// namespace can pick its own primary (and optional fallback) instead
+    /// of all sharing one provider.
+    pub registry: Arc<ProviderRegistry>,
     pub agent: Arc<Agent>,
     pub default_room_id: Option<String>,
     /// Config snapshot used to enumerate memory namespaces and resolve
@@ -56,6 +61,14 @@ impl Heartbeat {
         } else {
             self.config.namespace_for_room(&meta.room_id).to_string()
         }
+    }
+
+    /// Background provider for `namespace`. Honours the namespace's
+    /// `background_profile`, falling back through the global background
+    /// profile to plain Anthropic.
+    fn provider_for_namespace(&self, namespace: &str) -> Arc<dyn Provider> {
+        self.registry
+            .background_provider_for_namespace(&self.config, namespace)
     }
 }
 
@@ -88,6 +101,7 @@ impl Heartbeat {
             );
             let mut total: usize = 0;
             for ns in self.config.all_memory_namespaces() {
+                let provider = self.provider_for_namespace(&ns);
                 let ns_for_predicate = ns.clone();
                 let me = Arc::clone(&self);
                 let predicate = move |meta: &crate::session::SessionMeta| -> bool {
@@ -95,7 +109,7 @@ impl Heartbeat {
                 };
                 total += catchup_pending_daily_logs(
                     &self.session_store,
-                    self.provider.as_ref(),
+                    provider.as_ref(),
                     &self.ws_state,
                     &self.workspace_dir,
                     &ns,
@@ -104,7 +118,7 @@ impl Heartbeat {
                 )
                 .await;
                 total += catchup_missing_daily_digests(
-                    self.provider.as_ref(),
+                    provider.as_ref(),
                     &self.ws_state,
                     &self.workspace_dir,
                     &ns,
@@ -112,7 +126,7 @@ impl Heartbeat {
                 .await;
                 if self.digest_cfg.weekly_enabled {
                     total += catchup_pending_weekly_logs(
-                        self.provider.as_ref(),
+                        provider.as_ref(),
                         &self.ws_state,
                         &self.workspace_dir,
                         &ns,
@@ -122,7 +136,7 @@ impl Heartbeat {
                 }
                 if self.digest_cfg.monthly_enabled {
                     total += catchup_pending_monthly_logs(
-                        self.provider.as_ref(),
+                        provider.as_ref(),
                         &self.ws_state,
                         &self.workspace_dir,
                         &ns,
@@ -132,7 +146,7 @@ impl Heartbeat {
                 }
                 if self.digest_cfg.yearly_enabled {
                     total += catchup_pending_yearly_logs(
-                        self.provider.as_ref(),
+                        provider.as_ref(),
                         &self.ws_state,
                         &self.workspace_dir,
                         &ns,
@@ -166,6 +180,7 @@ impl Heartbeat {
                 let today = yesterday + Duration::days(1);
                 let mut any_generated = false;
                 for ns in self.config.all_memory_namespaces() {
+                    let provider = self.provider_for_namespace(&ns);
                     info!("Heartbeat: generating daily log for {yesterday} in '{ns}'");
                     let ns_for_predicate = ns.clone();
                     let me = Arc::clone(&self);
@@ -174,7 +189,7 @@ impl Heartbeat {
                     };
                     match generate_daily_log(
                         &self.session_store,
-                        self.provider.as_ref(),
+                        provider.as_ref(),
                         &self.ws_state,
                         &self.workspace_dir,
                         &ns,
@@ -200,7 +215,7 @@ impl Heartbeat {
                             iso.week()
                         );
                         match generate_weekly_log(
-                            self.provider.as_ref(),
+                            provider.as_ref(),
                             &self.ws_state,
                             &self.workspace_dir,
                             &ns,
@@ -224,7 +239,7 @@ impl Heartbeat {
                             "Heartbeat: generating monthly log for {year:04}-{month:02} in '{ns}'"
                         );
                         match generate_monthly_log(
-                            self.provider.as_ref(),
+                            provider.as_ref(),
                             &self.ws_state,
                             &self.workspace_dir,
                             &ns,
@@ -246,7 +261,7 @@ impl Heartbeat {
                         let year = yesterday.year();
                         info!("Heartbeat: generating yearly log for {year:04} in '{ns}'");
                         match generate_yearly_log(
-                            self.provider.as_ref(),
+                            provider.as_ref(),
                             &self.ws_state,
                             &self.workspace_dir,
                             &ns,
@@ -270,8 +285,9 @@ impl Heartbeat {
 
             if self.memory_compaction_enabled {
                 for ns in self.config.all_memory_namespaces() {
+                    let provider = self.provider_for_namespace(&ns);
                     info!("Heartbeat: compacting MEMORY.md in '{ns}'");
-                    compact_memory(self.provider.as_ref(), &self.workspace_dir, &ns).await;
+                    compact_memory(provider.as_ref(), &self.workspace_dir, &ns).await;
                 }
             }
         }

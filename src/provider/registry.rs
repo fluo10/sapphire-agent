@@ -120,6 +120,27 @@ impl ProviderRegistry {
             self.anthropic()
         }
     }
+
+    /// Provider used by background tasks operating under a specific memory
+    /// namespace. Resolution order:
+    ///
+    ///   1. `memory_namespace.<n>.background_profile` if set
+    ///   2. global `[profiles.background]` if defined
+    ///   3. plain Anthropic
+    ///
+    /// Lets an NSFW namespace route directly to its permissive local
+    /// provider without paying a refusal-fallback hop on every daily-log
+    /// generation.
+    pub fn background_provider_for_namespace(
+        &self,
+        config: &Config,
+        namespace: &str,
+    ) -> Arc<dyn Provider> {
+        match config.background_profile_for_namespace(namespace) {
+            Some(profile_name) => self.for_profile(config, profile_name),
+            None => self.anthropic(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -261,6 +282,65 @@ fallback_provider = "local"
         assert!(
             !Arc::ptr_eq(&raw_anthropic, &bg),
             "background provider should be wrapped when profile has fallback"
+        );
+    }
+
+    #[test]
+    fn background_provider_for_namespace_uses_namespace_override() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[providers.local]
+type = "openai_compatible"
+base_url = "http://127.0.0.1:8080/v1"
+model = "gemma-4-31b-it"
+
+[profiles.local_only]
+provider = "local"
+
+[memory_namespace.user_nsfw]
+include            = ["default"]
+background_profile = "local_only"
+"#,
+        );
+        let reg = ProviderRegistry::from_config(&cfg).unwrap();
+        let p = reg.background_provider_for_namespace(&cfg, "user_nsfw");
+        assert_eq!(p.name(), "local");
+        // Namespaces without their own override fall back to anthropic
+        // when no global [profiles.background] is defined.
+        let p_default = reg.background_provider_for_namespace(&cfg, "default");
+        assert_eq!(p_default.name(), "anthropic");
+    }
+
+    #[test]
+    fn background_provider_for_namespace_falls_back_to_global() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[providers.local]
+type = "openai_compatible"
+base_url = "http://127.0.0.1:8080/v1"
+model = "gemma-4-31b-it"
+
+[profiles.background]
+provider          = "anthropic"
+fallback_provider = "local"
+"#,
+        );
+        let reg = ProviderRegistry::from_config(&cfg).unwrap();
+        // No namespace override → use the global [profiles.background].
+        // The provider's name forwards to the primary (anthropic), but a
+        // FallbackProvider was wrapped around it — verify by Arc identity
+        // against the bare anthropic provider.
+        let raw_anthropic = reg.anthropic();
+        let p = reg.background_provider_for_namespace(&cfg, "default");
+        assert!(
+            !Arc::ptr_eq(&raw_anthropic, &p),
+            "expected wrapped FallbackProvider, got the bare anthropic Arc"
         );
     }
 

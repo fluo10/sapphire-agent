@@ -126,10 +126,20 @@ system_prompt = "You are a helpful personal assistant."
 #
 # [memory_namespace.user_nsfw]
 # include = ["user"]
+# # background_profile pins which profile drives this namespace's
+# # daily-log generation, periodic digests, and MEMORY.md compaction.
+# # Useful for routing an NSFW namespace directly to a permissive local
+# # model instead of bouncing through Anthropic refusal-fallback every
+# # day. Resolution: this field > global [profiles.background] > plain
+# # Anthropic.
+# background_profile = "nsfw"
 #
 # [profiles.user_nsfw]
 # provider         = "local"
 # memory_namespace = "user_nsfw"
+#
+# [profiles.nsfw]
+# provider = "local"
 #
 # Caveat: workspace retrieve (FTS / vector search) currently spans every
 # namespace because sapphire-workspace 0.10.x has no path_prefix filter.

@@ -274,10 +274,6 @@ async fn main() -> Result<()> {
                 ProviderRegistry::from_config(&config)
                     .context("Failed to build provider registry")?,
             );
-            // Heartbeat / serve / daily-log run on the "background" profile
-            // when defined (with optional refusal fallback) and on plain
-            // Anthropic otherwise.
-            let provider: Arc<dyn provider::Provider> = registry.background_provider(&config);
 
             // ── API session store (sessions/api/) ───────────────────────────
             let api_session_store = Arc::new(SessionStore::with_workspace(
@@ -320,11 +316,16 @@ async fn main() -> Result<()> {
                 };
 
                 // ── Catch-up: iterate every configured memory namespace ────
+                // Each namespace's background tasks run on its own provider
+                // (resolved via `background_provider_for_namespace`), so an
+                // NSFW namespace can route to its local model up front
+                // instead of bouncing through Anthropic refusal-fallback.
                 let today_local = session::local_date_for_timestamp(
                     chrono::Local::now(),
                     config.day_boundary_hour,
                 );
                 for ns in config.all_memory_namespaces() {
+                    let provider = registry.background_provider_for_namespace(&config, &ns);
                     let cfg_for_predicate = config.clone();
                     let ns_for_predicate = ns.clone();
                     let predicate = move |meta: &session::SessionMeta| -> bool {
@@ -412,7 +413,7 @@ async fn main() -> Result<()> {
                     memory_compaction_enabled: config.memory_compaction_enabled,
                     digest_cfg: config.digest.clone(),
                     session_store: Arc::clone(&channel_session_store),
-                    provider: Arc::clone(&provider),
+                    registry: Arc::clone(&registry),
                     agent: Arc::clone(&agent),
                     default_room_id,
                     config: config.clone(),
