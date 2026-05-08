@@ -203,6 +203,11 @@ async fn main() -> Result<()> {
         Command::Serve { bind } => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
 
+            // ── Migrate pre-namespace memory layout (one-time) ─────────────
+            if let Err(e) = migrate_pre_namespace_layout(&workspace_dir) {
+                anyhow::bail!("Memory layout migration failed: {e:#}");
+            }
+
             // ── Bootstrap file loader (AGENTS.md, SOUL.md, MEMORY.md …) ────
             let workspace = Arc::new(Workspace::new(workspace_dir.clone(), config.digest.clone()));
 
@@ -314,53 +319,67 @@ async fn main() -> Result<()> {
                     unreachable!()
                 };
 
-                // ── Catch up on any pending daily logs ──────────────────────
-                catchup_pending_daily_logs(
-                    &channel_session_store,
-                    provider.as_ref(),
-                    &ws_state,
-                    &workspace_dir,
-                    config.day_boundary_hour,
-                )
-                .await;
-
-                // ── Back-fill digest frontmatter on existing dailies ────────
-                catchup_missing_daily_digests(provider.as_ref(), &ws_state, &workspace_dir).await;
-
-                // ── Catch up on pending weekly / monthly / yearly logs ──────
-                // Day-boundary fires only run on Mon / day-1 / Jan-1, so an
-                // offline or crashed agent at those moments would otherwise
-                // leave those logs permanently missing.
+                // ── Catch-up: iterate every configured memory namespace ────
                 let today_local = session::local_date_for_timestamp(
                     chrono::Local::now(),
                     config.day_boundary_hour,
                 );
-                if config.digest.weekly_enabled {
-                    catchup_pending_weekly_logs(
+                for ns in config.all_memory_namespaces() {
+                    let cfg_for_predicate = config.clone();
+                    let ns_for_predicate = ns.clone();
+                    let predicate = move |meta: &session::SessionMeta| -> bool {
+                        if meta.channel == "api" {
+                            return ns_for_predicate == config::DEFAULT_NAMESPACE_NAME;
+                        }
+                        cfg_for_predicate.namespace_for_room(&meta.room_id) == ns_for_predicate
+                    };
+                    catchup_pending_daily_logs(
+                        &channel_session_store,
                         provider.as_ref(),
                         &ws_state,
                         &workspace_dir,
-                        today_local,
+                        &ns,
+                        config.day_boundary_hour,
+                        &predicate,
                     )
                     .await;
-                }
-                if config.digest.monthly_enabled {
-                    catchup_pending_monthly_logs(
+                    catchup_missing_daily_digests(
                         provider.as_ref(),
                         &ws_state,
                         &workspace_dir,
-                        today_local,
+                        &ns,
                     )
                     .await;
-                }
-                if config.digest.yearly_enabled {
-                    catchup_pending_yearly_logs(
-                        provider.as_ref(),
-                        &ws_state,
-                        &workspace_dir,
-                        today_local,
-                    )
-                    .await;
+                    if config.digest.weekly_enabled {
+                        catchup_pending_weekly_logs(
+                            provider.as_ref(),
+                            &ws_state,
+                            &workspace_dir,
+                            &ns,
+                            today_local,
+                        )
+                        .await;
+                    }
+                    if config.digest.monthly_enabled {
+                        catchup_pending_monthly_logs(
+                            provider.as_ref(),
+                            &ws_state,
+                            &workspace_dir,
+                            &ns,
+                            today_local,
+                        )
+                        .await;
+                    }
+                    if config.digest.yearly_enabled {
+                        catchup_pending_yearly_logs(
+                            provider.as_ref(),
+                            &ws_state,
+                            &workspace_dir,
+                            &ns,
+                            today_local,
+                        )
+                        .await;
+                    }
                 }
 
                 // ── Agent ───────────────────────────────────────────────────
@@ -396,6 +415,7 @@ async fn main() -> Result<()> {
                     provider: Arc::clone(&provider),
                     agent: Arc::clone(&agent),
                     default_room_id,
+                    config: config.clone(),
                 };
                 if config.heartbeat_enabled {
                     heartbeat.spawn();
@@ -453,4 +473,175 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// One-shot migration from the pre-namespace `memory/{daily,weekly,monthly,
+/// yearly}/` layout to the namespaced `memory/default/{...}` layout. Also
+/// moves a top-level MEMORY.md (or lowercase memory.md) into
+/// `memory/default/MEMORY.md`.
+///
+/// Idempotent: skips silently when `memory/default/` already exists with
+/// no top-level periodic dirs to move. Refuses to run when both old and
+/// new layouts coexist (ambiguous merge — the user must reconcile).
+fn migrate_pre_namespace_layout(workspace_dir: &std::path::Path) -> anyhow::Result<()> {
+    let memory_root = workspace_dir.join("memory");
+    let has_top_memory_md = ["MEMORY.md", "memory.md"]
+        .iter()
+        .any(|f| workspace_dir.join(f).is_file());
+    if !memory_root.is_dir() && !has_top_memory_md {
+        return Ok(());
+    }
+
+    let default_root = memory_root.join(config::DEFAULT_NAMESPACE_NAME);
+    let kinds = ["daily", "weekly", "monthly", "yearly"];
+    let pre_dirs: Vec<_> = kinds
+        .iter()
+        .filter(|k| memory_root.join(k).is_dir())
+        .copied()
+        .collect();
+    let pre_memory_md = ["MEMORY.md", "memory.md"]
+        .iter()
+        .map(|f| workspace_dir.join(f))
+        .find(|p| p.is_file());
+
+    if pre_dirs.is_empty() && pre_memory_md.is_none() {
+        return Ok(());
+    }
+
+    if default_root.is_dir() && !pre_dirs.is_empty() {
+        anyhow::bail!(
+            "Both pre-namespace memory dirs ({}) and memory/{} exist — refuse to migrate. \
+             Reconcile manually before starting.",
+            pre_dirs.join(", "),
+            config::DEFAULT_NAMESPACE_NAME,
+        );
+    }
+
+    std::fs::create_dir_all(&default_root)
+        .with_context(|| format!("create {}", default_root.display()))?;
+
+    for kind in &pre_dirs {
+        let src = memory_root.join(kind);
+        let dst = default_root.join(kind);
+        std::fs::rename(&src, &dst).with_context(|| {
+            format!("rename {} -> {}", src.display(), dst.display())
+        })?;
+        tracing::info!(
+            "Migrated memory subdir: {} -> {}",
+            src.display(),
+            dst.display()
+        );
+    }
+
+    if let Some(src) = pre_memory_md {
+        let dst = default_root.join("MEMORY.md");
+        std::fs::rename(&src, &dst)
+            .with_context(|| format!("rename {} -> {}", src.display(), dst.display()))?;
+        tracing::info!(
+            "Migrated MEMORY.md: {} -> {}",
+            src.display(),
+            dst.display()
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_stub(path: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn migration_no_op_on_fresh_workspace() {
+        let td = tempfile::tempdir().unwrap();
+        migrate_pre_namespace_layout(td.path()).expect("clean migration");
+        // Nothing created.
+        assert!(!td.path().join("memory").exists());
+    }
+
+    #[test]
+    fn migration_moves_pre_namespace_layout() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        write_stub(&root.join("memory/daily/2026-04-15.md"), "daily body");
+        write_stub(&root.join("memory/weekly/2026-W16.md"), "weekly body");
+        write_stub(&root.join("memory/monthly/2026-04.md"), "monthly body");
+        write_stub(&root.join("memory/yearly/2026.md"), "yearly body");
+        write_stub(&root.join("MEMORY.md"), "core memory");
+
+        migrate_pre_namespace_layout(root).expect("migration");
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("memory/default/daily/2026-04-15.md")).unwrap(),
+            "daily body"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("memory/default/weekly/2026-W16.md")).unwrap(),
+            "weekly body"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("memory/default/monthly/2026-04.md")).unwrap(),
+            "monthly body"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("memory/default/yearly/2026.md")).unwrap(),
+            "yearly body"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("memory/default/MEMORY.md")).unwrap(),
+            "core memory"
+        );
+        // Old paths gone.
+        assert!(!root.join("memory/daily").exists());
+        assert!(!root.join("MEMORY.md").exists());
+    }
+
+    #[test]
+    fn migration_accepts_lowercase_memory_md() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        write_stub(&root.join("memory.md"), "lowercase memory");
+
+        migrate_pre_namespace_layout(root).expect("migration");
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("memory/default/MEMORY.md")).unwrap(),
+            "lowercase memory"
+        );
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        write_stub(&root.join("memory/daily/2026-04-15.md"), "daily body");
+        migrate_pre_namespace_layout(root).expect("first migration");
+        // Run again — pre-namespace dirs no longer exist; default tree
+        // already in place.
+        migrate_pre_namespace_layout(root).expect("idempotent migration");
+        assert_eq!(
+            std::fs::read_to_string(root.join("memory/default/daily/2026-04-15.md")).unwrap(),
+            "daily body"
+        );
+    }
+
+    #[test]
+    fn migration_refuses_when_layouts_coexist() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        // Both old and new layouts present — ambiguous.
+        write_stub(&root.join("memory/daily/2026-04-15.md"), "old");
+        write_stub(&root.join("memory/default/daily/2026-04-16.md"), "new");
+
+        let err = migrate_pre_namespace_layout(root).err().expect("error");
+        assert!(format!("{err:#}").contains("Reconcile manually"));
+        // Files untouched.
+        assert!(root.join("memory/daily/2026-04-15.md").exists());
+        assert!(root.join("memory/default/daily/2026-04-16.md").exists());
+    }
 }

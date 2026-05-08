@@ -23,7 +23,9 @@ struct WorkspaceFileDef {
 }
 
 /// Ordered list of workspace files, following openclaw's convention.
-/// Files that don't exist are silently skipped.
+/// Files that don't exist are silently skipped. MEMORY.md is **not**
+/// included here — it lives under `memory/<namespace>/MEMORY.md` and is
+/// assembled per turn from the room's namespace chain.
 /// See: https://github.com/openclaw/openclaw (src/agents/workspace.ts)
 static WORKSPACE_FILES: &[WorkspaceFileDef] = &[
     // openclaw uses "AGENTS.md" (plural); we also accept "AGENT.md" for
@@ -51,11 +53,6 @@ static WORKSPACE_FILES: &[WorkspaceFileDef] = &[
     WorkspaceFileDef {
         candidates: &["BOOTSTRAP.md"],
         heading: "# Bootstrap",
-    },
-    // openclaw tries "MEMORY.md" first, falls back to lowercase "memory.md".
-    WorkspaceFileDef {
-        candidates: &["MEMORY.md", "memory.md"],
-        heading: "# Memory",
     },
 ];
 
@@ -97,8 +94,20 @@ impl Workspace {
     /// Build the full system prompt:
     /// 1. Base system_prompt from config (if any)
     /// 2. Each workspace file that exists, in openclaw order
-    /// 3. Previous day's daily log (if it exists)
-    pub async fn build_system_prompt(&self, base: Option<&str>, boundary_hour: u8) -> String {
+    /// 3. Chained MEMORY.md from the room's namespace and its includes
+    /// 4. Previous day's daily log (if it exists)
+    ///
+    /// `namespace_chain` is the DFS-pre-order list of namespaces this
+    /// room reads from — typically computed via
+    /// `Config::resolve_namespace_chain(Config::namespace_for_room(room_id))`.
+    /// The first entry is the room's own namespace; later entries are
+    /// included parents.
+    pub async fn build_system_prompt(
+        &self,
+        base: Option<&str>,
+        boundary_hour: u8,
+        namespace_chain: &[String],
+    ) -> String {
         let mut parts: Vec<String> = Vec::new();
 
         if let Some(b) = base.filter(|s| !s.is_empty()) {
@@ -121,37 +130,75 @@ impl Workspace {
             }
         }
 
+        // Per-namespace MEMORY.md, chained.
+        if let Some(block) = self.build_memory_block(namespace_chain).await {
+            parts.push(block);
+        }
+
         // Inject periodic logs (yesterday's full body + digest blocks for
         // this week / month / year / past years).
         let today = crate::session::local_date_for_timestamp(now_local, boundary_hour);
-        self.inject_periodic_logs(&mut parts, today);
+        self.inject_periodic_logs(&mut parts, today, namespace_chain);
 
         parts.join("\n\n---\n\n")
     }
 
-    /// Append log injection blocks to `parts`: yesterday's full body, then
-    /// top-N digest blocks for this week / month / year / past years.
-    fn inject_periodic_logs(&self, parts: &mut Vec<String>, today: chrono::NaiveDate) {
-        // Yesterday's full body (kept verbatim from pre-#42 behaviour).
-        if let Some(yesterday) = today.pred_opt()
+    /// Read MEMORY.md from each namespace in the chain (closest first) and
+    /// concatenate as `## <namespace>` subsections under one combined
+    /// `# Memory` heading. Namespaces with no MEMORY.md are skipped.
+    /// Returns `None` if the entire chain has no MEMORY.md to inject.
+    async fn build_memory_block(&self, namespace_chain: &[String]) -> Option<String> {
+        let mut subsections = Vec::new();
+        for ns in namespace_chain {
+            let rel = format!("memory/{ns}/MEMORY.md");
+            if let Some(content) = self.read_file(&rel).await
+                && !content.trim().is_empty()
+            {
+                subsections.push(format!("## {ns}\n\n{content}"));
+            }
+        }
+        if subsections.is_empty() {
+            None
+        } else {
+            Some(format!("# Memory\n\n{}", subsections.join("\n\n")))
+        }
+    }
+
+    /// Append log injection blocks to `parts`: yesterday's full body
+    /// (room's own namespace only) plus top-N digest blocks aggregated
+    /// across the namespace chain.
+    fn inject_periodic_logs(
+        &self,
+        parts: &mut Vec<String>,
+        today: chrono::NaiveDate,
+        namespace_chain: &[String],
+    ) {
+        // Yesterday's full body — read only from the room's direct
+        // namespace (the first chain entry). Reading from the chain would
+        // balloon the body verbatim; parents' yesterday context is
+        // conveyed through digest items below.
+        if let Some(direct_ns) = namespace_chain.first()
+            && let Some(yesterday) = today.pred_opt()
             && let Some(body) = periodic_log::read_body(
                 &self.dir,
+                direct_ns,
                 LogKind::Daily,
                 &periodic_log::daily_stem(yesterday),
             )
             && !body.trim().is_empty()
         {
             let truncated = truncate_chars(&body, MAX_FILE_CHARS);
-            debug!("Injecting yesterday's daily log: {yesterday}");
+            debug!("Injecting yesterday's daily log from '{direct_ns}': {yesterday}");
             parts.push(format!("# Yesterday's Log\n\n{truncated}"));
         }
 
         // "This Week's Digests" — daily files in `[iso_week_start, yesterday)`.
         if self.digest_cfg.daily_items > 0 {
             let stems = periodic_log::daily_stems_in_current_iso_week_before(today);
-            if let Some(b) = build_digest_block(
+            if let Some(b) = build_chained_digest_block(
                 "# This Week's Digests",
                 &self.dir,
+                namespace_chain,
                 LogKind::Daily,
                 &stems,
                 self.digest_cfg.daily_items,
@@ -164,9 +211,10 @@ impl Workspace {
         // calendar month, excluding the current ISO week.
         if self.digest_cfg.weekly_items > 0 {
             let stems = periodic_log::week_stems_in_month_before(today);
-            if let Some(b) = build_digest_block(
+            if let Some(b) = build_chained_digest_block(
                 "# This Month's Digests",
                 &self.dir,
+                namespace_chain,
                 LogKind::Weekly,
                 &stems,
                 self.digest_cfg.weekly_items,
@@ -178,9 +226,10 @@ impl Workspace {
         // "This Year's Digests" — monthly files Jan..(current month - 1).
         if self.digest_cfg.monthly_items > 0 {
             let stems = periodic_log::month_stems_in_year_before(today);
-            if let Some(b) = build_digest_block(
+            if let Some(b) = build_chained_digest_block(
                 "# This Year's Digests",
                 &self.dir,
+                namespace_chain,
                 LogKind::Monthly,
                 &stems,
                 self.digest_cfg.monthly_items,
@@ -189,17 +238,32 @@ impl Workspace {
             }
         }
 
-        // "Past Years' Digests" — every yearly file on disk.
+        // "Past Years' Digests" — every yearly file on disk for any
+        // namespace in the chain. We compute a per-namespace stem list
+        // since each namespace can have its own yearly files.
         if self.digest_cfg.yearly_items > 0 {
-            let stems = periodic_log::existing_yearly_stems(&self.dir);
-            if let Some(b) = build_digest_block(
-                "# Past Years' Digests",
-                &self.dir,
-                LogKind::Yearly,
-                &stems,
-                self.digest_cfg.yearly_items,
-            ) {
-                parts.push(b);
+            let mut subsections: Vec<String> = Vec::new();
+            for ns in namespace_chain {
+                let stems = periodic_log::existing_yearly_stems(&self.dir, ns);
+                for stem in &stems {
+                    if let Some(items) = periodic_log::read_digest_top_n(
+                        &self.dir,
+                        ns,
+                        LogKind::Yearly,
+                        stem,
+                        self.digest_cfg.yearly_items,
+                    ) {
+                        if items.is_empty() {
+                            continue;
+                        }
+                        let bullets: Vec<String> =
+                            items.into_iter().map(|i| format!("- {i}")).collect();
+                        subsections.push(format!("## {ns}/{stem}\n\n{}", bullets.join("\n")));
+                    }
+                }
+            }
+            if !subsections.is_empty() {
+                parts.push(format!("# Past Years' Digests\n\n{}", subsections.join("\n\n")));
             }
         }
     }
@@ -268,26 +332,30 @@ impl Workspace {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Assemble a heading + per-stem bulleted subsections of top-N digest items.
-/// Each subsection is introduced by `## {stem}` followed by the top-N items
-/// as Markdown bullets. Stems with no digest or an empty digest are skipped.
-/// Returns `None` if every stem was skipped.
-fn build_digest_block(
+/// Assemble a heading + per-`(namespace, stem)` bulleted subsections of
+/// top-N digest items, walking each stem against every namespace in the
+/// chain. Each subsection is introduced by `## {namespace}/{stem}`.
+/// `(namespace, stem)` pairs whose file is missing or has an empty digest
+/// are skipped. Returns `None` if no pair produced a subsection.
+fn build_chained_digest_block(
     heading: &str,
     workspace_dir: &Path,
+    namespace_chain: &[String],
     kind: LogKind,
     stems: &[String],
     n: usize,
 ) -> Option<String> {
     let mut subsections = Vec::new();
-    for stem in stems {
-        let items =
-            periodic_log::read_digest_top_n(workspace_dir, kind, stem, n).unwrap_or_default();
-        if items.is_empty() {
-            continue;
+    for ns in namespace_chain {
+        for stem in stems {
+            let items = periodic_log::read_digest_top_n(workspace_dir, ns, kind, stem, n)
+                .unwrap_or_default();
+            if items.is_empty() {
+                continue;
+            }
+            let bullets: Vec<String> = items.into_iter().map(|i| format!("- {i}")).collect();
+            subsections.push(format!("## {ns}/{stem}\n\n{}", bullets.join("\n")));
         }
-        let bullets: Vec<String> = items.into_iter().map(|i| format!("- {i}")).collect();
-        subsections.push(format!("## {stem}\n\n{}", bullets.join("\n")));
     }
     if subsections.is_empty() {
         None

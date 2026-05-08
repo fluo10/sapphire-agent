@@ -486,6 +486,66 @@ impl SessionStore {
         results
     }
 
+    /// Like `sessions_for_day`, but only returns sessions for which
+    /// `predicate(&meta)` is true. Used by daily-log generation when it
+    /// runs per memory namespace: the caller supplies a predicate that
+    /// keeps only rooms mapped to the namespace being generated.
+    pub fn sessions_for_day_filtered<F>(
+        &self,
+        date: NaiveDate,
+        boundary_hour: u8,
+        predicate: F,
+    ) -> Vec<(SessionMeta, Vec<StoredMessage>)>
+    where
+        F: Fn(&SessionMeta) -> bool,
+    {
+        self.sessions_for_day(date, boundary_hour)
+            .into_iter()
+            .filter(|(meta, _)| predicate(meta))
+            .collect()
+    }
+
+    /// Like `all_session_dates`, but only counts sessions whose `meta`
+    /// satisfies `predicate`. Used so per-namespace daily-log catch-up
+    /// only enumerates dates that have at least one in-namespace session.
+    pub fn all_session_dates_filtered<F>(
+        &self,
+        boundary_hour: u8,
+        predicate: F,
+    ) -> Vec<NaiveDate>
+    where
+        F: Fn(&SessionMeta) -> bool,
+    {
+        let dir = match fs::read_dir(&self.sessions_dir) {
+            Ok(d) => d,
+            Err(_) => return vec![],
+        };
+
+        let mut dates = std::collections::HashSet::new();
+
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            if let Some((meta, messages, _, _)) = load_session_file(&path) {
+                if !predicate(&meta) {
+                    continue;
+                }
+                for msg in messages {
+                    let local_ts = msg.timestamp.with_timezone(&Local);
+                    let date = local_date_for_timestamp(local_ts, boundary_hour);
+                    dates.insert(date);
+                }
+            }
+        }
+
+        let mut sorted: Vec<NaiveDate> = dates.into_iter().collect();
+        sorted.sort();
+        sorted
+    }
+
     /// Return all local dates for which at least one session message exists.
     /// Used by daily_log to find dates that need a log generated.
     pub fn all_session_dates(&self, boundary_hour: u8) -> Vec<NaiveDate> {

@@ -553,13 +553,21 @@ async fn run_turn(
     //    initialize-time; absent that, the background provider is used.
     let provider = state.provider_for_session(&session_id).await;
 
-    // 3a. System prompt (rebuilt fresh per request)
+    // 3a. System prompt (rebuilt fresh per request). Namespace chain
+    //     follows the session's pinned profile when set, otherwise the
+    //     implicit default namespace.
+    let namespace = match state.session_profiles.lock().await.get(&session_id) {
+        Some(profile) => state.config.namespace_for_profile(profile).to_string(),
+        None => crate::config::DEFAULT_NAMESPACE_NAME.to_string(),
+    };
+    let namespace_chain = state.config.resolve_namespace_chain(&namespace);
     let system = {
         let sp = state
             .workspace
             .build_system_prompt(
                 state.config.anthropic.system_prompt.as_deref(),
                 state.config.day_boundary_hour,
+                &namespace_chain,
             )
             .await;
         if sp.is_empty() { None } else { Some(sp) }
@@ -659,18 +667,22 @@ async fn run_turn(
                     .await;
                 }
 
-                // Execute all tools concurrently
+                // Execute all tools concurrently — each call wrapped in
+                // the session's memory namespace (task_local) so the
+                // memory tool writes under `memory/<namespace>/...`.
                 let tools = Arc::clone(&state.tools);
+                let ns = namespace.clone();
                 let results: Vec<(String, String)> =
                     futures_util::future::join_all(tool_calls.iter().map(|c| {
                         let tools = Arc::clone(&tools);
                         let c = c.clone();
-                        async move {
+                        let ns = ns.clone();
+                        crate::tools::workspace_tools::scope_memory_namespace(ns, async move {
                             info!("Executing tool: {} (id={})", c.name, c.id);
                             let result = tools.execute(&c).await;
                             info!("Tool {} done", c.name);
                             (c.id, result)
-                        }
+                        })
                     }))
                     .await;
 

@@ -103,3 +103,35 @@ system_prompt = "You are a helpful personal assistant."
 # [profiles.background]
 # provider          = "anthropic"
 # fallback_provider = "local"
+
+# ── Memory namespaces ────────────────────────────────────────────────────
+# A memory namespace owns one subtree of `memory/`: its own MEMORY.md
+# plus the daily/weekly/monthly/yearly logs and digests. Profiles pin
+# their writes to one namespace via `profile.memory_namespace`, and
+# rooms / API sessions reading the system prompt also pull in the
+# parents declared via `include`. Reads chain through the include DAG;
+# writes go only to the leaf namespace.
+#
+# The `default` namespace is implicit (no need to declare it explicitly)
+# and is what every config without `[memory_namespace.*]` resolves to.
+# `default` is also the migration target — on first startup, an existing
+# pre-namespace `memory/{daily,weekly,...}/` tree is auto-moved to
+# `memory/default/{...}` so existing workspaces keep working unchanged.
+#
+# The hierarchy below stacks: a `user_nsfw` room reads `user_nsfw` +
+# `user` + `default`, but a bare `default` room sees nothing private.
+#
+# [memory_namespace.user]
+# include = ["default"]
+#
+# [memory_namespace.user_nsfw]
+# include = ["user"]
+#
+# [profiles.user_nsfw]
+# provider         = "local"
+# memory_namespace = "user_nsfw"
+#
+# Caveat: workspace retrieve (FTS / vector search) currently spans every
+# namespace because sapphire-workspace 0.10.x has no path_prefix filter.
+# Contamination prevention is digest- and MEMORY.md-only in this
+# release; retrieve hits may still leak across namespaces.

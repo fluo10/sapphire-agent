@@ -18,6 +18,41 @@ fn lock(state: &Mutex<WorkspaceState>) -> std::sync::MutexGuard<'_, WorkspaceSta
 }
 
 // ---------------------------------------------------------------------------
+// Active memory namespace
+// ---------------------------------------------------------------------------
+//
+// The memory tool needs to know which namespace to write under
+// (`memory/<namespace>/<category>/<slug>.md`). The choice is per chat
+// turn — Matrix/Discord rooms and pinned API sessions each map to their
+// own namespace via Config — but the Tool trait's `execute(input)` API
+// has no per-call context. Bridging that with a `tokio::task_local` lets
+// the agent and serve loops scope each tool execution without changing
+// the trait, and keeps the default ("default") behaviour for any future
+// caller that forgets to scope.
+
+tokio::task_local! {
+    static MEMORY_NAMESPACE_TL: String;
+}
+
+/// Run `fut` with `MEMORY_NAMESPACE_TL` set to `namespace`. Used by the
+/// agent / API serve loops to scope per-turn tool executions to the
+/// caller's namespace.
+pub fn scope_memory_namespace<F: std::future::Future>(
+    namespace: String,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    MEMORY_NAMESPACE_TL.scope(namespace, fut)
+}
+
+/// The namespace this turn's tool calls should read/write under. Falls
+/// back to `"default"` when called outside a `scope_memory_namespace`.
+fn current_memory_namespace() -> String {
+    MEMORY_NAMESPACE_TL
+        .try_with(|s| s.clone())
+        .unwrap_or_else(|_| crate::config::DEFAULT_NAMESPACE_NAME.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // memory
 // ---------------------------------------------------------------------------
 
@@ -52,7 +87,8 @@ fn memory_entry_path(
 ) -> Result<(String, std::path::PathBuf)> {
     validate_segment("category", category)?;
     validate_segment("slug", slug)?;
-    let rel = format!("memory/{category}/{slug}.md");
+    let namespace = current_memory_namespace();
+    let rel = format!("memory/{namespace}/{category}/{slug}.md");
     let abs = lock(state).workspace.root.join(&rel);
     Ok((rel, abs))
 }
