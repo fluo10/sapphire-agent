@@ -34,11 +34,11 @@ recovery_key = "EsT... "
 #   "none"    — no day-boundary action
 # session_policy = "compact"
 
-# Per-room overrides. Keys are room_ids; values may set session_policy
-# and/or pick a named profile (see [profiles] below).
-# [rooms."!roomid:example.com"]
-# session_policy = "reset"
-# profile        = "nsfw"
+# Per-room behaviour is configured via [room_profile.<n>] further down,
+# not via per-room blocks. A room profile bundles `(profile, namespace,
+# session_policy)` and applies to a list of rooms — perfect when several
+# rooms share the same setup, and trivial to add API access controls to
+# later (see issue #73).
 
 # Periodic log digests. The agent summarises weekly/monthly/yearly activity
 # into short importance-ordered bullet lists, stored as YAML frontmatter in
@@ -76,28 +76,30 @@ system_prompt = "You are a helpful personal assistant."
 # api_key  = ""                          # optional; llama.cpp does not need one
 # max_tokens = 4096
 
-# ── Profiles ────────────────────────────────────────────────────────────
-# A profile binds a use-case to a provider. Rooms select a profile via
-# `profile = "..."` in their `[rooms."<id>"]` block; the API may also pass
-# `profile` per request. The conventional `default` profile, when defined,
-# is used by rooms that don't pick one explicitly. Profiles that name an
-# unknown provider cause startup to fail.
+# ── Profiles (LLM presets) ──────────────────────────────────────────────
+# A profile is a *pure* LLM preset: a provider plus an optional
+# refusal-fallback provider. Profiles know nothing about rooms or memory
+# namespaces; pairings happen via [room_profile.<n>] (for chat) and
+# memory_namespace.<n>.background_profile (for daily-log / digests /
+# compaction). Profiles that name an unknown provider cause startup to
+# fail.
 #
 # `fallback_provider` is consulted at runtime: when the primary refuses
 # (Anthropic `stop_reason = "refusal"`, OpenAI `finish_reason =
 # "content_filter"`, or a recognised apology pattern) or errors out, the
 # call is replayed against the named fallback provider.
 #
-# The conventional `background` profile is what the daily-log generator,
-# memory compaction, and periodic digests run under. Defining it lets a
-# session that mixes safe-for-Anthropic and refused content still produce
-# its end-of-day summary by handing off the refused parts to a permissive
-# local model.
+# The conventional `background` profile is the workspace-wide fallback
+# for background tasks (daily-log generator, memory compaction, periodic
+# digests) when a memory namespace doesn't pin its own.
 #
 # [profiles.default]
 # provider = "anthropic"
 #
-# [profiles.nsfw]
+# [profiles.opus]
+# provider = "anthropic"            # use claude-opus-4-7 in [anthropic.model]
+#
+# [profiles.local]
 # provider = "local"
 #
 # [profiles.background]
@@ -106,11 +108,10 @@ system_prompt = "You are a helpful personal assistant."
 
 # ── Memory namespaces ────────────────────────────────────────────────────
 # A memory namespace owns one subtree of `memory/`: its own MEMORY.md
-# plus the daily/weekly/monthly/yearly logs and digests. Profiles pin
-# their writes to one namespace via `profile.memory_namespace`, and
-# rooms / API sessions reading the system prompt also pull in the
-# parents declared via `include`. Reads chain through the include DAG;
-# writes go only to the leaf namespace.
+# plus the daily/weekly/monthly/yearly logs and digests. Room profiles
+# pin their writes to one namespace; rooms reading the system prompt
+# also pull in parent namespaces declared via `include`. Reads chain
+# through the include DAG; writes go only to the leaf namespace.
 #
 # The `default` namespace is implicit (no need to declare it explicitly)
 # and is what every config without `[memory_namespace.*]` resolves to.
@@ -128,18 +129,39 @@ system_prompt = "You are a helpful personal assistant."
 # include = ["user"]
 # # background_profile pins which profile drives this namespace's
 # # daily-log generation, periodic digests, and MEMORY.md compaction.
-# # Useful for routing an NSFW namespace directly to a permissive local
-# # model instead of bouncing through Anthropic refusal-fallback every
-# # day. Resolution: this field > global [profiles.background] > plain
+# # Routes an NSFW namespace directly to a permissive local model
+# # instead of bouncing through Anthropic refusal-fallback every day.
+# # Resolution: this field > global [profiles.background] > plain
 # # Anthropic.
-# background_profile = "nsfw"
+# background_profile = "local"
+
+# ── Room profiles ───────────────────────────────────────────────────────
+# A room profile bundles a chat profile + memory namespace + session
+# policy and applies to a list of rooms (Matrix room_ids, Discord
+# channel ids, etc). Each room_id may appear in at most one room
+# profile. Rooms not listed anywhere fall back to [room_profile.default]
+# if defined, otherwise the built-in defaults (Anthropic provider,
+# `default` namespace, global session_policy).
 #
-# [profiles.user_nsfw]
-# provider         = "local"
+# API sessions pin a room profile at `initialize` time via the
+# `room_profile` parameter (sapphire-call: `--room-profile <name>`).
+#
+# [room_profile.everyday]
+# profile          = "default"
+# memory_namespace = "default"     # optional; defaults to "default"
+# session_policy   = "reset"       # optional; defaults to global setting
+# rooms            = ["!chat:example.com"]
+#
+# [room_profile.development]
+# profile = "opus"                 # higher-quality model for coding work
+# rooms   = ["!dev:example.com", "!code:example.com"]
+# # memory_namespace omitted → writes to "default" alongside everyday chat
+#
+# [room_profile.private_nsfw]
+# profile          = "local"
 # memory_namespace = "user_nsfw"
-#
-# [profiles.nsfw]
-# provider = "local"
+# session_policy   = "compact"
+# rooms            = ["!nsfw:example.com"]
 #
 # Caveat: workspace retrieve (FTS / vector search) currently spans every
 # namespace because sapphire-workspace 0.10.x has no path_prefix filter.

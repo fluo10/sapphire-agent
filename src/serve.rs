@@ -47,25 +47,27 @@ pub struct ServeState {
     /// that quitting without sending anything leaves no empty file behind.
     /// Maps internal UUID → reserved public_id (grain-id).
     pending_sessions: tokio::sync::Mutex<HashMap<String, String>>,
-    /// Per-session profile assignment from `initialize`. Sessions absent from
-    /// this map fall through to the background provider. Not persisted across
-    /// restarts — clients must re-pass `profile` on resume.
-    session_profiles: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Per-session room_profile pin from `initialize`. Sessions absent
+    /// from this map fall through to the background provider. Not
+    /// persisted across restarts — clients must re-pass `room_profile`
+    /// on resume.
+    session_room_profiles: tokio::sync::Mutex<HashMap<String, String>>,
 }
 
 impl ServeState {
-    /// Provider that should serve the given session: the profile-bound
-    /// primary (with optional refusal fallback) when the client picked a
-    /// profile at initialize-time, otherwise the background provider.
+    /// Provider that should serve the given session. Resolves the
+    /// session's pinned room_profile to its `profile`, then to a
+    /// concrete provider (with optional refusal fallback). Falls back
+    /// to the background provider when no room_profile is pinned.
     async fn provider_for_session(&self, session_id: &str) -> Arc<dyn Provider> {
-        let profile = self
-            .session_profiles
+        let rp_name = self
+            .session_room_profiles
             .lock()
             .await
             .get(session_id)
             .cloned();
-        match profile {
-            Some(name) => self.registry.for_profile(&self.config, &name),
+        match rp_name.and_then(|n| self.config.room_profile(&n).map(|rp| rp.profile.clone())) {
+            Some(profile_name) => self.registry.for_profile(&self.config, &profile_name),
             None => self.registry.background_provider(&self.config),
         }
     }
@@ -140,7 +142,7 @@ pub async fn run(
         api_session_store,
         sessions: tokio::sync::Mutex::new(HashMap::new()),
         pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
-        session_profiles: tokio::sync::Mutex::new(HashMap::new()),
+        session_room_profiles: tokio::sync::Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -247,16 +249,18 @@ async fn handle_initialize(
     params: Option<Value>,
     existing_header_session: Option<String>,
 ) -> axum::response::Response {
-    // Optional `params.profile` — must reference a defined `[profiles.*]`
-    // entry. Rejected eagerly so misspellings surface at session start
-    // rather than as a silent fallback to the background provider.
-    let requested_profile: Option<String> = params
+    // Optional `params.room_profile` — must reference a defined
+    // `[room_profile.<n>]` entry. Rejected eagerly so misspellings
+    // surface at session start rather than as a silent fallback to
+    // the background provider.
+    let requested_room_profile: Option<String> = params
         .as_ref()
-        .and_then(|p| p["profile"].as_str())
+        .and_then(|p| p["room_profile"].as_str())
         .map(|s| s.to_string());
-    if let Some(name) = &requested_profile {
-        if !state.config.profiles.contains_key(name) {
-            let body = error_response(req_id, -32602, &format!("Unknown profile '{name}'"));
+    if let Some(name) = &requested_room_profile {
+        if state.config.room_profile(name).is_none() {
+            let body =
+                error_response(req_id, -32602, &format!("Unknown room_profile '{name}'"));
             return body.into_response();
         }
     }
@@ -331,9 +335,9 @@ async fn handle_initialize(
             .and_then(|m| m.public_id)
     };
 
-    if let Some(name) = requested_profile {
+    if let Some(name) = requested_room_profile {
         state
-            .session_profiles
+            .session_room_profiles
             .lock()
             .await
             .insert(session_id.clone(), name);
@@ -346,8 +350,8 @@ async fn handle_initialize(
     if let Some(ref pub_id) = public_id {
         result["public_id"] = json!(pub_id);
     }
-    if let Some(name) = state.session_profiles.lock().await.get(&session_id) {
-        result["profile"] = json!(name);
+    if let Some(name) = state.session_room_profiles.lock().await.get(&session_id) {
+        result["room_profile"] = json!(name);
     }
 
     let body = json!({
@@ -554,10 +558,10 @@ async fn run_turn(
     let provider = state.provider_for_session(&session_id).await;
 
     // 3a. System prompt (rebuilt fresh per request). Namespace chain
-    //     follows the session's pinned profile when set, otherwise the
-    //     implicit default namespace.
-    let namespace = match state.session_profiles.lock().await.get(&session_id) {
-        Some(profile) => state.config.namespace_for_profile(profile).to_string(),
+    //     follows the session's pinned room_profile when set; otherwise
+    //     the implicit default namespace.
+    let namespace = match state.session_room_profiles.lock().await.get(&session_id) {
+        Some(rp_name) => state.config.namespace_for_room_profile(rp_name).to_string(),
         None => crate::config::DEFAULT_NAMESPACE_NAME.to_string(),
     };
     let namespace_chain = state.config.resolve_namespace_chain(&namespace);

@@ -32,22 +32,26 @@ pub struct Config {
     /// Used for session resets and daily log generation. Default: 0 (midnight).
     #[serde(default)]
     pub day_boundary_hour: u8,
-    /// Default session policy applied at the day boundary. Can be overridden
-    /// per room via `[rooms."<id>"]`. Default: `reset` (back-compat).
+    /// Default session policy applied at the day boundary when no room
+    /// profile sets its own policy. Default: `reset` (back-compat).
     #[serde(default)]
     pub session_policy: SessionPolicy,
-    /// Per-room overrides keyed by `room_id`.
-    #[serde(default)]
-    pub rooms: HashMap<String, RoomConfig>,
     /// Additional LLM providers beyond the built-in `anthropic` one.
     /// Keyed by user-chosen name (e.g. `"local"`, `"openai"`).
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
-    /// Named profiles that bind a use-case (e.g. `"default"`, `"nsfw"`)
-    /// to a provider name. Rooms select a profile via `RoomConfig.profile`;
-    /// the API can also pass a profile name on a per-request basis.
+    /// Named profiles that bind a use-case (e.g. `"casual"`, `"opus"`,
+    /// `"local"`) to a provider name and optional refusal-fallback
+    /// provider. A profile is a *pure* LLM preset — it does **not**
+    /// know about memory namespaces or rooms; pairing happens via
+    /// `[room_profile.<n>]`.
     #[serde(default)]
     pub profiles: HashMap<String, ProfileConfig>,
+    /// Room profiles: bundle a chat profile + memory namespace +
+    /// session policy and apply to a list of rooms / API channel
+    /// targets. Each room_id appears in at most one room profile.
+    #[serde(default, rename = "room_profile")]
+    pub room_profiles: HashMap<String, RoomProfileConfig>,
     /// Memory namespaces. Each namespace owns its own subtree under
     /// `memory/<namespace>/` (daily/weekly/monthly/yearly logs and
     /// MEMORY.md). Profiles pin their writes to one namespace, and
@@ -122,15 +126,38 @@ pub enum SessionPolicy {
     None,
 }
 
-/// Per-room configuration overrides.
+/// Bundle of (chat profile, memory namespace, session policy)
+/// applied to a set of rooms.
+///
+/// Each `room_id` may appear in at most one room profile. Rooms that
+/// don't appear in any room profile fall back to `[room_profile.default]`
+/// if defined, otherwise the built-in defaults (Anthropic provider,
+/// `"default"` namespace, global `session_policy`).
+///
+/// Future-extension fields (planned for a follow-up release):
+///   - `api_enabled: bool` — gate API access per room profile
+///   - `api_keys: Vec<String>` — bearer tokens accepted by the API for
+///     this room profile
+///
+/// See https://github.com/fluo10/sapphire-agent/issues/73
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct RoomConfig {
-    /// Override the day-boundary session policy for this room.
+pub struct RoomProfileConfig {
+    /// Name of the LLM profile (in `[profiles.<n>]`) that drives chat
+    /// turns for rooms in this room profile. Required.
+    pub profile: String,
+    /// Memory namespace these rooms read and write under. Defaults to
+    /// the implicit `"default"` namespace.
+    #[serde(default)]
+    pub memory_namespace: Option<String>,
+    /// Override the day-boundary session policy for these rooms.
+    /// Falls through to `Config.session_policy` when absent.
+    #[serde(default)]
     pub session_policy: Option<SessionPolicy>,
-    /// Profile name to use for this room. If unset, falls back to the
-    /// `"default"` profile when defined, otherwise the built-in
-    /// `anthropic` provider.
-    pub profile: Option<String>,
+    /// Channel-side room ids this profile applies to. Matrix room ids,
+    /// Discord channel ids, etc. Empty `[]` means the room profile is
+    /// usable from API sessions only — no channel rooms map to it.
+    #[serde(default)]
+    pub rooms: Vec<String>,
 }
 
 /// Definition of an additional LLM provider.
@@ -145,11 +172,13 @@ pub enum ProviderConfig {
     OpenAiCompatible(crate::provider::openai_compatible::OpenAICompatibleConfig),
 }
 
-/// Definition of a named profile.
+/// Pure LLM preset — provider plus optional refusal-fallback provider.
 ///
-/// A profile picks a provider (and optionally a fallback) for a given
-/// use-case. The `"default"` profile, if defined, is used by rooms that
-/// don't specify their own profile.
+/// Profiles intentionally know **nothing** about memory namespaces or
+/// rooms. They are referenced by:
+///   - `[room_profile.<n>].profile` for chat turns
+///   - `[memory_namespace.<n>].background_profile` for daily-log /
+///     digest / compaction work
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProfileConfig {
     /// Name of the provider to use. Either `"anthropic"` (built-in) or a
@@ -159,11 +188,6 @@ pub struct ProfileConfig {
     /// (e.g. NSFW content). Wired up by the routing layer.
     #[serde(default)]
     pub fallback_provider: Option<String>,
-    /// Memory namespace this profile reads and writes. Defaults to
-    /// `"default"`. Must reference a defined `[memory_namespace.<name>]`
-    /// (or the implicit `"default"`).
-    #[serde(default)]
-    pub memory_namespace: Option<String>,
 }
 
 /// Definition of a memory namespace — a subtree under `memory/<name>/`
@@ -506,26 +530,44 @@ impl Config {
         }
     }
 
-    /// Resolve the session policy for a given `room_id`, falling back to the
-    /// global default when no room-specific override is set.
+    /// Find the room profile a `room_id` belongs to.
+    ///
+    /// Order: explicit listing in `[room_profile.<n>].rooms` >
+    /// conventional `[room_profile.default]` (catches all unmatched
+    /// rooms) > `None`.
+    pub fn room_profile_for(&self, room_id: &str) -> Option<(&str, &RoomProfileConfig)> {
+        for (name, rp) in &self.room_profiles {
+            if rp.rooms.iter().any(|r| r == room_id) {
+                return Some((name.as_str(), rp));
+            }
+        }
+        self.room_profiles
+            .get_key_value(DEFAULT_PROFILE_NAME)
+            .map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Look up a room profile by name. Used by API sessions, which pin
+    /// a room_profile name at `initialize` time.
+    pub fn room_profile(&self, name: &str) -> Option<&RoomProfileConfig> {
+        self.room_profiles.get(name)
+    }
+
+    /// Resolve the session policy for a given `room_id`, falling back to
+    /// the global default when no room profile sets one.
     pub fn session_policy_for(&self, room_id: &str) -> SessionPolicy {
-        self.rooms
-            .get(room_id)
-            .and_then(|r| r.session_policy)
+        self.room_profile_for(room_id)
+            .and_then(|(_, rp)| rp.session_policy)
             .unwrap_or(self.session_policy)
     }
 
-    /// Resolve the profile name for a given `room_id`.
+    /// Resolve the LLM profile name for a given `room_id`.
     ///
-    /// Order: explicit room override > `"default"` profile if defined >
-    /// `None` (caller should fall back to the built-in anthropic provider).
+    /// Order: room profile that contains this room > `[profiles.default]`
+    /// if defined > `None` (caller falls back to the built-in Anthropic
+    /// provider).
     pub fn profile_for(&self, room_id: &str) -> Option<&str> {
-        if let Some(name) = self
-            .rooms
-            .get(room_id)
-            .and_then(|r| r.profile.as_deref())
-        {
-            return Some(name);
+        if let Some((_, rp)) = self.room_profile_for(room_id) {
+            return Some(rp.profile.as_str());
         }
         if self.profiles.contains_key(DEFAULT_PROFILE_NAME) {
             return Some(DEFAULT_PROFILE_NAME);
@@ -566,22 +608,29 @@ impl Config {
                 }
             }
         }
-        for (rid, rcfg) in &self.rooms {
-            if let Some(pname) = &rcfg.profile {
-                if !self.profiles.contains_key(pname) {
+        // Room profile references and uniqueness of room_ids across profiles.
+        let mut seen_rooms: HashMap<String, String> = HashMap::new();
+        for (rp_name, rp) in &self.room_profiles {
+            if !self.profiles.contains_key(&rp.profile) {
+                errors.push(format!(
+                    "room_profile '{rp_name}' references unknown profile '{}'",
+                    rp.profile
+                ));
+            }
+            if let Some(ns) = &rp.memory_namespace {
+                if !self.namespace_is_defined(ns) {
                     errors.push(format!(
-                        "room '{rid}' references unknown profile '{pname}'"
+                        "room_profile '{rp_name}' references unknown memory_namespace '{ns}'"
                     ));
                 }
             }
-        }
-        // Memory namespace references on profiles.
-        for (pname, prof) in &self.profiles {
-            if let Some(ns) = &prof.memory_namespace {
-                if !self.namespace_is_defined(ns) {
+            for room in &rp.rooms {
+                if let Some(prev) = seen_rooms.get(room) {
                     errors.push(format!(
-                        "profile '{pname}' references unknown memory_namespace '{ns}'"
+                        "room '{room}' appears in multiple room_profiles: '{prev}' and '{rp_name}'"
                     ));
+                } else {
+                    seen_rooms.insert(room.clone(), rp_name.clone());
                 }
             }
         }
@@ -705,36 +754,34 @@ impl Config {
         None
     }
 
-    /// Resolve the memory namespace for a given profile.
-    ///
-    /// Order: explicit `profile.memory_namespace` > `"default"`.
-    pub fn namespace_for_profile(&self, profile_name: &str) -> &str {
-        self.profiles
-            .get(profile_name)
-            .and_then(|p| p.memory_namespace.as_deref())
+    /// Resolve the memory namespace declared by a room profile (by
+    /// name). Falls back to `"default"` if the room profile is unknown
+    /// or doesn't set one.
+    pub fn namespace_for_room_profile(&self, name: &str) -> &str {
+        self.room_profiles
+            .get(name)
+            .and_then(|rp| rp.memory_namespace.as_deref())
             .unwrap_or(DEFAULT_NAMESPACE_NAME)
     }
 
-    /// Resolve the memory namespace for a given `room_id`. Combines
-    /// `profile_for` with `namespace_for_profile`; rooms without a profile
-    /// fall through to `"default"`.
+    /// Resolve the memory namespace for a given `room_id`. Rooms not
+    /// present in any room profile fall through to `"default"`.
     pub fn namespace_for_room(&self, room_id: &str) -> &str {
-        match self.profile_for(room_id) {
-            Some(p) => self.namespace_for_profile(p),
-            None => DEFAULT_NAMESPACE_NAME,
-        }
+        self.room_profile_for(room_id)
+            .and_then(|(_, rp)| rp.memory_namespace.as_deref())
+            .unwrap_or(DEFAULT_NAMESPACE_NAME)
     }
 
     /// Every memory namespace name relevant to this config: the implicit
     /// `"default"`, every `[memory_namespace.<name>]` key, and every
-    /// namespace named by a profile. Used by background catch-up loops to
-    /// know what subtrees to enumerate.
+    /// namespace named by a room profile. Used by background catch-up
+    /// loops to know what subtrees to enumerate.
     pub fn all_memory_namespaces(&self) -> Vec<String> {
         let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         out.insert(DEFAULT_NAMESPACE_NAME.to_string());
         out.extend(self.memory_namespaces.keys().cloned());
-        for prof in self.profiles.values() {
-            if let Some(ns) = &prof.memory_namespace {
+        for rp in self.room_profiles.values() {
+            if let Some(ns) = &rp.memory_namespace {
                 out.insert(ns.clone());
             }
         }
@@ -786,7 +833,7 @@ provider = "anthropic"
     }
 
     #[test]
-    fn room_override_wins_over_default_profile() {
+    fn room_profile_assigns_profile_to_listed_rooms() {
         let cfg = parse(
             r#"
 [anthropic]
@@ -803,15 +850,73 @@ provider = "anthropic"
 [profiles.nsfw]
 provider = "local"
 
-[rooms."!nsfw:srv"]
+[room_profile.private_nsfw]
 profile = "nsfw"
+rooms   = ["!nsfw:srv"]
 "#,
         );
         assert_eq!(cfg.profile_for("!nsfw:srv"), Some("nsfw"));
+        // Unmatched room falls through to [profiles.default].
         assert_eq!(cfg.profile_for("!other:srv"), Some("default"));
         assert_eq!(cfg.provider_for_profile("nsfw"), Some("local"));
         assert_eq!(cfg.provider_for_profile("default"), Some("anthropic"));
         assert!(cfg.validate_profiles().is_empty());
+    }
+
+    #[test]
+    fn default_room_profile_catches_unmatched_rooms() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.casual]
+provider = "anthropic"
+
+[profiles.opus]
+provider = "anthropic"
+
+[room_profile.default]
+profile = "casual"
+rooms   = []
+
+[room_profile.dev]
+profile = "opus"
+rooms   = ["!dev:srv"]
+"#,
+        );
+        assert_eq!(cfg.profile_for("!dev:srv"), Some("opus"));
+        // An unmatched room falls through to room_profile.default.
+        assert_eq!(cfg.profile_for("!chat:srv"), Some("casual"));
+    }
+
+    #[test]
+    fn validate_rejects_room_listed_in_two_profiles() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.a]
+provider = "anthropic"
+
+[profiles.b]
+provider = "anthropic"
+
+[room_profile.first]
+profile = "a"
+rooms   = ["!shared:srv"]
+
+[room_profile.second]
+profile = "b"
+rooms   = ["!shared:srv"]
+"#,
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("multiple room_profiles")),
+            "expected duplicate-room error, got: {errors:?}"
+        );
     }
 
     #[test]
@@ -849,19 +954,22 @@ fallback_provider = "ghost"
     }
 
     #[test]
-    fn validate_flags_unknown_profile_in_room() {
+    fn validate_flags_unknown_profile_in_room_profile() {
         let cfg = parse(
             r#"
 [anthropic]
 api_key = "test"
 
-[rooms."!x:srv"]
+[room_profile.x]
 profile = "missing"
+rooms   = ["!x:srv"]
 "#,
         );
         let errors = cfg.validate_profiles();
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("missing"));
+        assert!(
+            errors.iter().any(|e| e.contains("missing")),
+            "got: {errors:?}"
+        );
     }
 
     #[test]
@@ -978,7 +1086,7 @@ include = ["ghost"]
     }
 
     #[test]
-    fn profile_memory_namespace_resolves() {
+    fn room_profile_assigns_memory_namespace() {
         let cfg = parse(
             r#"
 [anthropic]
@@ -988,28 +1096,34 @@ api_key = "test"
 include = ["default"]
 
 [profiles.nsfw]
-provider         = "anthropic"
-memory_namespace = "user_nsfw"
+provider = "anthropic"
 
-[rooms."!nsfw:srv"]
-profile = "nsfw"
+[room_profile.private_nsfw]
+profile          = "nsfw"
+memory_namespace = "user_nsfw"
+rooms            = ["!nsfw:srv"]
 "#,
         );
         assert!(cfg.validate_profiles().is_empty());
         assert_eq!(cfg.namespace_for_room("!nsfw:srv"), "user_nsfw");
         assert_eq!(cfg.namespace_for_room("!other:srv"), "default");
+        assert_eq!(cfg.namespace_for_room_profile("private_nsfw"), "user_nsfw");
     }
 
     #[test]
-    fn profile_unknown_memory_namespace_is_rejected() {
+    fn room_profile_unknown_memory_namespace_is_rejected() {
         let cfg = parse(
             r#"
 [anthropic]
 api_key = "test"
 
-[profiles.nsfw]
-provider         = "anthropic"
+[profiles.x]
+provider = "anthropic"
+
+[room_profile.bad]
+profile          = "x"
 memory_namespace = "ghost"
+rooms            = ["!x:srv"]
 "#,
         );
         let errors = cfg.validate_profiles();

@@ -35,11 +35,11 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
-    /// Profile name to bind to a newly created session. Must match a
-    /// `[profiles.<name>]` entry on the server side. Ignored when
+    /// Room profile name to bind to a newly created session. Must match a
+    /// `[room_profile.<name>]` entry on the server side. Ignored when
     /// resuming an existing session via --session.
     #[arg(long)]
-    profile: Option<String>,
+    room_profile: Option<String>,
 }
 
 #[tokio::main]
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
         cli.message,
         cli.history,
         cli.json,
-        cli.profile,
+        cli.room_profile,
     )
     .await
 }

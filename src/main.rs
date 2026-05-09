@@ -116,11 +116,11 @@ enum Command {
         /// and --message; ignored in REPL mode.
         #[arg(long)]
         json: bool,
-        /// Profile name to bind to a newly created session. Must match a
-        /// `[profiles.<name>]` entry on the server side. Ignored when
+        /// Room profile name to bind to a newly created session. Must match a
+        /// `[room_profile.<name>]` entry on the server side. Ignored when
         /// resuming an existing session via --session.
         #[arg(long)]
-        profile: Option<String>,
+        room_profile: Option<String>,
     },
 }
 
@@ -144,10 +144,10 @@ async fn main() -> Result<()> {
         message,
         history,
         json,
-        profile,
+        room_profile,
     }) = cli.command
     {
-        return call::run(server, session, list, message, history, json, profile).await;
+        return call::run(server, session, list, message, history, json, room_profile).await;
     }
 
     let config_path = cli.config.unwrap_or_else(Config::default_path);

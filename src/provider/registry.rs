@@ -376,8 +376,9 @@ model = "gemma-4-31b-it"
 [profiles.nsfw]
 provider = "local"
 
-[rooms."!nsfw:srv"]
+[room_profile.private_nsfw]
 profile = "nsfw"
+rooms   = ["!nsfw:srv"]
 "#,
         );
         let reg = ProviderRegistry::from_config(&cfg).unwrap();
