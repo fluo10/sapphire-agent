@@ -62,7 +62,7 @@ pub async fn run(
     message: Option<String>,
     history: bool,
     json: bool,
-    profile: Option<String>,
+    room_profile: Option<String>,
 ) -> Result<()> {
     let base = server.trim_end_matches('/').to_string();
     let client = reqwest::Client::new();
@@ -76,7 +76,7 @@ pub async fn run(
 
     // -- Initialize session ---------------------------------------------------
     let (mut mcp_session_id, actual_session_id, is_new) =
-        initialize_session(&client, &base, session, profile.as_deref()).await?;
+        initialize_session(&client, &base, session, room_profile.as_deref()).await?;
 
     // -- --history dump-only mode ---------------------------------------------
     if history {
@@ -132,7 +132,7 @@ pub async fn run(
                 continue;
             }
             "/clear" => {
-                match initialize_session(&client, &base, None, profile.as_deref()).await {
+                match initialize_session(&client, &base, None, room_profile.as_deref()).await {
                     Ok((new_mcp_id, new_session_id, _)) => {
                         mcp_session_id = new_mcp_id;
                         println!("[new session: {new_session_id}]");
@@ -162,12 +162,12 @@ async fn initialize_session(
     client: &reqwest::Client,
     base: &str,
     session: Option<String>,
-    profile: Option<&str>,
+    room_profile: Option<&str>,
 ) -> Result<(String, String, bool)> {
     let session_id_req = session.as_deref().unwrap_or("new");
     let mut params = json!({ "session_id": session_id_req });
-    if let Some(p) = profile {
-        params["profile"] = json!(p);
+    if let Some(p) = room_profile {
+        params["room_profile"] = json!(p);
     }
     let body = json!({
         "jsonrpc": "2.0",

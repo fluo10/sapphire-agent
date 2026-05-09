@@ -8,7 +8,7 @@
 //!    triggers on the agent according to each task's cron schedule.
 
 use crate::agent::Agent;
-use crate::config::DigestConfig;
+use crate::config::{Config, DigestConfig};
 use crate::heartbeat_config::{load_heartbeat_dir, next_due};
 use crate::memory_compaction::compact_memory;
 use crate::periodic_log::{
@@ -17,6 +17,7 @@ use crate::periodic_log::{
     generate_monthly_log, generate_weekly_log, generate_yearly_log,
 };
 use crate::provider::Provider;
+use crate::provider::registry::ProviderRegistry;
 use crate::session::SessionStore;
 use chrono::{Datelike, Duration, Local, NaiveTime, Timelike, Weekday};
 use sapphire_workspace::WorkspaceState;
@@ -36,9 +37,39 @@ pub struct Heartbeat {
     pub memory_compaction_enabled: bool,
     pub digest_cfg: DigestConfig,
     pub session_store: Arc<SessionStore>,
-    pub provider: Arc<dyn Provider>,
+    /// Provider registry — every background LLM call resolves through
+    /// `registry.background_provider_for_namespace(&config, &ns)` so each
+    /// namespace can pick its own primary (and optional fallback) instead
+    /// of all sharing one provider.
+    pub registry: Arc<ProviderRegistry>,
     pub agent: Arc<Agent>,
     pub default_room_id: Option<String>,
+    /// Config snapshot used to enumerate memory namespaces and resolve
+    /// per-room namespace assignment for periodic-log catch-up.
+    pub config: Config,
+}
+
+impl Heartbeat {
+    /// Resolve which namespace a session belongs to. Matrix/Discord rooms
+    /// follow `Config::namespace_for_room`. API sessions (channel="api")
+    /// fall back to the default namespace because their per-session
+    /// profile pinning is in-memory only and not persisted in the JSONL
+    /// metadata.
+    fn namespace_for_session(&self, meta: &crate::session::SessionMeta) -> String {
+        if meta.channel == "api" {
+            crate::config::DEFAULT_NAMESPACE_NAME.to_string()
+        } else {
+            self.config.namespace_for_room(&meta.room_id).to_string()
+        }
+    }
+
+    /// Background provider for `namespace`. Honours the namespace's
+    /// `background_profile`, falling back through the global background
+    /// profile to plain Anthropic.
+    fn provider_for_namespace(&self, namespace: &str) -> Arc<dyn Provider> {
+        self.registry
+            .background_provider_for_namespace(&self.config, namespace)
+    }
 }
 
 impl Heartbeat {
@@ -64,58 +95,67 @@ impl Heartbeat {
         tick.tick().await; // skip immediate fire — startup catchup already ran in main
         loop {
             tick.tick().await;
-            let logs = catchup_pending_daily_logs(
-                &self.session_store,
-                self.provider.as_ref(),
-                &self.ws_state,
-                &self.workspace_dir,
-                self.day_boundary_hour,
-            )
-            .await;
-            let digests = catchup_missing_daily_digests(
-                self.provider.as_ref(),
-                &self.ws_state,
-                &self.workspace_dir,
-            )
-            .await;
             let today_local = crate::session::local_date_for_timestamp(
                 Local::now(),
                 self.day_boundary_hour,
             );
-            let weekly = if self.digest_cfg.weekly_enabled {
-                catchup_pending_weekly_logs(
-                    self.provider.as_ref(),
+            let mut total: usize = 0;
+            for ns in self.config.all_memory_namespaces() {
+                let provider = self.provider_for_namespace(&ns);
+                let ns_for_predicate = ns.clone();
+                let me = Arc::clone(&self);
+                let predicate = move |meta: &crate::session::SessionMeta| -> bool {
+                    me.namespace_for_session(meta) == ns_for_predicate
+                };
+                total += catchup_pending_daily_logs(
+                    &self.session_store,
+                    provider.as_ref(),
                     &self.ws_state,
                     &self.workspace_dir,
-                    today_local,
+                    &ns,
+                    self.day_boundary_hour,
+                    &predicate,
                 )
-                .await
-            } else {
-                0
-            };
-            let monthly = if self.digest_cfg.monthly_enabled {
-                catchup_pending_monthly_logs(
-                    self.provider.as_ref(),
+                .await;
+                total += catchup_missing_daily_digests(
+                    provider.as_ref(),
                     &self.ws_state,
                     &self.workspace_dir,
-                    today_local,
+                    &ns,
                 )
-                .await
-            } else {
-                0
-            };
-            let yearly = if self.digest_cfg.yearly_enabled {
-                catchup_pending_yearly_logs(
-                    self.provider.as_ref(),
-                    &self.ws_state,
-                    &self.workspace_dir,
-                    today_local,
-                )
-                .await
-            } else {
-                0
-            };
-            if logs + digests + weekly + monthly + yearly > 0 {
+                .await;
+                if self.digest_cfg.weekly_enabled {
+                    total += catchup_pending_weekly_logs(
+                        provider.as_ref(),
+                        &self.ws_state,
+                        &self.workspace_dir,
+                        &ns,
+                        today_local,
+                    )
+                    .await;
+                }
+                if self.digest_cfg.monthly_enabled {
+                    total += catchup_pending_monthly_logs(
+                        provider.as_ref(),
+                        &self.ws_state,
+                        &self.workspace_dir,
+                        &ns,
+                        today_local,
+                    )
+                    .await;
+                }
+                if self.digest_cfg.yearly_enabled {
+                    total += catchup_pending_yearly_logs(
+                        provider.as_ref(),
+                        &self.ws_state,
+                        &self.workspace_dir,
+                        &ns,
+                        today_local,
+                    )
+                    .await;
+                }
+            }
+            if total > 0 {
                 self.agent.invalidate_system_prompts().await;
             }
         }
@@ -137,84 +177,104 @@ impl Heartbeat {
             );
 
             if self.daily_log_enabled {
-                info!("Heartbeat: generating daily log for {yesterday}");
-                let mut any_generated = false;
-                match generate_daily_log(
-                    &self.session_store,
-                    self.provider.as_ref(),
-                    &self.ws_state,
-                    &self.workspace_dir,
-                    yesterday,
-                    self.day_boundary_hour,
-                )
-                .await
-                {
-                    Ok(true) => any_generated = true,
-                    Ok(false) => {}
-                    Err(e) => {
-                        warn!("Heartbeat: failed to generate daily log for {yesterday}: {e:#}")
-                    }
-                }
-
-                // Weekly: today is Monday → last ISO week closed yesterday.
                 let today = yesterday + Duration::days(1);
-                if self.digest_cfg.weekly_enabled && today.weekday() == Weekday::Mon {
-                    let iso = yesterday.iso_week();
-                    info!(
-                        "Heartbeat: generating weekly log for {}-W{:02}",
-                        iso.year(),
-                        iso.week()
-                    );
-                    match generate_weekly_log(
-                        self.provider.as_ref(),
+                let mut any_generated = false;
+                for ns in self.config.all_memory_namespaces() {
+                    let provider = self.provider_for_namespace(&ns);
+                    info!("Heartbeat: generating daily log for {yesterday} in '{ns}'");
+                    let ns_for_predicate = ns.clone();
+                    let me = Arc::clone(&self);
+                    let predicate = move |meta: &crate::session::SessionMeta| -> bool {
+                        me.namespace_for_session(meta) == ns_for_predicate
+                    };
+                    match generate_daily_log(
+                        &self.session_store,
+                        provider.as_ref(),
                         &self.ws_state,
                         &self.workspace_dir,
-                        iso.year(),
-                        iso.week(),
+                        &ns,
+                        yesterday,
+                        self.day_boundary_hour,
+                        &predicate,
                     )
                     .await
                     {
                         Ok(true) => any_generated = true,
                         Ok(false) => {}
-                        Err(e) => warn!("Heartbeat: failed to generate weekly log: {e:#}"),
+                        Err(e) => warn!(
+                            "Heartbeat: failed to generate daily log for {yesterday} in '{ns}': {e:#}"
+                        ),
                     }
-                }
 
-                // Monthly: today is day 1 → last calendar month ended yesterday.
-                if self.digest_cfg.monthly_enabled && today.day() == 1 {
-                    let (year, month) = (yesterday.year(), yesterday.month());
-                    info!("Heartbeat: generating monthly log for {year:04}-{month:02}");
-                    match generate_monthly_log(
-                        self.provider.as_ref(),
-                        &self.ws_state,
-                        &self.workspace_dir,
-                        year,
-                        month,
-                    )
-                    .await
-                    {
-                        Ok(true) => any_generated = true,
-                        Ok(false) => {}
-                        Err(e) => warn!("Heartbeat: failed to generate monthly log: {e:#}"),
+                    // Weekly: today is Monday → last ISO week closed yesterday.
+                    if self.digest_cfg.weekly_enabled && today.weekday() == Weekday::Mon {
+                        let iso = yesterday.iso_week();
+                        info!(
+                            "Heartbeat: generating weekly log for {}-W{:02} in '{ns}'",
+                            iso.year(),
+                            iso.week()
+                        );
+                        match generate_weekly_log(
+                            provider.as_ref(),
+                            &self.ws_state,
+                            &self.workspace_dir,
+                            &ns,
+                            iso.year(),
+                            iso.week(),
+                        )
+                        .await
+                        {
+                            Ok(true) => any_generated = true,
+                            Ok(false) => {}
+                            Err(e) => {
+                                warn!("Heartbeat: failed to generate weekly log in '{ns}': {e:#}")
+                            }
+                        }
                     }
-                }
 
-                // Yearly: today is Jan 1 → last calendar year ended yesterday.
-                // Runs after monthly so December's monthly is available as input.
-                if self.digest_cfg.yearly_enabled && today.day() == 1 && today.month() == 1 {
-                    let year = yesterday.year();
-                    info!("Heartbeat: generating yearly log for {year:04}");
-                    match generate_yearly_log(
-                        self.provider.as_ref(),
-                        &self.ws_state,
-                        &self.workspace_dir,
-                        year,
-                    )
-                    .await
-                    {
-                        Ok(true) => any_generated = true,
-                        Ok(false) => {}
-                        Err(e) => warn!("Heartbeat: failed to generate yearly log: {e:#}"),
+                    // Monthly: today is day 1 → last calendar month ended yesterday.
+                    if self.digest_cfg.monthly_enabled && today.day() == 1 {
+                        let (year, month) = (yesterday.year(), yesterday.month());
+                        info!(
+                            "Heartbeat: generating monthly log for {year:04}-{month:02} in '{ns}'"
+                        );
+                        match generate_monthly_log(
+                            provider.as_ref(),
+                            &self.ws_state,
+                            &self.workspace_dir,
+                            &ns,
+                            year,
+                            month,
+                        )
+                        .await
+                        {
+                            Ok(true) => any_generated = true,
+                            Ok(false) => {}
+                            Err(e) => {
+                                warn!("Heartbeat: failed to generate monthly log in '{ns}': {e:#}")
+                            }
+                        }
+                    }
+
+                    // Yearly: today is Jan 1 → last calendar year ended yesterday.
+                    if self.digest_cfg.yearly_enabled && today.day() == 1 && today.month() == 1 {
+                        let year = yesterday.year();
+                        info!("Heartbeat: generating yearly log for {year:04} in '{ns}'");
+                        match generate_yearly_log(
+                            provider.as_ref(),
+                            &self.ws_state,
+                            &self.workspace_dir,
+                            &ns,
+                            year,
+                        )
+                        .await
+                        {
+                            Ok(true) => any_generated = true,
+                            Ok(false) => {}
+                            Err(e) => {
+                                warn!("Heartbeat: failed to generate yearly log in '{ns}': {e:#}")
+                            }
+                        }
                     }
                 }
 
@@ -224,8 +284,11 @@ impl Heartbeat {
             }
 
             if self.memory_compaction_enabled {
-                info!("Heartbeat: compacting MEMORY.md");
-                compact_memory(self.provider.as_ref(), &self.workspace_dir).await;
+                for ns in self.config.all_memory_namespaces() {
+                    let provider = self.provider_for_namespace(&ns);
+                    info!("Heartbeat: compacting MEMORY.md in '{ns}'");
+                    compact_memory(provider.as_ref(), &self.workspace_dir, &ns).await;
+                }
             }
         }
     }

@@ -510,11 +510,14 @@ impl Agent {
             }
         }
 
+        let namespace = self.config.namespace_for_room(&key.0);
+        let chain = self.config.resolve_namespace_chain(namespace);
         let system_prompt = self
             .workspace
             .build_system_prompt(
                 self.config.anthropic.system_prompt.as_deref(),
                 self.config.day_boundary_hour,
+                &chain,
             )
             .await;
 
@@ -719,17 +722,28 @@ impl Agent {
                         .push(msg.clone());
                     self.persist(&session_id, &msg);
 
-                    // Execute tools concurrently
+                    // Execute tools concurrently. Each task gets the
+                    // room's memory namespace via task_local so the
+                    // memory tool writes under `memory/<namespace>/...`.
+                    // tokio::spawn does not propagate task_local, so we
+                    // re-bind it inside each spawned future.
                     let tools = Arc::clone(self.tools.as_ref().unwrap());
+                    let ns = self.config.namespace_for_room(&incoming.room_id).to_string();
                     let mut handles = Vec::with_capacity(tool_calls.len());
                     for call in tool_calls {
                         let tools = Arc::clone(&tools);
-                        handles.push(tokio::spawn(async move {
-                            info!("Executing tool: {} (id={})", call.name, call.id);
-                            let result = tools.execute(&call).await;
-                            info!("Tool {} result: {}", call.name, result);
-                            (call.id, result)
-                        }));
+                        let ns = ns.clone();
+                        handles.push(tokio::spawn(
+                            crate::tools::workspace_tools::scope_memory_namespace(
+                                ns,
+                                async move {
+                                    info!("Executing tool: {} (id={})", call.name, call.id);
+                                    let result = tools.execute(&call).await;
+                                    info!("Tool {} result: {}", call.name, result);
+                                    (call.id, result)
+                                },
+                            ),
+                        ));
                     }
 
                     let mut results = Vec::with_capacity(handles.len());
