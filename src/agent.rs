@@ -1,4 +1,4 @@
-use crate::channel::{Attachment, Channel, OutgoingMessage};
+use crate::channel::{Attachment, Channels, OutgoingMessage};
 use crate::config::{Config, SessionPolicy};
 use crate::context_compression::{generate_summary, maybe_compress};
 use crate::provider::registry::ProviderRegistry;
@@ -39,7 +39,7 @@ struct SystemSnapshot {
 
 pub struct Agent {
     config: Config,
-    channel: Arc<dyn Channel>,
+    channels: Arc<Channels>,
     providers: Arc<ProviderRegistry>,
     workspace: Arc<Workspace>,
     tools: Option<Arc<ToolSet>>,
@@ -71,7 +71,7 @@ pub struct Agent {
 impl Agent {
     pub fn new(
         config: Config,
-        channel: Arc<dyn Channel>,
+        channels: Arc<Channels>,
         providers: Arc<ProviderRegistry>,
         workspace: Arc<Workspace>,
         tools: Option<Arc<ToolSet>>,
@@ -86,7 +86,7 @@ impl Agent {
         );
         Self {
             config,
-            channel,
+            channels,
             providers,
             workspace,
             tools,
@@ -123,24 +123,35 @@ impl Agent {
             return;
         }
 
-        // Build the set of room/channel IDs this instance is configured to
-        // handle.  An empty set means "no restriction" (e.g. Discord with
-        // channel_ids = []) and falls back to processing everything.
+        // Build the set of room/channel IDs this instance is configured
+        // to handle. If any configured channel uses the "listen
+        // everywhere" wildcard (Discord with channel_ids = []), treat
+        // the whole agent as unrestricted — narrowing to only the other
+        // channel's explicit set would silently drop everything that
+        // channel was supposed to handle.
+        let mut wildcard = false;
         let allowed: std::collections::HashSet<String> = {
             let mut set = std::collections::HashSet::new();
             if let Some(m) = &self.config.matrix {
-                set.extend(m.room_ids.iter().cloned());
+                if m.room_ids.is_empty() {
+                    wildcard = true;
+                } else {
+                    set.extend(m.room_ids.iter().cloned());
+                }
             }
             if let Some(d) = &self.config.discord {
-                set.extend(d.channel_ids.iter().cloned());
+                if d.channel_ids.is_empty() {
+                    wildcard = true;
+                } else {
+                    set.extend(d.channel_ids.iter().cloned());
+                }
             }
             set
         };
 
         let (to_process, skipped): (Vec<(ConversationKey, Vec<ChatMessage>)>, usize) =
-            if allowed.is_empty() {
-                // No restriction configured (e.g. Discord with channel_ids=[])
-                // — process all sessions.
+            if wildcard || allowed.is_empty() {
+                // No restriction configured — process all sessions.
                 (pending, 0)
             } else {
                 let (yes, no): (Vec<_>, Vec<_>) = pending
@@ -272,9 +283,9 @@ impl Agent {
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let (tx, mut rx) = mpsc::channel(64);
 
-        let channel = Arc::clone(&self.channel);
+        let channels = Arc::clone(&self.channels);
         let listen_handle = tokio::spawn(async move {
-            if let Err(e) = channel.listen(tx).await {
+            if let Err(e) = channels.listen_all(tx).await {
                 error!("Channel listen error: {e:#}");
             }
         });
@@ -324,7 +335,17 @@ impl Agent {
         if let Some(id) = sessions.get(key) {
             return id.clone();
         }
-        let channel_name = self.channel.name().to_string();
+        let channel_name = self
+            .channels
+            .channel_name_for_room(&key.0)
+            .await
+            .unwrap_or_else(|| {
+                self.channels
+                    .names()
+                    .first()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
         match self.session_store.create_session(key, &channel_name) {
             Ok(id) => {
                 sessions.insert(key.clone(), id.clone());
@@ -602,7 +623,7 @@ impl Agent {
             self.persist(&session_id, &msg);
         }
 
-        let _ = self.channel.start_typing(&incoming.room_id).await;
+        let _ = self.channels.start_typing(&incoming.room_id).await;
 
         // Refresh MCP tools if any server signalled a change.
         if let Some(tools) = &self.tools {
@@ -682,9 +703,9 @@ impl Agent {
             match response {
                 Err(e) => {
                     error!("Provider error: {e:#}");
-                    let _ = self.channel.stop_typing(&incoming.room_id).await;
+                    let _ = self.channels.stop_typing(&incoming.room_id).await;
                     let _ = self
-                        .channel
+                        .channels
                         .send(&OutgoingMessage::new(
                             format!("⚠️ Error: {e}"),
                             incoming.room_id.clone(),
@@ -766,7 +787,7 @@ impl Agent {
             }
         };
 
-        let _ = self.channel.stop_typing(&incoming.room_id).await;
+        let _ = self.channels.stop_typing(&incoming.room_id).await;
 
         if let Some(text) = final_text {
             if !text.is_empty() {
@@ -775,7 +796,7 @@ impl Agent {
                     room_id: incoming.room_id.clone(),
                     thread_id: incoming.thread_id.clone(),
                 };
-                self.channel
+                self.channels
                     .send(&out)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to send response: {e:#}"))?;

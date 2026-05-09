@@ -207,6 +207,14 @@ async fn main() -> Result<()> {
             if let Err(e) = migrate_pre_namespace_layout(&workspace_dir) {
                 anyhow::bail!("Memory layout migration failed: {e:#}");
             }
+            // ── Consolidate sessions/{matrix,discord} into sessions/channel ──
+            // Both chat channels can run concurrently now and share one
+            // session store keyed by ULID; the originating channel is
+            // still recorded inside each session's metadata.
+            let sessions_base_for_migration = config.resolved_sessions_dir(&workspace_dir);
+            if let Err(e) = migrate_per_channel_sessions(&sessions_base_for_migration) {
+                anyhow::bail!("Session layout migration failed: {e:#}");
+            }
 
             // ── Bootstrap file loader (AGENTS.md, SOUL.md, MEMORY.md …) ────
             let workspace = Arc::new(Workspace::new(workspace_dir.clone(), config.digest.clone()));
@@ -293,27 +301,39 @@ async fn main() -> Result<()> {
             // returns, cancelling any in-flight LLM call (#48).
             let mut agent_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-            // ── Channel + Agent (Matrix or Discord, if configured) ──────────
+            // ── Channel + Agent (Matrix and/or Discord, if configured) ──────
             if !config.standby_mode && (config.matrix.is_some() || config.discord.is_some()) {
-                let channel_name = if config.discord.is_some() {
-                    "discord"
-                } else {
-                    "matrix"
-                };
+                // Sessions from every chat channel land in one shared
+                // directory now that both Matrix and Discord can run
+                // concurrently. The originating channel name is still
+                // recorded in each session's metadata. See
+                // `migrate_per_channel_sessions` for the one-time move.
                 let channel_session_store = Arc::new(SessionStore::with_workspace(
-                    sessions_base.join(channel_name),
+                    sessions_base.join("channel"),
                     Arc::clone(&ws_state),
                 ));
 
-                let channel: Arc<dyn channel::Channel> = if let Some(d) = &config.discord {
-                    Arc::new(
-                        DiscordChannel::new(d).context("Failed to initialise Discord channel")?,
-                    )
-                } else if let Some(m) = &config.matrix {
-                    Arc::new(MatrixChannel::new(m))
-                } else {
-                    unreachable!()
-                };
+                let mut channel_list: Vec<(String, Arc<dyn channel::Channel>)> = Vec::new();
+                if let Some(m) = &config.matrix {
+                    channel_list.push(("matrix".to_string(), Arc::new(MatrixChannel::new(m))));
+                }
+                if let Some(d) = &config.discord {
+                    channel_list.push((
+                        "discord".to_string(),
+                        Arc::new(
+                            DiscordChannel::new(d)
+                                .context("Failed to initialise Discord channel")?,
+                        ),
+                    ));
+                }
+                let channels = Arc::new(channel::Channels::new(
+                    channel_list,
+                    channel::seed_routing_from_config(&config),
+                ));
+                tracing::info!(
+                    "Channels active: {}",
+                    channels.names().join(", ")
+                );
 
                 // ── Catch-up: iterate every configured memory namespace ────
                 // Each namespace's background tasks run on its own provider
@@ -386,7 +406,7 @@ async fn main() -> Result<()> {
                 // ── Agent ───────────────────────────────────────────────────
                 let agent = Arc::new(Agent::new(
                     config.clone(),
-                    channel,
+                    Arc::clone(&channels),
                     Arc::clone(&registry),
                     Arc::clone(&workspace),
                     Some(Arc::clone(&tool_set)),
@@ -473,6 +493,76 @@ async fn main() -> Result<()> {
         Command::Call { .. } => unreachable!(),
     }
 
+    Ok(())
+}
+
+/// One-shot migration from the per-channel session layout
+/// (`sessions/matrix/` + `sessions/discord/`) to the consolidated
+/// `sessions/channel/` directory. The originating channel is still
+/// recorded in each session's `meta.channel` field, so the move is
+/// pure reshuffling.
+///
+/// Idempotent: skips silently when neither legacy directory exists.
+/// Refuses to run when a name collision would clobber an existing
+/// `sessions/channel/<id>.jsonl` (extremely unlikely with ULIDs but
+/// handled for safety).
+fn migrate_per_channel_sessions(sessions_base: &std::path::Path) -> anyhow::Result<()> {
+    let target = sessions_base.join("channel");
+    let mut sources: Vec<std::path::PathBuf> = Vec::new();
+    for legacy in ["matrix", "discord"] {
+        let dir = sessions_base.join(legacy);
+        if dir.is_dir() {
+            sources.push(dir);
+        }
+    }
+    if sources.is_empty() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&target)
+        .with_context(|| format!("create {}", target.display()))?;
+
+    for src in sources {
+        let entries = match std::fs::read_dir(&src) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("Skipping {}: {e}", src.display());
+                continue;
+            }
+        };
+        let mut moved = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(file_name) = path.file_name() else {
+                continue;
+            };
+            let dst = target.join(file_name);
+            if dst.exists() {
+                anyhow::bail!(
+                    "Refusing to migrate {}: destination {} already exists. \
+                     Reconcile manually before starting.",
+                    path.display(),
+                    dst.display(),
+                );
+            }
+            std::fs::rename(&path, &dst).with_context(|| {
+                format!("rename {} -> {}", path.display(), dst.display())
+            })?;
+            moved += 1;
+        }
+        // Remove the now-empty legacy directory; non-fatal if it has
+        // unexpected leftover entries (e.g. user-dropped files).
+        let _ = std::fs::remove_dir(&src);
+        tracing::info!(
+            "Migrated {} session file(s) from {} to {}",
+            moved,
+            src.display(),
+            target.display()
+        );
+    }
     Ok(())
 }
 
@@ -644,5 +734,62 @@ mod tests {
         // Files untouched.
         assert!(root.join("memory/daily/2026-04-15.md").exists());
         assert!(root.join("memory/default/daily/2026-04-16.md").exists());
+    }
+
+    #[test]
+    fn session_migration_no_op_on_fresh_workspace() {
+        let td = tempfile::tempdir().unwrap();
+        migrate_per_channel_sessions(td.path()).expect("clean migration");
+        assert!(!td.path().join("channel").exists());
+    }
+
+    #[test]
+    fn session_migration_consolidates_matrix_and_discord() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path();
+        write_stub(&base.join("matrix/01H1.jsonl"), "matrix");
+        write_stub(&base.join("matrix/01H2.jsonl"), "matrix2");
+        write_stub(&base.join("discord/01H3.jsonl"), "discord");
+
+        migrate_per_channel_sessions(base).expect("migration");
+
+        for stem in ["01H1", "01H2", "01H3"] {
+            let path = base.join("channel").join(format!("{stem}.jsonl"));
+            assert!(path.exists(), "missing: {}", path.display());
+        }
+        assert!(!base.join("matrix").exists(), "matrix dir should be removed");
+        assert!(!base.join("discord").exists(), "discord dir should be removed");
+    }
+
+    #[test]
+    fn session_migration_is_idempotent() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path();
+        write_stub(&base.join("matrix/01H1.jsonl"), "matrix");
+        migrate_per_channel_sessions(base).expect("first");
+        migrate_per_channel_sessions(base).expect("second is a no-op");
+        assert!(base.join("channel/01H1.jsonl").exists());
+    }
+
+    #[test]
+    fn session_migration_refuses_on_collision() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path();
+        write_stub(&base.join("matrix/01H1.jsonl"), "matrix");
+        write_stub(&base.join("channel/01H1.jsonl"), "pre-existing");
+        let err = migrate_per_channel_sessions(base).err().expect("error");
+        assert!(
+            format!("{err:#}").contains("already exists"),
+            "got: {err:#}"
+        );
+        // Original files untouched.
+        assert_eq!(
+            std::fs::read_to_string(base.join("matrix/01H1.jsonl")).unwrap(),
+            "matrix"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("channel/01H1.jsonl")).unwrap(),
+            "pre-existing"
+        );
     }
 }
