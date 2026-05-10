@@ -6,10 +6,13 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
-    /// Matrix channel configuration. Required if `discord` is not set.
+    /// Matrix channel configuration. Both `matrix` and `discord` may be
+    /// configured at once — when set, both run concurrently in the
+    /// same `serve` process. At least one of them is required (unless
+    /// `standby_mode = true`).
     #[serde(default)]
     pub matrix: Option<MatrixConfig>,
-    /// Discord channel configuration. Required if `matrix` is not set.
+    /// Discord channel configuration. May coexist with `matrix`.
     #[serde(default)]
     pub discord: Option<DiscordConfig>,
     pub anthropic: AnthropicConfig,
