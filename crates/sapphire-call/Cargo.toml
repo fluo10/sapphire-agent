@@ -13,8 +13,8 @@ path = "src/main.rs"
 [dependencies]
 sapphire-agent-api = { path = "../sapphire-agent-api", version = "0.5.0" }
 
-# Async runtime
-tokio.workspace = true
+# Async runtime — voice subcommand needs sync, time, and rt features.
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "signal"] }
 
 # CLI
 clap.workspace = true
@@ -24,3 +24,12 @@ anyhow.workspace = true
 
 # Logging
 tracing-subscriber.workspace = true
+
+# Audio I/O for the voice subcommand: mic capture + speaker playback.
+cpal = "0.15"
+
+# Push-to-talk key handling (raw-mode terminal input).
+crossterm = "0.28"
+
+# HTTP client (shared with sapphire-agent-api for the voice MCP call).
+reqwest.workspace = true
