@@ -49,6 +49,10 @@ default = ["lancedb-store", "fastembed-embed", "git-sync"]
 lancedb-store = ["sapphire-workspace/lancedb-store"]
 fastembed-embed = ["sapphire-workspace/fastembed-embed"]
 git-sync = ["sapphire-workspace/git-sync"]
+# Compile in the local whisper.cpp STT provider. Off by default because
+# whisper-rs pulls in a sizeable C build; users who only need cloud STT
+# can skip it.
+voice-whisper = ["dep:whisper-rs"]
 
 [dependencies]
 # Async runtime
@@ -146,6 +150,11 @@ serenity = { version = "0.12", default-features = false, features = [
     "model",
     "rustls_backend",
 ] }
+
+# Local whisper.cpp STT. Optional — gated behind the `voice-whisper` feature
+# to keep the default build lightweight. When the feature is off, configs
+# that reference `type = "whisper_rs"` fail at startup with a clear message.
+whisper-rs = { version = "0.16", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

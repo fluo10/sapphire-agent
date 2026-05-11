@@ -72,9 +72,26 @@ fn build_stt(name: &str, cfg: &SttProviderConfig) -> anyhow::Result<Arc<dyn SttP
             name.to_string(),
             transcript.clone(),
         ))),
-        SttProviderConfig::WhisperRs { .. } | SttProviderConfig::OpenAiWhisperApi { .. } => {
+        SttProviderConfig::WhisperRs { model } => {
+            #[cfg(feature = "voice-whisper")]
+            {
+                Ok(Arc::new(providers::WhisperRsStt::new(
+                    name.to_string(),
+                    model,
+                )?))
+            }
+            #[cfg(not(feature = "voice-whisper"))]
+            {
+                let _ = model;
+                anyhow::bail!(
+                    "stt_provider '{name}': type = \"whisper_rs\" requires the \
+                     `voice-whisper` cargo feature to be enabled at build time"
+                )
+            }
+        }
+        SttProviderConfig::OpenAiWhisperApi { .. } => {
             anyhow::bail!(
-                "stt_provider '{name}': non-mock STT providers are not yet implemented"
+                "stt_provider '{name}': type = \"openai_whisper_api\" is not yet implemented"
             )
         }
     }

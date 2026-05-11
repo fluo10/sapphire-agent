@@ -678,6 +678,12 @@ async fn run_voice_turn(
         .collect();
 
     // Stage: STT
+    info!(
+        "voice/pipeline_run: STT via '{}' ({} samples, lang={:?})",
+        stt.name(),
+        pcm.len(),
+        language.as_deref().or(pipeline.language.as_deref()),
+    );
     send(notification_event(
         "notifications/progress",
         json!({"kind": "stage", "stage": "stt", "status": "start"}),
@@ -736,6 +742,11 @@ async fn run_voice_turn(
     .await;
 
     // Stage: TTS
+    info!(
+        "voice/pipeline_run: TTS via '{}' ({} chars)",
+        tts.name(),
+        reply_text.len(),
+    );
     send(notification_event(
         "notifications/progress",
         json!({"kind": "stage", "stage": "tts", "status": "start"}),
