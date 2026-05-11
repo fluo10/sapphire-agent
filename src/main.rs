@@ -13,6 +13,7 @@ mod provider;
 mod serve;
 mod session;
 mod tools;
+mod voice;
 mod workspace;
 
 use agent::Agent;
@@ -471,6 +472,14 @@ async fn main() -> Result<()> {
                     })
                     .unwrap_or_else(|| "127.0.0.1:9000".to_string());
 
+                let voice_providers = if config.stt_providers.is_empty()
+                    && config.tts_providers.is_empty()
+                {
+                    None
+                } else {
+                    Some(Arc::new(voice::VoiceProviders::from_config(&config)?))
+                };
+
                 serve::run(
                     addr,
                     config,
@@ -478,6 +487,7 @@ async fn main() -> Result<()> {
                     workspace,
                     tool_set,
                     api_session_store,
+                    voice_providers,
                 )
                 .await?;
             }

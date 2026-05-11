@@ -105,6 +105,15 @@ pub struct Config {
     /// Periodic log digest configuration (weekly / monthly / yearly).
     #[serde(default)]
     pub digest: DigestConfig,
+    /// Voice pipeline presets, referenced by `[room_profile.<n>].voice_pipeline`.
+    #[serde(default, rename = "voice_pipeline")]
+    pub voice_pipelines: HashMap<String, VoicePipelineConfig>,
+    /// Named STT providers, referenced by `[voice_pipeline.<n>].stt_provider`.
+    #[serde(default, rename = "stt_provider")]
+    pub stt_providers: HashMap<String, SttProviderConfig>,
+    /// Named TTS providers, referenced by `[voice_pipeline.<n>].tts_provider`.
+    #[serde(default, rename = "tts_provider")]
+    pub tts_providers: HashMap<String, TtsProviderConfig>,
 }
 
 fn default_true() -> bool {
@@ -161,6 +170,11 @@ pub struct RoomProfileConfig {
     /// usable from API sessions only — no channel rooms map to it.
     #[serde(default)]
     pub rooms: Vec<String>,
+    /// Voice pipeline preset (in `[voice_pipeline.<n>]`) used when the
+    /// MCP `voice/pipeline_run` method targets this room profile.
+    /// Absent means voice is disabled for this room profile.
+    #[serde(default)]
+    pub voice_pipeline: Option<String>,
 }
 
 /// Definition of an additional LLM provider.
@@ -218,6 +232,127 @@ pub struct MemoryNamespaceConfig {
     ///   3. plain Anthropic
     #[serde(default)]
     pub background_profile: Option<String>,
+}
+
+/// Voice pipeline preset — references a named STT provider and TTS provider
+/// plus per-pipeline defaults (language, capture limits). Bound to a
+/// `[room_profile.<n>]` via that profile's `voice_pipeline` field.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VoicePipelineConfig {
+    /// Name of the entry in `[stt_provider.<n>]`.
+    pub stt_provider: String,
+    /// Name of the entry in `[tts_provider.<n>]`.
+    pub tts_provider: String,
+    /// BCP-47 language hint passed to STT when the caller omits one.
+    /// `None` lets the provider auto-detect (whisper) or use its own default.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Hard cap on a single utterance, in milliseconds. Helps reject
+    /// runaway clients that forget to stop. Default: 30 seconds.
+    #[serde(default = "default_capture_max_ms")]
+    pub capture_max_ms: u32,
+}
+
+fn default_capture_max_ms() -> u32 {
+    30_000
+}
+
+/// STT provider definition. Tagged by `type` so future providers (e.g.
+/// Deepgram, AssemblyAI, sherpa-rs) can be added without breaking config.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum SttProviderConfig {
+    /// Local whisper.cpp via whisper-rs.
+    #[serde(rename = "whisper_rs")]
+    WhisperRs {
+        /// Path to a ggml/gguf whisper model file.
+        model: String,
+    },
+    /// OpenAI Whisper API (audio/transcriptions).
+    #[serde(rename = "openai_whisper_api")]
+    OpenAiWhisperApi {
+        /// Environment variable holding the API key.
+        api_key_env: String,
+        /// Optional base URL override (for OpenAI-compatible endpoints
+        /// like Groq, OpenRouter). Defaults to OpenAI's public endpoint.
+        #[serde(default)]
+        base_url: Option<String>,
+        /// Model name. Defaults to `whisper-1` when omitted.
+        #[serde(default)]
+        model: Option<String>,
+    },
+    /// Deterministic mock — always returns the same configured text.
+    /// Useful for testing the pipeline plumbing without any model setup.
+    #[serde(rename = "mock")]
+    Mock {
+        /// Text to return for every transcription. Default: `"test transcript"`.
+        #[serde(default = "default_mock_transcript")]
+        transcript: String,
+    },
+}
+
+fn default_mock_transcript() -> String {
+    "test transcript".to_string()
+}
+
+/// TTS provider definition. Tagged by `type` so we can add `piper_shell`,
+/// `elevenlabs`, etc. without breaking config.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum TtsProviderConfig {
+    /// Generic Gradio Web UI client. Works against any Gradio-hosted TTS
+    /// app (Irodori-TTS, Style-Bert-VITS2, etc.) — the user supplies the
+    /// endpoint name and a payload template.
+    #[serde(rename = "gradio")]
+    Gradio {
+        /// Gradio base URL (without the `/gradio_api/...` suffix).
+        base_url: String,
+        /// Endpoint name as exposed by the Gradio app (e.g. `/predict`,
+        /// or a numeric fn_index as a string).
+        fn_name: String,
+        /// Payload template (JSON). `{{text}}` is substituted with the
+        /// utterance text at call time.
+        payload: String,
+        /// JSONPath-ish field selector telling the client where in the
+        /// response JSON to find the audio file URL or base64 blob.
+        /// Examples: `data[0]`, `data[0].url`.
+        audio_field: String,
+    },
+    /// OpenAI's `audio/speech` endpoint (`tts-1` / `tts-1-hd`).
+    #[serde(rename = "openai_tts")]
+    OpenAiTts {
+        /// Environment variable holding the API key.
+        api_key_env: String,
+        /// Optional base URL override. Defaults to OpenAI's public endpoint.
+        #[serde(default)]
+        base_url: Option<String>,
+        /// Model name. Defaults to `tts-1` when omitted.
+        #[serde(default)]
+        model: Option<String>,
+        /// Voice name (`alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`).
+        /// Defaults to `alloy`.
+        #[serde(default)]
+        voice: Option<String>,
+    },
+    /// Synthetic mock — returns a fixed-length sine wave. Useful for
+    /// testing the pipeline plumbing without any model setup.
+    #[serde(rename = "mock")]
+    Mock {
+        /// Duration of the generated tone in milliseconds. Default: 200ms.
+        #[serde(default = "default_mock_duration_ms")]
+        duration_ms: u32,
+        /// Tone frequency in Hz. Default: 440Hz.
+        #[serde(default = "default_mock_freq_hz")]
+        frequency_hz: u32,
+    },
+}
+
+fn default_mock_duration_ms() -> u32 {
+    200
+}
+
+fn default_mock_freq_hz() -> u32 {
+    440
 }
 
 /// Built-in name of the Anthropic provider — referenced by profiles.
@@ -662,6 +797,30 @@ impl Config {
                 ));
             }
         }
+        // Voice pipeline references.
+        for (rp_name, rp) in &self.room_profiles {
+            if let Some(vp) = &rp.voice_pipeline {
+                if !self.voice_pipelines.contains_key(vp) {
+                    errors.push(format!(
+                        "room_profile '{rp_name}' references unknown voice_pipeline '{vp}'"
+                    ));
+                }
+            }
+        }
+        for (vp_name, vp) in &self.voice_pipelines {
+            if !self.stt_providers.contains_key(&vp.stt_provider) {
+                errors.push(format!(
+                    "voice_pipeline '{vp_name}' references unknown stt_provider '{}'",
+                    vp.stt_provider
+                ));
+            }
+            if !self.tts_providers.contains_key(&vp.tts_provider) {
+                errors.push(format!(
+                    "voice_pipeline '{vp_name}' references unknown tts_provider '{}'",
+                    vp.tts_provider
+                ));
+            }
+        }
         errors
     }
 
@@ -789,6 +948,16 @@ impl Config {
             }
         }
         out.into_iter().collect()
+    }
+
+    /// Voice pipeline preset for the given room profile name, if any.
+    /// Returns `None` when the room profile is unknown or has no
+    /// `voice_pipeline` set.
+    pub fn voice_pipeline_for_room_profile(&self, name: &str) -> Option<&VoicePipelineConfig> {
+        self.room_profiles
+            .get(name)
+            .and_then(|rp| rp.voice_pipeline.as_ref())
+            .and_then(|vp_name| self.voice_pipelines.get(vp_name))
     }
 
     /// Resolve the default config path: `~/.config/sapphire-agent/config.toml`
@@ -1233,6 +1402,101 @@ include = ["user"]
         assert!(all.contains(&"default".to_string()));
         assert!(all.contains(&"user".to_string()));
         assert!(all.contains(&"user_nsfw".to_string()));
+    }
+
+    #[test]
+    fn voice_pipeline_config_parses_and_validates() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.casual]
+provider = "anthropic"
+
+[voice_pipeline.default]
+stt_provider = "whisper_local"
+tts_provider = "irodori"
+language     = "ja"
+
+[stt_provider.whisper_local]
+type  = "whisper_rs"
+model = "/tmp/whisper.bin"
+
+[tts_provider.irodori]
+type        = "gradio"
+base_url    = "http://localhost:7860"
+fn_name     = "/predict"
+payload     = '{"data":["{{text}}"]}'
+audio_field = "data[0]"
+
+[room_profile.home]
+profile        = "casual"
+voice_pipeline = "default"
+rooms          = []
+"#,
+        );
+        assert!(
+            cfg.validate_profiles().is_empty(),
+            "errors: {:?}",
+            cfg.validate_profiles()
+        );
+        let vp = cfg
+            .voice_pipeline_for_room_profile("home")
+            .expect("voice pipeline resolved");
+        assert_eq!(vp.stt_provider, "whisper_local");
+        assert_eq!(vp.tts_provider, "irodori");
+        assert_eq!(vp.language.as_deref(), Some("ja"));
+        assert_eq!(vp.capture_max_ms, 30_000); // default
+    }
+
+    #[test]
+    fn voice_pipeline_rejects_unknown_stt() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[voice_pipeline.default]
+stt_provider = "ghost"
+tts_provider = "irodori"
+
+[tts_provider.irodori]
+type        = "gradio"
+base_url    = "http://localhost:7860"
+fn_name     = "/predict"
+payload     = '{}'
+audio_field = "data[0]"
+"#,
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("ghost")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn room_profile_voice_pipeline_must_exist() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.casual]
+provider = "anthropic"
+
+[room_profile.home]
+profile        = "casual"
+voice_pipeline = "ghost"
+rooms          = []
+"#,
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("ghost")),
+            "got: {errors:?}"
+        );
     }
 
     #[test]
