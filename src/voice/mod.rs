@@ -107,9 +107,21 @@ fn build_tts(name: &str, cfg: &TtsProviderConfig) -> anyhow::Result<Arc<dyn TtsP
             *duration_ms,
             *frequency_hz,
         ))),
-        TtsProviderConfig::Gradio { .. } | TtsProviderConfig::OpenAiTts { .. } => {
+        TtsProviderConfig::Gradio {
+            base_url,
+            fn_name,
+            payload,
+            audio_field,
+        } => Ok(Arc::new(providers::GradioTts::new(
+            name.to_string(),
+            base_url.clone(),
+            fn_name.clone(),
+            payload.clone(),
+            audio_field.clone(),
+        )?)),
+        TtsProviderConfig::OpenAiTts { .. } => {
             anyhow::bail!(
-                "tts_provider '{name}': non-mock TTS providers are not yet implemented"
+                "tts_provider '{name}': type = \"openai_tts\" is not yet implemented"
             )
         }
     }

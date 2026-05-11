@@ -305,17 +305,23 @@ pub enum TtsProviderConfig {
     /// endpoint name and a payload template.
     #[serde(rename = "gradio")]
     Gradio {
-        /// Gradio base URL (without the `/gradio_api/...` suffix).
+        /// Gradio base URL (without the `/gradio_api/...` suffix), e.g.
+        /// `http://localhost:7860`.
         base_url: String,
-        /// Endpoint name as exposed by the Gradio app (e.g. `/predict`,
-        /// or a numeric fn_index as a string).
+        /// API endpoint name as exposed by the Gradio app. Becomes
+        /// `{base_url}/gradio_api/call/{fn_name}` — a leading `/` is
+        /// stripped. Examples: `generate`, `predict`.
         fn_name: String,
-        /// Payload template (JSON). `{{text}}` is substituted with the
-        /// utterance text at call time.
+        /// Payload template (JSON, serialized as a string). `{{text}}`
+        /// is substituted with the utterance text at call time. Must
+        /// resolve to a `{"data": [...]}` shape per Gradio's API.
         payload: String,
-        /// JSONPath-ish field selector telling the client where in the
-        /// response JSON to find the audio file URL or base64 blob.
-        /// Examples: `data[0]`, `data[0].url`.
+        /// RFC 6901 JSON Pointer selecting the audio location in the
+        /// Gradio response JSON. The pointer must resolve to either:
+        ///   * a string (treated as a URL or path),
+        ///   * an object with `url` or `path` (the value of either is
+        ///     used as a URL/path).
+        /// Examples: `/data/0/url`, `/data/0`, `/0/path`.
         audio_field: String,
     },
     /// OpenAI's `audio/speech` endpoint (`tts-1` / `tts-1-hd`).
