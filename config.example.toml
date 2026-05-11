@@ -167,3 +167,52 @@ system_prompt = "You are a helpful personal assistant."
 # namespace because sapphire-workspace 0.10.x has no path_prefix filter.
 # Contamination prevention is digest- and MEMORY.md-only in this
 # release; retrieve hits may still leak across namespaces.
+
+# ─────────────────────────────────────────────────────────────────────
+# Voice pipeline (optional)
+# ─────────────────────────────────────────────────────────────────────
+# Enables the `voice/pipeline_run` MCP method used by `sapphire-call
+# voice`. Each room_profile can opt in via `voice_pipeline = "<name>"`.
+# Without these blocks the method returns -32601 "Method not found".
+#
+# Local STT requires the `voice-whisper` cargo feature:
+#     cargo build --release --features voice-whisper
+#
+# [voice_pipeline.default]
+# stt_provider   = "whisper_local"
+# tts_provider   = "irodori"
+# language       = "ja"             # BCP-47 hint; client param overrides
+# capture_max_ms = 30000            # server-side hard cap, default 30s
+#
+# [stt_provider.whisper_local]
+# type  = "whisper_rs"              # requires --features voice-whisper
+# model = "~/models/ggml-small.bin"
+#
+# [stt_provider.mock_stt]           # for testing the pipeline plumbing
+# type       = "mock"
+# transcript = "test transcript"
+#
+# [tts_provider.irodori]            # any Gradio Web UI TTS works here
+# type        = "gradio"
+# base_url    = "http://localhost:7860"
+# fn_name     = "generate"
+# # JSON template — {{text}} is substituted with the LLM reply, escaped
+# # for JSON string context. The shape must match the Gradio app's API
+# # (check /info on the Gradio host for the exact arg list).
+# payload     = '''
+# {"data": ["{{text}}", null, 40, 1, "", "independent", 3.0, 5.0, "", 0.5, 1.0, true, "", "", "", "", "0.9", ""]}
+# '''
+# # RFC 6901 JSON Pointer into the Gradio response JSON. For gr.Audio
+# # outputs Gradio returns {"path": ..., "url": ...} — point at either
+# # the wrapping object (auto-unwraps to url) or directly at /data/0/url.
+# audio_field = "/data/0"
+#
+# [tts_provider.mock_tts]           # synthetic sine wave; testing only
+# type         = "mock"
+# duration_ms  = 200
+# frequency_hz = 440
+#
+# [room_profile.home_voice]
+# profile          = "casual"
+# voice_pipeline   = "default"
+# rooms            = []             # MCP-only; not bound to chat rooms
