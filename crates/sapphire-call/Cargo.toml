@@ -28,5 +28,25 @@ tracing-subscriber.workspace = true
 # Audio I/O for the voice subcommand: mic capture + speaker playback.
 cpal = "0.15"
 
-# HTTP client (shared with sapphire-agent-api for the voice MCP call).
-reqwest.workspace = true
+# HTTP client. The blocking variant is used by the voice satellite for
+# one-shot model downloads during startup (before the tokio runtime is
+# busy with audio I/O).
+reqwest = { workspace = true, features = ["blocking"] }
+
+# Local Silero VAD + (later) keyword spotting via the official sherpa-onnx
+# Rust crate. Statically links the C++ runtime; first build is slow.
+sherpa-onnx = "1.13"
+
+# Model bundle extraction (sherpa-onnx ships tar.bz2 model archives on
+# GitHub releases).
+tar = "0.4"
+bzip2 = "0.5"
+
+# XDG cache dir resolution for downloaded models.
+directories = "6.0"
+
+# Path expansion for ~/...
+shellexpand = "3.1"
+
+# Logging — surface model downloads to the operator.
+tracing = "0.1"

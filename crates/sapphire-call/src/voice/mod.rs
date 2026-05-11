@@ -1,18 +1,16 @@
-//! Voice satellite subcommand: always-on listening with energy VAD.
+//! Voice satellite subcommand: always-on listening with Silero VAD.
 //!
 //! v1 has no wake word and no push-to-talk — the mic is hot for the
-//! lifetime of the process. An energy-based VAD chunks the incoming
-//! stream into utterances (200 ms of speech to confirm onset; 600 ms
-//! of silence to confirm end; 30 s hard cap), and each completed
-//! utterance is shipped to the agent via `voice/pipeline_run`. The
-//! mic is gated off while the reply plays back so the agent doesn't
-//! transcribe its own TTS.
-//!
-//! Wake word support arrives in a follow-up; until then the energy
-//! threshold is a best-effort filter — quiet rooms work well, noisy
-//! environments may chatter spuriously.
+//! lifetime of the process. Sherpa-onnx's Silero VAD chunks the
+//! incoming stream into utterances and each completed segment is
+//! shipped to the agent via `voice/pipeline_run`. The mic is gated
+//! off while the reply plays back so the satellite doesn't transcribe
+//! its own TTS. Wake-word support arrives in a follow-up.
+
+mod download;
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,21 +18,21 @@ use anyhow::{Context, Result, anyhow};
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sapphire_agent_api::{VoiceEvent, voice::PIPELINE_SAMPLE_RATE, voice_pipeline_run};
+use sherpa_onnx::{
+    SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
+};
 use tokio::sync::mpsc;
 
-/// 20 ms frame at the pipeline rate (16 kHz mono).
-const VAD_FRAME_SAMPLES: usize = (PIPELINE_SAMPLE_RATE as usize) / 50;
-/// Minimum sustained speech (ms) before VAD declares an utterance open.
-const VAD_MIN_SPEECH_MS: u32 = 200;
-/// Trailing silence (ms) that closes an open utterance.
-const VAD_END_SILENCE_MS: u32 = 600;
-/// Hard cap on a single utterance, matches the server's default
-/// `capture_max_ms`.
-const VAD_MAX_UTTERANCE_MS: u32 = 30_000;
-/// RMS amplitude threshold (i16 scale, ~ -36 dBFS) above which a frame
-/// is considered speech. Quiet rooms register ~50–200, normal speech
-/// 1000+. Tune later if needed.
-const VAD_ENERGY_THRESHOLD: f64 = 500.0;
+/// Silero VAD frame size in samples. Required by the model.
+const VAD_WINDOW_SAMPLES: usize = 512;
+/// Hard cap on a single utterance (seconds). Matches the server's
+/// default capture_max_ms / 1000.
+const VAD_MAX_SPEECH_SECONDS: f32 = 30.0;
+
+/// Public URL of the Silero VAD ONNX model on the sherpa-onnx
+/// releases page. Auto-downloaded on first run.
+const SILERO_VAD_URL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
 
 /// Entry point for `sapphire-call voice`.
 pub async fn run(
@@ -55,6 +53,12 @@ pub async fn run(
         if is_new { ", new" } else { ", resumed" }
     );
 
+    // ── VAD model ────────────────────────────────────────────────────────
+    let vad_model_path = ensure_silero_model()
+        .context("failed to fetch Silero VAD model")?;
+    eprintln!("VAD model: {}", vad_model_path.display());
+    let vad = build_vad(&vad_model_path)?;
+
     // ── Audio I/O ────────────────────────────────────────────────────────
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<i16>>();
     let mic_enabled = Arc::new(AtomicBool::new(true));
@@ -64,16 +68,16 @@ pub async fn run(
 
     let playback_queue: Arc<std::sync::Mutex<VecDeque<i16>>> =
         Arc::new(std::sync::Mutex::new(VecDeque::new()));
-    let (output_stream, output_rate, output_channels) =
+    let (output_stream, output_rate, _output_channels) =
         open_output_stream(Arc::clone(&playback_queue))?;
     output_stream.play()?;
 
     eprintln!(
-        "input: {input_rate} Hz × {input_channels}ch  output: {output_rate} Hz × {output_channels}ch",
+        "input: {input_rate} Hz × {input_channels}ch  output: {output_rate} Hz",
     );
     eprintln!("Listening. Ctrl-C to quit.");
 
-    // ── Spawn ctrl-c handler (no terminal raw mode this time) ───────────
+    // ── Ctrl-C handler ──────────────────────────────────────────────────
     let shutdown = Arc::new(AtomicBool::new(false));
     {
         let shutdown = Arc::clone(&shutdown);
@@ -85,25 +89,22 @@ pub async fn run(
         });
     }
 
-    listen_loop(
-        ListenCtx {
-            audio_rx,
-            input_rate,
-            input_channels,
-            mic_enabled,
-            playback_queue,
-            output_rate,
-            client,
-            base,
-            mcp_session_id,
-            language,
-            shutdown,
-        },
-    )
+    listen_loop(ListenCtx {
+        audio_rx,
+        input_rate,
+        input_channels,
+        mic_enabled,
+        playback_queue,
+        output_rate,
+        client,
+        base,
+        mcp_session_id,
+        language,
+        shutdown,
+        vad,
+    })
     .await?;
 
-    // cpal streams drop here, closing the audio devices.
-    let _ = output_channels;
     Ok(())
 }
 
@@ -119,16 +120,11 @@ struct ListenCtx {
     mcp_session_id: String,
     language: Option<String>,
     shutdown: Arc<AtomicBool>,
+    vad: VoiceActivityDetector,
 }
 
 async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
-    let mut vad = EnergyVad::new(
-        VAD_ENERGY_THRESHOLD,
-        VAD_MIN_SPEECH_MS,
-        VAD_END_SILENCE_MS,
-        VAD_MAX_UTTERANCE_MS,
-    );
-
+    let mut window_buf: Vec<f32> = Vec::with_capacity(VAD_WINDOW_SAMPLES);
     while !ctx.shutdown.load(Ordering::SeqCst) {
         let Some(raw) = ctx.audio_rx.recv().await else {
             break;
@@ -136,15 +132,35 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
         if !ctx.mic_enabled.load(Ordering::SeqCst) {
             continue;
         }
-        // Convert to mono + resample to the pipeline rate before VAD.
+        // Convert to mono + resample to the pipeline rate, then to f32
+        // for sherpa-onnx.
         let mono = to_mono(&raw, ctx.input_channels);
         let pcm16k = resample_to(&mono, ctx.input_rate, PIPELINE_SAMPLE_RATE);
-        for utterance in vad.feed(&pcm16k) {
+        for s in &pcm16k {
+            window_buf.push(*s as f32 / 32768.0);
+            if window_buf.len() == VAD_WINDOW_SAMPLES {
+                ctx.vad.accept_waveform(&window_buf);
+                window_buf.clear();
+            }
+        }
+        // Drain every completed speech segment Silero has emitted.
+        while !ctx.vad.is_empty() {
+            let Some(segment) = ctx.vad.front() else {
+                break;
+            };
+            // f32 mono → i16 mono (pipeline format).
+            let utterance: Vec<i16> = segment
+                .samples()
+                .iter()
+                .map(|f| (f.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                .collect();
+            ctx.vad.pop();
             // Gate the mic so the agent's TTS reply doesn't feed back
             // into the VAD as a new utterance.
             ctx.mic_enabled.store(false, Ordering::SeqCst);
-            // Drop any buffered audio from the suppressed window.
             while ctx.audio_rx.try_recv().is_ok() {}
+            ctx.vad.reset();
+            window_buf.clear();
 
             eprintln!(
                 "→ uploading {} samples ({:.2}s)",
@@ -164,12 +180,10 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
             {
                 eprintln!("[error: {e:#}]");
             }
-            // Wait for playback to fully drain before re-enabling the mic.
             wait_for_playback_drain(&ctx.playback_queue).await;
-            // Flush any audio captured during the suppressed window
-            // (including TTS bleed through the mic).
             while ctx.audio_rx.try_recv().is_ok() {}
-            vad.reset();
+            ctx.vad.reset();
+            window_buf.clear();
             ctx.mic_enabled.store(true, Ordering::SeqCst);
             eprintln!("Listening.");
         }
@@ -181,9 +195,6 @@ async fn wait_for_playback_drain(queue: &Arc<std::sync::Mutex<VecDeque<i16>>>) {
     loop {
         let empty = queue.lock().map(|q| q.is_empty()).unwrap_or(true);
         if empty {
-            // Brief settle so the trailing tail of the output buffer
-            // (handled by cpal internally) has time to play before the
-            // mic re-opens.
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             return;
         }
@@ -191,126 +202,35 @@ async fn wait_for_playback_drain(queue: &Arc<std::sync::Mutex<VecDeque<i16>>>) {
     }
 }
 
-// ── Energy VAD ──────────────────────────────────────────────────────────
+// ── Silero VAD setup ────────────────────────────────────────────────────
 
-#[derive(PartialEq, Eq)]
-enum VadState {
-    Idle,
-    Speaking,
+fn ensure_silero_model() -> Result<PathBuf> {
+    let dest = download::cache_dir().join("silero_vad.onnx");
+    download::ensure_single_file(SILERO_VAD_URL, &dest)
 }
 
-struct EnergyVad {
-    threshold: f64,
-    min_speech_frames: u32,
-    end_silence_frames: u32,
-    max_utterance_frames: u32,
-    state: VadState,
-    consecutive_speech: u32,
-    consecutive_silence: u32,
-    buffer: Vec<i16>,
-    pending: Vec<i16>,
-    utterance_frames: u32,
+fn build_vad(model_path: &std::path::Path) -> Result<VoiceActivityDetector> {
+    let silero = SileroVadModelConfig {
+        model: Some(model_path.to_string_lossy().into_owned()),
+        threshold: 0.5,
+        min_silence_duration: 0.25,
+        min_speech_duration: 0.25,
+        window_size: VAD_WINDOW_SAMPLES as i32,
+        max_speech_duration: VAD_MAX_SPEECH_SECONDS,
+    };
+    let config = VadModelConfig {
+        silero_vad: silero,
+        ten_vad: Default::default(),
+        sample_rate: PIPELINE_SAMPLE_RATE as i32,
+        num_threads: 1,
+        provider: Some("cpu".to_string()),
+        debug: false,
+    };
+    VoiceActivityDetector::create(&config, VAD_MAX_SPEECH_SECONDS)
+        .ok_or_else(|| anyhow!("failed to create sherpa-onnx VoiceActivityDetector"))
 }
 
-impl EnergyVad {
-    fn new(
-        threshold: f64,
-        min_speech_ms: u32,
-        end_silence_ms: u32,
-        max_utterance_ms: u32,
-    ) -> Self {
-        let frame_ms = 1000 / 50; // 20 ms per frame
-        Self {
-            threshold,
-            min_speech_frames: min_speech_ms / frame_ms,
-            end_silence_frames: end_silence_ms / frame_ms,
-            max_utterance_frames: max_utterance_ms / frame_ms,
-            state: VadState::Idle,
-            consecutive_speech: 0,
-            consecutive_silence: 0,
-            buffer: Vec::new(),
-            pending: Vec::new(),
-            utterance_frames: 0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.state = VadState::Idle;
-        self.consecutive_speech = 0;
-        self.consecutive_silence = 0;
-        self.buffer.clear();
-        self.pending.clear();
-        self.utterance_frames = 0;
-    }
-
-    /// Push 16 kHz mono PCM into the VAD. Returns zero or more
-    /// completed utterances. Caller should `reset()` after gating the
-    /// mic and re-enabling so onset thresholds are computed fresh.
-    fn feed(&mut self, samples: &[i16]) -> Vec<Vec<i16>> {
-        self.pending.extend_from_slice(samples);
-        let mut completed = Vec::new();
-        while self.pending.len() >= VAD_FRAME_SAMPLES {
-            let frame: Vec<i16> = self.pending.drain(..VAD_FRAME_SAMPLES).collect();
-            if let Some(utterance) = self.process_frame(&frame) {
-                completed.push(utterance);
-            }
-        }
-        completed
-    }
-
-    fn process_frame(&mut self, frame: &[i16]) -> Option<Vec<i16>> {
-        let rms = rms_of(frame);
-        let is_speech = rms > self.threshold;
-        match self.state {
-            VadState::Idle => {
-                if is_speech {
-                    self.consecutive_speech += 1;
-                    self.buffer.extend_from_slice(frame);
-                    self.utterance_frames += 1;
-                    if self.consecutive_speech >= self.min_speech_frames {
-                        self.state = VadState::Speaking;
-                        self.consecutive_silence = 0;
-                    }
-                } else {
-                    self.consecutive_speech = 0;
-                    self.buffer.clear();
-                    self.utterance_frames = 0;
-                }
-                None
-            }
-            VadState::Speaking => {
-                self.buffer.extend_from_slice(frame);
-                self.utterance_frames += 1;
-                if is_speech {
-                    self.consecutive_silence = 0;
-                } else {
-                    self.consecutive_silence += 1;
-                }
-                let end_of_speech = self.consecutive_silence >= self.end_silence_frames;
-                let hit_cap = self.utterance_frames >= self.max_utterance_frames;
-                if end_of_speech || hit_cap {
-                    let utterance = std::mem::take(&mut self.buffer);
-                    self.state = VadState::Idle;
-                    self.consecutive_speech = 0;
-                    self.consecutive_silence = 0;
-                    self.utterance_frames = 0;
-                    return Some(utterance);
-                }
-                None
-            }
-        }
-    }
-}
-
-fn rms_of(frame: &[i16]) -> f64 {
-    if frame.is_empty() {
-        return 0.0;
-    }
-    let sum_sq: f64 = frame.iter().map(|s| (*s as f64).powi(2)).sum();
-    (sum_sq / frame.len() as f64).sqrt()
-}
-
-// ── Audio capture / playback (cpal) ─────────────────────────────────────
+// ── Audio capture / playback (cpal) — unchanged ─────────────────────────
 
 fn open_input_stream(
     tx: mpsc::UnboundedSender<Vec<i16>>,
@@ -498,7 +418,6 @@ async fn process_utterance(
     playback_queue: Arc<std::sync::Mutex<VecDeque<i16>>>,
     output_rate: u32,
 ) -> Result<()> {
-    // Clear any residual playback so a re-entry doesn't blend audio.
     if let Ok(mut q) = playback_queue.lock() {
         q.clear();
     }
@@ -567,9 +486,7 @@ fn to_mono(samples: &[i16], channels: u16) -> Vec<i16> {
         .collect()
 }
 
-/// Linear interpolation resample. Same approach as the server-side
-/// Gradio TTS helper; good enough for speech, swap to rubato later
-/// if needed.
+/// Linear interpolation resample. Quality is fine for speech.
 fn resample_to(input: &[i16], src_rate: u32, dst_rate: u32) -> Vec<i16> {
     if input.is_empty() || src_rate == dst_rate {
         return input.to_vec();
@@ -610,50 +527,5 @@ mod tests {
     fn resample_no_op_on_equal_rates() {
         let frames: Vec<i16> = vec![1, 2, 3];
         assert_eq!(resample_to(&frames, 16000, 16000), frames);
-    }
-
-    #[test]
-    fn vad_detects_speech_then_silence() {
-        let mut vad = EnergyVad::new(500.0, 200, 600, 30_000);
-        // 200 ms of speech (10 frames of 20 ms) at amplitude 5000.
-        let speech_frame = vec![5000i16; VAD_FRAME_SAMPLES];
-        // 700 ms of silence (35 frames) — exceeds 600 ms close threshold.
-        let silent_frame = vec![0i16; VAD_FRAME_SAMPLES];
-
-        let mut utterances: Vec<Vec<i16>> = Vec::new();
-        for _ in 0..10 {
-            utterances.extend(vad.feed(&speech_frame));
-        }
-        for _ in 0..35 {
-            utterances.extend(vad.feed(&silent_frame));
-        }
-        assert_eq!(utterances.len(), 1, "exactly one utterance expected");
-        // 10 speech frames + at most 30 silence frames before close
-        // (end_silence_frames = 30 at 20ms/frame).
-        let u = &utterances[0];
-        assert!(
-            u.len() >= 10 * VAD_FRAME_SAMPLES,
-            "utterance shorter than 200 ms: {} samples",
-            u.len()
-        );
-    }
-
-    #[test]
-    fn vad_ignores_brief_noise_below_min_speech() {
-        let mut vad = EnergyVad::new(500.0, 200, 600, 30_000);
-        // Only 60 ms of speech (3 frames) — below 200 ms threshold.
-        let speech_frame = vec![5000i16; VAD_FRAME_SAMPLES];
-        let silent_frame = vec![0i16; VAD_FRAME_SAMPLES];
-        let mut utterances: Vec<Vec<i16>> = Vec::new();
-        for _ in 0..3 {
-            utterances.extend(vad.feed(&speech_frame));
-        }
-        for _ in 0..35 {
-            utterances.extend(vad.feed(&silent_frame));
-        }
-        assert!(
-            utterances.is_empty(),
-            "brief noise should not trigger utterance"
-        );
     }
 }

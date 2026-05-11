@@ -7322,11 +7322,17 @@ name = "sapphire-call"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "bzip2 0.5.2",
  "clap",
  "cpal",
+ "directories",
  "reqwest",
  "sapphire-agent-api",
+ "shellexpand",
+ "sherpa-onnx",
+ "tar",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
