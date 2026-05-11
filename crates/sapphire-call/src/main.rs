@@ -50,12 +50,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run as a voice satellite — always-on listening with energy VAD.
+    /// Run as a voice satellite — always-on listening with Silero VAD.
+    /// When `--wake-word-model` is set, audio only flows to VAD after
+    /// a wake phrase fires (KWS gate).
     Voice {
         /// BCP-47 language hint passed to STT (e.g. "ja", "en"). When
         /// omitted, the server's voice_pipeline default applies.
         #[arg(long)]
         language: Option<String>,
+
+        /// Sherpa-onnx KWS bundle name to enable wake-word mode.
+        /// Example: `sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01`.
+        /// When omitted, the satellite is always-on (VAD only).
+        #[arg(long)]
+        wake_word_model: Option<String>,
+
+        /// Path to a keywords file (sherpa-onnx tokenised format).
+        /// Defaults to `<bundle>/keywords.txt`. Ignored without
+        /// `--wake-word-model`.
+        #[arg(long)]
+        keywords_file: Option<String>,
     },
 }
 
@@ -69,12 +83,21 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    if let Some(Command::Voice { language }) = cli.command {
+    if let Some(Command::Voice {
+        language,
+        wake_word_model,
+        keywords_file,
+    }) = cli.command
+    {
         return voice::run(
             cli.server,
             cli.session,
             cli.room_profile,
-            language,
+            voice::VoiceOptions {
+                language,
+                wake_word_model,
+                keywords_file,
+            },
         )
         .await;
     }

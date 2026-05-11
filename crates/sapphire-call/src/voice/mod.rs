@@ -1,13 +1,20 @@
-//! Voice satellite subcommand: always-on listening with Silero VAD.
+//! Voice satellite subcommand.
 //!
-//! v1 has no wake word and no push-to-talk — the mic is hot for the
-//! lifetime of the process. Sherpa-onnx's Silero VAD chunks the
-//! incoming stream into utterances and each completed segment is
-//! shipped to the agent via `voice/pipeline_run`. The mic is gated
-//! off while the reply plays back so the satellite doesn't transcribe
-//! its own TTS. Wake-word support arrives in a follow-up.
+//! Two modes, selected by whether `--wake-word-model` is set:
+//!
+//! - **VAD-only (default):** hot mic for the process lifetime, Silero
+//!   VAD chunks the stream into utterances, each segment ships to the
+//!   agent. Good for quiet rooms / single-user desks.
+//! - **Wake-then-VAD:** sherpa-onnx KWS gates the VAD. While Idle the
+//!   satellite only feeds audio to the keyword spotter; on a wake
+//!   match it switches to VAD until an utterance completes, ships it,
+//!   plays the reply, and returns to wake-listening.
+//!
+//! In both modes the mic is gated off during reply playback so the
+//! satellite doesn't transcribe its own TTS.
 
 mod download;
+mod wake;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -34,12 +41,22 @@ const VAD_MAX_SPEECH_SECONDS: f32 = 30.0;
 const SILERO_VAD_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
 
+/// Run-time options collected from CLI flags.
+pub struct VoiceOptions {
+    pub language: Option<String>,
+    /// Sherpa-onnx KWS bundle name. When set, enables wake-word mode.
+    pub wake_word_model: Option<String>,
+    /// Override for the keywords file. Defaults to
+    /// `<wake_word_model bundle>/keywords.txt` when absent.
+    pub keywords_file: Option<String>,
+}
+
 /// Entry point for `sapphire-call voice`.
 pub async fn run(
     server: String,
     session: Option<String>,
     room_profile: Option<String>,
-    language: Option<String>,
+    options: VoiceOptions,
 ) -> Result<()> {
     let base = server.trim_end_matches('/').to_string();
     let client = reqwest::Client::new();
@@ -58,6 +75,20 @@ pub async fn run(
         .context("failed to fetch Silero VAD model")?;
     eprintln!("VAD model: {}", vad_model_path.display());
     let vad = build_vad(&vad_model_path)?;
+
+    // ── Optional wake-word detector ─────────────────────────────────────
+    let wake_detector = if let Some(bundle) = options.wake_word_model.as_deref() {
+        let detector =
+            wake::WakeDetector::create(bundle, options.keywords_file.as_deref())
+                .context("failed to initialise wake-word detector")?;
+        eprintln!(
+            "wake-word: {} (waiting for trigger; speak the wake phrase to talk)",
+            bundle
+        );
+        Some(detector)
+    } else {
+        None
+    };
 
     // ── Audio I/O ────────────────────────────────────────────────────────
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<i16>>();
@@ -89,6 +120,7 @@ pub async fn run(
         });
     }
 
+    let awaiting_wake = wake_detector.is_some();
     listen_loop(ListenCtx {
         audio_rx,
         input_rate,
@@ -99,9 +131,11 @@ pub async fn run(
         client,
         base,
         mcp_session_id,
-        language,
+        language: options.language,
         shutdown,
         vad,
+        wake: wake_detector,
+        awaiting_wake,
     })
     .await?;
 
@@ -121,6 +155,13 @@ struct ListenCtx {
     language: Option<String>,
     shutdown: Arc<AtomicBool>,
     vad: VoiceActivityDetector,
+    /// `Some` enables wake-word mode; the satellite gates VAD behind
+    /// successful keyword spotting on this detector.
+    wake: Option<wake::WakeDetector>,
+    /// In wake-word mode: true while we're waiting for the next wake
+    /// trigger, false once it fires and we're capturing the utterance.
+    /// Always false in VAD-only mode.
+    awaiting_wake: bool,
 }
 
 async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
@@ -132,12 +173,30 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
         if !ctx.mic_enabled.load(Ordering::SeqCst) {
             continue;
         }
-        // Convert to mono + resample to the pipeline rate, then to f32
-        // for sherpa-onnx.
+        // Convert to mono + resample to the pipeline rate, then to f32.
         let mono = to_mono(&raw, ctx.input_channels);
         let pcm16k = resample_to(&mono, ctx.input_rate, PIPELINE_SAMPLE_RATE);
-        for s in &pcm16k {
-            window_buf.push(*s as f32 / 32768.0);
+        let pcm_f32: Vec<f32> = pcm16k.iter().map(|s| *s as f32 / 32768.0).collect();
+
+        // Wake-word gate: while we're awaiting a wake trigger, feed
+        // audio to KWS only — VAD doesn't see the stream until the
+        // wake phrase has fired.
+        if ctx.awaiting_wake {
+            if let Some(ref mut wake) = ctx.wake {
+                if let Some(keyword) = wake.feed(&pcm_f32)? {
+                    eprintln!("[wake: {keyword}] now listening for command...");
+                    ctx.awaiting_wake = false;
+                    // Clear any audio left over from before the wake so
+                    // the VAD starts on the post-wake utterance.
+                    ctx.vad.reset();
+                    window_buf.clear();
+                }
+            }
+            continue;
+        }
+
+        for f in &pcm_f32 {
+            window_buf.push(*f);
             if window_buf.len() == VAD_WINDOW_SAMPLES {
                 ctx.vad.accept_waveform(&window_buf);
                 window_buf.clear();
@@ -184,8 +243,16 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
             while ctx.audio_rx.try_recv().is_ok() {}
             ctx.vad.reset();
             window_buf.clear();
+            // In wake-word mode, return to wake-listening for the next
+            // command. In VAD-only mode, stay in capture mode.
+            if let Some(ref mut wake) = ctx.wake {
+                wake.reset();
+                ctx.awaiting_wake = true;
+                eprintln!("Waiting for wake word.");
+            } else {
+                eprintln!("Listening.");
+            }
             ctx.mic_enabled.store(true, Ordering::SeqCst);
-            eprintln!("Listening.");
         }
     }
     Ok(())
