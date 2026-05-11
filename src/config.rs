@@ -258,16 +258,18 @@ fn default_capture_max_ms() -> u32 {
 }
 
 /// STT provider definition. Tagged by `type` so future providers (e.g.
-/// Deepgram, AssemblyAI, sherpa-rs) can be added without breaking config.
+/// Deepgram, AssemblyAI) can be added without breaking config.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum SttProviderConfig {
-    /// Local whisper.cpp via whisper-rs.
-    #[serde(rename = "whisper_rs")]
-    WhisperRs {
-        /// Path to a ggml/gguf whisper model file.
-        model: String,
-    },
+    /// Local STT via the official sherpa-onnx Rust crate.
+    ///
+    /// Requires building with `--features voice-sherpa`. Model family
+    /// (SenseVoice, Whisper, Paraformer, …) is determined by `kind`;
+    /// the bundle is auto-downloaded from sherpa-onnx GitHub releases
+    /// when `model` is a known bundle name and `model_dir` is absent.
+    #[serde(rename = "sherpa_onnx")]
+    SherpaOnnx(SherpaSttConfig),
     /// OpenAI Whisper API (audio/transcriptions).
     #[serde(rename = "openai_whisper_api")]
     OpenAiWhisperApi {
@@ -293,6 +295,51 @@ pub enum SttProviderConfig {
 
 fn default_mock_transcript() -> String {
     "test transcript".to_string()
+}
+
+/// Configuration for the sherpa-onnx STT provider.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SherpaSttConfig {
+    /// Model family. Each family has a different on-disk layout that
+    /// sherpa-onnx expects; this tells the wrapper which fields to set.
+    pub kind: SherpaSttKind,
+    /// Either a known bundle name (auto-downloaded to the cache dir)
+    /// or an explicit path to an extracted model directory. When both
+    /// `model` and `model_dir` are set, `model_dir` wins.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Explicit path to an extracted model directory. Takes precedence
+    /// over `model` when both are present.
+    #[serde(default)]
+    pub model_dir: Option<String>,
+    /// BCP-47 language hint passed to model families that accept one
+    /// (SenseVoice, Whisper). Ignored by others.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Number of CPU threads used for inference. Default: 2.
+    #[serde(default = "default_sherpa_num_threads")]
+    pub num_threads: i32,
+    /// ONNX runtime provider (`cpu`, `cuda`, `coreml`). Default: `cpu`.
+    #[serde(default = "default_sherpa_provider")]
+    pub provider: String,
+}
+
+fn default_sherpa_num_threads() -> i32 {
+    2
+}
+
+fn default_sherpa_provider() -> String {
+    "cpu".to_string()
+}
+
+/// Model families supported by the sherpa-onnx STT provider.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SherpaSttKind {
+    /// SenseVoice — multilingual (zh/en/ja/ko/yue), recommended default.
+    SenseVoice,
+    /// OpenAI Whisper running on the sherpa-onnx runtime.
+    Whisper,
 }
 
 /// TTS provider definition. Tagged by `type` so we can add `piper_shell`,
@@ -351,6 +398,12 @@ pub enum TtsProviderConfig {
         #[serde(default = "default_mock_freq_hz")]
         frequency_hz: u32,
     },
+    /// Local TTS via the official sherpa-onnx Rust crate. Requires
+    /// building with `--features voice-sherpa`. Bundle is auto-downloaded
+    /// from sherpa-onnx GitHub releases when `model` is a known name
+    /// and `model_dir` is absent.
+    #[serde(rename = "sherpa_onnx")]
+    SherpaOnnx(SherpaTtsConfig),
 }
 
 fn default_mock_duration_ms() -> u32 {
@@ -359,6 +412,45 @@ fn default_mock_duration_ms() -> u32 {
 
 fn default_mock_freq_hz() -> u32 {
     440
+}
+
+/// Configuration for the sherpa-onnx TTS provider.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SherpaTtsConfig {
+    /// Model family — determines how the on-disk files are wired up.
+    pub kind: SherpaTtsKind,
+    /// Bundle name (auto-downloaded) or path. Either `model` or
+    /// `model_dir` must be set; `model_dir` wins when both are.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_dir: Option<String>,
+    /// Speaker id for multi-speaker models. Default: 0.
+    #[serde(default)]
+    pub speaker_id: i32,
+    /// Synthesis speed (1.0 = normal, <1.0 = slower, >1.0 = faster).
+    #[serde(default = "default_tts_speed")]
+    pub speed: f32,
+    #[serde(default = "default_sherpa_num_threads")]
+    pub num_threads: i32,
+    #[serde(default = "default_sherpa_provider")]
+    pub provider: String,
+}
+
+fn default_tts_speed() -> f32 {
+    1.0
+}
+
+/// Model families supported by the sherpa-onnx TTS provider.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SherpaTtsKind {
+    /// VITS — broad language coverage, single ONNX model file.
+    Vits,
+    /// Matcha — Flow Matching, needs a separate vocoder.
+    Matcha,
+    /// Kokoro — multilingual flow-matching, voice embeddings file.
+    Kokoro,
 }
 
 /// Built-in name of the Anthropic provider — referenced by profiles.
@@ -1421,20 +1513,21 @@ api_key = "test"
 provider = "anthropic"
 
 [voice_pipeline.default]
-stt_provider = "whisper_local"
+stt_provider = "sense_voice"
 tts_provider = "irodori"
 language     = "ja"
 
-[stt_provider.whisper_local]
-type  = "whisper_rs"
-model = "/tmp/whisper.bin"
+[stt_provider.sense_voice]
+type  = "sherpa_onnx"
+kind  = "sense_voice"
+model = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 
 [tts_provider.irodori]
 type        = "gradio"
 base_url    = "http://localhost:7860"
 fn_name     = "/predict"
 payload     = '{"data":["{{text}}"]}'
-audio_field = "data[0]"
+audio_field = "/data/0"
 
 [room_profile.home]
 profile        = "casual"
@@ -1450,7 +1543,7 @@ rooms          = []
         let vp = cfg
             .voice_pipeline_for_room_profile("home")
             .expect("voice pipeline resolved");
-        assert_eq!(vp.stt_provider, "whisper_local");
+        assert_eq!(vp.stt_provider, "sense_voice");
         assert_eq!(vp.tts_provider, "irodori");
         assert_eq!(vp.language.as_deref(), Some("ja"));
         assert_eq!(vp.capture_max_ms, 30_000); // default
@@ -1472,7 +1565,7 @@ type        = "gradio"
 base_url    = "http://localhost:7860"
 fn_name     = "/predict"
 payload     = '{}'
-audio_field = "data[0]"
+audio_field = "/data/0"
 "#,
         );
         let errors = cfg.validate_profiles();

@@ -175,20 +175,25 @@ system_prompt = "You are a helpful personal assistant."
 # voice`. Each room_profile can opt in via `voice_pipeline = "<name>"`.
 # Without these blocks the method returns -32601 "Method not found".
 #
-# Local STT requires the `voice-whisper` cargo feature:
-#     cargo build --release --features voice-whisper
+# Local STT and TTS require the `voice-sherpa` cargo feature:
+#     cargo build --release --features voice-sherpa
+# Gradio TTS (Irodori-TTS, Style-Bert-VITS2, etc.) works without it —
+# pure HTTP, no native build.
 #
 # [voice_pipeline.default]
-# stt_provider   = "whisper_local"
+# stt_provider   = "sense_voice"
 # tts_provider   = "irodori"
 # language       = "ja"             # BCP-47 hint; client param overrides
 # capture_max_ms = 30000            # server-side hard cap, default 30s
 #
-# [stt_provider.whisper_local]
-# type  = "whisper_rs"              # requires --features voice-whisper
-# model = "~/models/ggml-small.bin"
+# [stt_provider.sense_voice]        # requires --features voice-sherpa
+# type   = "sherpa_onnx"
+# kind   = "sense_voice"            # multi-lingual zh/en/ja/ko/yue
+# model  = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+# # If `model_dir` is set it takes precedence over the bundle name.
+# # model_dir = "~/.local/share/sapphire-agent/voice-models/..."
 #
-# [stt_provider.mock_stt]           # for testing the pipeline plumbing
+# [stt_provider.mock_stt]           # testing only
 # type       = "mock"
 # transcript = "test transcript"
 #
@@ -206,6 +211,13 @@ system_prompt = "You are a helpful personal assistant."
 # # outputs Gradio returns {"path": ..., "url": ...} — point at either
 # # the wrapping object (auto-unwraps to url) or directly at /data/0/url.
 # audio_field = "/data/0"
+#
+# [tts_provider.vits_ja]            # local TTS, requires --features voice-sherpa
+# type   = "sherpa_onnx"
+# kind   = "vits"
+# model  = "vits-melo-tts-zh_en"    # placeholder — pick a ja-capable VITS bundle
+# speaker_id = 0
+# speed      = 1.0
 #
 # [tts_provider.mock_tts]           # synthetic sine wave; testing only
 # type         = "mock"

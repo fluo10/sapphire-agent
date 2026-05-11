@@ -49,10 +49,11 @@ default = ["lancedb-store", "fastembed-embed", "git-sync"]
 lancedb-store = ["sapphire-workspace/lancedb-store"]
 fastembed-embed = ["sapphire-workspace/fastembed-embed"]
 git-sync = ["sapphire-workspace/git-sync"]
-# Compile in the local whisper.cpp STT provider. Off by default because
-# whisper-rs pulls in a sizeable C build; users who only need cloud STT
-# can skip it.
-voice-whisper = ["dep:whisper-rs"]
+# Compile in the local sherpa-onnx STT + TTS providers. Off by default
+# because sherpa-onnx-sys pulls in a large C++ build (sherpa-onnx +
+# ONNX runtime, ~5–10 minutes on a cold cache). Users who only run the
+# Gradio TTS path or who don't need voice at all should skip it.
+voice-sherpa = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2"]
 
 [dependencies]
 # Async runtime
@@ -151,10 +152,17 @@ serenity = { version = "0.12", default-features = false, features = [
     "rustls_backend",
 ] }
 
-# Local whisper.cpp STT. Optional — gated behind the `voice-whisper` feature
-# to keep the default build lightweight. When the feature is off, configs
-# that reference `type = "whisper_rs"` fail at startup with a clear message.
-whisper-rs = { version = "0.16", optional = true }
+# Local STT + TTS via the official sherpa-onnx Rust crate (k2-fsa).
+# Statically links sherpa-onnx + ONNX runtime — no system install needed.
+# Optional, gated behind the `voice-sherpa` feature; the build is slow
+# (sherpa-onnx-sys compiles C++ via CMake).
+sherpa-onnx = { version = "1.13", optional = true }
+
+# Model bundle extraction. sherpa-onnx ships pre-trained models as
+# tar.bz2 archives on GitHub releases; both crates are gated alongside
+# sherpa-onnx itself.
+tar = { version = "0.4", optional = true }
+bzip2 = { version = "0.5", optional = true }
 
 # WAV decoding for TTS providers that return audio files (e.g. Gradio Web UI).
 hound = "3.5"

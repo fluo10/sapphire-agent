@@ -72,20 +72,20 @@ fn build_stt(name: &str, cfg: &SttProviderConfig) -> anyhow::Result<Arc<dyn SttP
             name.to_string(),
             transcript.clone(),
         ))),
-        SttProviderConfig::WhisperRs { model } => {
-            #[cfg(feature = "voice-whisper")]
+        SttProviderConfig::SherpaOnnx(cfg) => {
+            #[cfg(feature = "voice-sherpa")]
             {
-                Ok(Arc::new(providers::WhisperRsStt::new(
+                Ok(Arc::new(providers::SherpaOnnxStt::new(
                     name.to_string(),
-                    model,
+                    cfg.clone(),
                 )?))
             }
-            #[cfg(not(feature = "voice-whisper"))]
+            #[cfg(not(feature = "voice-sherpa"))]
             {
-                let _ = model;
+                let _ = cfg;
                 anyhow::bail!(
-                    "stt_provider '{name}': type = \"whisper_rs\" requires the \
-                     `voice-whisper` cargo feature to be enabled at build time"
+                    "stt_provider '{name}': type = \"sherpa_onnx\" requires the \
+                     `voice-sherpa` cargo feature to be enabled at build time"
                 )
             }
         }
@@ -123,6 +123,23 @@ fn build_tts(name: &str, cfg: &TtsProviderConfig) -> anyhow::Result<Arc<dyn TtsP
             anyhow::bail!(
                 "tts_provider '{name}': type = \"openai_tts\" is not yet implemented"
             )
+        }
+        TtsProviderConfig::SherpaOnnx(cfg) => {
+            #[cfg(feature = "voice-sherpa")]
+            {
+                Ok(Arc::new(providers::SherpaOnnxTts::new(
+                    name.to_string(),
+                    cfg.clone(),
+                )?))
+            }
+            #[cfg(not(feature = "voice-sherpa"))]
+            {
+                let _ = cfg;
+                anyhow::bail!(
+                    "tts_provider '{name}': type = \"sherpa_onnx\" requires the \
+                     `voice-sherpa` cargo feature to be enabled at build time"
+                )
+            }
         }
     }
 }
