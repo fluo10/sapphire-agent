@@ -1,27 +1,40 @@
-//! Voice satellite subcommand: push-to-talk capture + streaming playback.
+//! Voice satellite subcommand: always-on listening with energy VAD.
 //!
-//! Holds Space to record, releases to ship the utterance to the agent
-//! via `voice/pipeline_run`, and plays the streamed TTS reply through
-//! the default output device as audio_chunks arrive. v1 — no wake
-//! word, no VAD, no barge-in.
+//! v1 has no wake word and no push-to-talk — the mic is hot for the
+//! lifetime of the process. An energy-based VAD chunks the incoming
+//! stream into utterances (200 ms of speech to confirm onset; 600 ms
+//! of silence to confirm end; 30 s hard cap), and each completed
+//! utterance is shipped to the agent via `voice/pipeline_run`. The
+//! mic is gated off while the reply plays back so the agent doesn't
+//! transcribe its own TTS.
+//!
+//! Wake word support arrives in a follow-up; until then the energy
+//! threshold is a best-effort filter — quiet rooms work well, noisy
+//! environments may chatter spuriously.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use sapphire_agent_api::{VoiceEvent, voice::PIPELINE_SAMPLE_RATE, voice_pipeline_run};
 use tokio::sync::mpsc;
 
-/// Maximum utterance length in samples at the pipeline rate (16 kHz mono).
-/// Hard cap matches the server's default capture_max_ms (30 s) so the
-/// satellite drops anything the server would refuse anyway.
-const MAX_UTTERANCE_SAMPLES: usize = (PIPELINE_SAMPLE_RATE as usize) * 30;
+/// 20 ms frame at the pipeline rate (16 kHz mono).
+const VAD_FRAME_SAMPLES: usize = (PIPELINE_SAMPLE_RATE as usize) / 50;
+/// Minimum sustained speech (ms) before VAD declares an utterance open.
+const VAD_MIN_SPEECH_MS: u32 = 200;
+/// Trailing silence (ms) that closes an open utterance.
+const VAD_END_SILENCE_MS: u32 = 600;
+/// Hard cap on a single utterance, matches the server's default
+/// `capture_max_ms`.
+const VAD_MAX_UTTERANCE_MS: u32 = 30_000;
+/// RMS amplitude threshold (i16 scale, ~ -36 dBFS) above which a frame
+/// is considered speech. Quiet rooms register ~50–200, normal speech
+/// 1000+. Tune later if needed.
+const VAD_ENERGY_THRESHOLD: f64 = 500.0;
 
 /// Entry point for `sapphire-call voice`.
 pub async fn run(
@@ -37,14 +50,16 @@ pub async fn run(
         sapphire_agent_api::initialize(&client, &base, session, room_profile.as_deref())
             .await
             .context("failed to initialize MCP session")?;
-    eprintln!("sapphire-call voice (session: {display_id}{})", if is_new { ", new" } else { ", resumed" });
+    eprintln!(
+        "sapphire-call voice (session: {display_id}{})",
+        if is_new { ", new" } else { ", resumed" }
+    );
 
     // ── Audio I/O ────────────────────────────────────────────────────────
-    let input_buf: Arc<std::sync::Mutex<Vec<i16>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    let recording = Arc::new(AtomicBool::new(false));
+    let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+    let mic_enabled = Arc::new(AtomicBool::new(true));
     let (input_stream, input_rate, input_channels) =
-        open_input_stream(Arc::clone(&input_buf), Arc::clone(&recording))?;
+        open_input_stream(audio_tx, Arc::clone(&mic_enabled))?;
     input_stream.play()?;
 
     let playback_queue: Arc<std::sync::Mutex<VecDeque<i16>>> =
@@ -56,149 +71,250 @@ pub async fn run(
     eprintln!(
         "input: {input_rate} Hz × {input_channels}ch  output: {output_rate} Hz × {output_channels}ch",
     );
+    eprintln!("Listening. Ctrl-C to quit.");
 
-    // ── PTT key reader (raw mode) ────────────────────────────────────────
-    enable_raw_mode().context("failed to enable terminal raw mode")?;
-    let _raw_guard = RawModeGuard;
-
-    eprintln!("Hold SPACE to talk, release to send. Ctrl-C to quit.\r");
-
-    let (key_tx, mut key_rx) = mpsc::unbounded_channel::<KeyMsg>();
-    let key_tx_clone = key_tx.clone();
-    let key_thread = std::thread::spawn(move || key_event_loop(key_tx_clone));
-    // Drop the producer-side handle so the channel closes if the thread exits.
-    drop(key_tx);
-
-    let mut holding = false;
-    loop {
-        let Some(msg) = key_rx.recv().await else {
-            break;
-        };
-        match msg {
-            KeyMsg::SpaceDown if !holding => {
-                holding = true;
-                input_buf
-                    .lock()
-                    .map_err(|_| anyhow!("input buffer poisoned"))?
-                    .clear();
-                recording.store(true, Ordering::SeqCst);
-                eprint!("\r● recording...\r");
+    // ── Spawn ctrl-c handler (no terminal raw mode this time) ───────────
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("\nShutting down...");
+                shutdown.store(true, Ordering::SeqCst);
             }
-            KeyMsg::SpaceUp if holding => {
-                holding = false;
-                recording.store(false, Ordering::SeqCst);
-                let pcm: Vec<i16> = {
-                    let mut buf = input_buf
-                        .lock()
-                        .map_err(|_| anyhow!("input buffer poisoned"))?;
-                    std::mem::take(&mut *buf)
-                };
-                let mono = to_mono(&pcm, input_channels);
-                let resampled = resample_to(&mono, input_rate, PIPELINE_SAMPLE_RATE);
-                if resampled.is_empty() {
-                    eprintln!("(no audio captured)\r");
-                    continue;
-                }
-                let trimmed = if resampled.len() > MAX_UTTERANCE_SAMPLES {
-                    eprintln!(
-                        "(utterance exceeded {} s; truncating)\r",
-                        MAX_UTTERANCE_SAMPLES / PIPELINE_SAMPLE_RATE as usize
-                    );
-                    resampled[..MAX_UTTERANCE_SAMPLES].to_vec()
-                } else {
-                    resampled
-                };
-                eprintln!(
-                    "→ uploading {} samples ({:.2}s)\r",
-                    trimmed.len(),
-                    trimmed.len() as f32 / PIPELINE_SAMPLE_RATE as f32
-                );
-                if let Err(e) = process_utterance(
-                    &client,
-                    &base,
-                    &mcp_session_id,
-                    &trimmed,
-                    language.as_deref(),
-                    Arc::clone(&playback_queue),
-                    output_rate,
-                    output_channels,
-                )
-                .await
-                {
-                    eprintln!("[error: {e:#}]\r");
-                }
-            }
-            KeyMsg::CtrlC => {
-                eprintln!("\rQuitting...");
-                break;
-            }
-            _ => {}
-        }
+        });
     }
 
-    // The key thread is blocked on event::read; once main exits, raw mode
-    // is dropped and the thread will eventually exit on its next read.
-    // Detach (don't join) — we don't want shutdown to hang on a keypress.
-    drop(key_thread);
+    listen_loop(
+        ListenCtx {
+            audio_rx,
+            input_rate,
+            input_channels,
+            mic_enabled,
+            playback_queue,
+            output_rate,
+            client,
+            base,
+            mcp_session_id,
+            language,
+            shutdown,
+        },
+    )
+    .await?;
+
+    // cpal streams drop here, closing the audio devices.
+    let _ = output_channels;
     Ok(())
 }
 
-// ── PTT key reader ──────────────────────────────────────────────────────
-
-enum KeyMsg {
-    SpaceDown,
-    SpaceUp,
-    CtrlC,
+struct ListenCtx {
+    audio_rx: mpsc::UnboundedReceiver<Vec<i16>>,
+    input_rate: u32,
+    input_channels: u16,
+    mic_enabled: Arc<AtomicBool>,
+    playback_queue: Arc<std::sync::Mutex<VecDeque<i16>>>,
+    output_rate: u32,
+    client: reqwest::Client,
+    base: String,
+    mcp_session_id: String,
+    language: Option<String>,
+    shutdown: Arc<AtomicBool>,
 }
 
-fn key_event_loop(tx: mpsc::UnboundedSender<KeyMsg>) {
-    loop {
-        // Short poll so we can notice channel closure without blocking forever.
-        match crossterm::event::poll(Duration::from_millis(100)) {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(_) => break,
-        }
-        let Ok(evt) = crossterm::event::read() else {
+async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
+    let mut vad = EnergyVad::new(
+        VAD_ENERGY_THRESHOLD,
+        VAD_MIN_SPEECH_MS,
+        VAD_END_SILENCE_MS,
+        VAD_MAX_UTTERANCE_MS,
+    );
+
+    while !ctx.shutdown.load(Ordering::SeqCst) {
+        let Some(raw) = ctx.audio_rx.recv().await else {
             break;
         };
-        let Event::Key(KeyEvent {
-            code,
-            kind,
-            modifiers,
-            ..
-        }) = evt
-        else {
+        if !ctx.mic_enabled.load(Ordering::SeqCst) {
             continue;
-        };
-        let msg = match (code, kind) {
-            (KeyCode::Char('c'), _) if modifiers.contains(KeyModifiers::CONTROL) => KeyMsg::CtrlC,
-            (KeyCode::Char(' '), KeyEventKind::Press) => KeyMsg::SpaceDown,
-            (KeyCode::Char(' '), KeyEventKind::Release) => KeyMsg::SpaceUp,
-            // Many terminals don't deliver key Release events; without them
-            // we degrade to "tap Space to toggle" — alternate Press toggles
-            // between recording and not.
-            (KeyCode::Char(' '), KeyEventKind::Repeat) => continue,
-            _ => continue,
-        };
-        if tx.send(msg).is_err() {
-            break;
+        }
+        // Convert to mono + resample to the pipeline rate before VAD.
+        let mono = to_mono(&raw, ctx.input_channels);
+        let pcm16k = resample_to(&mono, ctx.input_rate, PIPELINE_SAMPLE_RATE);
+        for utterance in vad.feed(&pcm16k) {
+            // Gate the mic so the agent's TTS reply doesn't feed back
+            // into the VAD as a new utterance.
+            ctx.mic_enabled.store(false, Ordering::SeqCst);
+            // Drop any buffered audio from the suppressed window.
+            while ctx.audio_rx.try_recv().is_ok() {}
+
+            eprintln!(
+                "→ uploading {} samples ({:.2}s)",
+                utterance.len(),
+                utterance.len() as f32 / PIPELINE_SAMPLE_RATE as f32
+            );
+            if let Err(e) = process_utterance(
+                &ctx.client,
+                &ctx.base,
+                &ctx.mcp_session_id,
+                &utterance,
+                ctx.language.as_deref(),
+                Arc::clone(&ctx.playback_queue),
+                ctx.output_rate,
+            )
+            .await
+            {
+                eprintln!("[error: {e:#}]");
+            }
+            // Wait for playback to fully drain before re-enabling the mic.
+            wait_for_playback_drain(&ctx.playback_queue).await;
+            // Flush any audio captured during the suppressed window
+            // (including TTS bleed through the mic).
+            while ctx.audio_rx.try_recv().is_ok() {}
+            vad.reset();
+            ctx.mic_enabled.store(true, Ordering::SeqCst);
+            eprintln!("Listening.");
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_playback_drain(queue: &Arc<std::sync::Mutex<VecDeque<i16>>>) {
+    loop {
+        let empty = queue.lock().map(|q| q.is_empty()).unwrap_or(true);
+        if empty {
+            // Brief settle so the trailing tail of the output buffer
+            // (handled by cpal internally) has time to play before the
+            // mic re-opens.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+// ── Energy VAD ──────────────────────────────────────────────────────────
+
+#[derive(PartialEq, Eq)]
+enum VadState {
+    Idle,
+    Speaking,
+}
+
+struct EnergyVad {
+    threshold: f64,
+    min_speech_frames: u32,
+    end_silence_frames: u32,
+    max_utterance_frames: u32,
+    state: VadState,
+    consecutive_speech: u32,
+    consecutive_silence: u32,
+    buffer: Vec<i16>,
+    pending: Vec<i16>,
+    utterance_frames: u32,
+}
+
+impl EnergyVad {
+    fn new(
+        threshold: f64,
+        min_speech_ms: u32,
+        end_silence_ms: u32,
+        max_utterance_ms: u32,
+    ) -> Self {
+        let frame_ms = 1000 / 50; // 20 ms per frame
+        Self {
+            threshold,
+            min_speech_frames: min_speech_ms / frame_ms,
+            end_silence_frames: end_silence_ms / frame_ms,
+            max_utterance_frames: max_utterance_ms / frame_ms,
+            state: VadState::Idle,
+            consecutive_speech: 0,
+            consecutive_silence: 0,
+            buffer: Vec::new(),
+            pending: Vec::new(),
+            utterance_frames: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.state = VadState::Idle;
+        self.consecutive_speech = 0;
+        self.consecutive_silence = 0;
+        self.buffer.clear();
+        self.pending.clear();
+        self.utterance_frames = 0;
+    }
+
+    /// Push 16 kHz mono PCM into the VAD. Returns zero or more
+    /// completed utterances. Caller should `reset()` after gating the
+    /// mic and re-enabling so onset thresholds are computed fresh.
+    fn feed(&mut self, samples: &[i16]) -> Vec<Vec<i16>> {
+        self.pending.extend_from_slice(samples);
+        let mut completed = Vec::new();
+        while self.pending.len() >= VAD_FRAME_SAMPLES {
+            let frame: Vec<i16> = self.pending.drain(..VAD_FRAME_SAMPLES).collect();
+            if let Some(utterance) = self.process_frame(&frame) {
+                completed.push(utterance);
+            }
+        }
+        completed
+    }
+
+    fn process_frame(&mut self, frame: &[i16]) -> Option<Vec<i16>> {
+        let rms = rms_of(frame);
+        let is_speech = rms > self.threshold;
+        match self.state {
+            VadState::Idle => {
+                if is_speech {
+                    self.consecutive_speech += 1;
+                    self.buffer.extend_from_slice(frame);
+                    self.utterance_frames += 1;
+                    if self.consecutive_speech >= self.min_speech_frames {
+                        self.state = VadState::Speaking;
+                        self.consecutive_silence = 0;
+                    }
+                } else {
+                    self.consecutive_speech = 0;
+                    self.buffer.clear();
+                    self.utterance_frames = 0;
+                }
+                None
+            }
+            VadState::Speaking => {
+                self.buffer.extend_from_slice(frame);
+                self.utterance_frames += 1;
+                if is_speech {
+                    self.consecutive_silence = 0;
+                } else {
+                    self.consecutive_silence += 1;
+                }
+                let end_of_speech = self.consecutive_silence >= self.end_silence_frames;
+                let hit_cap = self.utterance_frames >= self.max_utterance_frames;
+                if end_of_speech || hit_cap {
+                    let utterance = std::mem::take(&mut self.buffer);
+                    self.state = VadState::Idle;
+                    self.consecutive_speech = 0;
+                    self.consecutive_silence = 0;
+                    self.utterance_frames = 0;
+                    return Some(utterance);
+                }
+                None
+            }
         }
     }
 }
 
-struct RawModeGuard;
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
+fn rms_of(frame: &[i16]) -> f64 {
+    if frame.is_empty() {
+        return 0.0;
     }
+    let sum_sq: f64 = frame.iter().map(|s| (*s as f64).powi(2)).sum();
+    (sum_sq / frame.len() as f64).sqrt()
 }
 
 // ── Audio capture / playback (cpal) ─────────────────────────────────────
 
 fn open_input_stream(
-    buf: Arc<std::sync::Mutex<Vec<i16>>>,
-    recording: Arc<AtomicBool>,
+    tx: mpsc::UnboundedSender<Vec<i16>>,
+    enabled: Arc<AtomicBool>,
 ) -> Result<(cpal::Stream, u32, u16)> {
     let host = cpal::default_host();
     let device = host
@@ -212,58 +328,55 @@ fn open_input_stream(
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.clone().into();
 
-    let err_fn = |e| eprintln!("[input stream error: {e}]\r");
+    let err_fn = |e| eprintln!("[input stream error: {e}]");
 
     let stream = match format {
         SampleFormat::F32 => {
-            let buf = Arc::clone(&buf);
-            let recording = Arc::clone(&recording);
+            let tx = tx.clone();
+            let enabled = Arc::clone(&enabled);
             device.build_input_stream(
                 &config,
                 move |data: &[f32], _| {
-                    if !recording.load(Ordering::SeqCst) {
+                    if !enabled.load(Ordering::SeqCst) {
                         return;
                     }
-                    if let Ok(mut b) = buf.lock() {
-                        b.extend(
-                            data.iter()
-                                .map(|f| (f.clamp(-1.0, 1.0) * i16::MAX as f32) as i16),
-                        );
-                    }
+                    let pcm: Vec<i16> = data
+                        .iter()
+                        .map(|f| (f.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                        .collect();
+                    let _ = tx.send(pcm);
                 },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::I16 => {
-            let buf = Arc::clone(&buf);
-            let recording = Arc::clone(&recording);
+            let tx = tx.clone();
+            let enabled = Arc::clone(&enabled);
             device.build_input_stream(
                 &config,
                 move |data: &[i16], _| {
-                    if !recording.load(Ordering::SeqCst) {
+                    if !enabled.load(Ordering::SeqCst) {
                         return;
                     }
-                    if let Ok(mut b) = buf.lock() {
-                        b.extend_from_slice(data);
-                    }
+                    let _ = tx.send(data.to_vec());
                 },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::U16 => {
-            let buf = Arc::clone(&buf);
-            let recording = Arc::clone(&recording);
+            let tx = tx.clone();
+            let enabled = Arc::clone(&enabled);
             device.build_input_stream(
                 &config,
                 move |data: &[u16], _| {
-                    if !recording.load(Ordering::SeqCst) {
+                    if !enabled.load(Ordering::SeqCst) {
                         return;
                     }
-                    if let Ok(mut b) = buf.lock() {
-                        b.extend(data.iter().map(|s| (*s as i32 - 32768) as i16));
-                    }
+                    let pcm: Vec<i16> =
+                        data.iter().map(|s| (*s as i32 - 32768) as i16).collect();
+                    let _ = tx.send(pcm);
                 },
                 err_fn,
                 None,
@@ -289,7 +402,7 @@ fn open_output_stream(
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.clone().into();
 
-    let err_fn = |e| eprintln!("[output stream error: {e}]\r");
+    let err_fn = |e| eprintln!("[output stream error: {e}]");
 
     let stream = match format {
         SampleFormat::F32 => {
@@ -376,7 +489,6 @@ fn open_output_stream(
 
 // ── Per-utterance flow ──────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 async fn process_utterance(
     client: &reqwest::Client,
     base: &str,
@@ -385,10 +497,8 @@ async fn process_utterance(
     language: Option<&str>,
     playback_queue: Arc<std::sync::Mutex<VecDeque<i16>>>,
     output_rate: u32,
-    output_channels: u16,
 ) -> Result<()> {
-    // Drain any leftover playback bytes from the previous reply so a
-    // mid-playback re-press doesn't blend audio.
+    // Clear any residual playback so a re-entry doesn't blend audio.
     if let Ok(mut q) = playback_queue.lock() {
         q.clear();
     }
@@ -401,48 +511,39 @@ async fn process_utterance(
         let pcm = pcm_16khz.to_vec();
         let lang = language.map(String::from);
         async move {
-            voice_pipeline_run(
-                &client,
-                &base,
-                &sid,
-                &pcm,
-                lang.as_deref(),
-                event_tx,
-            )
-            .await
+            voice_pipeline_run(&client, &base, &sid, &pcm, lang.as_deref(), event_tx).await
         }
     });
 
     while let Some(evt) = event_rx.recv().await {
         match evt {
             VoiceEvent::StageStart { stage } => {
-                eprint!("\r[{stage}…] ");
+                eprint!("[{stage}…] ");
             }
             VoiceEvent::StageEnd { stage } => {
                 let _ = stage;
             }
             VoiceEvent::SttFinal { text } => {
-                eprintln!("\r> {text}\r");
+                eprintln!("> {text}");
             }
             VoiceEvent::AssistantText { text } => {
-                eprintln!("\r{text}\r");
+                eprintln!("{text}");
             }
             VoiceEvent::AudioChunk { pcm } => {
                 let upsampled = resample_to(&pcm, PIPELINE_SAMPLE_RATE, output_rate);
-                let _ = output_channels; // channel fan-out happens in the output callback
                 if let Ok(mut q) = playback_queue.lock() {
                     q.extend(upsampled);
                 }
             }
             VoiceEvent::ToolStart { name } => {
-                eprint!("\r[tool: {name}] ");
+                eprint!("[tool: {name}] ");
             }
             VoiceEvent::ToolEnd { name } => {
                 let _ = name;
             }
             VoiceEvent::Done { .. } => break,
             VoiceEvent::Error { message } => {
-                eprintln!("\r[error: {message}]\r");
+                eprintln!("[error: {message}]");
                 break;
             }
         }
@@ -509,5 +610,50 @@ mod tests {
     fn resample_no_op_on_equal_rates() {
         let frames: Vec<i16> = vec![1, 2, 3];
         assert_eq!(resample_to(&frames, 16000, 16000), frames);
+    }
+
+    #[test]
+    fn vad_detects_speech_then_silence() {
+        let mut vad = EnergyVad::new(500.0, 200, 600, 30_000);
+        // 200 ms of speech (10 frames of 20 ms) at amplitude 5000.
+        let speech_frame = vec![5000i16; VAD_FRAME_SAMPLES];
+        // 700 ms of silence (35 frames) — exceeds 600 ms close threshold.
+        let silent_frame = vec![0i16; VAD_FRAME_SAMPLES];
+
+        let mut utterances: Vec<Vec<i16>> = Vec::new();
+        for _ in 0..10 {
+            utterances.extend(vad.feed(&speech_frame));
+        }
+        for _ in 0..35 {
+            utterances.extend(vad.feed(&silent_frame));
+        }
+        assert_eq!(utterances.len(), 1, "exactly one utterance expected");
+        // 10 speech frames + at most 30 silence frames before close
+        // (end_silence_frames = 30 at 20ms/frame).
+        let u = &utterances[0];
+        assert!(
+            u.len() >= 10 * VAD_FRAME_SAMPLES,
+            "utterance shorter than 200 ms: {} samples",
+            u.len()
+        );
+    }
+
+    #[test]
+    fn vad_ignores_brief_noise_below_min_speech() {
+        let mut vad = EnergyVad::new(500.0, 200, 600, 30_000);
+        // Only 60 ms of speech (3 frames) — below 200 ms threshold.
+        let speech_frame = vec![5000i16; VAD_FRAME_SAMPLES];
+        let silent_frame = vec![0i16; VAD_FRAME_SAMPLES];
+        let mut utterances: Vec<Vec<i16>> = Vec::new();
+        for _ in 0..3 {
+            utterances.extend(vad.feed(&speech_frame));
+        }
+        for _ in 0..35 {
+            utterances.extend(vad.feed(&silent_frame));
+        }
+        assert!(
+            utterances.is_empty(),
+            "brief noise should not trigger utterance"
+        );
     }
 }

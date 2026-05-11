@@ -50,7 +50,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run as a voice satellite — hold Space to talk, release to send.
+    /// Run as a voice satellite — always-on listening with energy VAD.
     Voice {
         /// BCP-47 language hint passed to STT (e.g. "ja", "en"). When
         /// omitted, the server's voice_pipeline default applies.
