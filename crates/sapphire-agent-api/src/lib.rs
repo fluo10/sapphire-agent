@@ -4,6 +4,8 @@
 //! interactive REPL that can be embedded in any binary (`sapphire-agent call`
 //! or the standalone `sapphire-call`).
 
+pub mod voice;
+
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use reedline::{
@@ -13,6 +15,21 @@ use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::io::{Write, stderr, stdout};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+pub use voice::{VoiceEvent, voice_pipeline_run};
+
+/// Initialize an MCP session against `base`. Returns the internal
+/// `Mcp-Session-Id`, the human-readable display id, and whether the
+/// session is brand-new. Exposed so out-of-tree clients (e.g. the voice
+/// satellite) can reuse the same session-setup flow as the REPL.
+pub async fn initialize(
+    client: &reqwest::Client,
+    base: &str,
+    session: Option<String>,
+    room_profile: Option<&str>,
+) -> Result<(String, String, bool)> {
+    initialize_session(client, base, session, room_profile).await
+}
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 

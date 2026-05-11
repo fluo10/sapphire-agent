@@ -1,0 +1,263 @@
+//! Client-side helpers for the `voice/pipeline_run` MCP method.
+//!
+//! Wraps the request/response shape used by the server in `serve.rs`:
+//! audio in (base64 s16le mono 16 kHz) → SSE progress events
+//! (`stt_final`, `assistant_text`, `audio_chunk`) → final JSON result
+//! (`transcript`, `assistant_text`).
+//!
+//! Audio I/O is intentionally not handled here — that's the
+//! satellite's job (see `sapphire-call`'s voice subcommand). This
+//! module deals only in `Vec<i16>` PCM and JSON-RPC over HTTP/SSE.
+
+use anyhow::Result;
+use base64::Engine;
+use futures_util::StreamExt;
+use serde_json::{Value, json};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::mpsc;
+
+static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_id() -> u64 {
+    REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Pipeline sample rate. Must match the server-side constant in
+/// `sapphire-agent::voice::PIPELINE_SAMPLE_RATE`. Duplicated here so
+/// the API crate doesn't depend on the agent binary.
+pub const PIPELINE_SAMPLE_RATE: u32 = 16_000;
+
+/// Streaming events emitted while a `voice/pipeline_run` call is in
+/// flight. Consumers typically:
+///   * push `AudioChunk` PCM into a playback queue as soon as it
+///     arrives (low-latency speech)
+///   * display `SttFinal` / `AssistantText` in a transcript view
+///   * stop reading on `Done` or `Error`
+#[derive(Debug, Clone)]
+pub enum VoiceEvent {
+    /// Pipeline stage started (e.g. "stt", "intent", "tts").
+    StageStart { stage: String },
+    /// Pipeline stage ended.
+    StageEnd { stage: String },
+    /// Final transcript from STT.
+    SttFinal { text: String },
+    /// Assistant's text reply (echo of what gets synthesized to audio).
+    AssistantText { text: String },
+    /// One chunk of synthesized speech (mono s16le @ 16 kHz).
+    AudioChunk { pcm: Vec<i16> },
+    /// Tool call started during the LLM turn.
+    ToolStart { name: String },
+    /// Tool call finished during the LLM turn.
+    ToolEnd { name: String },
+    /// Pipeline completed; carries the same transcript + reply text the
+    /// caller can also reconstruct from prior `SttFinal` / `AssistantText`.
+    Done {
+        transcript: String,
+        assistant_text: String,
+    },
+    /// Pipeline failed — message describes the JSON-RPC error.
+    Error { message: String },
+}
+
+/// Run one voice pipeline pass: upload `pcm` as a single utterance,
+/// stream progress events into `event_tx`, and return when the server
+/// emits its final JSON-RPC result. Closing `event_tx` is the caller's
+/// responsibility — it happens automatically when the returned future
+/// is dropped, but explicit closure helps the playback consumer exit.
+pub async fn voice_pipeline_run(
+    client: &reqwest::Client,
+    base: &str,
+    mcp_session_id: &str,
+    pcm: &[i16],
+    language: Option<&str>,
+    event_tx: mpsc::Sender<VoiceEvent>,
+) -> Result<()> {
+    let base = base.trim_end_matches('/');
+
+    // Encode PCM (mono s16le) as base64.
+    let mut bytes = Vec::with_capacity(pcm.len() * 2);
+    for s in pcm {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+    let mut params = json!({ "audio": audio_b64 });
+    if let Some(l) = language {
+        params["language"] = json!(l);
+    }
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": next_id(),
+        "method": "voice/pipeline_run",
+        "params": params,
+    });
+
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("mcp-session-id", mcp_session_id)
+        .header("accept", "text/event-stream")
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    while let Some(chunk) = stream.next().await {
+        buf.push_str(&String::from_utf8_lossy(&chunk?));
+        while let Some(pos) = buf.find("\n\n") {
+            let raw: String = buf.drain(..pos + 2).collect();
+            let Some(value) = parse_sse_data(&raw) else {
+                continue;
+            };
+            if dispatch_event(&value, &event_tx).await {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_sse_data(raw: &str) -> Option<Value> {
+    let data_line = raw.lines().find(|l| l.starts_with("data:"))?;
+    let data = data_line.strip_prefix("data:").unwrap_or("").trim();
+    serde_json::from_str(data).ok()
+}
+
+/// Map one parsed JSON-RPC frame to a `VoiceEvent` and push it. Returns
+/// `true` when the stream should be considered complete (final result
+/// or error received).
+async fn dispatch_event(val: &Value, tx: &mpsc::Sender<VoiceEvent>) -> bool {
+    // Notification frames.
+    if let Some(method) = val["method"].as_str() {
+        let params = &val["params"];
+        let evt = match method {
+            "notifications/progress" => {
+                let kind = params["kind"].as_str().unwrap_or("");
+                match kind {
+                    "stage" => {
+                        let stage = params["stage"].as_str().unwrap_or("").to_string();
+                        match params["status"].as_str() {
+                            Some("start") => Some(VoiceEvent::StageStart { stage }),
+                            Some("end") => Some(VoiceEvent::StageEnd { stage }),
+                            _ => None,
+                        }
+                    }
+                    "stt_final" => params["text"].as_str().map(|s| VoiceEvent::SttFinal {
+                        text: s.to_string(),
+                    }),
+                    "assistant_text" => {
+                        params["text"].as_str().map(|s| VoiceEvent::AssistantText {
+                            text: s.to_string(),
+                        })
+                    }
+                    "audio_chunk" => params["data"].as_str().and_then(decode_audio_chunk),
+                    _ => None,
+                }
+            }
+            "tool_start" => params["name"].as_str().map(|s| VoiceEvent::ToolStart {
+                name: s.to_string(),
+            }),
+            "tool_end" => params["name"].as_str().map(|s| VoiceEvent::ToolEnd {
+                name: s.to_string(),
+            }),
+            _ => None,
+        };
+        if let Some(evt) = evt {
+            let _ = tx.send(evt).await;
+        }
+        return false;
+    }
+
+    // Final result / error frames carry an `id`.
+    if val.get("result").is_some() {
+        let result = &val["result"];
+        let transcript = result["transcript"].as_str().unwrap_or("").to_string();
+        let assistant_text = result["assistant_text"].as_str().unwrap_or("").to_string();
+        let _ = tx
+            .send(VoiceEvent::Done {
+                transcript,
+                assistant_text,
+            })
+            .await;
+        return true;
+    }
+    if let Some(err) = val.get("error") {
+        let message = err["message"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string();
+        let _ = tx.send(VoiceEvent::Error { message }).await;
+        return true;
+    }
+    false
+}
+
+fn decode_audio_chunk(b64: &str) -> Option<VoiceEvent> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .ok()?;
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let pcm: Vec<i16> = bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    Some(VoiceEvent::AudioChunk { pcm })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn audio_chunk_round_trip() {
+        let pcm: Vec<i16> = vec![0, 100, -100, 32767, -32768];
+        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let evt = decode_audio_chunk(&b64).unwrap();
+        match evt {
+            VoiceEvent::AudioChunk { pcm: out } => assert_eq!(out, pcm),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_stt_final_emits_event() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {"kind": "stt_final", "text": "hello"},
+        });
+        let done = dispatch_event(&frame, &tx).await;
+        assert!(!done);
+        match rx.recv().await.unwrap() {
+            VoiceEvent::SttFinal { text } => assert_eq!(text, "hello"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_final_result_signals_done() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"transcript": "hi", "assistant_text": "hello there"},
+        });
+        let done = dispatch_event(&frame, &tx).await;
+        assert!(done);
+        match rx.recv().await.unwrap() {
+            VoiceEvent::Done {
+                transcript,
+                assistant_text,
+            } => {
+                assert_eq!(transcript, "hi");
+                assert_eq!(assistant_text, "hello there");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+}
