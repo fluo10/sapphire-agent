@@ -221,6 +221,19 @@ system_prompt = "You are a helpful personal assistant."
 # speaker_id = 0
 # speed      = 1.0
 #
+# [tts_provider.sbv2]               # Style-Bert-VITS2 (https://github.com/litagin02/Style-Bert-VITS2)
+# type        = "style_bert_vits2"  # simple REST API; no Gradio shenanigans
+# base_url    = "http://localhost:5000"
+# model_id    = 0                   # check GET /models/info on the server
+# speaker_id  = 0
+# # style       = "Neutral"         # optional; defaults to model's default style
+# # style_weight = 1.0
+# # language    = "JP"              # JP / EN / ZH per SBV2 convention
+# # length      = 1.0               # speaking rate (<1 slower, >1 faster)
+# # sdp_ratio   = 0.2
+# # noise       = 0.6
+# # noisew      = 0.8
+#
 # [tts_provider.mock_tts]           # synthetic sine wave; testing only
 # type         = "mock"
 # duration_ms  = 200

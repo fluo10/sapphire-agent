@@ -124,6 +124,10 @@ fn build_tts(name: &str, cfg: &TtsProviderConfig) -> anyhow::Result<Arc<dyn TtsP
                 "tts_provider '{name}': type = \"openai_tts\" is not yet implemented"
             )
         }
+        TtsProviderConfig::StyleBertVits2(cfg) => Ok(Arc::new(providers::StyleBertVits2Tts::new(
+            name.to_string(),
+            cfg.clone(),
+        )?)),
         TtsProviderConfig::SherpaOnnx(cfg) => {
             #[cfg(feature = "voice-sherpa")]
             {

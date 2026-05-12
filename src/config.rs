@@ -461,6 +461,65 @@ pub enum TtsProviderConfig {
     /// and `model_dir` is absent.
     #[serde(rename = "sherpa_onnx")]
     SherpaOnnx(SherpaTtsConfig),
+    /// Style-Bert-VITS2 FastAPI server
+    /// (https://github.com/litagin02/Style-Bert-VITS2). Simpler API
+    /// than Gradio — single `POST /voice` returns a WAV — and the
+    /// training/merging ecosystem is more mature than Irodori-TTS's,
+    /// which makes it the practical choice for custom Japanese voices.
+    #[serde(rename = "style_bert_vits2")]
+    StyleBertVits2(StyleBertVits2Config),
+}
+
+/// Configuration for the Style-Bert-VITS2 TTS provider.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StyleBertVits2Config {
+    /// Base URL where the SBV2 FastAPI server is reachable, e.g.
+    /// `"http://localhost:5000"`.
+    pub base_url: String,
+    /// Numeric `model_id` registered with the server. See
+    /// `GET /models/info` on the server for the list.
+    #[serde(default)]
+    pub model_id: i32,
+    /// Numeric `speaker_id` within the chosen model.
+    #[serde(default)]
+    pub speaker_id: i32,
+    /// Style name (defaults to the model's default style when omitted).
+    #[serde(default)]
+    pub style: Option<String>,
+    /// Style strength (1.0 = neutral; higher exaggerates).
+    #[serde(default = "default_sbv2_style_weight")]
+    pub style_weight: f32,
+    /// BCP-47 language ("JP", "EN", "ZH" per SBV2 convention).
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Speaking rate (1.0 = normal; <1.0 slower, >1.0 faster).
+    #[serde(default = "default_sbv2_length")]
+    pub length: f32,
+    /// SDP ratio (0.0–1.0). Default 0.2 per SBV2 README.
+    #[serde(default = "default_sbv2_sdp_ratio")]
+    pub sdp_ratio: f32,
+    /// Noise scale (prosody jitter). Default 0.6.
+    #[serde(default = "default_sbv2_noise")]
+    pub noise: f32,
+    /// Noise-w scale (cadence jitter). Default 0.8.
+    #[serde(default = "default_sbv2_noisew")]
+    pub noisew: f32,
+}
+
+fn default_sbv2_style_weight() -> f32 {
+    1.0
+}
+fn default_sbv2_length() -> f32 {
+    1.0
+}
+fn default_sbv2_sdp_ratio() -> f32 {
+    0.2
+}
+fn default_sbv2_noise() -> f32 {
+    0.6
+}
+fn default_sbv2_noisew() -> f32 {
+    0.8
 }
 
 fn default_mock_duration_ms() -> u32 {

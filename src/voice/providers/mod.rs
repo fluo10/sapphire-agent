@@ -13,6 +13,8 @@ mod sherpa_stt;
 mod sherpa_tts;
 #[cfg(feature = "voice-sherpa")]
 pub(crate) mod sherpa_download;
+mod style_bert_vits2_tts;
+mod wav_stream;
 
 pub(super) use gradio_tts::GradioTts;
 pub(super) use mock::{MockStt, MockTts};
@@ -20,3 +22,4 @@ pub(super) use mock::{MockStt, MockTts};
 pub(super) use sherpa_stt::SherpaOnnxStt;
 #[cfg(feature = "voice-sherpa")]
 pub(super) use sherpa_tts::SherpaOnnxTts;
+pub(super) use style_bert_vits2_tts::StyleBertVits2Tts;

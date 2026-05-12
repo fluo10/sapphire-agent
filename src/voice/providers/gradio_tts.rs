@@ -12,7 +12,6 @@
 //! the consumer can play them smoothly without buffering the entire
 //! reply before audio starts.
 
-use std::io::Cursor;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -246,128 +245,13 @@ impl TtsProvider for GradioTts {
         let response = self.await_completion(&event_id).await?;
         let audio_ref = self.resolve_audio_ref(&response)?;
         let bytes = self.fetch_audio_bytes(&audio_ref).await?;
-
-        // Decode WAV. hound handles 16-bit PCM directly; floats are
-        // converted in spawn_blocking since hound is sync and decoding
-        // a few MB of WAV shouldn't block the runtime.
-        let (samples, sample_rate, channels) =
-            tokio::task::spawn_blocking(move || decode_wav(&bytes))
-                .await
-                .map_err(|e| anyhow::anyhow!("WAV decode task panicked: {e}"))??;
-
-        let mono = if channels == 1 {
-            samples
-        } else {
-            // Average channels for stereo+ → mono.
-            samples
-                .chunks(channels as usize)
-                .map(|frame| {
-                    let sum: i32 = frame.iter().map(|s| *s as i32).sum();
-                    (sum / channels as i32) as i16
-                })
-                .collect()
-        };
-
-        let resampled = if sample_rate == PIPELINE_SAMPLE_RATE {
-            mono
-        } else {
-            linear_resample(&mono, sample_rate, PIPELINE_SAMPLE_RATE)
-        };
-
-        // Pace 20 ms chunks (320 samples @ 16 kHz). No actual sleep —
-        // backpressure on the bounded mpsc paces the producer naturally.
-        let chunk_size = (PIPELINE_SAMPLE_RATE as usize) / 50;
-        for chunk in resampled.chunks(chunk_size) {
-            if pcm_tx.send(chunk.to_vec()).await.is_err() {
-                // Receiver dropped — caller cancelled.
-                break;
-            }
-        }
-        Ok(())
+        super::wav_stream::stream_wav(bytes, pcm_tx).await
     }
-}
-
-/// Decode a WAV blob into interleaved i16 samples. Returns
-/// `(samples, sample_rate, channels)`.
-fn decode_wav(bytes: &[u8]) -> anyhow::Result<(Vec<i16>, u32, u16)> {
-    let mut reader = hound::WavReader::new(Cursor::new(bytes))
-        .map_err(|e| anyhow::anyhow!("WAV header parse failed: {e}"))?;
-    let spec = reader.spec();
-    let samples: Vec<i16> = match spec.sample_format {
-        hound::SampleFormat::Int => {
-            let bits = spec.bits_per_sample;
-            reader
-                .samples::<i32>()
-                .map(|s| {
-                    s.map(|v| {
-                        // Normalize any int bit depth to i16.
-                        if bits == 16 {
-                            v as i16
-                        } else {
-                            let shift = (bits as i32) - 16;
-                            if shift > 0 {
-                                (v >> shift) as i16
-                            } else {
-                                (v << (-shift)) as i16
-                            }
-                        }
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| anyhow::anyhow!("WAV sample read failed: {e}"))?
-        }
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .map(|s| s.map(|v| (v.clamp(-1.0, 1.0) * (i16::MAX as f32)) as i16))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("WAV f32 sample read failed: {e}"))?,
-    };
-    Ok((samples, spec.sample_rate, spec.channels))
-}
-
-/// Linear-interpolation resampler. Quick and simple; adequate for
-/// speech in v1. If TTS quality matters, swap in rubato later.
-fn linear_resample(input: &[i16], src_rate: u32, dst_rate: u32) -> Vec<i16> {
-    if input.is_empty() || src_rate == dst_rate {
-        return input.to_vec();
-    }
-    let ratio = src_rate as f64 / dst_rate as f64;
-    let out_len = ((input.len() as f64) / ratio).round() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src_pos = i as f64 * ratio;
-        let idx = src_pos.floor() as usize;
-        let frac = src_pos - idx as f64;
-        let s0 = input[idx.min(input.len() - 1)] as f64;
-        let s1 = input[(idx + 1).min(input.len() - 1)] as f64;
-        let interpolated = s0 * (1.0 - frac) + s1 * frac;
-        out.push(interpolated.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16);
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resample_downsample_halves_length_approximately() {
-        let input: Vec<i16> = (0..32000).map(|i| (i % 1000) as i16).collect();
-        let out = linear_resample(&input, 32000, 16000);
-        // Allow ±1 rounding tolerance.
-        assert!(
-            (out.len() as isize - 16000).abs() <= 1,
-            "got len {}",
-            out.len()
-        );
-    }
-
-    #[test]
-    fn resample_no_op_when_rates_match() {
-        let input: Vec<i16> = vec![100, 200, 300];
-        let out = linear_resample(&input, 16000, 16000);
-        assert_eq!(out, input);
-    }
 
     #[test]
     fn resolve_audio_ref_string() {
