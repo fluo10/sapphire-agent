@@ -164,72 +164,39 @@ First boot auto-downloads Silero VAD (~2 MB) to
 
 ## 3. Wake-word mode (optional)
 
-Wake-word configuration lives on the server, under the room_profile.
-Every satellite for that room_profile fetches the same phrase via
-`voice/config` at startup — change the AI's name in one place and
-every connected device picks it up.
+Wake words are AI-name-specific (Saphina, Fina, whatever you've
+trained), so pre-built KWS vocabularies don't cover them. The only
+realistic engine is **openWakeWord** with a classifier you train
+externally and drop on the server. Every connected satellite fetches
+the same ONNX via `voice/config` and caches it by SHA-256.
 
-Server config (add to `test-configs/voice-irodori.toml` or your real
-config):
+### Server config
 
 ```toml
-[room_profile.voice_irodori]
-profile          = "casual"
-voice_pipeline   = "irodori"
-rooms            = []
-wake_word        = "ハロー、クロード"
-wake_word_model  = "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
+[voice]
+wake_word_model = "/srv/sapphire/wake-models/saphina-v1.onnx"
 ```
 
-Both fields are required together; setting one alone fails
-`validate_profiles` at server startup.
+That's it — global to all room_profiles. Validation catches a typo
+in the path at startup; missing files surface as a clean
+`validate_profiles` error, not a 500 on the first satellite call.
 
-Then on the satellite, just connect — no extra CLI flags needed:
+### Satellite
+
+No extra CLI flags. The satellite fetches the ONNX at startup along
+with the openWakeWord shared frontend models (mel + embedding,
+~6 MB total, downloaded once from the openWakeWord v0.5.1 GitHub
+release to `~/.local/share/sapphire-call/voice-models/oww/`):
 
 ```sh
 cargo run --release --bin sapphire-call -- voice \
     --room-profile voice_irodori
 ```
 
-First run downloads the KWS bundle (~50 MB). The phrase is split into
-characters and looked up in the bundle's `tokens.txt`; characters
-that aren't in vocab abort startup with a clear message listing them
-(so users can pick a different phrase, or a model whose vocab covers
-their language).
+The display label printed on wake-fire is derived from the ONNX
+filename (e.g. `saphina-v1.onnx` → `saphina`).
 
-### Choosing a KWS model for your language
-
-| Phrase looks like | Try this bundle |
-|---|---|
-| Chinese chars (你好) | `sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01` |
-| English (`hey claude`) | `sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01` |
-| Custom AI name (`サフィナ`, `Saphina`, etc.) | No prebuilt sherpa-onnx KWS covers arbitrary names. **Use the openWakeWord engine** — see §3.5. |
-
-### 3.5 Custom AI names via openWakeWord
-
-Train a wake-word classifier once with openWakeWord's Python pipeline
-(synthetic-data, no manual recordings), drop the resulting `.onnx`
-onto the server, and every connected satellite picks it up. The
-classifier is small (~250 KB), distributed inline in the
-`voice/config` response, and cached on the satellite by SHA-256.
-
-Server config:
-
-```toml
-[room_profile.home_voice]
-profile           = "casual"
-voice_pipeline    = "default"
-rooms             = []
-wake_word         = "Saphina"                  # display label only
-wake_word_engine  = "open_wake_word"
-wake_word_model   = "/srv/sapphire/wake-models/saphina-v1.onnx"
-```
-
-Validation catches a typo in the path at startup. The bytes are read
-once per `voice/config` call, so updates take effect on the
-satellite's next restart.
-
-#### Training a custom model
+### Training a custom model
 
 ```sh
 git clone https://github.com/dscripka/openWakeWord
@@ -241,38 +208,20 @@ pip install -e . piper-tts
 # Output: my_wakeword.onnx (~250 KB).
 ```
 
-Then drop `my_wakeword.onnx` somewhere readable by sapphire-agent,
-point `wake_word_model` at it, restart.
+Drop the resulting `.onnx` on the server, point
+`[voice].wake_word_model` at it, restart sapphire-agent. Each
+satellite picks up the new model on its next boot (cache hits
+re-use existing models; new SHA = re-download once).
 
-#### First-run downloads on the satellite
+### Limitations
 
-The satellite needs two shared frontend ONNX models in addition to
-the custom classifier:
-
-- `melspectrogram.onnx` (~1 MB)
-- `embedding_model.onnx` (~5 MB)
-
-Both auto-downloaded from openWakeWord's `v0.5.1` GitHub release on
-first OWW run to `~/.local/share/sapphire-call/voice-models/oww/`.
-
-#### Limitations
-
-- Threshold is fixed at 0.5 — adjust via env var coming later if
-  needed.
-- The Rust port of OWW's streaming feature pipeline is faithful to
+- Threshold is fixed at 0.5 — make it config-tunable when the
+  trained model needs more sensitivity / less.
+- The Rust port of openWakeWord's streaming feature pipeline is
+  faithful to
   the Python source but hasn't been validated against the official
   Python implementation's output yet. False positives / negatives
   may need threshold tuning per model.
-
-### CLI overrides (testing only)
-
-`--wake-word "phrase"` and `--wake-word-model <bundle>` override the
-server-supplied values per invocation. Useful when iterating before
-locking a phrase into the server config.
-
-`--keywords-file <path>` skips phrase tokenisation entirely and feeds
-a raw sherpa-onnx keywords file to the KWS — escape hatch for
-BPE-based models where character splitting isn't appropriate.
 
 ---
 

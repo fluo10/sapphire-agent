@@ -28,57 +28,45 @@ fn next_id() -> u64 {
 pub const PIPELINE_SAMPLE_RATE: u32 = 16_000;
 
 /// Wake-word configuration fetched from the server's `voice/config`
-/// method. `phrase` is present when wake-word mode is available for
-/// the session's room profile; `model` carries the engine-specific
-/// payload (a sherpa bundle name OR an inline openWakeWord ONNX blob).
+/// method. The model is `None` when no wake word is configured on
+/// the server; satellites in that case run in VAD-only mode.
 #[derive(Debug, Clone, Default)]
 pub struct WakeWordConfig {
-    /// Display phrase. For `sherpa_onnx` this is also the
-    /// natural-language string the client tokenises against the
-    /// bundle's `tokens.txt`. For `open_wake_word` it's just a label
-    /// printed when wake fires.
-    pub phrase: Option<String>,
-    /// `None` when the room profile has no wake-word set; otherwise
-    /// the engine-specific model handle.
+    /// Inline openWakeWord classifier — `None` if voice.wake_word_model
+    /// is unset server-side. Wake words must be custom-trained for
+    /// AI names that aren't in any pre-trained KWS vocabulary, which
+    /// makes openWakeWord the only realistic engine.
     pub model: Option<WakeWordModel>,
 }
 
-/// Engine-tagged wake-word model payload.
+/// openWakeWord classifier ONNX, distributed inline so the satellite
+/// never needs direct access to the agent's filesystem. The satellite
+/// caches by `sha256` and reuses across runs.
 #[derive(Debug, Clone)]
-pub enum WakeWordModel {
-    /// Sherpa-onnx KWS bundle name. Satellites resolve it against
-    /// the sherpa-onnx GitHub releases tag on first use.
-    SherpaBundle { name: String },
-    /// openWakeWord classifier ONNX, distributed inline so the
-    /// satellite never has to talk to the user's training box. The
-    /// satellite caches by `sha256`.
-    OnnxInline {
-        filename: String,
-        sha256: String,
-        /// Decoded model bytes. `voice_config()` does the base64
-        /// decode so callers don't have to.
-        bytes: Vec<u8>,
-    },
+pub struct WakeWordModel {
+    pub filename: String,
+    pub sha256: String,
+    /// Decoded model bytes. `voice_config()` does the base64 decode so
+    /// callers stay in pure Rust types.
+    pub bytes: Vec<u8>,
 }
 
-/// Fetch the wake-word configuration the server has bound to the
-/// given `room_profile`. Returns an empty `WakeWordConfig` when the
-/// room profile has no wake-word set.
+/// Fetch the server's global wake-word configuration. Returns an
+/// empty `WakeWordConfig` when `[voice].wake_word_model` is unset.
 ///
-/// No MCP session is needed — voice clients identify themselves by
-/// `device_id` + `room_profile` per request rather than by a
-/// long-lived session token.
+/// No session or MCP token needed — wake-word config is the same for
+/// every satellite regardless of room_profile, so this is a stateless
+/// GET-like call.
 pub async fn voice_config(
     client: &reqwest::Client,
     base: &str,
-    room_profile: &str,
 ) -> Result<WakeWordConfig> {
     let base = base.trim_end_matches('/');
     let body = json!({
         "jsonrpc": "2.0",
         "id": next_id(),
         "method": "voice/config",
-        "params": { "room_profile": room_profile },
+        "params": {},
     });
     let val: Value = client
         .post(format!("{base}/mcp"))
@@ -92,10 +80,8 @@ pub async fn voice_config(
         let msg = err["message"].as_str().unwrap_or("unknown error");
         anyhow::bail!("voice/config: {msg}");
     }
-    let result = &val["result"];
-    let phrase = result["wake_word"].as_str().map(String::from);
-    let model = parse_wake_word_model(&result["wake_word_model"])?;
-    Ok(WakeWordConfig { phrase, model })
+    let model = parse_wake_word_model(&val["result"]["wake_word_model"])?;
+    Ok(WakeWordConfig { model })
 }
 
 fn parse_wake_word_model(value: &Value) -> Result<Option<WakeWordModel>> {
@@ -106,38 +92,28 @@ fn parse_wake_word_model(value: &Value) -> Result<Option<WakeWordModel>> {
         Some(f) => f,
         None => return Ok(None),
     };
-    match format {
-        "sherpa_bundle" => {
-            let name = value["name"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("voice/config: sherpa_bundle missing 'name'"))?;
-            Ok(Some(WakeWordModel::SherpaBundle {
-                name: name.to_string(),
-            }))
-        }
-        "onnx_inline" => {
-            let filename = value["filename"]
-                .as_str()
-                .unwrap_or("wake.onnx")
-                .to_string();
-            let sha256 = value["sha256"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("voice/config: onnx_inline missing 'sha256'"))?
-                .to_string();
-            let data_b64 = value["data_b64"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("voice/config: onnx_inline missing 'data_b64'"))?;
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(data_b64.as_bytes())
-                .map_err(|e| anyhow::anyhow!("voice/config: onnx_inline base64 decode: {e}"))?;
-            Ok(Some(WakeWordModel::OnnxInline {
-                filename,
-                sha256,
-                bytes,
-            }))
-        }
-        other => anyhow::bail!("voice/config: unknown wake_word_model format '{other}'"),
+    if format != "onnx_inline" {
+        anyhow::bail!("voice/config: unknown wake_word_model format '{format}'");
     }
+    let filename = value["filename"]
+        .as_str()
+        .unwrap_or("wake.onnx")
+        .to_string();
+    let sha256 = value["sha256"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("voice/config: onnx_inline missing 'sha256'"))?
+        .to_string();
+    let data_b64 = value["data_b64"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("voice/config: onnx_inline missing 'data_b64'"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.as_bytes())
+        .map_err(|e| anyhow::anyhow!("voice/config: onnx_inline base64 decode: {e}"))?;
+    Ok(Some(WakeWordModel {
+        filename,
+        sha256,
+        bytes,
+    }))
 }
 
 /// Streaming events emitted while a `voice/pipeline_run` call is in

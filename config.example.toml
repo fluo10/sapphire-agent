@@ -243,20 +243,13 @@ system_prompt = "You are a helpful personal assistant."
 # profile          = "casual"
 # voice_pipeline   = "default"
 # rooms            = []             # MCP-only; not bound to chat rooms
-# # Wake word for satellites in this room_profile. Both fields
-# # required together. With the default `sherpa_onnx` engine the
-# # phrase is tokenised by the client against the chosen bundle's
-# # tokens.txt; punctuation is kept in the @label but dropped from
-# # the token list.
-# wake_word        = "ハロー、クロード"
-# wake_word_model  = "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
-# # wake_word_engine = "sherpa_onnx"  # default, can be omitted
-# #
-# # For custom AI names that aren't in any prebuilt KWS vocab,
-# # switch to openWakeWord. `wake_word_model` is then a filesystem
-# # path to a `.onnx` classifier trained externally (see TESTING.md
-# # §3.5 for the training pipeline). The phrase becomes a display
-# # label only.
-# # wake_word        = "Saphina"
-# # wake_word_engine = "open_wake_word"
-# # wake_word_model  = "/srv/sapphire/wake-models/saphina-v1.onnx"
+#
+# # ── Voice-mode global settings ───────────────────────────────────────
+# # AI-name wake words can't be served by pre-trained KWS bundles
+# # (their vocabulary is finite), so custom openWakeWord ONNXes are
+# # the only path. Train externally with
+# # https://github.com/dscripka/openWakeWord, drop the .onnx on the
+# # server, point `wake_word_model` at it, restart. Every connected
+# # satellite fetches the bytes via voice/config and caches by SHA-256.
+# [voice]
+# wake_word_model = "/srv/sapphire/wake-models/saphina-v1.onnx"

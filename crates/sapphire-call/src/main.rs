@@ -75,25 +75,6 @@ enum Command {
         #[arg(long)]
         language: Option<String>,
 
-        /// Override the server-supplied KWS bundle name. The default
-        /// comes from the room_profile's `wake_word_model` field. Set
-        /// this for one-off testing or when no server config is yet
-        /// in place.
-        #[arg(long)]
-        wake_word_model: Option<String>,
-
-        /// Override the server-supplied wake phrase. The default
-        /// comes from the room_profile's `wake_word` field.
-        /// Natural-language; tokenised at startup.
-        #[arg(long)]
-        wake_word: Option<String>,
-
-        /// Advanced: feed a pre-tokenised sherpa-onnx keywords file
-        /// straight to the KWS, skipping phrase tokenisation. Useful
-        /// for BPE-based models or non-character vocabularies.
-        #[arg(long)]
-        keywords_file: Option<String>,
-
         /// Enumerate every cpal input + output device visible on this
         /// host and exit. Useful when running headless against a USB
         /// speakerphone — the system "default" rarely points at it.
@@ -144,9 +125,6 @@ async fn main() -> Result<()> {
 
     if let Some(Command::Voice {
         language,
-        wake_word_model,
-        wake_word,
-        keywords_file,
         list_devices,
         input_device,
         output_device,
@@ -158,9 +136,6 @@ async fn main() -> Result<()> {
             room_profile,
             voice::VoiceOptions {
                 language: language.or(file_cfg.language.stt),
-                wake_word_model,
-                wake_word,
-                keywords_file,
                 list_devices,
                 input_device: input_device.or(file_cfg.audio.input_device),
                 output_device: output_device.or(file_cfg.audio.output_device),
