@@ -175,6 +175,24 @@ pub struct RoomProfileConfig {
     /// Absent means voice is disabled for this room profile.
     #[serde(default)]
     pub voice_pipeline: Option<String>,
+    /// Natural-language wake-word phrase. Satellites fetch this via
+    /// `voice/config` after `initialize` and tokenise it against
+    /// their KWS model's `tokens.txt`. Lives server-side so every
+    /// satellite for the same room_profile listens for the same
+    /// phrase — change the AI's name in one place.
+    ///
+    /// Requires `wake_word_model` to also be set; either alone is
+    /// rejected by `validate_profiles`.
+    #[serde(default)]
+    pub wake_word: Option<String>,
+    /// Sherpa-onnx KWS bundle name the satellite should download to
+    /// detect `wake_word`. Example:
+    /// `"sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"`.
+    /// The chosen model must have the wake phrase's characters in
+    /// its `tokens.txt` — mismatches surface at the satellite as a
+    /// clear "character not in vocab" error.
+    #[serde(default)]
+    pub wake_word_model: Option<String>,
 }
 
 /// Definition of an additional LLM provider.
@@ -946,6 +964,19 @@ impl Config {
                         "room_profile '{rp_name}' references unknown voice_pipeline '{vp}'"
                     ));
                 }
+            }
+            // Wake-word config is two paired fields — either both or
+            // neither. A phrase without a model gives the satellite
+            // nothing to download; a model without a phrase has no
+            // keyword to spot.
+            match (&rp.wake_word, &rp.wake_word_model) {
+                (Some(_), None) => errors.push(format!(
+                    "room_profile '{rp_name}': wake_word is set but wake_word_model is not"
+                )),
+                (None, Some(_)) => errors.push(format!(
+                    "room_profile '{rp_name}': wake_word_model is set but wake_word is not"
+                )),
+                _ => {}
             }
         }
         for (vp_name, vp) in &self.voice_pipelines {
@@ -1727,6 +1758,70 @@ rooms          = []
         assert!(
             errors.iter().any(|e| e.contains("ghost")),
             "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn wake_word_requires_both_phrase_and_model() {
+        let phrase_only = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.casual]
+provider = "anthropic"
+
+[room_profile.home]
+profile   = "casual"
+rooms     = []
+wake_word = "ハロー、クロード"
+"#,
+        );
+        let errors = phrase_only.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("wake_word_model")),
+            "got: {errors:?}"
+        );
+
+        let model_only = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.casual]
+provider = "anthropic"
+
+[room_profile.home]
+profile          = "casual"
+rooms            = []
+wake_word_model  = "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
+"#,
+        );
+        let errors = model_only.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("wake_word ")),
+            "got: {errors:?}"
+        );
+
+        let both = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.casual]
+provider = "anthropic"
+
+[room_profile.home]
+profile          = "casual"
+rooms            = []
+wake_word        = "ハロー、クロード"
+wake_word_model  = "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
+"#,
+        );
+        assert!(
+            both.validate_profiles().is_empty(),
+            "errors: {:?}",
+            both.validate_profiles()
         );
     }
 

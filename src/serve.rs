@@ -228,6 +228,7 @@ async fn mcp_post(
         "chat" => handle_chat(state, req_id, req.params, session_id).await,
         "list_sessions" => handle_list_sessions(state, req_id).await,
         "get_session" => handle_get_session(state, req_id, session_id).await,
+        "voice/config" => handle_voice_config(state, req_id, session_id).await,
         "voice/pipeline_run" => {
             handle_voice_pipeline_run(state, req_id, req.params, session_id).await
         }
@@ -521,6 +522,50 @@ async fn handle_get_session(
 // ---------------------------------------------------------------------------
 // voice/pipeline_run  — STT → LLM turn → TTS, streamed via SSE
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// voice/config — return the room_profile's wake-word + (future)
+// per-session voice settings so satellites can self-configure
+// ---------------------------------------------------------------------------
+
+async fn handle_voice_config(
+    state: Arc<ServeState>,
+    req_id: Value,
+    session_id: Option<String>,
+) -> axum::response::Response {
+    let session_id = match session_id {
+        Some(id) => id,
+        None => {
+            let body = error_response(req_id, -32602, "Missing Mcp-Session-Id header");
+            return body.into_response();
+        }
+    };
+    let rp_name = state
+        .session_room_profiles
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned();
+
+    let mut result = json!({});
+    if let Some(name) = rp_name.as_deref()
+        && let Some(rp) = state.config.room_profile(name)
+    {
+        if let Some(phrase) = &rp.wake_word {
+            result["wake_word"] = json!(phrase);
+        }
+        if let Some(model) = &rp.wake_word_model {
+            result["wake_word_model"] = json!(model);
+        }
+    }
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": result,
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
 
 async fn handle_voice_pipeline_run(
     state: Arc<ServeState>,

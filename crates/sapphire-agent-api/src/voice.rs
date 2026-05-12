@@ -27,6 +27,55 @@ fn next_id() -> u64 {
 /// the API crate doesn't depend on the agent binary.
 pub const PIPELINE_SAMPLE_RATE: u32 = 16_000;
 
+/// Wake-word configuration fetched from the server's `voice/config`
+/// method. Either both fields are `Some` (wake-word mode is
+/// available for this session's room profile) or both are `None`.
+#[derive(Debug, Clone, Default)]
+pub struct WakeWordConfig {
+    /// Natural-language phrase the satellite should listen for, e.g.
+    /// `"ハロー、クロード"`. Tokenized client-side against the KWS
+    /// model's `tokens.txt` before being passed to sherpa-onnx.
+    pub phrase: Option<String>,
+    /// Sherpa-onnx KWS bundle name the satellite should download and
+    /// use to detect `phrase`.
+    pub model: Option<String>,
+}
+
+/// Fetch the wake-word configuration the server has bound to this
+/// session's room profile. Returns an empty `WakeWordConfig` when the
+/// room profile has no wake-word set.
+pub async fn voice_config(
+    client: &reqwest::Client,
+    base: &str,
+    mcp_session_id: &str,
+) -> Result<WakeWordConfig> {
+    let base = base.trim_end_matches('/');
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": next_id(),
+        "method": "voice/config",
+        "params": {},
+    });
+    let val: Value = client
+        .post(format!("{base}/mcp"))
+        .header("mcp-session-id", mcp_session_id)
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if let Some(err) = val.get("error") {
+        let msg = err["message"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("voice/config: {msg}");
+    }
+    let result = &val["result"];
+    Ok(WakeWordConfig {
+        phrase: result["wake_word"].as_str().map(String::from),
+        model: result["wake_word_model"].as_str().map(String::from),
+    })
+}
+
 /// Streaming events emitted while a `voice/pipeline_run` call is in
 /// flight. Consumers typically:
 ///   * push `AudioChunk` PCM into a playback queue as soon as it

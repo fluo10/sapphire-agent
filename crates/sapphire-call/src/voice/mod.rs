@@ -42,12 +42,24 @@ const SILERO_VAD_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
 
 /// Run-time options collected from CLI flags.
+///
+/// Wake-word configuration intentionally lives server-side under the
+/// session's `[room_profile.*]`. The satellite fetches it via the
+/// `voice/config` MCP method right after `initialize`. CLI overrides
+/// stay available for one-off testing.
 pub struct VoiceOptions {
     pub language: Option<String>,
-    /// Sherpa-onnx KWS bundle name. When set, enables wake-word mode.
+    /// Override the server-supplied KWS bundle name. When neither
+    /// this nor the server's `wake_word_model` is set, the satellite
+    /// runs in VAD-only mode.
     pub wake_word_model: Option<String>,
-    /// Override for the keywords file. Defaults to
-    /// `<wake_word_model bundle>/keywords.txt` when absent.
+    /// Override the server-supplied wake phrase. Same fallback as
+    /// `wake_word_model` — empty here AND empty server-side means no
+    /// wake-word gating.
+    pub wake_word: Option<String>,
+    /// Advanced escape hatch: skip phrase tokenisation and feed a
+    /// pre-tokenised sherpa-onnx keywords file straight to the KWS.
+    /// When set, `wake_word` (CLI or server-supplied) is ignored.
     pub keywords_file: Option<String>,
     /// When true, enumerate cpal devices and exit before opening any
     /// stream or talking to the agent.
@@ -85,6 +97,21 @@ pub async fn run(
         if is_new { ", new" } else { ", resumed" }
     );
 
+    // ── Wake-word config: fetch from server, let CLI flags override ─────
+    let server_wake = sapphire_agent_api::voice_config(&client, &base, &mcp_session_id)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "warning: voice/config fetch failed ({e:#}); proceeding without server-side wake config"
+            );
+            sapphire_agent_api::WakeWordConfig::default()
+        });
+    let wake_model = options
+        .wake_word_model
+        .clone()
+        .or(server_wake.model);
+    let wake_phrase = options.wake_word.clone().or(server_wake.phrase);
+
     // ── VAD model ────────────────────────────────────────────────────────
     // The download + sherpa-onnx construction are synchronous and use
     // `reqwest::blocking` internally, which spawns its own tokio
@@ -103,19 +130,33 @@ pub async fn run(
     .map_err(|e| anyhow!("VAD build task panicked: {e}"))??;
 
     // ── Optional wake-word detector ─────────────────────────────────────
-    let wake_detector = if let Some(bundle) = options.wake_word_model.as_deref() {
+    let wake_detector = if let Some(bundle) = wake_model.as_deref() {
         let bundle_owned = bundle.to_string();
-        let keywords_owned = options.keywords_file.clone();
+        let keywords_file = options.keywords_file.clone();
+        let phrase = wake_phrase.clone();
         let detector = tokio::task::spawn_blocking(move || {
-            wake::WakeDetector::create(&bundle_owned, keywords_owned.as_deref())
+            let source = if let Some(path) = keywords_file.as_deref() {
+                wake::WakeKeywordSource::File(std::path::Path::new(path))
+            } else if let Some(p) = phrase.as_deref() {
+                // Single phrase from CLI/server; pass as 1-element slice.
+                let phrases = vec![p.to_string()];
+                return wake::WakeDetector::create(
+                    &bundle_owned,
+                    wake::WakeKeywordSource::Phrases(&phrases),
+                );
+            } else {
+                wake::WakeKeywordSource::BundleDefault
+            };
+            wake::WakeDetector::create(&bundle_owned, source)
         })
         .await
         .map_err(|e| anyhow!("wake-word init task panicked: {e}"))?
         .context("failed to initialise wake-word detector")?;
-        eprintln!(
-            "wake-word: {} (waiting for trigger; speak the wake phrase to talk)",
-            bundle
-        );
+        let trigger_hint = wake_phrase
+            .as_deref()
+            .map(|p| format!(" — say \"{p}\" to talk"))
+            .unwrap_or_default();
+        eprintln!("wake-word: {}{trigger_hint}", bundle);
         Some(detector)
     } else {
         None

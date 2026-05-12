@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::io::{Write, stderr, stdout};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use voice::{VoiceEvent, voice_pipeline_run};
+pub use voice::{VoiceEvent, WakeWordConfig, voice_config, voice_pipeline_run};
 
 /// Initialize an MCP session against `base`. Returns the internal
 /// `Mcp-Session-Id`, the human-readable display id, and whether the
