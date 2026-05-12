@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tracing::{debug, info};
 
 use crate::voice::{PIPELINE_SAMPLE_RATE, TtsProvider};
 
@@ -84,6 +85,10 @@ impl GradioTts {
         })?;
 
         let url = format!("{}/gradio_api/call/{}", self.base_url, self.fn_name);
+        info!(
+            "Gradio TTS '{}': POST {} body={}",
+            self.name, url, parsed
+        );
         let resp = self
             .client
             .post(&url)
@@ -93,6 +98,7 @@ impl GradioTts {
             .await?
             .error_for_status()?;
         let json: Value = resp.json().await?;
+        debug!("Gradio TTS '{}': schedule response = {}", self.name, json);
         json.get("event_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
@@ -109,16 +115,24 @@ impl GradioTts {
             "{}/gradio_api/call/{}/{}",
             self.base_url, self.fn_name, event_id
         );
+        info!("Gradio TTS '{}': GET {}", self.name, url);
         let resp = self.client.get(&url).send().await?.error_for_status()?;
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
         let mut current_event = String::new();
+        // Accumulated raw frames so that on an empty "error" event we
+        // can dump the entire stream — Gradio sometimes precedes the
+        // error with a `generating` event carrying the actual Python
+        // traceback or progress info.
+        let mut frame_log: Vec<String> = Vec::new();
         while let Some(chunk) = stream.next().await {
             let bytes = chunk?;
             buf.push_str(std::str::from_utf8(&bytes)?);
             // SSE frames are separated by blank lines.
             while let Some(idx) = buf.find("\n\n") {
                 let frame: String = buf.drain(..idx + 2).collect();
+                debug!("Gradio TTS '{}': SSE frame: {frame:?}", self.name);
+                frame_log.push(frame.clone());
                 let mut event_name: Option<&str> = None;
                 let mut data: Option<&str> = None;
                 for line in frame.lines() {
@@ -138,13 +152,25 @@ impl GradioTts {
                             anyhow::anyhow!("Gradio 'complete' payload not JSON: {e}\n{data}")
                         });
                     }
-                    "error" => anyhow::bail!("Gradio reported error: {data}"),
+                    "error" => {
+                        // Dump every frame seen so far — useful when
+                        // the `error` data is empty (`{"error": null}`)
+                        // and the real failure leaked into an earlier
+                        // `generating` / `log` / `status` frame.
+                        anyhow::bail!(
+                            "Gradio reported error: {data}\n--- preceding SSE frames ---\n{}",
+                            frame_log.join("")
+                        );
+                    }
                     // "generating" / "heartbeat" / etc. — ignore intermediates.
                     _ => continue,
                 }
             }
         }
-        anyhow::bail!("Gradio SSE stream ended without a 'complete' event")
+        anyhow::bail!(
+            "Gradio SSE stream ended without a 'complete' event\n--- received frames ---\n{}",
+            frame_log.join("")
+        )
     }
 
     /// Resolve `audio_field` against the response JSON to a single URL or

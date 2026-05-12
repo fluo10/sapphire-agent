@@ -754,12 +754,9 @@ async fn run_voice_turn(
     .await;
     let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<i16>>(32);
     let reply_for_tts = reply_text.clone();
-    let synth_handle = tokio::spawn(async move {
-        let res = tts.synthesize_stream(&reply_for_tts, pcm_tx).await;
-        if let Err(e) = res {
-            warn!("TTS synthesis error: {e:#}");
-        }
-    });
+    let synth_handle =
+        tokio::spawn(async move { tts.synthesize_stream(&reply_for_tts, pcm_tx).await });
+    let mut chunks_emitted = 0usize;
     while let Some(chunk) = pcm_rx.recv().await {
         let bytes: Vec<u8> = chunk
             .iter()
@@ -771,8 +768,51 @@ async fn run_voice_turn(
             json!({"kind": "audio_chunk", "data": b64}),
         ))
         .await;
+        chunks_emitted += 1;
     }
-    let _ = synth_handle.await;
+    // Surface TTS failures to the client — without this the satellite
+    // saw a silent "no audio_chunks" stream and assumed playback was
+    // empty, which looked like a text-only reply.
+    match synth_handle.await {
+        Ok(Ok(())) => {
+            if chunks_emitted == 0 {
+                warn!(
+                    "TTS returned no audio chunks (provider: {})",
+                    pipeline.tts_provider
+                );
+                send(error_event(
+                    &req_id,
+                    -32603,
+                    &format!(
+                        "TTS provider '{}' produced no audio (check fn_name / payload / audio_field)",
+                        pipeline.tts_provider
+                    ),
+                ))
+                .await;
+                return;
+            }
+        }
+        Ok(Err(e)) => {
+            error!("TTS synthesis error: {e:#}");
+            send(error_event(
+                &req_id,
+                -32603,
+                &format!("TTS synthesis failed: {e:#}"),
+            ))
+            .await;
+            return;
+        }
+        Err(join_err) => {
+            error!("TTS task panicked: {join_err}");
+            send(error_event(
+                &req_id,
+                -32603,
+                &format!("TTS task panicked: {join_err}"),
+            ))
+            .await;
+            return;
+        }
+    }
     send(notification_event(
         "notifications/progress",
         json!({"kind": "stage", "stage": "tts", "status": "end"}),
