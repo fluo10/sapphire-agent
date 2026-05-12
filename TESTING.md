@@ -180,7 +180,54 @@ line per phrase, tokens separated by spaces, then `@<readable label>`.
 
 ---
 
-## 4. Common gotchas
+## 4. Headless Linux deployment (smart-speaker style)
+
+Running the satellite on a server with just a USB speakerphone (Jabra
+Speak, AnkerWork, eMeet, etc.) attached:
+
+### Discover devices
+
+```sh
+sapphire-call voice --list-devices
+```
+
+prints every input / output device cpal can see, marks the system
+defaults with `*`, and exits. The names are exact strings — copy
+them verbatim into the selection flags.
+
+### Pin specific devices
+
+```sh
+sapphire-call voice \
+    --input-device  "Jabra SPEAK 510 USB"  \
+    --output-device "Jabra SPEAK 510 USB"  \
+    --language ja --room-profile voice_irodori
+```
+
+The system "default" rarely points at a USB speakerphone — it
+usually picks the internal codec instead.
+
+### Make the service survive logout
+
+If you're running `sapphire-call voice` as a systemd user service
+under a non-login account, the PipeWire / PulseAudio user daemons
+shut down when no session is active. Enable lingering so the audio
+graph (and the satellite) keep running:
+
+```sh
+sudo loginctl enable-linger <user>
+```
+
+### Echo / feedback
+
+The satellite gates the mic during reply playback, but in wake-word
+mode the mic is open while waiting for the trigger — TTS bleed into
+the mic can confuse Silero VAD. If you hear the agent talking to
+itself, enable PipeWire's `echo-cancel` module
+(`pactl load-module module-echo-cancel`) or physically separate the
+mic from the speaker.
+
+## 5. Common gotchas
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -193,7 +240,7 @@ line per phrase, tokens separated by spaces, then `@<readable label>`.
 
 ---
 
-## 5. What's still in unit-test territory
+## 6. What's still in unit-test territory
 
 The TOML schema, MCP wire format helpers, VAD math, and resampler are
 covered by `cargo test --workspace`. The whole MCP-server-to-cpal

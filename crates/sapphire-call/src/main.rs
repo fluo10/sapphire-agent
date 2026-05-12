@@ -70,6 +70,23 @@ enum Command {
         /// `--wake-word-model`.
         #[arg(long)]
         keywords_file: Option<String>,
+
+        /// Enumerate every cpal input + output device visible on this
+        /// host and exit. Useful when running headless against a USB
+        /// speakerphone — the system "default" rarely points at it.
+        #[arg(long)]
+        list_devices: bool,
+
+        /// Capture audio from the device whose cpal name matches this
+        /// string exactly. Discover names with `--list-devices`.
+        /// Defaults to the host's default input device.
+        #[arg(long)]
+        input_device: Option<String>,
+
+        /// Play audio through the device whose cpal name matches this
+        /// string exactly. Defaults to the host's default output device.
+        #[arg(long)]
+        output_device: Option<String>,
     },
 }
 
@@ -87,6 +104,9 @@ async fn main() -> Result<()> {
         language,
         wake_word_model,
         keywords_file,
+        list_devices,
+        input_device,
+        output_device,
     }) = cli.command
     {
         return voice::run(
@@ -97,6 +117,9 @@ async fn main() -> Result<()> {
                 language,
                 wake_word_model,
                 keywords_file,
+                list_devices,
+                input_device,
+                output_device,
             },
         )
         .await;

@@ -49,6 +49,15 @@ pub struct VoiceOptions {
     /// Override for the keywords file. Defaults to
     /// `<wake_word_model bundle>/keywords.txt` when absent.
     pub keywords_file: Option<String>,
+    /// When true, enumerate cpal devices and exit before opening any
+    /// stream or talking to the agent.
+    pub list_devices: bool,
+    /// Pin capture to the cpal device with this exact name; None ⇒
+    /// `default_input_device()`.
+    pub input_device: Option<String>,
+    /// Pin playback to the cpal device with this exact name; None ⇒
+    /// `default_output_device()`.
+    pub output_device: Option<String>,
 }
 
 /// Entry point for `sapphire-call voice`.
@@ -58,6 +67,12 @@ pub async fn run(
     room_profile: Option<String>,
     options: VoiceOptions,
 ) -> Result<()> {
+    // `--list-devices` short-circuits before we touch the network /
+    // download any models / open any audio streams.
+    if options.list_devices {
+        return list_devices();
+    }
+
     let base = server.trim_end_matches('/').to_string();
     let client = reqwest::Client::new();
 
@@ -109,14 +124,19 @@ pub async fn run(
     // ── Audio I/O ────────────────────────────────────────────────────────
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<i16>>();
     let mic_enabled = Arc::new(AtomicBool::new(true));
-    let (input_stream, input_rate, input_channels) =
-        open_input_stream(audio_tx, Arc::clone(&mic_enabled))?;
+    let (input_stream, input_rate, input_channels) = open_input_stream(
+        options.input_device.as_deref(),
+        audio_tx,
+        Arc::clone(&mic_enabled),
+    )?;
     input_stream.play()?;
 
     let playback_queue: Arc<std::sync::Mutex<VecDeque<i16>>> =
         Arc::new(std::sync::Mutex::new(VecDeque::new()));
-    let (output_stream, output_rate, _output_channels) =
-        open_output_stream(Arc::clone(&playback_queue))?;
+    let (output_stream, output_rate, _output_channels) = open_output_stream(
+        options.output_device.as_deref(),
+        Arc::clone(&playback_queue),
+    )?;
     output_stream.play()?;
 
     eprintln!(
@@ -313,19 +333,134 @@ fn build_vad(model_path: &std::path::Path) -> Result<VoiceActivityDetector> {
         .ok_or_else(|| anyhow!("failed to create sherpa-onnx VoiceActivityDetector"))
 }
 
+// ── Device enumeration / selection ─────────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum DeviceKind {
+    Input,
+    Output,
+}
+
+/// Resolve a cpal device by exact name match, or fall back to the
+/// host's default for the requested kind.
+fn pick_device(
+    host: &cpal::Host,
+    name: Option<&str>,
+    kind: DeviceKind,
+) -> Result<cpal::Device> {
+    if let Some(want) = name {
+        let candidates: Vec<cpal::Device> = match kind {
+            DeviceKind::Input => host.input_devices()?.collect(),
+            DeviceKind::Output => host.output_devices()?.collect(),
+        };
+        for d in candidates {
+            if d.name().ok().as_deref() == Some(want) {
+                return Ok(d);
+            }
+        }
+        // Not found — list what we did see so the user can re-issue.
+        let mut seen: Vec<String> = match kind {
+            DeviceKind::Input => host.input_devices()?,
+            DeviceKind::Output => host.output_devices()?,
+        }
+        .filter_map(|d| d.name().ok())
+        .collect();
+        seen.sort();
+        anyhow::bail!(
+            "no {} device named '{}'. Available: {}",
+            match kind {
+                DeviceKind::Input => "input",
+                DeviceKind::Output => "output",
+            },
+            want,
+            seen.join(", ")
+        );
+    }
+    match kind {
+        DeviceKind::Input => host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("no default input device")),
+        DeviceKind::Output => host
+            .default_output_device()
+            .ok_or_else(|| anyhow!("no default output device")),
+    }
+}
+
+/// `--list-devices` implementation. Dumps every input + output device
+/// visible on the default cpal host, marking the system defaults so
+/// the operator can decide which name to feed `--input-device` /
+/// `--output-device`.
+fn list_devices() -> Result<()> {
+    let host = cpal::default_host();
+    let default_in = host
+        .default_input_device()
+        .and_then(|d| d.name().ok());
+    let default_out = host
+        .default_output_device()
+        .and_then(|d| d.name().ok());
+
+    println!("cpal host: {}", host.id().name());
+    println!();
+    println!("input devices:");
+    print_devices(host.input_devices()?, default_in.as_deref(), true);
+    println!();
+    println!("output devices:");
+    print_devices(host.output_devices()?, default_out.as_deref(), false);
+    Ok(())
+}
+
+fn print_devices<I: Iterator<Item = cpal::Device>>(
+    devices: I,
+    default_name: Option<&str>,
+    is_input: bool,
+) {
+    let mut any = false;
+    for d in devices {
+        any = true;
+        let name = d.name().unwrap_or_else(|_| "<unnamed>".to_string());
+        let marker = if Some(name.as_str()) == default_name {
+            "*"
+        } else {
+            " "
+        };
+        let cfg = if is_input {
+            d.default_input_config().ok()
+        } else {
+            d.default_output_config().ok()
+        };
+        match cfg {
+            Some(c) => println!(
+                "  {marker} {name}\n      {} Hz × {}ch ({:?})",
+                c.sample_rate().0,
+                c.channels(),
+                c.sample_format(),
+            ),
+            None => println!("  {marker} {name}\n      (config unavailable)"),
+        }
+    }
+    if !any {
+        println!("  (none)");
+    }
+    if default_name.is_some() {
+        println!("\n  * = default");
+    }
+}
+
 // ── Audio capture / playback (cpal) — unchanged ─────────────────────────
 
 fn open_input_stream(
+    name: Option<&str>,
     tx: mpsc::UnboundedSender<Vec<i16>>,
     enabled: Arc<AtomicBool>,
 ) -> Result<(cpal::Stream, u32, u16)> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("no default input device"))?;
+    let device = pick_device(&host, name, DeviceKind::Input)?;
+    if let Some(n) = name {
+        eprintln!("input device: {n}");
+    }
     let supported = device
         .default_input_config()
-        .context("failed to query default input config")?;
+        .context("failed to query input config")?;
     let rate = supported.sample_rate().0;
     let channels = supported.channels();
     let format = supported.sample_format();
@@ -391,15 +526,17 @@ fn open_input_stream(
 }
 
 fn open_output_stream(
+    name: Option<&str>,
     queue: Arc<std::sync::Mutex<VecDeque<i16>>>,
 ) -> Result<(cpal::Stream, u32, u16)> {
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow!("no default output device"))?;
+    let device = pick_device(&host, name, DeviceKind::Output)?;
+    if let Some(n) = name {
+        eprintln!("output device: {n}");
+    }
     let supported = device
         .default_output_config()
-        .context("failed to query default output config")?;
+        .context("failed to query output config")?;
     let rate = supported.sample_rate().0;
     let channels = supported.channels();
     let format = supported.sample_format();
