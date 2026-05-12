@@ -118,7 +118,7 @@ pub struct VoiceOptions {
 /// Entry point for `sapphire-call voice`.
 pub async fn run(
     server: String,
-    session: Option<String>,
+    _session: Option<String>,
     room_profile: Option<String>,
     options: VoiceOptions,
 ) -> Result<()> {
@@ -131,17 +131,23 @@ pub async fn run(
     let base = server.trim_end_matches('/').to_string();
     let client = reqwest::Client::new();
 
-    let (mcp_session_id, display_id, is_new) =
-        sapphire_agent_api::initialize(&client, &base, session, room_profile.as_deref())
-            .await
-            .context("failed to initialize MCP session")?;
+    // Voice conversations are routed by (device_id, room_profile) so
+    // the satellite picks up where it left off across restarts.
+    // `session` (legacy chat session id) is ignored in voice mode.
+    let device_id = crate::device_id::ensure_device_id()
+        .context("failed to load or generate sapphire-call device id")?;
+    let room_profile = room_profile.ok_or_else(|| {
+        anyhow!(
+            "voice mode requires a room_profile — set [server].room_profile in the config \
+             or pass --room-profile <name>"
+        )
+    })?;
     eprintln!(
-        "sapphire-call voice (session: {display_id}{})",
-        if is_new { ", new" } else { ", resumed" }
+        "sapphire-call voice (device: {device_id}, room_profile: {room_profile})",
     );
 
     // ── Wake-word config: fetch from server, let CLI flags override ─────
-    let server_wake = sapphire_agent_api::voice_config(&client, &base, &mcp_session_id)
+    let server_wake = sapphire_agent_api::voice_config(&client, &base, &room_profile)
         .await
         .unwrap_or_else(|e| {
             eprintln!(
@@ -293,7 +299,8 @@ pub async fn run(
         output_rate,
         client,
         base,
-        mcp_session_id,
+        device_id,
+        room_profile,
         language: options.language,
         shutdown,
         vad,
@@ -314,7 +321,8 @@ struct ListenCtx {
     output_rate: u32,
     client: reqwest::Client,
     base: String,
-    mcp_session_id: String,
+    device_id: String,
+    room_profile: String,
     language: Option<String>,
     shutdown: Arc<AtomicBool>,
     vad: VoiceActivityDetector,
@@ -392,7 +400,8 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
             if let Err(e) = process_utterance(
                 &ctx.client,
                 &ctx.base,
-                &ctx.mcp_session_id,
+                &ctx.device_id,
+                &ctx.room_profile,
                 &utterance,
                 ctx.language.as_deref(),
                 Arc::clone(&ctx.playback_queue),
@@ -756,10 +765,12 @@ fn open_output_stream(
 
 // ── Per-utterance flow ──────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn process_utterance(
     client: &reqwest::Client,
     base: &str,
-    mcp_session_id: &str,
+    device_id: &str,
+    room_profile: &str,
     pcm_16khz: &[i16],
     language: Option<&str>,
     playback_queue: Arc<std::sync::Mutex<VecDeque<i16>>>,
@@ -773,11 +784,21 @@ async fn process_utterance(
     let server_call = tokio::spawn({
         let client = client.clone();
         let base = base.to_string();
-        let sid = mcp_session_id.to_string();
+        let device = device_id.to_string();
+        let room = room_profile.to_string();
         let pcm = pcm_16khz.to_vec();
         let lang = language.map(String::from);
         async move {
-            voice_pipeline_run(&client, &base, &sid, &pcm, lang.as_deref(), event_tx).await
+            voice_pipeline_run(
+                &client,
+                &base,
+                &device,
+                &room,
+                &pcm,
+                lang.as_deref(),
+                event_tx,
+            )
+            .await
         }
     });
 

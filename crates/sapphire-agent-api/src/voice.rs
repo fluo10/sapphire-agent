@@ -61,24 +61,27 @@ pub enum WakeWordModel {
     },
 }
 
-/// Fetch the wake-word configuration the server has bound to this
-/// session's room profile. Returns an empty `WakeWordConfig` when the
+/// Fetch the wake-word configuration the server has bound to the
+/// given `room_profile`. Returns an empty `WakeWordConfig` when the
 /// room profile has no wake-word set.
+///
+/// No MCP session is needed — voice clients identify themselves by
+/// `device_id` + `room_profile` per request rather than by a
+/// long-lived session token.
 pub async fn voice_config(
     client: &reqwest::Client,
     base: &str,
-    mcp_session_id: &str,
+    room_profile: &str,
 ) -> Result<WakeWordConfig> {
     let base = base.trim_end_matches('/');
     let body = json!({
         "jsonrpc": "2.0",
         "id": next_id(),
         "method": "voice/config",
-        "params": {},
+        "params": { "room_profile": room_profile },
     });
     let val: Value = client
         .post(format!("{base}/mcp"))
-        .header("mcp-session-id", mcp_session_id)
         .json(&body)
         .send()
         .await?
@@ -170,14 +173,21 @@ pub enum VoiceEvent {
 }
 
 /// Run one voice pipeline pass: upload `pcm` as a single utterance,
-/// stream progress events into `event_tx`, and return when the server
-/// emits its final JSON-RPC result. Closing `event_tx` is the caller's
-/// responsibility — it happens automatically when the returned future
-/// is dropped, but explicit closure helps the playback consumer exit.
+/// stream progress events into `event_tx`, and return when the
+/// server emits its final JSON-RPC result. Closing `event_tx` is the
+/// caller's responsibility — it happens automatically when the
+/// returned future is dropped, but explicit closure helps the
+/// playback consumer exit.
+///
+/// `device_id` + `room_profile` are the conversation-routing key. The
+/// server derives a deterministic session id from this pair so the
+/// satellite can resume the same conversation across restarts /
+/// network blips without juggling explicit session tokens.
 pub async fn voice_pipeline_run(
     client: &reqwest::Client,
     base: &str,
-    mcp_session_id: &str,
+    device_id: &str,
+    room_profile: &str,
     pcm: &[i16],
     language: Option<&str>,
     event_tx: mpsc::Sender<VoiceEvent>,
@@ -191,7 +201,11 @@ pub async fn voice_pipeline_run(
     }
     let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
-    let mut params = json!({ "audio": audio_b64 });
+    let mut params = json!({
+        "audio": audio_b64,
+        "device_id": device_id,
+        "room_profile": room_profile,
+    });
     if let Some(l) = language {
         params["language"] = json!(l);
     }
@@ -204,7 +218,6 @@ pub async fn voice_pipeline_run(
 
     let resp = client
         .post(format!("{base}/mcp"))
-        .header("mcp-session-id", mcp_session_id)
         .header("accept", "text/event-stream")
         .json(&body)
         .send()

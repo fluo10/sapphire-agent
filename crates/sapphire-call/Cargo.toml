@@ -55,6 +55,9 @@ tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.0"
 
+# UUID v7 for the per-installation device id.
+uuid = { version = "1", features = ["v7"] }
+
 # openWakeWord runtime: ONNX runtime + ndarray. ort downloads
 # precompiled ONNX runtime binaries from pykeio's hosted mirror; this
 # is independent of sherpa-onnx-sys's statically-linked runtime so
@@ -64,3 +67,6 @@ ndarray = "0.17"
 
 # SHA-256 for content-addressing the openWakeWord ONNX cache.
 sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

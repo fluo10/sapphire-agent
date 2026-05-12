@@ -1,4 +1,5 @@
 mod config;
+mod device_id;
 mod voice;
 
 use std::path::PathBuf;

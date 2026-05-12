@@ -228,9 +228,9 @@ async fn mcp_post(
         "chat" => handle_chat(state, req_id, req.params, session_id).await,
         "list_sessions" => handle_list_sessions(state, req_id).await,
         "get_session" => handle_get_session(state, req_id, session_id).await,
-        "voice/config" => handle_voice_config(state, req_id, session_id).await,
+        "voice/config" => handle_voice_config(state, req_id, req.params).await,
         "voice/pipeline_run" => {
-            handle_voice_pipeline_run(state, req_id, req.params, session_id).await
+            handle_voice_pipeline_run(state, req_id, req.params).await
         }
         _ => {
             let body = error_response(req_id, -32601, "Method not found");
@@ -531,29 +531,22 @@ async fn handle_get_session(
 async fn handle_voice_config(
     state: Arc<ServeState>,
     req_id: Value,
-    session_id: Option<String>,
+    params: Option<Value>,
 ) -> axum::response::Response {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
 
-    let session_id = match session_id {
-        Some(id) => id,
+    let params = params.unwrap_or(Value::Null);
+    let room_profile = match params["room_profile"].as_str() {
+        Some(s) => s.to_string(),
         None => {
-            let body = error_response(req_id, -32602, "Missing Mcp-Session-Id header");
+            let body = error_response(req_id, -32602, "Missing params.room_profile");
             return body.into_response();
         }
     };
-    let rp_name = state
-        .session_room_profiles
-        .lock()
-        .await
-        .get(&session_id)
-        .cloned();
 
     let mut result = json!({});
-    if let Some(name) = rp_name.as_deref()
-        && let Some(rp) = state.config.room_profile(name)
-    {
+    if let Some(rp) = state.config.room_profile(&room_profile) {
         if let Some(phrase) = &rp.wake_word {
             result["wake_word"] = json!(phrase);
         }
@@ -624,16 +617,7 @@ async fn handle_voice_pipeline_run(
     state: Arc<ServeState>,
     req_id: Value,
     params: Option<Value>,
-    session_id: Option<String>,
 ) -> axum::response::Response {
-    let session_id = match session_id {
-        Some(id) => id,
-        None => {
-            let body = error_response(req_id, -32602, "Missing Mcp-Session-Id header");
-            return body.into_response();
-        }
-    };
-
     if state.voice.is_none() {
         let body = error_response(
             req_id,
@@ -651,7 +635,44 @@ async fn handle_voice_pipeline_run(
             return body.into_response();
         }
     };
+    let device_id = match params["device_id"].as_str() {
+        Some(s) => s.to_string(),
+        None => {
+            let body = error_response(req_id, -32602, "Missing params.device_id");
+            return body.into_response();
+        }
+    };
+    let room_profile = match params["room_profile"].as_str() {
+        Some(s) => s.to_string(),
+        None => {
+            let body = error_response(req_id, -32602, "Missing params.room_profile");
+            return body.into_response();
+        }
+    };
+    // Validate room_profile up front so typos surface as a clean
+    // JSON-RPC error rather than as a silent fallback to the
+    // background provider.
+    if state.config.room_profile(&room_profile).is_none() {
+        let body = error_response(
+            req_id,
+            -32602,
+            &format!("Unknown room_profile '{room_profile}'"),
+        );
+        return body.into_response();
+    }
     let language = params["language"].as_str().map(|s| s.to_string());
+
+    // Derive a deterministic session id from (device_id, room_profile)
+    // so the satellite can resume the conversation thread across
+    // restarts / day boundaries without juggling explicit session
+    // tokens. Pin the room_profile so run_llm_turn picks up the
+    // right LLM profile + memory namespace + voice config.
+    let session_id = voice_session_id(&device_id, &room_profile);
+    state
+        .session_room_profiles
+        .lock()
+        .await
+        .insert(session_id.clone(), room_profile.clone());
 
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
@@ -663,6 +684,29 @@ async fn handle_voice_pipeline_run(
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
         .into_response()
+}
+
+/// Deterministic session id derived from `(device_id, room_profile)`.
+/// Always-same input ⇒ always-same id, so a satellite reconnecting
+/// after a crash or day rollover resumes the same conversation file.
+///
+/// Format: `voice-<first 16 hex chars of SHA-256>`. Filesystem-safe,
+/// unique enough for any realistic deployment.
+fn voice_session_id(device_id: &str, room_profile: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"voice:");
+    hasher.update(device_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(room_profile.as_bytes());
+    let hash = hasher.finalize();
+    let mut s = String::with_capacity(22);
+    s.push_str("voice-");
+    for b in &hash[..8] {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
 }
 
 async fn run_voice_turn(
