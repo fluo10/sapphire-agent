@@ -175,24 +175,54 @@ pub struct RoomProfileConfig {
     /// Absent means voice is disabled for this room profile.
     #[serde(default)]
     pub voice_pipeline: Option<String>,
-    /// Natural-language wake-word phrase. Satellites fetch this via
-    /// `voice/config` after `initialize` and tokenise it against
-    /// their KWS model's `tokens.txt`. Lives server-side so every
-    /// satellite for the same room_profile listens for the same
-    /// phrase — change the AI's name in one place.
+    /// Wake-word phrase. With the default `sherpa_onnx` engine this
+    /// is a natural-language string tokenised by the client against
+    /// the bundle's `tokens.txt`; with `open_wake_word` it's just a
+    /// display label printed when the wake fires (the actual
+    /// detection is purely model-driven).
     ///
     /// Requires `wake_word_model` to also be set; either alone is
     /// rejected by `validate_profiles`.
     #[serde(default)]
     pub wake_word: Option<String>,
-    /// Sherpa-onnx KWS bundle name the satellite should download to
-    /// detect `wake_word`. Example:
-    /// `"sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"`.
-    /// The chosen model must have the wake phrase's characters in
-    /// its `tokens.txt` — mismatches surface at the satellite as a
-    /// clear "character not in vocab" error.
+    /// Wake-word model identifier. Interpretation depends on
+    /// `wake_word_engine`:
+    ///   * `sherpa_onnx` → KWS bundle name, e.g.
+    ///     `"sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"`,
+    ///     auto-downloaded from sherpa-onnx GitHub releases.
+    ///   * `open_wake_word` → absolute filesystem path to a custom
+    ///     `.onnx` classifier trained externally (e.g. with
+    ///     openWakeWord's Python tooling). Read once at startup and
+    ///     distributed to satellites inline in the `voice/config`
+    ///     response.
     #[serde(default)]
     pub wake_word_model: Option<String>,
+    /// Wake-word backend. Default `sherpa_onnx` preserves the
+    /// existing flow (character-tokenised phrase against a Zipformer
+    /// KWS bundle). `open_wake_word` switches to a custom ONNX
+    /// classifier — needed for AI-name wake words that aren't in any
+    /// pre-trained KWS vocabulary.
+    #[serde(default)]
+    pub wake_word_engine: WakeWordEngine,
+}
+
+/// Backend that actually decides "did the user just say the wake
+/// word". Picking one constrains how `wake_word_model` is interpreted
+/// and which inference code the satellite runs.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeWordEngine {
+    /// Sherpa-onnx Zipformer-Transducer KWS — `wake_word_model` is a
+    /// release bundle name, `wake_word` is a natural-language phrase
+    /// tokenised on the client. Works only for phrases whose
+    /// characters are in the bundle's `tokens.txt`.
+    #[default]
+    SherpaOnnx,
+    /// openWakeWord custom ONNX classifier — `wake_word_model` is a
+    /// filesystem path to a `.onnx` trained externally (see
+    /// https://github.com/dscripka/openWakeWord). `wake_word` is just
+    /// a display label.
+    OpenWakeWord,
 }
 
 /// Definition of an additional LLM provider.
@@ -978,6 +1008,21 @@ impl Config {
                 )),
                 _ => {}
             }
+            // For open_wake_word, the model field is a filesystem path
+            // that must exist at server startup — catch typos now
+            // instead of letting them surface as a 500 the first time
+            // a satellite calls voice/config.
+            if rp.wake_word_engine == WakeWordEngine::OpenWakeWord {
+                if let Some(path) = &rp.wake_word_model {
+                    let expanded = shellexpand::tilde(path);
+                    if !std::path::Path::new(expanded.as_ref()).is_file() {
+                        errors.push(format!(
+                            "room_profile '{rp_name}': wake_word_model = '{path}' \
+                             (open_wake_word) is not an existing file"
+                        ));
+                    }
+                }
+            }
         }
         for (vp_name, vp) in &self.voice_pipelines {
             if !self.stt_providers.contains_key(&vp.stt_provider) {
@@ -1757,6 +1802,53 @@ rooms          = []
         let errors = cfg.validate_profiles();
         assert!(
             errors.iter().any(|e| e.contains("ghost")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn wake_word_engine_defaults_to_sherpa_onnx() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.casual]
+provider = "anthropic"
+
+[room_profile.home]
+profile = "casual"
+rooms   = []
+"#,
+        );
+        let rp = cfg.room_profile("home").unwrap();
+        assert_eq!(rp.wake_word_engine, WakeWordEngine::SherpaOnnx);
+    }
+
+    #[test]
+    fn wake_word_engine_parses_open_wake_word() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.casual]
+provider = "anthropic"
+
+[room_profile.home]
+profile           = "casual"
+rooms             = []
+wake_word         = "Saphina"
+wake_word_engine  = "open_wake_word"
+wake_word_model   = "/nonexistent/saphina.onnx"
+"#,
+        );
+        let rp = cfg.room_profile("home").unwrap();
+        assert_eq!(rp.wake_word_engine, WakeWordEngine::OpenWakeWord);
+        // Path validation should reject the bogus path.
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("/nonexistent/saphina.onnx")),
             "got: {errors:?}"
         );
     }

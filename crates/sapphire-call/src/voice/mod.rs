@@ -106,11 +106,25 @@ pub async fn run(
             );
             sapphire_agent_api::WakeWordConfig::default()
         });
-    let wake_model = options
-        .wake_word_model
-        .clone()
-        .or(server_wake.model);
     let wake_phrase = options.wake_word.clone().or(server_wake.phrase);
+    // CLI `--wake-word-model <bundle>` always means sherpa engine; the
+    // openWakeWord path can only be enabled via server config because
+    // its model lives in the agent's filesystem.
+    let wake_model: Option<String> = if let Some(bundle) = options.wake_word_model.clone() {
+        Some(bundle)
+    } else {
+        match server_wake.model {
+            Some(sapphire_agent_api::WakeWordModel::SherpaBundle { name }) => Some(name),
+            Some(sapphire_agent_api::WakeWordModel::OnnxInline { filename, .. }) => {
+                eprintln!(
+                    "warning: server requested openWakeWord model '{filename}', but the OWW \
+                     runtime is not yet wired up on this client — falling back to VAD-only mode"
+                );
+                None
+            }
+            None => None,
+        }
+    };
 
     // ── VAD model ────────────────────────────────────────────────────────
     // The download + sherpa-onnx construction are synchronous and use

@@ -533,6 +533,9 @@ async fn handle_voice_config(
     req_id: Value,
     session_id: Option<String>,
 ) -> axum::response::Response {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
     let session_id = match session_id {
         Some(id) => id,
         None => {
@@ -554,8 +557,58 @@ async fn handle_voice_config(
         if let Some(phrase) = &rp.wake_word {
             result["wake_word"] = json!(phrase);
         }
-        if let Some(model) = &rp.wake_word_model {
-            result["wake_word_model"] = json!(model);
+        // wake_word_model serialisation depends on engine.
+        match rp.wake_word_engine {
+            crate::config::WakeWordEngine::SherpaOnnx => {
+                if let Some(model) = &rp.wake_word_model {
+                    // Sherpa: just the bundle name; satellite downloads
+                    // from sherpa-onnx GitHub releases itself.
+                    result["wake_word_engine"] = json!("sherpa_onnx");
+                    result["wake_word_model"] = json!({
+                        "format": "sherpa_bundle",
+                        "name": model,
+                    });
+                }
+            }
+            crate::config::WakeWordEngine::OpenWakeWord => {
+                if let Some(path_str) = &rp.wake_word_model {
+                    let expanded = shellexpand::tilde(path_str).into_owned();
+                    match std::fs::read(&expanded) {
+                        Ok(bytes) => {
+                            let mut hasher = Sha256::new();
+                            hasher.update(&bytes);
+                            let sha = format!("{:x}", hasher.finalize());
+                            let b64 = base64::engine::general_purpose::STANDARD
+                                .encode(&bytes);
+                            let filename = std::path::Path::new(&expanded)
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("wake.onnx")
+                                .to_string();
+                            result["wake_word_engine"] = json!("open_wake_word");
+                            result["wake_word_model"] = json!({
+                                "format": "onnx_inline",
+                                "filename": filename,
+                                "sha256": sha,
+                                "data_b64": b64,
+                            });
+                        }
+                        Err(e) => {
+                            error!(
+                                "voice/config: failed to read openWakeWord model '{expanded}': {e}"
+                            );
+                            let body = error_response(
+                                req_id,
+                                -32603,
+                                &format!(
+                                    "openWakeWord model at '{expanded}' could not be read: {e}"
+                                ),
+                            );
+                            return body.into_response();
+                        }
+                    }
+                }
+            }
         }
     }
 

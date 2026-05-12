@@ -28,17 +28,37 @@ fn next_id() -> u64 {
 pub const PIPELINE_SAMPLE_RATE: u32 = 16_000;
 
 /// Wake-word configuration fetched from the server's `voice/config`
-/// method. Either both fields are `Some` (wake-word mode is
-/// available for this session's room profile) or both are `None`.
+/// method. `phrase` is present when wake-word mode is available for
+/// the session's room profile; `model` carries the engine-specific
+/// payload (a sherpa bundle name OR an inline openWakeWord ONNX blob).
 #[derive(Debug, Clone, Default)]
 pub struct WakeWordConfig {
-    /// Natural-language phrase the satellite should listen for, e.g.
-    /// `"ハロー、クロード"`. Tokenized client-side against the KWS
-    /// model's `tokens.txt` before being passed to sherpa-onnx.
+    /// Display phrase. For `sherpa_onnx` this is also the
+    /// natural-language string the client tokenises against the
+    /// bundle's `tokens.txt`. For `open_wake_word` it's just a label
+    /// printed when wake fires.
     pub phrase: Option<String>,
-    /// Sherpa-onnx KWS bundle name the satellite should download and
-    /// use to detect `phrase`.
-    pub model: Option<String>,
+    /// `None` when the room profile has no wake-word set; otherwise
+    /// the engine-specific model handle.
+    pub model: Option<WakeWordModel>,
+}
+
+/// Engine-tagged wake-word model payload.
+#[derive(Debug, Clone)]
+pub enum WakeWordModel {
+    /// Sherpa-onnx KWS bundle name. Satellites resolve it against
+    /// the sherpa-onnx GitHub releases tag on first use.
+    SherpaBundle { name: String },
+    /// openWakeWord classifier ONNX, distributed inline so the
+    /// satellite never has to talk to the user's training box. The
+    /// satellite caches by `sha256`.
+    OnnxInline {
+        filename: String,
+        sha256: String,
+        /// Decoded model bytes. `voice_config()` does the base64
+        /// decode so callers don't have to.
+        bytes: Vec<u8>,
+    },
 }
 
 /// Fetch the wake-word configuration the server has bound to this
@@ -70,10 +90,51 @@ pub async fn voice_config(
         anyhow::bail!("voice/config: {msg}");
     }
     let result = &val["result"];
-    Ok(WakeWordConfig {
-        phrase: result["wake_word"].as_str().map(String::from),
-        model: result["wake_word_model"].as_str().map(String::from),
-    })
+    let phrase = result["wake_word"].as_str().map(String::from);
+    let model = parse_wake_word_model(&result["wake_word_model"])?;
+    Ok(WakeWordConfig { phrase, model })
+}
+
+fn parse_wake_word_model(value: &Value) -> Result<Option<WakeWordModel>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let format = match value["format"].as_str() {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+    match format {
+        "sherpa_bundle" => {
+            let name = value["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("voice/config: sherpa_bundle missing 'name'"))?;
+            Ok(Some(WakeWordModel::SherpaBundle {
+                name: name.to_string(),
+            }))
+        }
+        "onnx_inline" => {
+            let filename = value["filename"]
+                .as_str()
+                .unwrap_or("wake.onnx")
+                .to_string();
+            let sha256 = value["sha256"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("voice/config: onnx_inline missing 'sha256'"))?
+                .to_string();
+            let data_b64 = value["data_b64"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("voice/config: onnx_inline missing 'data_b64'"))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data_b64.as_bytes())
+                .map_err(|e| anyhow::anyhow!("voice/config: onnx_inline base64 decode: {e}"))?;
+            Ok(Some(WakeWordModel::OnnxInline {
+                filename,
+                sha256,
+                bytes,
+            }))
+        }
+        other => anyhow::bail!("voice/config: unknown wake_word_model format '{other}'"),
+    }
 }
 
 /// Streaming events emitted while a `voice/pipeline_run` call is in

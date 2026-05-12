@@ -143,6 +143,10 @@ tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 # Base64 encoding (image attachments → Anthropic API)
 base64 = "0.22"
 
+# SHA-256 for content-addressing voice/config payloads (so satellites
+# can cache the openWakeWord model by hash instead of re-downloading).
+sha2 = "0.10"
+
 # Discord bot (gateway + HTTP, rustls TLS)
 # Requires MESSAGE_CONTENT privileged intent enabled in Discord Developer Portal
 serenity = { version = "0.12", default-features = false, features = [

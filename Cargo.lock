@@ -7291,6 +7291,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "serenity",
+ "sha2",
  "shellexpand",
  "sherpa-onnx",
  "tar",
