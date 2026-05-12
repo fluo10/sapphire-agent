@@ -24,6 +24,16 @@ use songbird::model::payload::Speaking;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "voice-sherpa")]
+use crate::voice::vad::{VAD_WINDOW_SAMPLES, build_default as build_silero_default};
+#[cfg(feature = "voice-sherpa")]
+use sherpa_onnx::VoiceActivityDetector;
+
+/// Discord ships voice as 48 kHz stereo s16le; our pipeline runs at
+/// 16 kHz mono. We downmix + resample inline before the VAD sees it.
+const DISCORD_SAMPLE_RATE: u32 = 48_000;
+const PIPELINE_SAMPLE_RATE: u32 = 16_000;
+
 /// Per-voice-channel runtime state. Tracks which humans are currently
 /// in the channel (so we can gate audio processing) and the
 /// SSRC↔UserId map songbird requires to associate audio with speakers.
@@ -34,6 +44,10 @@ pub struct ChannelState {
     pub present_users: HashSet<UserId>,
     /// ssrc → user_id mapping populated by SpeakingStateUpdate events.
     pub ssrc_to_user: HashMap<u32, UserId>,
+    /// Per-speaker audio + VAD state. Built lazily on first
+    /// VoiceTick from a speaker — songbird re-issues new ssrcs when
+    /// users disconnect / reconnect, so we don't preallocate.
+    pub speakers: HashMap<u32, SpeakerState>,
     /// `true` when at least one human is present. Cheap atomic check
     /// for the audio receive callback.
     pub has_human: Arc<AtomicBool>,
@@ -45,6 +59,7 @@ impl ChannelState {
             channel_id,
             present_users: HashSet::new(),
             ssrc_to_user: HashMap::new(),
+            speakers: HashMap::new(),
             has_human: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -52,6 +67,32 @@ impl ChannelState {
     fn recompute_presence(&self) {
         self.has_human
             .store(!self.present_users.is_empty(), Ordering::SeqCst);
+    }
+}
+
+/// Per-speaker buffer + VAD state. Each Discord user gets one.
+pub struct SpeakerState {
+    /// Pending samples waiting for the next 512-sample VAD window.
+    pub pending: Vec<f32>,
+    /// Silero VAD instance — one per speaker so internal smoothing
+    /// state doesn't bleed across users.
+    #[cfg(feature = "voice-sherpa")]
+    pub vad: VoiceActivityDetector,
+}
+
+impl SpeakerState {
+    #[cfg(feature = "voice-sherpa")]
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            pending: Vec::with_capacity(VAD_WINDOW_SAMPLES * 2),
+            vad: build_silero_default()?,
+        })
+    }
+    #[cfg(not(feature = "voice-sherpa"))]
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            pending: Vec::new(),
+        })
     }
 }
 
@@ -113,25 +154,14 @@ impl VoiceEventHandler for VoiceReceiver {
                 if !self.has_human.load(Ordering::SeqCst) {
                     return None;
                 }
-                // TODO(next commit): for each speaking ssrc, look up
-                // user_id, push `decoded_voice` (48 kHz stereo i16)
-                // into a per-user ring buffer, feed Silero VAD, on
-                // utterance complete call into the shared voice
-                // pipeline (STT → LLM → TTS).
-                if !speaking.is_empty() {
-                    let st = self.state.lock().await;
-                    let speakers: Vec<String> = speaking
-                        .keys()
-                        .map(|ssrc| match st.ssrc_to_user.get(ssrc) {
-                            Some(uid) => format!("user {} (ssrc {ssrc})", uid),
-                            None => format!("ssrc {ssrc}"),
-                        })
-                        .collect();
-                    debug!(
-                        "discord_voice {}: speaking — {}",
-                        self.channel_id,
-                        speakers.join(", ")
-                    );
+                let mut st = self.state.lock().await;
+                for (ssrc, data) in speaking {
+                    let Some(decoded) = data.decoded_voice.as_ref() else {
+                        continue;
+                    };
+                    // 48 kHz stereo i16 → 16 kHz mono f32.
+                    let mono16k = downmix_and_resample(decoded);
+                    on_speaker_audio(&mut st, *ssrc, &mono16k, self.channel_id).await;
                 }
             }
             _ => {}
@@ -308,4 +338,94 @@ pub fn parse_channel_ids(raw: &[String]) -> anyhow::Result<Vec<u64>> {
                 .with_context(|| format!("invalid Discord voice channel id '{s}'"))
         })
         .collect()
+}
+
+/// Downmix Discord's 48 kHz stereo i16 (interleaved) to 16 kHz mono
+/// f32 normalised to [-1, 1]. Linear-interpolation resample, same
+/// approach the satellite + sherpa-onnx TTS provider use — quality
+/// is fine for speech.
+fn downmix_and_resample(stereo_48k: &[i16]) -> Vec<f32> {
+    // Stereo → mono (i16).
+    let mut mono: Vec<i16> = Vec::with_capacity(stereo_48k.len() / 2);
+    for frame in stereo_48k.chunks_exact(2) {
+        let sum = frame[0] as i32 + frame[1] as i32;
+        mono.push((sum / 2) as i16);
+    }
+    // 48 kHz → 16 kHz (ratio 3:1).
+    let ratio = DISCORD_SAMPLE_RATE as f64 / PIPELINE_SAMPLE_RATE as f64;
+    let out_len = ((mono.len() as f64) / ratio).round() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    if mono.is_empty() {
+        return out;
+    }
+    for i in 0..out_len {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos.floor() as usize;
+        let frac = src_pos - idx as f64;
+        let s0 = mono[idx.min(mono.len() - 1)] as f64;
+        let s1 = mono[(idx + 1).min(mono.len() - 1)] as f64;
+        let v = (s0 * (1.0 - frac) + s1 * frac) / (i16::MAX as f64);
+        out.push(v as f32);
+    }
+    out
+}
+
+/// Push fresh 16 kHz mono audio from one speaker into their per-ssrc
+/// state and drain any complete utterances out of the VAD. Drops
+/// audio silently when the `voice-sherpa` feature is off (Silero VAD
+/// requires sherpa-onnx).
+async fn on_speaker_audio(
+    ch: &mut ChannelState,
+    ssrc: u32,
+    samples_16k_f32: &[f32],
+    channel_id: ChannelId,
+) {
+    let speaker = match ch.speakers.entry(ssrc) {
+        std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+        std::collections::hash_map::Entry::Vacant(v) => match SpeakerState::new() {
+            Ok(s) => v.insert(s),
+            Err(e) => {
+                warn!("discord_voice {channel_id}: failed to init speaker {ssrc}: {e:#}");
+                return;
+            }
+        },
+    };
+    speaker.pending.extend_from_slice(samples_16k_f32);
+
+    #[cfg(feature = "voice-sherpa")]
+    {
+        while speaker.pending.len() >= VAD_WINDOW_SAMPLES {
+            let frame: Vec<f32> = speaker.pending.drain(..VAD_WINDOW_SAMPLES).collect();
+            speaker.vad.accept_waveform(&frame);
+        }
+        while !speaker.vad.is_empty() {
+            let Some(segment) = speaker.vad.front() else {
+                break;
+            };
+            let samples = segment.samples().to_vec();
+            speaker.vad.pop();
+            let user_str = ch
+                .ssrc_to_user
+                .get(&ssrc)
+                .map(|u| format!("user {u}"))
+                .unwrap_or_else(|| format!("ssrc {ssrc}"));
+            info!(
+                "discord_voice {channel_id}: utterance from {user_str} ({:.2}s, {} samples) \
+                 — TODO: dispatch to voice pipeline",
+                samples.len() as f32 / PIPELINE_SAMPLE_RATE as f32,
+                samples.len()
+            );
+            // TODO(next commit): convert `samples` (f32 mono 16k) to
+            // i16 and hand to the shared run_voice_turn. Audio reply
+            // comes back as PCM chunks that we feed into a songbird
+            // track for playback.
+        }
+    }
+
+    #[cfg(not(feature = "voice-sherpa"))]
+    {
+        let _ = (samples_16k_f32, channel_id, speaker);
+        // Without voice-sherpa: VAD is not available, so we just
+        // buffer + drop. Log throttling to avoid spam.
+    }
 }

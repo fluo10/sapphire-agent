@@ -18,6 +18,8 @@
 
 pub mod stt;
 pub mod tts;
+#[cfg(feature = "voice-sherpa")]
+pub mod vad;
 
 mod providers;
 
