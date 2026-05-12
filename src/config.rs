@@ -685,6 +685,13 @@ pub struct DiscordConfig {
     /// Text channel IDs the bot listens to. Empty = all channels the bot can see.
     #[serde(default)]
     pub channel_ids: Vec<String>,
+    /// Voice channel IDs the bot auto-joins for the voice pipeline.
+    /// Audio capture is gated on at least one human user being present
+    /// in the channel — when the bot is alone, no STT/LLM/TTS work
+    /// runs. Each id must also appear in some `[room_profile.<n>].rooms`
+    /// so the voice pipeline knows which profile drives it.
+    #[serde(default)]
+    pub voice_channel_ids: Vec<String>,
     /// Discord user IDs allowed to interact. Empty = all users.
     #[serde(default)]
     pub allowed_users: Vec<String>,

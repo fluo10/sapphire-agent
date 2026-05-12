@@ -153,7 +153,21 @@ serenity = { version = "0.12", default-features = false, features = [
     "client",
     "gateway",
     "model",
+    "voice",
     "rustls_backend",
+] }
+
+# Discord voice (songbird). `receive` is opt-in (not default) — we
+# need it to get decoded PCM out of voice channels for VAD/STT.
+# `tungstenite` is required when `driver` is enabled (the build
+# script enforces exactly one of tungstenite/tws — we're on serenity).
+songbird = { version = "0.6", default-features = false, features = [
+    "driver",
+    "gateway",
+    "rustls",
+    "serenity",
+    "receive",
+    "tungstenite",
 ] }
 
 # Local STT + TTS via the official sherpa-onnx Rust crate (k2-fsa).
