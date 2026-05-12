@@ -1044,6 +1044,22 @@ impl Config {
                 ));
             }
         }
+        // Every Discord voice channel id must also appear in some
+        // room_profile.rooms list — that's how the voice pipeline
+        // resolves which profile / pipeline / namespace to use.
+        if let Some(d) = &self.discord {
+            for vc in &d.voice_channel_ids {
+                let in_rp = self
+                    .room_profiles
+                    .values()
+                    .any(|rp| rp.rooms.iter().any(|r| r == vc));
+                if !in_rp {
+                    errors.push(format!(
+                        "discord.voice_channel_ids '{vc}' is not listed in any [room_profile.<n>].rooms"
+                    ));
+                }
+            }
+        }
         for (vp_name, vp) in &self.voice_pipelines {
             if !self.stt_providers.contains_key(&vp.stt_provider) {
                 errors.push(format!(

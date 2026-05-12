@@ -1,12 +1,14 @@
+use crate::channel::discord_voice::{self, VoiceContext, VoiceStateUpdate};
 use crate::channel::{Attachment, Channel, IncomingMessage, MAX_ATTACHMENT_BYTES, OutgoingMessage};
 use crate::config::DiscordConfig;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serenity::Client;
 use serenity::all::{
-    ChannelId, Context as SerenityCtx, EventHandler, GatewayIntents, Message, Ready,
+    ChannelId, Context as SerenityCtx, EventHandler, GatewayIntents, Message, Ready, VoiceState,
 };
 use serenity::http::Http;
+use songbird::SerenityInit;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{OnceCell, mpsc};
@@ -20,12 +22,31 @@ struct DiscordHandler {
     tx: mpsc::Sender<IncomingMessage>,
     allowed_channel_ids: HashSet<u64>,
     allowed_user_ids: HashSet<u64>,
+    /// `Some` when voice channels are configured; drives the voice
+    /// auto-join logic on the `ready` event and the presence map on
+    /// `voice_state_update`.
+    voice: Option<VoiceContext>,
 }
 
 #[serenity::async_trait]
 impl EventHandler for DiscordHandler {
-    async fn ready(&self, _ctx: SerenityCtx, ready: Ready) {
+    async fn ready(&self, ctx: SerenityCtx, ready: Ready) {
         info!("Discord bot connected as {}", ready.user.name);
+        if let Some(voice) = &self.voice {
+            discord_voice::on_ready(&ctx, ready.user.id, voice).await;
+        }
+    }
+
+    async fn voice_state_update(
+        &self,
+        _ctx: SerenityCtx,
+        _old: Option<VoiceState>,
+        new: VoiceState,
+    ) {
+        let Some(voice) = &self.voice else {
+            return;
+        };
+        discord_voice::on_voice_state_update(voice, VoiceStateUpdate::from(&new)).await;
     }
 
     async fn message(&self, _ctx: SerenityCtx, msg: Message) {
@@ -77,6 +98,7 @@ impl EventHandler for DiscordHandler {
 pub struct DiscordChannel {
     token: String,
     channel_ids: HashSet<u64>,
+    voice_channel_ids: Vec<u64>,
     allowed_user_ids: HashSet<u64>,
     /// Filled by `listen()` once the gateway client is built; used by `send()`.
     http: Arc<OnceCell<Arc<Http>>>,
@@ -98,6 +120,8 @@ impl DiscordChannel {
             .map(|s| s.parse::<u64>().context("Invalid Discord channel_id"))
             .collect::<Result<HashSet<_>>>()?;
 
+        let voice_channel_ids = discord_voice::parse_channel_ids(&cfg.voice_channel_ids)?;
+
         let allowed_user_ids = cfg
             .allowed_users
             .iter()
@@ -110,6 +134,7 @@ impl DiscordChannel {
         Ok(Self {
             token: cfg.bot_token.clone(),
             channel_ids,
+            voice_channel_ids,
             allowed_user_ids,
             http: Arc::new(OnceCell::new()),
         })
@@ -157,9 +182,22 @@ impl Channel for DiscordChannel {
     async fn listen(&self, tx: mpsc::Sender<IncomingMessage>) -> Result<()> {
         // MESSAGE_CONTENT is a privileged intent — enable it in Discord Developer Portal
         // (Bot → Privileged Gateway Intents → Message Content Intent).
+        // GUILD_VOICE_STATES is required to receive voice_state_update
+        // events (presence in voice channels). Always enabled — it's
+        // not privileged and costs nothing when voice isn't used.
         let intents = GatewayIntents::GUILD_MESSAGES
             | GatewayIntents::DIRECT_MESSAGES
-            | GatewayIntents::MESSAGE_CONTENT;
+            | GatewayIntents::MESSAGE_CONTENT
+            | GatewayIntents::GUILD_VOICE_STATES;
+
+        // Voice context, once and only once. Cloned into each handler
+        // instance on reconnect; the underlying state Arc survives so
+        // presence + channel-state survive transient disconnects.
+        let voice_ctx = if self.voice_channel_ids.is_empty() {
+            None
+        } else {
+            Some(VoiceContext::new(self.voice_channel_ids.clone()))
+        };
 
         let min_backoff = std::time::Duration::from_secs(1);
         let max_backoff = std::time::Duration::from_secs(300);
@@ -171,10 +209,17 @@ impl Channel for DiscordChannel {
                 tx: tx.clone(),
                 allowed_channel_ids: self.channel_ids.clone(),
                 allowed_user_ids: self.allowed_user_ids.clone(),
+                voice: voice_ctx.clone(),
             };
 
-            let mut client = Client::builder(&self.token, intents)
-                .event_handler(handler)
+            let mut builder = Client::builder(&self.token, intents).event_handler(handler);
+            if voice_ctx.is_some() {
+                // Register songbird against this serenity client so
+                // event handlers can fetch the manager via
+                // `songbird::get(&ctx).await` on `ready`.
+                builder = builder.register_songbird_from_config(discord_voice::songbird_config());
+            }
+            let mut client = builder
                 .await
                 .context("Failed to build Discord client")?;
 

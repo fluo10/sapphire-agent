@@ -1,4 +1,4 @@
-//! Discord voice channel listener (scaffold).
+//! Discord voice channel listener.
 //!
 //! Auto-joins the channel IDs listed under `[discord].voice_channel_ids`,
 //! subscribes to per-speaker audio via songbird, and gates processing
@@ -6,18 +6,17 @@
 //! bot is alone — no humans in the voice chat — incoming voice ticks
 //! are discarded without spending CPU on VAD / STT.
 //!
-//! **Status: scaffolding only.** This commit gets the bot to join
-//! voice channels and surfaces audio events via tracing logs so the
-//! basic wiring can be verified end-to-end. The actual VAD →
-//! utterance assembly → voice pipeline → playback path lands in
-//! subsequent commits. Until then, the bot silently observes —
-//! nothing is forwarded to the LLM and nothing is played back.
+//! Audio receive path (VAD / STT / LLM / TTS / playback) is wired
+//! up incrementally — this commit gets the bot joining channels and
+//! tracking presence reliably; subsequent commits hang the actual
+//! voice pipeline off the speaking-ssrc dispatch.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use serenity::all::{ChannelId, GuildId, UserId, VoiceState};
+use anyhow::Context as _;
+use serenity::all::{ChannelId, ChannelType, Context as SerenityContext, GuildId, UserId, VoiceState};
 use serenity::async_trait;
 use songbird::events::context_data::VoiceTick;
 use songbird::events::{CoreEvent, Event, EventContext, EventHandler as VoiceEventHandler};
@@ -58,18 +57,42 @@ impl ChannelState {
 
 /// Shared state across the whole voice subsystem. Keyed by voice
 /// channel id so multiple channels coexist cleanly.
+///
+/// Cloning is cheap (just bumps the Arc); pass clones to every event
+/// handler that needs read or write access.
 #[derive(Clone, Default)]
-pub struct VoiceState_ {
-    pub channels: Arc<Mutex<HashMap<ChannelId, ChannelState>>>,
+pub struct VoiceContext {
+    /// Channel id → state. The outer Mutex protects the map shape;
+    /// each entry is its own state struct (Mutex internally locked
+    /// during updates by the VoiceReceiver).
+    pub channels: Arc<Mutex<HashMap<ChannelId, Arc<Mutex<ChannelState>>>>>,
+    /// Voice channel ids the operator listed in
+    /// `[discord].voice_channel_ids`. Looked up at ready-time so the
+    /// bot only joins channels it's been told to.
+    pub configured_ids: Arc<HashSet<u64>>,
+    /// Bot's own user id, populated by `on_ready`. Filter for
+    /// `voice_state_update` so the bot's own join/leave doesn't
+    /// toggle the "humans present" gate.
+    pub bot_user_id: Arc<Mutex<Option<UserId>>>,
+}
+
+impl VoiceContext {
+    pub fn new(configured_ids: Vec<u64>) -> Self {
+        Self {
+            channels: Arc::new(Mutex::new(HashMap::new())),
+            configured_ids: Arc::new(configured_ids.into_iter().collect()),
+            bot_user_id: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 /// songbird event handler installed per-channel. Currently logs
 /// presence transitions and speaker-level audio activity; future
 /// commits replace the log calls with VAD / STT dispatch.
-pub struct VoiceReceiver {
-    pub channel_id: ChannelId,
-    pub state: Arc<Mutex<ChannelState>>,
-    pub has_human: Arc<AtomicBool>,
+struct VoiceReceiver {
+    channel_id: ChannelId,
+    state: Arc<Mutex<ChannelState>>,
+    has_human: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -117,33 +140,27 @@ impl VoiceEventHandler for VoiceReceiver {
     }
 }
 
-/// React to a Discord `voice_state_update` event. Returns whether the
-/// channel's presence state changed (caller logs the transition).
-pub async fn on_voice_state_update(
-    voice_state: &VoiceStateUpdate,
-    bot_user_id: UserId,
-    state: &Mutex<HashMap<ChannelId, ChannelState>>,
-) {
-    let mut channels = state.lock().await;
-    for ch_state in channels.values_mut() {
-        // A user is now considered "in" this channel if their new
-        // voice_state names it. We don't track per-user move history;
-        // just snapshot membership from each event.
-        let user = voice_state.user_id;
+/// React to a Discord `voice_state_update` event. The bot's own
+/// user id (populated by `on_ready`) is used to filter out the
+/// bot's own join/leave so it doesn't toggle the "humans present"
+/// gate.
+pub async fn on_voice_state_update(voice: &VoiceContext, update: VoiceStateUpdate) {
+    let bot_uid = *voice.bot_user_id.lock().await;
+    if Some(update.user_id) == bot_uid {
+        return;
+    }
+    let channels = voice.channels.lock().await;
+    for (ch_id, state_arc) in channels.iter() {
+        let mut ch_state = state_arc.lock().await;
+        let user = update.user_id;
         let was_present = ch_state.present_users.contains(&user);
-        let is_present = voice_state.channel_id == Some(ch_state.channel_id);
-        let counts_as_human = user != bot_user_id;
-        if !counts_as_human {
-            continue;
-        }
+        let is_present = update.channel_id == Some(*ch_id);
         match (was_present, is_present) {
             (false, true) => {
                 ch_state.present_users.insert(user);
                 ch_state.recompute_presence();
                 info!(
-                    "discord_voice {}: user {} joined (presence={})",
-                    ch_state.channel_id,
-                    user,
+                    "discord_voice {ch_id}: user {user} joined (humans now {})",
                     ch_state.present_users.len()
                 );
             }
@@ -151,9 +168,7 @@ pub async fn on_voice_state_update(
                 ch_state.present_users.remove(&user);
                 ch_state.recompute_presence();
                 info!(
-                    "discord_voice {}: user {} left (presence={})",
-                    ch_state.channel_id,
-                    user,
+                    "discord_voice {ch_id}: user {user} left (humans now {})",
                     ch_state.present_users.len()
                 );
             }
@@ -165,6 +180,7 @@ pub async fn on_voice_state_update(
 /// Light wrapper over the data we care about from a Discord
 /// `voice_state_update` payload, so the call site doesn't have to
 /// pull all of serenity's VoiceState fields.
+#[derive(Debug, Clone, Copy)]
 pub struct VoiceStateUpdate {
     pub user_id: UserId,
     pub channel_id: Option<ChannelId>,
@@ -190,9 +206,70 @@ pub fn songbird_config() -> songbird::Config {
     ))
 }
 
+/// On serenity `ready`, walk every configured voice channel id and
+/// have songbird join it. Resolves guild_id via the Discord API
+/// because configs only know about channel ids.
+pub async fn on_ready(
+    ctx: &SerenityContext,
+    bot_user_id: UserId,
+    voice: &VoiceContext,
+) {
+    *voice.bot_user_id.lock().await = Some(bot_user_id);
+
+    let manager = match songbird::get(ctx).await {
+        Some(m) => m,
+        None => {
+            warn!("discord_voice: songbird manager not registered on the serenity client");
+            return;
+        }
+    };
+
+    for &raw_id in voice.configured_ids.iter() {
+        let channel_id = ChannelId::new(raw_id);
+        let channel = match channel_id.to_channel(&ctx.http).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("discord_voice {channel_id}: failed to fetch channel info: {e}");
+                continue;
+            }
+        };
+        let guild_channel = match channel.guild() {
+            Some(gc) => gc,
+            None => {
+                warn!("discord_voice {channel_id}: not a guild channel (DMs unsupported)");
+                continue;
+            }
+        };
+        if guild_channel.kind != ChannelType::Voice && guild_channel.kind != ChannelType::Stage {
+            warn!(
+                "discord_voice {channel_id}: not a voice channel (kind={:?}); skipping",
+                guild_channel.kind
+            );
+            continue;
+        }
+        let guild_id = guild_channel.guild_id;
+
+        match manager.join(guild_id, channel_id).await {
+            Ok(call) => {
+                let ch_state = Arc::new(Mutex::new(ChannelState::new(channel_id)));
+                voice
+                    .channels
+                    .lock()
+                    .await
+                    .insert(channel_id, Arc::clone(&ch_state));
+                register_handlers(&call, ch_state, channel_id).await;
+                info!("discord_voice: joined {channel_id} in guild {guild_id}");
+            }
+            Err(e) => {
+                warn!("discord_voice {channel_id}: failed to join: {e}");
+            }
+        }
+    }
+}
+
 /// Install our event handlers on a fresh songbird `Call` after the
 /// bot joins a voice channel.
-pub async fn register_handlers(
+async fn register_handlers(
     call: &Arc<tokio::sync::Mutex<songbird::Call>>,
     state: Arc<Mutex<ChannelState>>,
     channel_id: ChannelId,
@@ -207,18 +284,28 @@ pub async fn register_handlers(
         has_human,
     };
     let mut call = call.lock().await;
-    call.add_global_event(CoreEvent::SpeakingStateUpdate.into(), receiver_clone(&receiver));
+    call.add_global_event(
+        CoreEvent::SpeakingStateUpdate.into(),
+        receiver_clone(&receiver),
+    );
     call.add_global_event(CoreEvent::VoiceTick.into(), receiver);
 }
 
-/// `VoiceReceiver` is not `Clone` by design (it owns Arcs internally
-/// already, but songbird's `add_global_event` needs us to register
-/// multiple times with separate handler instances). This is a hand
-/// clone for that purpose.
 fn receiver_clone(r: &VoiceReceiver) -> VoiceReceiver {
     VoiceReceiver {
         channel_id: r.channel_id,
         state: Arc::clone(&r.state),
         has_human: Arc::clone(&r.has_human),
     }
+}
+
+/// Convenience: anyhow-typed channel-id parse so the discord.rs
+/// caller doesn't have to repeat the conversion logic.
+pub fn parse_channel_ids(raw: &[String]) -> anyhow::Result<Vec<u64>> {
+    raw.iter()
+        .map(|s| {
+            s.parse::<u64>()
+                .with_context(|| format!("invalid Discord voice channel id '{s}'"))
+        })
+        .collect()
 }
