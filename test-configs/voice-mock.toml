@@ -27,6 +27,14 @@ api_key = "REPLACE_OR_USE_ENV"
 # Light model keeps smoke-test cost negligible.
 model = "claude-haiku-4-5-20251001"
 
+# Disable the workspace git auto-sync. The smoke-test config sits
+# inside the sapphire-agent repo, so `workspace_dir` resolves to a
+# directory that's already in git — without this knob, sapphire-sync
+# would commit every state file the agent emits (devices.jsonl,
+# sessions/, memory/, …) on top of the repo's own history.
+[sync]
+backend = "none"
+
 # --- Voice pipeline ---------------------------------------------------
 
 [voice_pipeline.mock]

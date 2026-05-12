@@ -20,3 +20,12 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 .claude
+
+# Runtime artifacts produced when test-configs/* is used as the
+# agent's workspace_dir (the test configs live inside this repo, so
+# without ignoring these we'd track the agent's own state on top of
+# source history). `[sync] backend = "none"` is set in those configs
+# too, but ignore as a belt-and-braces defence.
+test-configs/.sapphire-agent/
+test-configs/sessions/
+test-configs/memory/
