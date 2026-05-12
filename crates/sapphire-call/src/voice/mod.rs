@@ -14,6 +14,7 @@
 //! satellite doesn't transcribe its own TTS.
 
 mod download;
+mod oww;
 mod wake;
 
 use std::collections::VecDeque;
@@ -40,6 +41,48 @@ const VAD_MAX_SPEECH_SECONDS: f32 = 30.0;
 /// releases page. Auto-downloaded on first run.
 const SILERO_VAD_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
+
+/// Resolved wake-word backend to instantiate. Built from the merge
+/// of CLI overrides + the server's `voice/config` response.
+enum WakeSelection {
+    /// Sherpa-onnx KWS Zipformer bundle (name only — downloaded by
+    /// the detector). Phrase tokenisation happens against the
+    /// bundle's `tokens.txt`.
+    Sherpa(String),
+    /// Custom openWakeWord ONNX classifier delivered inline by the
+    /// server. The satellite caches the bytes under
+    /// `<cache>/oww/<sha256>.onnx` and runs the three-stage pipeline
+    /// (mel + embedding + classifier).
+    OpenWakeWord {
+        filename: String,
+        sha256: String,
+        bytes: Vec<u8>,
+    },
+}
+
+/// Engine-tagged wake detector handle. Hides the difference between
+/// sherpa-onnx KWS (f32 normalised, takes mel internally) and
+/// openWakeWord (i16, builds its own mel + embedding stack) from the
+/// listen loop.
+enum AnyWakeDetector {
+    Sherpa(wake::WakeDetector),
+    OpenWakeWord(oww::OpenWakeWordDetector),
+}
+
+impl AnyWakeDetector {
+    fn feed(&mut self, pcm_i16: &[i16], pcm_f32_norm: &[f32]) -> Result<Option<String>> {
+        match self {
+            Self::Sherpa(d) => d.feed(pcm_f32_norm),
+            Self::OpenWakeWord(d) => d.feed(pcm_i16),
+        }
+    }
+    fn reset(&mut self) {
+        match self {
+            Self::Sherpa(d) => d.reset(),
+            Self::OpenWakeWord(d) => d.reset(),
+        }
+    }
+}
 
 /// Run-time options collected from CLI flags.
 ///
@@ -110,18 +153,23 @@ pub async fn run(
     // CLI `--wake-word-model <bundle>` always means sherpa engine; the
     // openWakeWord path can only be enabled via server config because
     // its model lives in the agent's filesystem.
-    let wake_model: Option<String> = if let Some(bundle) = options.wake_word_model.clone() {
-        Some(bundle)
+    let wake_selection: Option<WakeSelection> = if let Some(bundle) = options.wake_word_model.clone()
+    {
+        Some(WakeSelection::Sherpa(bundle))
     } else {
         match server_wake.model {
-            Some(sapphire_agent_api::WakeWordModel::SherpaBundle { name }) => Some(name),
-            Some(sapphire_agent_api::WakeWordModel::OnnxInline { filename, .. }) => {
-                eprintln!(
-                    "warning: server requested openWakeWord model '{filename}', but the OWW \
-                     runtime is not yet wired up on this client — falling back to VAD-only mode"
-                );
-                None
+            Some(sapphire_agent_api::WakeWordModel::SherpaBundle { name }) => {
+                Some(WakeSelection::Sherpa(name))
             }
+            Some(sapphire_agent_api::WakeWordModel::OnnxInline {
+                filename,
+                sha256,
+                bytes,
+            }) => Some(WakeSelection::OpenWakeWord {
+                filename,
+                sha256,
+                bytes,
+            }),
             None => None,
         }
     };
@@ -144,36 +192,60 @@ pub async fn run(
     .map_err(|e| anyhow!("VAD build task panicked: {e}"))??;
 
     // ── Optional wake-word detector ─────────────────────────────────────
-    let wake_detector = if let Some(bundle) = wake_model.as_deref() {
-        let bundle_owned = bundle.to_string();
-        let keywords_file = options.keywords_file.clone();
-        let phrase = wake_phrase.clone();
-        let detector = tokio::task::spawn_blocking(move || {
-            let source = if let Some(path) = keywords_file.as_deref() {
-                wake::WakeKeywordSource::File(std::path::Path::new(path))
-            } else if let Some(p) = phrase.as_deref() {
-                // Single phrase from CLI/server; pass as 1-element slice.
-                let phrases = vec![p.to_string()];
-                return wake::WakeDetector::create(
-                    &bundle_owned,
-                    wake::WakeKeywordSource::Phrases(&phrases),
-                );
-            } else {
-                wake::WakeKeywordSource::BundleDefault
-            };
-            wake::WakeDetector::create(&bundle_owned, source)
-        })
-        .await
-        .map_err(|e| anyhow!("wake-word init task panicked: {e}"))?
-        .context("failed to initialise wake-word detector")?;
-        let trigger_hint = wake_phrase
-            .as_deref()
-            .map(|p| format!(" — say \"{p}\" to talk"))
-            .unwrap_or_default();
-        eprintln!("wake-word: {}{trigger_hint}", bundle);
-        Some(detector)
-    } else {
-        None
+    let wake_detector: Option<AnyWakeDetector> = match wake_selection {
+        Some(WakeSelection::Sherpa(bundle)) => {
+            let bundle_owned = bundle.clone();
+            let keywords_file = options.keywords_file.clone();
+            let phrase = wake_phrase.clone();
+            let detector = tokio::task::spawn_blocking(move || {
+                if let Some(path) = keywords_file.as_deref() {
+                    return wake::WakeDetector::create(
+                        &bundle_owned,
+                        wake::WakeKeywordSource::File(std::path::Path::new(path)),
+                    );
+                }
+                if let Some(p) = phrase.as_deref() {
+                    let phrases = vec![p.to_string()];
+                    return wake::WakeDetector::create(
+                        &bundle_owned,
+                        wake::WakeKeywordSource::Phrases(&phrases),
+                    );
+                }
+                wake::WakeDetector::create(&bundle_owned, wake::WakeKeywordSource::BundleDefault)
+            })
+            .await
+            .map_err(|e| anyhow!("wake-word init task panicked: {e}"))?
+            .context("failed to initialise sherpa wake-word detector")?;
+            let trigger_hint = wake_phrase
+                .as_deref()
+                .map(|p| format!(" — say \"{p}\" to talk"))
+                .unwrap_or_default();
+            eprintln!("wake-word: sherpa_onnx / {bundle}{trigger_hint}");
+            Some(AnyWakeDetector::Sherpa(detector))
+        }
+        Some(WakeSelection::OpenWakeWord {
+            filename,
+            sha256,
+            bytes,
+        }) => {
+            let label = wake_phrase.clone().unwrap_or_else(|| filename.clone());
+            let detector = tokio::task::spawn_blocking(move || {
+                let (mel, embed) = download::ensure_oww_frontend()
+                    .context("failed to fetch openWakeWord frontend models")?;
+                let wake_path = download::cache_inline_oww(&bytes, &sha256)
+                    .context("failed to cache openWakeWord classifier")?;
+                oww::OpenWakeWordDetector::create(&mel, &embed, &wake_path, label)
+            })
+            .await
+            .map_err(|e| anyhow!("openWakeWord init task panicked: {e}"))??;
+            let trigger_hint = wake_phrase
+                .as_deref()
+                .map(|p| format!(" — say \"{p}\" to talk"))
+                .unwrap_or_default();
+            eprintln!("wake-word: open_wake_word / {filename}{trigger_hint}");
+            Some(AnyWakeDetector::OpenWakeWord(detector))
+        }
+        None => None,
     };
 
     // ── Audio I/O ────────────────────────────────────────────────────────
@@ -248,7 +320,7 @@ struct ListenCtx {
     vad: VoiceActivityDetector,
     /// `Some` enables wake-word mode; the satellite gates VAD behind
     /// successful keyword spotting on this detector.
-    wake: Option<wake::WakeDetector>,
+    wake: Option<AnyWakeDetector>,
     /// In wake-word mode: true while we're waiting for the next wake
     /// trigger, false once it fires and we're capturing the utterance.
     /// Always false in VAD-only mode.
@@ -270,11 +342,11 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
         let pcm_f32: Vec<f32> = pcm16k.iter().map(|s| *s as f32 / 32768.0).collect();
 
         // Wake-word gate: while we're awaiting a wake trigger, feed
-        // audio to KWS only — VAD doesn't see the stream until the
-        // wake phrase has fired.
+        // audio to the engine-specific detector only — VAD doesn't
+        // see the stream until the wake phrase has fired.
         if ctx.awaiting_wake {
             if let Some(ref mut wake) = ctx.wake {
-                if let Some(keyword) = wake.feed(&pcm_f32)? {
+                if let Some(keyword) = wake.feed(&pcm16k, &pcm_f32)? {
                     eprintln!("[wake: {keyword}] now listening for command...");
                     ctx.awaiting_wake = false;
                     // Clear any audio left over from before the wake so

@@ -203,7 +203,66 @@ their language).
 |---|---|
 | Chinese chars (你好) | `sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01` |
 | English (`hey claude`) | `sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01` |
-| Japanese katakana / kanji | No prebuilt sherpa-onnx KWS model has full katakana coverage yet. Options: train your own, use an ASR model with hotword boost, or pick a phrase that overlaps Chinese (e.g. kanji-only). |
+| Custom AI name (`サフィナ`, `Saphina`, etc.) | No prebuilt sherpa-onnx KWS covers arbitrary names. **Use the openWakeWord engine** — see §3.5. |
+
+### 3.5 Custom AI names via openWakeWord
+
+Train a wake-word classifier once with openWakeWord's Python pipeline
+(synthetic-data, no manual recordings), drop the resulting `.onnx`
+onto the server, and every connected satellite picks it up. The
+classifier is small (~250 KB), distributed inline in the
+`voice/config` response, and cached on the satellite by SHA-256.
+
+Server config:
+
+```toml
+[room_profile.home_voice]
+profile           = "casual"
+voice_pipeline    = "default"
+rooms             = []
+wake_word         = "Saphina"                  # display label only
+wake_word_engine  = "open_wake_word"
+wake_word_model   = "/srv/sapphire/wake-models/saphina-v1.onnx"
+```
+
+Validation catches a typo in the path at startup. The bytes are read
+once per `voice/config` call, so updates take effect on the
+satellite's next restart.
+
+#### Training a custom model
+
+```sh
+git clone https://github.com/dscripka/openWakeWord
+cd openWakeWord
+pip install -e . piper-tts
+
+# Generate synthetic samples + train.
+# The README's `Custom Models` notebook walks through it in 30–60 min.
+# Output: my_wakeword.onnx (~250 KB).
+```
+
+Then drop `my_wakeword.onnx` somewhere readable by sapphire-agent,
+point `wake_word_model` at it, restart.
+
+#### First-run downloads on the satellite
+
+The satellite needs two shared frontend ONNX models in addition to
+the custom classifier:
+
+- `melspectrogram.onnx` (~1 MB)
+- `embedding_model.onnx` (~5 MB)
+
+Both auto-downloaded from openWakeWord's `v0.5.1` GitHub release on
+first OWW run to `~/.local/share/sapphire-call/voice-models/oww/`.
+
+#### Limitations
+
+- Threshold is fixed at 0.5 — adjust via env var coming later if
+  needed.
+- The Rust port of OWW's streaming feature pipeline is faithful to
+  the Python source but hasn't been validated against the official
+  Python implementation's output yet. False positives / negatives
+  may need threshold tuning per model.
 
 ### CLI overrides (testing only)
 

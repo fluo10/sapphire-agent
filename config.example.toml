@@ -231,8 +231,19 @@ system_prompt = "You are a helpful personal assistant."
 # voice_pipeline   = "default"
 # rooms            = []             # MCP-only; not bound to chat rooms
 # # Wake word for satellites in this room_profile. Both fields
-# # required together. Natural-language phrase — tokenised by the
-# # client against the chosen model's tokens.txt. Punctuation is kept
-# # in the @label for display but dropped from the token list.
+# # required together. With the default `sherpa_onnx` engine the
+# # phrase is tokenised by the client against the chosen bundle's
+# # tokens.txt; punctuation is kept in the @label but dropped from
+# # the token list.
 # wake_word        = "ハロー、クロード"
 # wake_word_model  = "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
+# # wake_word_engine = "sherpa_onnx"  # default, can be omitted
+# #
+# # For custom AI names that aren't in any prebuilt KWS vocab,
+# # switch to openWakeWord. `wake_word_model` is then a filesystem
+# # path to a `.onnx` classifier trained externally (see TESTING.md
+# # §3.5 for the training pipeline). The phrase becomes a display
+# # label only.
+# # wake_word        = "Saphina"
+# # wake_word_engine = "open_wake_word"
+# # wake_word_model  = "/srv/sapphire/wake-models/saphina-v1.onnx"

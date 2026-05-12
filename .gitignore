@@ -29,3 +29,7 @@ target
 test-configs/.sapphire-agent/
 test-configs/sessions/
 test-configs/memory/
+
+# macOS Finder metadata
+.DS_Store
+**/.DS_Store

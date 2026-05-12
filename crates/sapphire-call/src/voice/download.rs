@@ -44,6 +44,60 @@ pub fn cache_dir() -> PathBuf {
     PathBuf::from(".sapphire-call/voice-models")
 }
 
+/// Subdirectory under [`cache_dir`] that holds openWakeWord shared
+/// frontend models (melspectrogram + embedding) and per-wake-word
+/// custom classifier ONNXes hashed by SHA-256.
+pub fn oww_cache_dir() -> PathBuf {
+    cache_dir().join("oww")
+}
+
+/// openWakeWord frontend model release. Pinned so cached files don't
+/// get invalidated by upstream version bumps.
+const OWW_RELEASE_TAG: &str = "v0.5.1";
+const OWW_MELSPEC_FILENAME: &str = "melspectrogram.onnx";
+const OWW_EMBEDDING_FILENAME: &str = "embedding_model.onnx";
+
+/// Make sure the openWakeWord melspectrogram and embedding ONNX
+/// frontend models are present in the local cache, downloading from
+/// the upstream GitHub release on first use. Returns the two
+/// resolved paths.
+pub fn ensure_oww_frontend() -> Result<(PathBuf, PathBuf)> {
+    let dir = oww_cache_dir();
+    fs::create_dir_all(&dir)?;
+    let mel = ensure_single_file(
+        &format!(
+            "https://github.com/dscripka/openWakeWord/releases/download/{}/{}",
+            OWW_RELEASE_TAG, OWW_MELSPEC_FILENAME
+        ),
+        &dir.join(OWW_MELSPEC_FILENAME),
+    )?;
+    let embed = ensure_single_file(
+        &format!(
+            "https://github.com/dscripka/openWakeWord/releases/download/{}/{}",
+            OWW_RELEASE_TAG, OWW_EMBEDDING_FILENAME
+        ),
+        &dir.join(OWW_EMBEDDING_FILENAME),
+    )?;
+    Ok((mel, embed))
+}
+
+/// Write a server-supplied wake-word ONNX blob into the cache under
+/// `<sha256>.onnx` and return the path. Re-uses the cached file when
+/// the SHA already matches — the inline distribution path stays
+/// idempotent across restarts.
+pub fn cache_inline_oww(bytes: &[u8], sha256: &str) -> Result<PathBuf> {
+    let dir = oww_cache_dir();
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{sha256}.onnx"));
+    if path.exists() {
+        return Ok(path);
+    }
+    let tmp = path.with_extension("partial");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
 /// Download a single file (not a bundle) and place it at `dest`. Used
 /// for the Silero VAD model, which ships as a bare .onnx on the VAD
 /// releases tag.
