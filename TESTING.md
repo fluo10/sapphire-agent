@@ -164,23 +164,79 @@ First boot auto-downloads Silero VAD (~2 MB) to
 
 ## 3. Wake-word mode (optional)
 
-Once the basic real path works, add a wake-word gate so the satellite
-only forwards utterances after a configured phrase fires.
+Wake-word configuration lives on the server, under the room_profile.
+Every satellite for that room_profile fetches the same phrase via
+`voice/config` at startup — change the AI's name in one place and
+every connected device picks it up.
+
+Server config (add to `test-configs/voice-irodori.toml` or your real
+config):
+
+```toml
+[room_profile.voice_irodori]
+profile          = "casual"
+voice_pipeline   = "irodori"
+rooms            = []
+wake_word        = "ハロー、クロード"
+wake_word_model  = "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
+```
+
+Both fields are required together; setting one alone fails
+`validate_profiles` at server startup.
+
+Then on the satellite, just connect — no extra CLI flags needed:
 
 ```sh
 cargo run --release --bin sapphire-call -- voice \
-    --room-profile voice_irodori --language ja \
-    --wake-word-model sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01
+    --room-profile voice_irodori
 ```
 
-First run downloads the KWS bundle (~50 MB). The bundle ships its own
-`keywords.txt`; override with `--keywords-file <path>` to use custom
-phrases. Note that keywords use sherpa-onnx's tokenised format — one
-line per phrase, tokens separated by spaces, then `@<readable label>`.
+First run downloads the KWS bundle (~50 MB). The phrase is split into
+characters and looked up in the bundle's `tokens.txt`; characters
+that aren't in vocab abort startup with a clear message listing them
+(so users can pick a different phrase, or a model whose vocab covers
+their language).
+
+### Choosing a KWS model for your language
+
+| Phrase looks like | Try this bundle |
+|---|---|
+| Chinese chars (你好) | `sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01` |
+| English (`hey claude`) | `sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01` |
+| Japanese katakana / kanji | No prebuilt sherpa-onnx KWS model has full katakana coverage yet. Options: train your own, use an ASR model with hotword boost, or pick a phrase that overlaps Chinese (e.g. kanji-only). |
+
+### CLI overrides (testing only)
+
+`--wake-word "phrase"` and `--wake-word-model <bundle>` override the
+server-supplied values per invocation. Useful when iterating before
+locking a phrase into the server config.
+
+`--keywords-file <path>` skips phrase tokenisation entirely and feeds
+a raw sherpa-onnx keywords file to the KWS — escape hatch for
+BPE-based models where character splitting isn't appropriate.
 
 ---
 
-## 4. Headless Linux deployment (smart-speaker style)
+## 4. Persistent satellite config
+
+So you don't have to type `--server …` every boot, drop a TOML
+config at `~/.config/sapphire-call/config.toml` (XDG location;
+override with `--config <path>`). See
+`crates/sapphire-call/config.example.toml` for the schema. Minimum:
+
+```toml
+[server]
+url          = "https://agent.example.com"
+room_profile = "home_voice"
+```
+
+CLI flags override config-file values. Wake-word fields are
+deliberately rejected here — server side is the source of truth
+(see §3).
+
+---
+
+## 5. Headless Linux deployment (smart-speaker style)
 
 Running the satellite on a server with just a USB speakerphone (Jabra
 Speak, AnkerWork, eMeet, etc.) attached:
@@ -227,7 +283,7 @@ itself, enable PipeWire's `echo-cancel` module
 (`pactl load-module module-echo-cancel`) or physically separate the
 mic from the speaker.
 
-## 5. Common gotchas
+## 6. Common gotchas
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -240,7 +296,7 @@ mic from the speaker.
 
 ---
 
-## 6. What's still in unit-test territory
+## 7. What's still in unit-test territory
 
 The TOML schema, MCP wire format helpers, VAD math, and resampler are
 covered by `cargo test --workspace`. The whole MCP-server-to-cpal

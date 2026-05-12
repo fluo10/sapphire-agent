@@ -50,3 +50,7 @@ shellexpand = "3.1"
 
 # Logging — surface model downloads to the operator.
 tracing = "0.1"
+
+# Config file parsing.
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.0"

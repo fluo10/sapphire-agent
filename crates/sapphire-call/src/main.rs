@@ -1,8 +1,15 @@
+mod config;
 mod voice;
+
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt};
+
+use config::CallConfig;
+
+const DEFAULT_SERVER_URL: &str = "http://localhost:9000";
 
 #[derive(Parser)]
 #[command(
@@ -10,19 +17,27 @@ use tracing_subscriber::{EnvFilter, fmt};
     about = "Interactive client for sapphire-agent (text or voice)"
 )]
 struct Cli {
-    /// Server base URL
-    #[arg(long, default_value = "http://localhost:9000", global = true)]
-    server: String,
+    /// Server base URL. Overrides `[server].url` in the config file.
+    #[arg(long, global = true)]
+    server: Option<String>,
 
-    /// Grain-id of an existing session to resume (e.g. a3b7k9p)
+    /// Grain-id of an existing session to resume (e.g. a3b7k9p).
+    /// Overrides `[server].session` in the config file.
     #[arg(long, global = true)]
     session: Option<String>,
 
     /// Room profile name to bind to a newly created session. Must match a
     /// `[room_profile.<name>]` entry on the server side. Ignored when
-    /// resuming an existing session via --session.
+    /// resuming an existing session via --session. Overrides
+    /// `[server].room_profile` in the config file.
     #[arg(long, global = true)]
     room_profile: Option<String>,
+
+    /// Path to a TOML config file. Defaults to
+    /// `~/.config/sapphire-call/config.toml` when present; missing is
+    /// fine (all values fall back to CLI flags / built-ins).
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
 
     /// List available API sessions and exit (chat mode only)
     #[arg(long)]
@@ -107,6 +122,25 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Load the config file if one exists. Explicit --config requires
+    // it to be readable; the implicit XDG location is best-effort.
+    let file_cfg = match cli.config.as_deref() {
+        Some(path) => CallConfig::load(path)?,
+        None => match CallConfig::default_path() {
+            Some(p) if p.exists() => CallConfig::load(&p)?,
+            _ => CallConfig::default(),
+        },
+    };
+
+    // Resolution order: CLI flag > config file > built-in default.
+    let server = cli
+        .server
+        .clone()
+        .or(file_cfg.server.url)
+        .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
+    let session = cli.session.clone().or(file_cfg.server.session);
+    let room_profile = cli.room_profile.clone().or(file_cfg.server.room_profile);
+
     if let Some(Command::Voice {
         language,
         wake_word_model,
@@ -118,30 +152,30 @@ async fn main() -> Result<()> {
     }) = cli.command
     {
         return voice::run(
-            cli.server,
-            cli.session,
-            cli.room_profile,
+            server,
+            session,
+            room_profile,
             voice::VoiceOptions {
-                language,
+                language: language.or(file_cfg.language.stt),
                 wake_word_model,
                 wake_word,
                 keywords_file,
                 list_devices,
-                input_device,
-                output_device,
+                input_device: input_device.or(file_cfg.audio.input_device),
+                output_device: output_device.or(file_cfg.audio.output_device),
             },
         )
         .await;
     }
 
     sapphire_agent_api::run(
-        cli.server,
-        cli.session,
+        server,
+        session,
         cli.list,
         cli.message,
         cli.history,
         cli.json,
-        cli.room_profile,
+        room_profile,
     )
     .await
 }

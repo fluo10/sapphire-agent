@@ -230,3 +230,9 @@ system_prompt = "You are a helpful personal assistant."
 # profile          = "casual"
 # voice_pipeline   = "default"
 # rooms            = []             # MCP-only; not bound to chat rooms
+# # Wake word for satellites in this room_profile. Both fields
+# # required together. Natural-language phrase — tokenised by the
+# # client against the chosen model's tokens.txt. Punctuation is kept
+# # in the @label for display but dropped from the token list.
+# wake_word        = "ハロー、クロード"
+# wake_word_model  = "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
