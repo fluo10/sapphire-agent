@@ -60,12 +60,13 @@ base_url    = "https://irodori.home.fireturtle.net"
 # `/generate` alias; self-hosted instances without `api_name=...` show
 # the underlying `_run_generation`.
 fn_name     = "_run_generation"
-# 23-arg payload schema. The first five values are deployment-side
-# runtime settings that the public HF demo doesn't have — fill them in
-# to match what your browser sends (DevTools → Network → POST
-# /gradio_api/call/_run_generation → request body's `data` array).
-# `{{text}}` at position 6 (the `text` field) is the only thing that
-# changes per call.
+# 24-arg payload schema matching Irodori-TTS gradio_app.py:452 `inputs=`.
+# Note: position 6 is `enable_watermark` (a gr.State(False) — *not*
+# listed in /gradio_api/info because Gradio's API doc generator hides
+# State components, but the click handler still expects a value).
+# The first five values are deployment-side runtime settings — fill
+# them in to match what your browser sends (DevTools → Network →
+# POST /gradio_api/call/_run_generation → request body's `data` array).
 payload = '''
 {"data": [
   "Aratako/Irodori-TTS-500M-v2",
@@ -73,6 +74,7 @@ payload = '''
   "fp32",
   "cuda",
   "fp32",
+  false,
   "{{text}}",
   null,
   40,
