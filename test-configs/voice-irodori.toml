@@ -1,0 +1,67 @@
+# Voice pipeline real test config — SenseVoice STT + Irodori-TTS.
+#
+# What you need:
+#   * `cargo build --release --features voice-sherpa --bin sapphire-agent`
+#     (first build is slow — sherpa-onnx + ONNX runtime via CMake)
+#   * Irodori-TTS running locally on http://localhost:7860
+#       git clone https://github.com/Aratako/Irodori-TTS
+#       cd Irodori-TTS && pip install -r requirements.txt
+#       python app.py  # or wherever the gradio entrypoint lives
+#   * ANTHROPIC_API_KEY
+#
+# What happens on first run:
+#   * SenseVoice model bundle (~230 MB) auto-downloads to
+#     ~/.local/share/sapphire-agent/voice-models/ (server side)
+#   * Silero VAD model (~2 MB) auto-downloads to
+#     ~/.local/share/sapphire-call/voice-models/ (client side)
+#
+# Run:
+#   ANTHROPIC_API_KEY=sk-... cargo run --release --features voice-sherpa \
+#       --bin sapphire-agent -- --config test-configs/voice-irodori.toml serve
+#
+# Then point the satellite at it (separate terminal):
+#   cargo run --release --bin sapphire-call -- voice \
+#       --room-profile voice_irodori --language ja
+
+[anthropic]
+api_key = "REPLACE_OR_USE_ENV"
+model = "claude-haiku-4-5-20251001"
+
+# --- Voice pipeline ---------------------------------------------------
+
+[voice_pipeline.irodori]
+stt_provider = "sense_voice"
+tts_provider = "irodori"
+language     = "ja"
+capture_max_ms = 30000
+
+[stt_provider.sense_voice]
+type  = "sherpa_onnx"
+kind  = "sense_voice"
+# Auto-downloaded from sherpa-onnx GitHub releases on first run.
+model = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+
+[tts_provider.irodori]
+type        = "gradio"
+base_url    = "http://localhost:7860"
+# Endpoint name as exposed by Irodori-TTS's Gradio app.
+fn_name     = "generate"
+# 18-arg payload schema for Irodori-TTS 500M-v2-Demo. {{text}} is
+# substituted with the assistant reply at call time, JSON-escaped.
+# Adjust if the upstream schema drifts.
+payload = '''
+{"data": ["{{text}}", null, 40, 1, "", "independent", 3.0, 5.0, "", 0.5, 1.0, true, "", "", "", "", "0.9", ""]}
+'''
+# RFC 6901 JSON Pointer — Gradio gr.Audio returns {"url": ..., "path": ...}
+# and our resolver auto-unwraps `url`.
+audio_field = "/data/0"
+
+# --- Profile + room_profile wiring -----------------------------------
+
+[profiles.casual]
+provider = "anthropic"
+
+[room_profile.voice_irodori]
+profile        = "casual"
+voice_pipeline = "irodori"
+rooms          = []

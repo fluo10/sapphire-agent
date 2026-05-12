@@ -1256,6 +1256,35 @@ rooms   = ["!x:srv"]
         );
     }
 
+    /// Smoke check that every TOML under `test-configs/` parses and
+    /// validates. These files are documentation templates the user
+    /// copies into place for manual end-to-end runs; if they break
+    /// we want to know before they're copy-pasted, not after.
+    #[test]
+    fn test_configs_parse_and_validate() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-configs");
+        let entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read_dir({}) failed: {e}", dir.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        assert!(
+            !entries.is_empty(),
+            "test-configs/ must contain at least one .toml"
+        );
+        for path in entries {
+            let cfg = Config::load(&path)
+                .unwrap_or_else(|e| panic!("{} failed to parse: {e:#}", path.display()));
+            let errs = cfg.validate_profiles();
+            assert!(
+                errs.is_empty(),
+                "{} validation errors: {:?}",
+                path.display(),
+                errs
+            );
+        }
+    }
+
     #[test]
     fn namespace_default_resolves_when_unconfigured() {
         let cfg = parse(MINIMAL);
@@ -1547,6 +1576,66 @@ rooms          = []
         assert_eq!(vp.tts_provider, "irodori");
         assert_eq!(vp.language.as_deref(), Some("ja"));
         assert_eq!(vp.capture_max_ms, 30_000); // default
+    }
+
+    #[test]
+    fn sherpa_stt_config_round_trips_with_defaults() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[stt_provider.sense_voice]
+type   = "sherpa_onnx"
+kind   = "sense_voice"
+model  = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+"#,
+        );
+        let stt = cfg
+            .stt_providers
+            .get("sense_voice")
+            .expect("provider parses");
+        match stt {
+            SttProviderConfig::SherpaOnnx(s) => {
+                assert!(matches!(s.kind, SherpaSttKind::SenseVoice));
+                assert_eq!(s.model.as_deref(), Some("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"));
+                assert_eq!(s.num_threads, 2);
+                assert_eq!(s.provider, "cpu");
+                assert!(s.language.is_none());
+            }
+            _ => panic!("expected SherpaOnnx variant"),
+        }
+    }
+
+    #[test]
+    fn sherpa_tts_config_round_trips_with_defaults() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[tts_provider.vits_ja]
+type        = "sherpa_onnx"
+kind        = "vits"
+model       = "vits-someone-2024"
+speaker_id  = 3
+speed       = 1.2
+"#,
+        );
+        let tts = cfg
+            .tts_providers
+            .get("vits_ja")
+            .expect("provider parses");
+        match tts {
+            TtsProviderConfig::SherpaOnnx(s) => {
+                assert!(matches!(s.kind, SherpaTtsKind::Vits));
+                assert_eq!(s.speaker_id, 3);
+                assert_eq!(s.speed, 1.2);
+                assert_eq!(s.num_threads, 2);
+                assert_eq!(s.provider, "cpu");
+            }
+            _ => panic!("expected SherpaOnnx variant"),
+        }
     }
 
     #[test]
