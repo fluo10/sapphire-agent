@@ -95,10 +95,15 @@ payload = '''
   ""
 ]}
 '''
-# RFC 6901 JSON Pointer — Gradio gr.Audio returns {"url": ..., "path": ...}
-# and our resolver auto-unwraps `url`. data[0] is the first of 32
-# Audio outputs; data[32]/[33] are Run Log and Timing strings.
-audio_field = "/data/0"
+# RFC 6901 JSON Pointer into the SSE `complete` event's bare array.
+# Each element is a Gradio component update of the form
+#   {"__type__": "update", "value": {...}, "visible": ...}
+# where `value` for an Audio output carries url/path/orig_name. Our
+# resolver auto-unwraps `url` from the `value` object, so this points
+# at the wrapper and lets the resolver dig the URL out.
+# [0..31] are the 32 Audio outputs (only [0] is populated when
+# num_candidates=1); [32] is Run Log; [33] is Timing.
+audio_field = "/0/value"
 
 # --- Profile + room_profile wiring -----------------------------------
 

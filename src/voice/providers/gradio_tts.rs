@@ -397,6 +397,43 @@ mod tests {
         assert_eq!(g.resolve_audio_ref(&json).unwrap(), "/file=foo.wav");
     }
 
+    /// Gradio 4.x `complete` SSE payload: bare array of component
+    /// updates, where each element is wrapped in `__type__: update`.
+    /// Audio outputs sit at `[i].value` as FileData objects.
+    #[test]
+    fn resolve_audio_ref_gradio_complete_shape() {
+        let g = GradioTts::new(
+            "test".into(),
+            "http://localhost".into(),
+            "predict".into(),
+            "{}".into(),
+            "/0/value".into(),
+        )
+        .unwrap();
+        let json = serde_json::json!([
+            {
+                "__type__": "update",
+                "value": {
+                    "is_stream": false,
+                    "meta": {"_type": "gradio.FileData"},
+                    "mime_type": null,
+                    "orig_name": "sample.wav",
+                    "path": "/tmp/gradio/abc/sample.wav",
+                    "size": null,
+                    "url": "https://example.com/gradio_api/file=/tmp/gradio/abc/sample.wav"
+                },
+                "visible": true
+            },
+            {"__type__": "update", "value": null, "visible": false},
+            "log text",
+            "[timing] ..."
+        ]);
+        assert_eq!(
+            g.resolve_audio_ref(&json).unwrap(),
+            "https://example.com/gradio_api/file=/tmp/gradio/abc/sample.wav"
+        );
+    }
+
     #[test]
     fn payload_substitution_quotes_safely() {
         let g = GradioTts::new(

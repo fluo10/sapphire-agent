@@ -207,10 +207,12 @@ system_prompt = "You are a helpful personal assistant."
 # payload     = '''
 # {"data": ["{{text}}", null, 40, 1, "", "independent", 3.0, 5.0, "", 0.5, 1.0, true, "", "", "", "", "0.9", ""]}
 # '''
-# # RFC 6901 JSON Pointer into the Gradio response JSON. For gr.Audio
-# # outputs Gradio returns {"path": ..., "url": ...} — point at either
-# # the wrapping object (auto-unwraps to url) or directly at /data/0/url.
-# audio_field = "/data/0"
+# # RFC 6901 JSON Pointer into the SSE `complete` event's bare array
+# # (note: bare array — Gradio 4.x doesn't wrap in {"data": ...}).
+# # Each element is {"__type__":"update","value":{...},"visible":...};
+# # for Audio outputs the inner `value` is {url, path, orig_name, ...}
+# # and our resolver auto-unwraps `url` from objects with that field.
+# audio_field = "/0/value"
 #
 # [tts_provider.vits_ja]            # local TTS, requires --features voice-sherpa
 # type   = "sherpa_onnx"

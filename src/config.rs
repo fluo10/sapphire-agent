@@ -364,11 +364,20 @@ pub enum TtsProviderConfig {
         /// resolve to a `{"data": [...]}` shape per Gradio's API.
         payload: String,
         /// RFC 6901 JSON Pointer selecting the audio location in the
-        /// Gradio response JSON. The pointer must resolve to either:
-        ///   * a string (treated as a URL or path),
-        ///   * an object with `url` or `path` (the value of either is
-        ///     used as a URL/path).
-        /// Examples: `/data/0/url`, `/data/0`, `/0/path`.
+        /// SSE `complete` event's parsed payload.
+        ///
+        /// Gradio 4.x emits a **bare JSON array** (not `{"data": [...]}`),
+        /// where each element is a component update of shape
+        /// `{"__type__": "update", "value": {...}, "visible": ...}`.
+        /// For an Audio component the inner `value` is a FileData
+        /// object with `url`, `path`, `orig_name`, etc.
+        ///
+        /// The pointer must resolve to one of:
+        ///   * a string (treated as URL or path),
+        ///   * an object with a string `url` or `path` field (auto-unwrapped).
+        ///
+        /// Typical values: `/0/value` (lets the resolver auto-unwrap
+        /// the FileData's `url`), `/0/value/url` (explicit).
         audio_field: String,
     },
     /// OpenAI's `audio/speech` endpoint (`tts-1` / `tts-1-hd`).
