@@ -24,7 +24,10 @@
 #       --room-profile voice_irodori --language ja
 
 [anthropic]
-api_key = "REPLACE_OR_USE_ENV"
+# api_key omitted → resolved from the `ANTHROPIC_API_KEY` env var at
+# server startup. Set it inline only if you really want the key on
+# disk (don't — this file lives in the repo).
+# api_key = "sk-ant-..."
 model = "claude-haiku-4-5-20251001"
 
 # Disable the workspace git auto-sync. This config sits inside the

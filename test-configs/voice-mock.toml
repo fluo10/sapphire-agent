@@ -23,7 +23,10 @@
 # real assistant text appears in the satellite's stderr above the beep.
 
 [anthropic]
-api_key = "REPLACE_OR_USE_ENV"
+# api_key omitted → resolved from the `ANTHROPIC_API_KEY` env var at
+# server startup. Set it inline only if you really want the key on
+# disk (don't — this file lives in the repo).
+# api_key = "sk-ant-..."
 # Light model keeps smoke-test cost negligible.
 model = "claude-haiku-4-5-20251001"
 

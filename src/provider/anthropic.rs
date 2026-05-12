@@ -21,14 +21,14 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn new(cfg: &AnthropicConfig) -> Self {
-        Self {
-            api_key: cfg.api_key.clone(),
+    pub fn new(cfg: &AnthropicConfig) -> Result<Self> {
+        Ok(Self {
+            api_key: cfg.resolve_api_key()?,
             model: cfg.model.clone(),
             light_model: cfg.light_model.clone(),
             max_tokens: cfg.max_tokens,
             client: Client::new(),
-        }
+        })
     }
 
     /// Choose model based on message content.

@@ -605,7 +605,13 @@ pub struct DiscordConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicConfig {
-    pub api_key: String,
+    /// Anthropic API key. Optional — when omitted (or commented out)
+    /// the value is read from the `ANTHROPIC_API_KEY` environment
+    /// variable at provider-construction time. Keeping the field
+    /// optional lets test configs sit in the repo with no secret
+    /// material on disk.
+    #[serde(default)]
+    pub api_key: Option<String>,
     #[serde(default = "default_model")]
     pub model: String,
     /// Cheaper model for casual (non-coding) conversations.
@@ -615,6 +621,34 @@ pub struct AnthropicConfig {
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     pub system_prompt: Option<String>,
+}
+
+/// Env var consulted when `[anthropic].api_key` is absent.
+pub const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+
+impl AnthropicConfig {
+    /// Return the effective API key, falling back to
+    /// [`ANTHROPIC_API_KEY_ENV`] when the config field is absent or
+    /// blank. Errors with a clear message when neither is set so the
+    /// failure surfaces at startup rather than as an opaque 401 from
+    /// the API.
+    pub fn resolve_api_key(&self) -> Result<String> {
+        let from_config = self
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(key) = from_config {
+            return Ok(key.to_string());
+        }
+        match std::env::var(ANTHROPIC_API_KEY_ENV) {
+            Ok(v) if !v.trim().is_empty() => Ok(v),
+            _ => Err(anyhow::anyhow!(
+                "no Anthropic API key found: set [anthropic].api_key in config or \
+                 the {ANTHROPIC_API_KEY_ENV} environment variable"
+            )),
+        }
+    }
 }
 
 /// Context compression configuration (provider-agnostic).
