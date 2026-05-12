@@ -477,7 +477,16 @@ async fn main() -> Result<()> {
                 {
                     None
                 } else {
-                    Some(Arc::new(voice::VoiceProviders::from_config(&config)?))
+                    // Voice provider construction may download model bundles
+                    // through `reqwest::blocking`, which spawns its own tokio
+                    // runtime. Offload to the blocking pool so the inner
+                    // runtime can be dropped outside our #[tokio::main].
+                    let cfg = config.clone();
+                    let providers =
+                        tokio::task::spawn_blocking(move || voice::VoiceProviders::from_config(&cfg))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("voice provider init panicked: {e}"))??;
+                    Some(Arc::new(providers))
                 };
 
                 serve::run(

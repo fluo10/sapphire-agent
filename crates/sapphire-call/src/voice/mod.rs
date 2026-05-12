@@ -71,16 +71,32 @@ pub async fn run(
     );
 
     // ── VAD model ────────────────────────────────────────────────────────
-    let vad_model_path = ensure_silero_model()
+    // The download + sherpa-onnx construction are synchronous and use
+    // `reqwest::blocking` internally, which spawns its own tokio
+    // runtime. Run them on the blocking thread pool so the inner
+    // runtime can drop without conflicting with our outer #[tokio::main].
+    let vad_model_path = tokio::task::spawn_blocking(ensure_silero_model)
+        .await
+        .map_err(|e| anyhow!("VAD download task panicked: {e}"))?
         .context("failed to fetch Silero VAD model")?;
     eprintln!("VAD model: {}", vad_model_path.display());
-    let vad = build_vad(&vad_model_path)?;
+    let vad = tokio::task::spawn_blocking({
+        let path = vad_model_path.clone();
+        move || build_vad(&path)
+    })
+    .await
+    .map_err(|e| anyhow!("VAD build task panicked: {e}"))??;
 
     // ── Optional wake-word detector ─────────────────────────────────────
     let wake_detector = if let Some(bundle) = options.wake_word_model.as_deref() {
-        let detector =
-            wake::WakeDetector::create(bundle, options.keywords_file.as_deref())
-                .context("failed to initialise wake-word detector")?;
+        let bundle_owned = bundle.to_string();
+        let keywords_owned = options.keywords_file.clone();
+        let detector = tokio::task::spawn_blocking(move || {
+            wake::WakeDetector::create(&bundle_owned, keywords_owned.as_deref())
+        })
+        .await
+        .map_err(|e| anyhow!("wake-word init task panicked: {e}"))?
+        .context("failed to initialise wake-word detector")?;
         eprintln!(
             "wake-word: {} (waiting for trigger; speak the wake phrase to talk)",
             bundle
