@@ -489,16 +489,15 @@ async fn main() -> Result<()> {
                     Some(Arc::new(providers))
                 };
 
-                serve::run(
-                    addr,
+                let serve_state = Arc::new(serve::ServeState::new(
                     config,
                     Arc::clone(&registry),
                     workspace,
                     tool_set,
                     api_session_store,
                     voice_providers,
-                )
-                .await?;
+                ));
+                serve::run(addr, serve_state).await?;
             }
 
             // Wait for the agent task's graceful shutdown to finish so its

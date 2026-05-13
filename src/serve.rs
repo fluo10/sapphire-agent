@@ -35,36 +35,61 @@ const MAX_TOOL_ROUNDS: usize = 10;
 // ---------------------------------------------------------------------------
 
 pub struct ServeState {
-    config: Config,
-    registry: Arc<ProviderRegistry>,
-    workspace: Arc<Workspace>,
-    tools: Arc<ToolSet>,
-    api_session_store: Arc<SessionStore>,
+    pub(crate) config: Config,
+    pub(crate) registry: Arc<ProviderRegistry>,
+    pub(crate) workspace: Arc<Workspace>,
+    pub(crate) tools: Arc<ToolSet>,
+    pub(crate) api_session_store: Arc<SessionStore>,
     /// In-memory conversation history, keyed by session_id.
     /// Lazy-loaded from JSONL on first access.
-    sessions: tokio::sync::Mutex<HashMap<String, Vec<ChatMessage>>>,
+    pub(crate) sessions: tokio::sync::Mutex<HashMap<String, Vec<ChatMessage>>>,
     /// Sessions that have been issued an ID via `initialize` but have not yet
     /// received a message — file creation is deferred until the first chat so
     /// that quitting without sending anything leaves no empty file behind.
     /// Maps internal UUID → reserved public_id (grain-id).
-    pending_sessions: tokio::sync::Mutex<HashMap<String, String>>,
+    pub(crate) pending_sessions: tokio::sync::Mutex<HashMap<String, String>>,
     /// Per-session room_profile pin from `initialize`. Sessions absent
     /// from this map fall through to the background provider. Not
     /// persisted across restarts — clients must re-pass `room_profile`
     /// on resume.
-    session_room_profiles: tokio::sync::Mutex<HashMap<String, String>>,
+    pub(crate) session_room_profiles: tokio::sync::Mutex<HashMap<String, String>>,
     /// Voice provider registry. `None` when no `[stt_provider.*]` /
     /// `[tts_provider.*]` blocks are configured — in that case the
     /// `voice/pipeline_run` method returns a method-not-available error.
-    voice: Option<Arc<VoiceProviders>>,
+    pub(crate) voice: Option<Arc<VoiceProviders>>,
 }
 
 impl ServeState {
+    /// Construct a runtime ready for both the HTTP API server and
+    /// the in-process channel handlers (Discord voice in particular).
+    /// Shared across both so they read from the same session store /
+    /// in-memory conversation map.
+    pub fn new(
+        config: Config,
+        registry: Arc<ProviderRegistry>,
+        workspace: Arc<Workspace>,
+        tools: Arc<ToolSet>,
+        api_session_store: Arc<SessionStore>,
+        voice: Option<Arc<VoiceProviders>>,
+    ) -> Self {
+        Self {
+            config,
+            registry,
+            workspace,
+            tools,
+            api_session_store,
+            sessions: tokio::sync::Mutex::new(HashMap::new()),
+            pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
+            session_room_profiles: tokio::sync::Mutex::new(HashMap::new()),
+            voice,
+        }
+    }
+
     /// Provider that should serve the given session. Resolves the
     /// session's pinned room_profile to its `profile`, then to a
     /// concrete provider (with optional refusal fallback). Falls back
     /// to the background provider when no room_profile is pinned.
-    async fn provider_for_session(&self, session_id: &str) -> Arc<dyn Provider> {
+    pub(crate) async fn provider_for_session(&self, session_id: &str) -> Arc<dyn Provider> {
         let rp_name = self
             .session_room_profiles
             .lock()
@@ -133,24 +158,8 @@ fn error_event(id: &Value, code: i32, message: &str) -> Event {
 
 pub async fn run(
     addr: String,
-    config: Config,
-    registry: Arc<ProviderRegistry>,
-    workspace: Arc<Workspace>,
-    tools: Arc<ToolSet>,
-    api_session_store: Arc<SessionStore>,
-    voice: Option<Arc<VoiceProviders>>,
+    state: Arc<ServeState>,
 ) -> anyhow::Result<()> {
-    let state = Arc::new(ServeState {
-        config,
-        registry,
-        workspace,
-        tools,
-        api_session_store,
-        sessions: tokio::sync::Mutex::new(HashMap::new()),
-        pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
-        session_room_profiles: tokio::sync::Mutex::new(HashMap::new()),
-        voice,
-    });
 
     let app = Router::new()
         .route("/mcp", post(mcp_post).get(mcp_get))
