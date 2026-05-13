@@ -53,6 +53,10 @@ pub struct ChannelState {
     /// `true` when at least one human is present. Cheap atomic check
     /// for the audio receive callback.
     pub has_human: Arc<AtomicBool>,
+    /// Songbird call handle for this channel. Populated right after
+    /// `manager.join` succeeds; used by the utterance dispatch task
+    /// to play TTS audio back into the channel.
+    pub call: Option<Arc<Mutex<songbird::Call>>>,
 }
 
 impl ChannelState {
@@ -63,6 +67,7 @@ impl ChannelState {
             ssrc_to_user: HashMap::new(),
             speakers: HashMap::new(),
             has_human: Arc::new(AtomicBool::new(false)),
+            call: None,
         }
     }
 
@@ -300,6 +305,10 @@ pub async fn on_ready(
         match manager.join(guild_id, channel_id).await {
             Ok(call) => {
                 let ch_state = Arc::new(Mutex::new(ChannelState::new(channel_id)));
+                {
+                    let mut st = ch_state.lock().await;
+                    st.call = Some(Arc::clone(&call));
+                }
                 voice
                     .channels
                     .lock()
@@ -437,7 +446,8 @@ async fn on_speaker_audio(
                 samples.len()
             );
             if let Some(state) = serve_state {
-                dispatch_utterance(Arc::clone(state), channel_id, samples);
+                let call = ch.call.clone();
+                dispatch_utterance(Arc::clone(state), channel_id, samples, call);
             }
         }
     }
@@ -459,7 +469,12 @@ async fn on_speaker_audio(
 /// best-effort fire-and-forget feed; a failed turn should not
 /// block subsequent speech from getting through.
 #[cfg(feature = "voice-sherpa")]
-fn dispatch_utterance(state: Arc<ServeState>, channel_id: ChannelId, samples_f32: Vec<f32>) {
+fn dispatch_utterance(
+    state: Arc<ServeState>,
+    channel_id: ChannelId,
+    samples_f32: Vec<f32>,
+    call: Option<Arc<Mutex<songbird::Call>>>,
+) {
     use crate::voice::pipeline::run_voice_turn_buffered;
 
     let room_id = channel_id.get().to_string();
@@ -512,13 +527,48 @@ fn dispatch_utterance(state: Arc<ServeState>, channel_id: ChannelId, samples_f32
                     outcome.assistant_text.len(),
                     outcome.audio_pcm_16k.len(),
                 );
-                // TODO(next commit): hand `outcome.audio_pcm_16k` to
-                // songbird Call::play() — needs PCM 16k → 48k stereo
-                // upsample and a TrackHandle stashed in ChannelState.
+                if let Some(call) = call {
+                    play_into_call(channel_id, call, outcome.audio_pcm_16k).await;
+                } else {
+                    warn!(
+                        "discord_voice {channel_id}: no Call handle stored; skipping playback"
+                    );
+                }
             }
             Err(e) => {
                 warn!("discord_voice {channel_id}: voice turn failed: {e:#}");
             }
         }
     });
+}
+
+/// Feed the TTS reply (16 kHz mono i16) into songbird for the
+/// given Call. Songbird's symphonia decoder handles the upsample
+/// to 48 kHz stereo internally, so we hand it raw mono f32 bytes
+/// via `RawAdapter` and let the driver mix it for the channel.
+#[cfg(feature = "voice-sherpa")]
+async fn play_into_call(
+    channel_id: ChannelId,
+    call: Arc<Mutex<songbird::Call>>,
+    pcm_16k_mono: Vec<i16>,
+) {
+    use songbird::input::{Input, RawAdapter};
+    use std::io::Cursor;
+
+    // i16 mono → f32 LE bytes. RawAdapter expects an interleaved f32
+    // PCM byte stream and prepends a sample-rate/channel-count header.
+    let mut bytes: Vec<u8> = Vec::with_capacity(pcm_16k_mono.len() * 4);
+    for s in &pcm_16k_mono {
+        let f = (*s as f32) / (i16::MAX as f32);
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    let adapter = RawAdapter::new(Cursor::new(bytes), 16_000, 1);
+    let input: Input = adapter.into();
+
+    let mut guard = call.lock().await;
+    let _handle = guard.play_input(input);
+    info!(
+        "discord_voice {channel_id}: TTS reply queued ({} samples @ 16 kHz mono)",
+        pcm_16k_mono.len()
+    );
 }
