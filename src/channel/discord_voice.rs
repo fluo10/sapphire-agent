@@ -24,6 +24,8 @@ use songbird::model::payload::Speaking;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::serve::ServeState;
+
 #[cfg(feature = "voice-sherpa")]
 use crate::voice::vad::{VAD_WINDOW_SAMPLES, build_default as build_silero_default};
 #[cfg(feature = "voice-sherpa")]
@@ -115,14 +117,19 @@ pub struct VoiceContext {
     /// `voice_state_update` so the bot's own join/leave doesn't
     /// toggle the "humans present" gate.
     pub bot_user_id: Arc<Mutex<Option<UserId>>>,
+    /// Shared server runtime: voice providers, sessions, namespaces.
+    /// Cloned into the per-utterance dispatch task. `None` only in
+    /// standby_mode (where Discord wouldn't be initialised anyway).
+    pub serve_state: Option<Arc<ServeState>>,
 }
 
 impl VoiceContext {
-    pub fn new(configured_ids: Vec<u64>) -> Self {
+    pub fn new(configured_ids: Vec<u64>, serve_state: Option<Arc<ServeState>>) -> Self {
         Self {
             channels: Arc::new(Mutex::new(HashMap::new())),
             configured_ids: Arc::new(configured_ids.into_iter().collect()),
             bot_user_id: Arc::new(Mutex::new(None)),
+            serve_state,
         }
     }
 }

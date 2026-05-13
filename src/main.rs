@@ -302,6 +302,42 @@ async fn main() -> Result<()> {
             // returns, cancelling any in-flight LLM call (#48).
             let mut agent_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+            // Built up-front (before channels) so the Discord voice path
+            // can share the same Config / registry / session store /
+            // tool set / voice providers as the HTTP API. Reused below
+            // by `serve::run`. None only in standby_mode where neither
+            // channels nor the HTTP server is brought up.
+            let serve_state: Option<Arc<serve::ServeState>> = if config.standby_mode {
+                None
+            } else {
+                let voice_providers = if config.stt_providers.is_empty()
+                    && config.tts_providers.is_empty()
+                {
+                    None
+                } else {
+                    // Voice provider construction may download model bundles
+                    // through `reqwest::blocking`, which spawns its own tokio
+                    // runtime. Offload to the blocking pool so the inner
+                    // runtime can be dropped outside our #[tokio::main].
+                    let cfg = config.clone();
+                    let providers = tokio::task::spawn_blocking(move || {
+                        voice::VoiceProviders::from_config(&cfg)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("voice provider init panicked: {e}"))??;
+                    Some(Arc::new(providers))
+                };
+
+                Some(Arc::new(serve::ServeState::new(
+                    config.clone(),
+                    Arc::clone(&registry),
+                    Arc::clone(&workspace),
+                    Arc::clone(&tool_set),
+                    Arc::clone(&api_session_store),
+                    voice_providers,
+                )))
+            };
+
             // ── Channel + Agent (Matrix and/or Discord, if configured) ──────
             if !config.standby_mode && (config.matrix.is_some() || config.discord.is_some()) {
                 // Sessions from every chat channel land in one shared
@@ -319,10 +355,11 @@ async fn main() -> Result<()> {
                     channel_list.push(("matrix".to_string(), Arc::new(MatrixChannel::new(m))));
                 }
                 if let Some(d) = &config.discord {
+                    let state_for_discord = serve_state.as_ref().map(Arc::clone);
                     channel_list.push((
                         "discord".to_string(),
                         Arc::new(
-                            DiscordChannel::new(d)
+                            DiscordChannel::new(d, state_for_discord)
                                 .context("Failed to initialise Discord channel")?,
                         ),
                     ));
@@ -472,31 +509,8 @@ async fn main() -> Result<()> {
                     })
                     .unwrap_or_else(|| "127.0.0.1:9000".to_string());
 
-                let voice_providers = if config.stt_providers.is_empty()
-                    && config.tts_providers.is_empty()
-                {
-                    None
-                } else {
-                    // Voice provider construction may download model bundles
-                    // through `reqwest::blocking`, which spawns its own tokio
-                    // runtime. Offload to the blocking pool so the inner
-                    // runtime can be dropped outside our #[tokio::main].
-                    let cfg = config.clone();
-                    let providers =
-                        tokio::task::spawn_blocking(move || voice::VoiceProviders::from_config(&cfg))
-                            .await
-                            .map_err(|e| anyhow::anyhow!("voice provider init panicked: {e}"))??;
-                    Some(Arc::new(providers))
-                };
-
-                let serve_state = Arc::new(serve::ServeState::new(
-                    config,
-                    Arc::clone(&registry),
-                    workspace,
-                    tool_set,
-                    api_session_store,
-                    voice_providers,
-                ));
+                let serve_state = serve_state
+                    .expect("serve_state is always built in non-standby mode");
                 serve::run(addr, serve_state).await?;
             }
 

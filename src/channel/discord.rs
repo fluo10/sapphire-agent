@@ -1,6 +1,7 @@
 use crate::channel::discord_voice::{self, VoiceContext, VoiceStateUpdate};
 use crate::channel::{Attachment, Channel, IncomingMessage, MAX_ATTACHMENT_BYTES, OutgoingMessage};
 use crate::config::DiscordConfig;
+use crate::serve::ServeState;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serenity::Client;
@@ -102,6 +103,10 @@ pub struct DiscordChannel {
     allowed_user_ids: HashSet<u64>,
     /// Filled by `listen()` once the gateway client is built; used by `send()`.
     http: Arc<OnceCell<Arc<Http>>>,
+    /// Shared server runtime so the Discord voice path can run the
+    /// same STT → LLM → TTS pipeline as the HTTP `voice/pipeline_run`
+    /// endpoint. `None` when voice is not configured.
+    serve_state: Option<Arc<ServeState>>,
 }
 
 impl std::fmt::Debug for DiscordChannel {
@@ -113,7 +118,7 @@ impl std::fmt::Debug for DiscordChannel {
 }
 
 impl DiscordChannel {
-    pub fn new(cfg: &DiscordConfig) -> Result<Self> {
+    pub fn new(cfg: &DiscordConfig, serve_state: Option<Arc<ServeState>>) -> Result<Self> {
         let channel_ids = cfg
             .channel_ids
             .iter()
@@ -137,6 +142,7 @@ impl DiscordChannel {
             voice_channel_ids,
             allowed_user_ids,
             http: Arc::new(OnceCell::new()),
+            serve_state,
         })
     }
 
@@ -196,7 +202,10 @@ impl Channel for DiscordChannel {
         let voice_ctx = if self.voice_channel_ids.is_empty() {
             None
         } else {
-            Some(VoiceContext::new(self.voice_channel_ids.clone()))
+            Some(VoiceContext::new(
+                self.voice_channel_ids.clone(),
+                self.serve_state.clone(),
+            ))
         };
 
         let min_backoff = std::time::Duration::from_secs(1);
