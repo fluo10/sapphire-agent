@@ -972,13 +972,14 @@ async fn run_voice_turn(
 // ---------------------------------------------------------------------------
 
 /// Outcome of [`run_llm_turn`].
-struct LlmTurnOutcome {
+pub(crate) struct LlmTurnOutcome {
     /// Final assistant text, when the turn completed successfully. `None`
     /// on provider error or when MAX_TOOL_ROUNDS was hit without resolving.
-    text: Option<String>,
+    pub(crate) text: Option<String>,
     /// True iff the session had no prior turns before this one. Used by
     /// callers to decide whether to spawn a title-generation task.
-    was_first_turn: bool,
+    #[allow(dead_code)]
+    pub(crate) was_first_turn: bool,
 }
 
 /// Execute one full LLM turn for an established session: hydrate history,
@@ -987,7 +988,11 @@ struct LlmTurnOutcome {
 /// send the final JSON-RPC result event — the caller is responsible for
 /// shaping the final payload (text reply, voice audio, etc.) and emitting
 /// the appropriate result event.
-async fn run_llm_turn(
+///
+/// In-process callers (e.g. Discord voice) that don't care about the
+/// SSE notifications pass a `tx` whose receiver they immediately
+/// drop; the `send().await` calls inside short-circuit harmlessly.
+pub(crate) async fn run_llm_turn(
     state: Arc<ServeState>,
     session_id: String,
     user_message: String,
