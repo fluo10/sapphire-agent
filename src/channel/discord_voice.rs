@@ -134,13 +134,17 @@ impl VoiceContext {
     }
 }
 
-/// songbird event handler installed per-channel. Currently logs
-/// presence transitions and speaker-level audio activity; future
-/// commits replace the log calls with VAD / STT dispatch.
+/// songbird event handler installed per-channel. Drives the
+/// presence tracker, runs per-speaker Silero VAD, and dispatches
+/// complete utterances through `run_voice_turn_buffered`.
 struct VoiceReceiver {
     channel_id: ChannelId,
     state: Arc<Mutex<ChannelState>>,
     has_human: Arc<AtomicBool>,
+    /// Shared server runtime. `None` only when voice providers
+    /// aren't configured — utterances still get logged but the
+    /// pipeline call is skipped.
+    serve_state: Option<Arc<ServeState>>,
 }
 
 #[async_trait]
@@ -168,7 +172,14 @@ impl VoiceEventHandler for VoiceReceiver {
                     };
                     // 48 kHz stereo i16 → 16 kHz mono f32.
                     let mono16k = downmix_and_resample(decoded);
-                    on_speaker_audio(&mut st, *ssrc, &mono16k, self.channel_id).await;
+                    on_speaker_audio(
+                        &mut st,
+                        *ssrc,
+                        &mono16k,
+                        self.channel_id,
+                        self.serve_state.as_ref(),
+                    )
+                    .await;
                 }
             }
             _ => {}
@@ -294,7 +305,7 @@ pub async fn on_ready(
                     .lock()
                     .await
                     .insert(channel_id, Arc::clone(&ch_state));
-                register_handlers(&call, ch_state, channel_id).await;
+                register_handlers(&call, ch_state, channel_id, voice.serve_state.clone()).await;
                 info!("discord_voice: joined {channel_id} in guild {guild_id}");
             }
             Err(e) => {
@@ -310,6 +321,7 @@ async fn register_handlers(
     call: &Arc<tokio::sync::Mutex<songbird::Call>>,
     state: Arc<Mutex<ChannelState>>,
     channel_id: ChannelId,
+    serve_state: Option<Arc<ServeState>>,
 ) {
     let has_human = {
         let st = state.lock().await;
@@ -319,6 +331,7 @@ async fn register_handlers(
         channel_id,
         state,
         has_human,
+        serve_state,
     };
     let mut call = call.lock().await;
     call.add_global_event(
@@ -333,6 +346,7 @@ fn receiver_clone(r: &VoiceReceiver) -> VoiceReceiver {
         channel_id: r.channel_id,
         state: Arc::clone(&r.state),
         has_human: Arc::clone(&r.has_human),
+        serve_state: r.serve_state.clone(),
     }
 }
 
@@ -386,6 +400,7 @@ async fn on_speaker_audio(
     ssrc: u32,
     samples_16k_f32: &[f32],
     channel_id: ChannelId,
+    serve_state: Option<&Arc<ServeState>>,
 ) {
     let speaker = match ch.speakers.entry(ssrc) {
         std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
@@ -417,22 +432,93 @@ async fn on_speaker_audio(
                 .map(|u| format!("user {u}"))
                 .unwrap_or_else(|| format!("ssrc {ssrc}"));
             info!(
-                "discord_voice {channel_id}: utterance from {user_str} ({:.2}s, {} samples) \
-                 — TODO: dispatch to voice pipeline",
+                "discord_voice {channel_id}: utterance from {user_str} ({:.2}s, {} samples)",
                 samples.len() as f32 / PIPELINE_SAMPLE_RATE as f32,
                 samples.len()
             );
-            // TODO(next commit): convert `samples` (f32 mono 16k) to
-            // i16 and hand to the shared run_voice_turn. Audio reply
-            // comes back as PCM chunks that we feed into a songbird
-            // track for playback.
+            if let Some(state) = serve_state {
+                dispatch_utterance(Arc::clone(state), channel_id, samples);
+            }
         }
     }
 
     #[cfg(not(feature = "voice-sherpa"))]
     {
-        let _ = (samples_16k_f32, channel_id, speaker);
+        let _ = (samples_16k_f32, channel_id, speaker, serve_state);
         // Without voice-sherpa: VAD is not available, so we just
-        // buffer + drop. Log throttling to avoid spam.
+        // buffer + drop.
     }
+}
+
+/// Spawn a dispatch task for one VAD-complete utterance. Resolves
+/// the channel's `room_profile`, pins it on a deterministic
+/// per-channel session id, and hands the audio to
+/// `run_voice_turn_buffered`.
+///
+/// Errors are logged but never propagated — Discord voice is a
+/// best-effort fire-and-forget feed; a failed turn should not
+/// block subsequent speech from getting through.
+#[cfg(feature = "voice-sherpa")]
+fn dispatch_utterance(state: Arc<ServeState>, channel_id: ChannelId, samples_f32: Vec<f32>) {
+    use crate::voice::pipeline::run_voice_turn_buffered;
+
+    let room_id = channel_id.get().to_string();
+    let (rp_name, _rp) = match state.config.room_profile_for(&room_id) {
+        Some(t) => (t.0.to_string(), t.1),
+        None => {
+            warn!(
+                "discord_voice {channel_id}: no room_profile matches room id; dropping utterance"
+            );
+            return;
+        }
+    };
+
+    // Per-channel deterministic session id. Same channel → same
+    // session file across restarts; different voice channels keep
+    // their threads separate. session_policy on the room_profile
+    // still controls reset / compact / none behavior.
+    let session_id = format!("voice-discord-{}", channel_id.get());
+
+    // f32 mono [-1,1] → i16 mono.
+    let pcm_i16: Vec<i16> = samples_f32
+        .iter()
+        .map(|&s| {
+            let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i32;
+            v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+        })
+        .collect();
+
+    tokio::spawn(async move {
+        // Pin the session → room_profile so run_llm_turn picks up
+        // the right LLM profile + memory namespace + voice config.
+        state
+            .session_room_profiles
+            .lock()
+            .await
+            .insert(session_id.clone(), rp_name.clone());
+
+        match run_voice_turn_buffered(
+            Arc::clone(&state),
+            session_id.clone(),
+            pcm_i16,
+            None,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                info!(
+                    "discord_voice {channel_id}: turn complete (transcript={:?}, reply_chars={}, audio_samples={})",
+                    outcome.transcript,
+                    outcome.assistant_text.len(),
+                    outcome.audio_pcm_16k.len(),
+                );
+                // TODO(next commit): hand `outcome.audio_pcm_16k` to
+                // songbird Call::play() — needs PCM 16k → 48k stereo
+                // upsample and a TrackHandle stashed in ChannelState.
+            }
+            Err(e) => {
+                warn!("discord_voice {channel_id}: voice turn failed: {e:#}");
+            }
+        }
+    });
 }
