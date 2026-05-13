@@ -16,6 +16,7 @@
 //! validate at registration time; non-16kHz providers are not supported
 //! in v1.
 
+pub mod pipeline;
 pub mod stt;
 pub mod tts;
 #[cfg(feature = "voice-sherpa")]
