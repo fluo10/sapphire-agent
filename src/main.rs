@@ -13,6 +13,7 @@ mod provider;
 mod serve;
 mod session;
 mod tools;
+mod voice;
 mod workspace;
 
 use agent::Agent;
@@ -471,15 +472,32 @@ async fn main() -> Result<()> {
                     })
                     .unwrap_or_else(|| "127.0.0.1:9000".to_string());
 
-                serve::run(
-                    addr,
+                let voice_providers = if config.stt_providers.is_empty()
+                    && config.tts_providers.is_empty()
+                {
+                    None
+                } else {
+                    // Voice provider construction may download model bundles
+                    // through `reqwest::blocking`, which spawns its own tokio
+                    // runtime. Offload to the blocking pool so the inner
+                    // runtime can be dropped outside our #[tokio::main].
+                    let cfg = config.clone();
+                    let providers =
+                        tokio::task::spawn_blocking(move || voice::VoiceProviders::from_config(&cfg))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("voice provider init panicked: {e}"))??;
+                    Some(Arc::new(providers))
+                };
+
+                let serve_state = Arc::new(serve::ServeState::new(
                     config,
                     Arc::clone(&registry),
                     workspace,
                     tool_set,
                     api_session_store,
-                )
-                .await?;
+                    voice_providers,
+                ));
+                serve::run(addr, serve_state).await?;
             }
 
             // Wait for the agent task's graceful shutdown to finish so its

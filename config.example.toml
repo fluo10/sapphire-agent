@@ -167,3 +167,74 @@ system_prompt = "You are a helpful personal assistant."
 # namespace because sapphire-workspace 0.10.x has no path_prefix filter.
 # Contamination prevention is digest- and MEMORY.md-only in this
 # release; retrieve hits may still leak across namespaces.
+
+# ─────────────────────────────────────────────────────────────────────
+# Voice pipeline (optional)
+# ─────────────────────────────────────────────────────────────────────
+# Enables the `voice/pipeline_run` MCP method used by `sapphire-call
+# voice`. Each room_profile can opt in via `voice_pipeline = "<name>"`.
+# Without these blocks the method returns -32601 "Method not found".
+#
+# Local STT and TTS require the `voice-sherpa` cargo feature:
+#     cargo build --release --features voice-sherpa
+# OpenAI TTS works without it — pure HTTP, no native build. The
+# `openai_tts` provider talks to OpenAI's `/v1/audio/speech` endpoint
+# and to any self-hosted server that speaks the same shape (e.g. an
+# Irodori-TTS fork with an OpenAI-compatible shim).
+#
+# [voice_pipeline.default]
+# stt_provider   = "sense_voice"
+# tts_provider   = "openai_remote"
+# language       = "ja"             # BCP-47 hint; client param overrides
+# capture_max_ms = 30000            # server-side hard cap, default 30s
+#
+# [stt_provider.sense_voice]        # requires --features voice-sherpa
+# type   = "sherpa_onnx"
+# kind   = "sense_voice"            # multi-lingual zh/en/ja/ko/yue
+# model  = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+# # If `model_dir` is set it takes precedence over the bundle name.
+# # model_dir = "~/.local/share/sapphire-agent/voice-models/..."
+#
+# [stt_provider.mock_stt]           # testing only
+# type       = "mock"
+# transcript = "test transcript"
+#
+# [tts_provider.openai_remote]      # OpenAI public endpoint
+# type        = "openai_tts"
+# api_key_env = "OPENAI_API_KEY"    # required for the public endpoint
+# # base_url defaults to https://api.openai.com
+# # model    = "tts-1"              # or "tts-1-hd"
+# # voice    = "alloy"              # alloy / echo / fable / onyx / nova / shimmer
+#
+# [tts_provider.openai_selfhosted]  # any OpenAI-compatible self-hosted shim
+# type     = "openai_tts"
+# base_url = "https://irodori-tts-api.example.net"
+# # api_key_env omitted → no Authorization header sent
+# # model / voice: pass through whatever the fork's catalogue defines
+#
+# [tts_provider.vits_ja]            # local TTS, requires --features voice-sherpa
+# type   = "sherpa_onnx"
+# kind   = "vits"
+# model  = "vits-melo-tts-zh_en"    # placeholder — pick a ja-capable VITS bundle
+# speaker_id = 0
+# speed      = 1.0
+#
+# [tts_provider.mock_tts]           # synthetic sine wave; testing only
+# type         = "mock"
+# duration_ms  = 200
+# frequency_hz = 440
+#
+# [room_profile.home_voice]
+# profile          = "casual"
+# voice_pipeline   = "default"
+# rooms            = []             # MCP-only; not bound to chat rooms
+#
+# # ── Voice-mode global settings ───────────────────────────────────────
+# # AI-name wake words can't be served by pre-trained KWS bundles
+# # (their vocabulary is finite), so custom openWakeWord ONNXes are
+# # the only path. Train externally with
+# # https://github.com/dscripka/openWakeWord, drop the .onnx on the
+# # server, point `wake_word_model` at it, restart. Every connected
+# # satellite fetches the bytes via voice/config and caches by SHA-256.
+# [voice]
+# wake_word_model = "/srv/sapphire/wake-models/saphina-v1.onnx"

@@ -105,6 +105,19 @@ pub struct Config {
     /// Periodic log digest configuration (weekly / monthly / yearly).
     #[serde(default)]
     pub digest: DigestConfig,
+    /// Voice pipeline presets, referenced by `[room_profile.<n>].voice_pipeline`.
+    #[serde(default, rename = "voice_pipeline")]
+    pub voice_pipelines: HashMap<String, VoicePipelineConfig>,
+    /// Named STT providers, referenced by `[voice_pipeline.<n>].stt_provider`.
+    #[serde(default, rename = "stt_provider")]
+    pub stt_providers: HashMap<String, SttProviderConfig>,
+    /// Named TTS providers, referenced by `[voice_pipeline.<n>].tts_provider`.
+    #[serde(default, rename = "tts_provider")]
+    pub tts_providers: HashMap<String, TtsProviderConfig>,
+    /// Global voice settings — `wake_word_model` etc. Same for every
+    /// satellite regardless of which room_profile they connect to.
+    #[serde(default)]
+    pub voice: VoiceConfig,
 }
 
 fn default_true() -> bool {
@@ -161,6 +174,26 @@ pub struct RoomProfileConfig {
     /// usable from API sessions only — no channel rooms map to it.
     #[serde(default)]
     pub rooms: Vec<String>,
+    /// Voice pipeline preset (in `[voice_pipeline.<n>]`) used when the
+    /// MCP `voice/pipeline_run` method targets this room profile.
+    /// Absent means voice is disabled for this room profile.
+    #[serde(default)]
+    pub voice_pipeline: Option<String>,
+}
+
+/// Voice-mode global settings — everything that's the same for every
+/// satellite regardless of which room_profile they connect to.
+/// Currently just the wake-word ONNX path; future global voice
+/// knobs (default language, sample rate overrides, etc.) land here.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct VoiceConfig {
+    /// Path to an openWakeWord-trained `.onnx` classifier. Loaded
+    /// once at startup, distributed to satellites inline in the
+    /// `voice/config` response. AI-name wake words can't realistically
+    /// be served by pre-trained KWS bundles (their vocabulary is
+    /// finite), so custom openWakeWord ONNXes are the only path.
+    #[serde(default)]
+    pub wake_word_model: Option<String>,
 }
 
 /// Definition of an additional LLM provider.
@@ -218,6 +251,211 @@ pub struct MemoryNamespaceConfig {
     ///   3. plain Anthropic
     #[serde(default)]
     pub background_profile: Option<String>,
+}
+
+/// Voice pipeline preset — references a named STT provider and TTS provider
+/// plus per-pipeline defaults (language, capture limits). Bound to a
+/// `[room_profile.<n>]` via that profile's `voice_pipeline` field.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VoicePipelineConfig {
+    /// Name of the entry in `[stt_provider.<n>]`.
+    pub stt_provider: String,
+    /// Name of the entry in `[tts_provider.<n>]`.
+    pub tts_provider: String,
+    /// BCP-47 language hint passed to STT when the caller omits one.
+    /// `None` lets the provider auto-detect (whisper) or use its own default.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Hard cap on a single utterance, in milliseconds. Helps reject
+    /// runaway clients that forget to stop. Default: 30 seconds.
+    #[serde(default = "default_capture_max_ms")]
+    pub capture_max_ms: u32,
+}
+
+fn default_capture_max_ms() -> u32 {
+    30_000
+}
+
+/// STT provider definition. Tagged by `type` so future providers (e.g.
+/// Deepgram, AssemblyAI) can be added without breaking config.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum SttProviderConfig {
+    /// Local STT via the official sherpa-onnx Rust crate.
+    ///
+    /// Requires building with `--features voice-sherpa`. Model family
+    /// (SenseVoice, Whisper, Paraformer, …) is determined by `kind`;
+    /// the bundle is auto-downloaded from sherpa-onnx GitHub releases
+    /// when `model` is a known bundle name and `model_dir` is absent.
+    #[serde(rename = "sherpa_onnx")]
+    SherpaOnnx(SherpaSttConfig),
+    /// OpenAI Whisper API (audio/transcriptions).
+    #[serde(rename = "openai_whisper_api")]
+    OpenAiWhisperApi {
+        /// Environment variable holding the API key.
+        api_key_env: String,
+        /// Optional base URL override (for OpenAI-compatible endpoints
+        /// like Groq, OpenRouter). Defaults to OpenAI's public endpoint.
+        #[serde(default)]
+        base_url: Option<String>,
+        /// Model name. Defaults to `whisper-1` when omitted.
+        #[serde(default)]
+        model: Option<String>,
+    },
+    /// Deterministic mock — always returns the same configured text.
+    /// Useful for testing the pipeline plumbing without any model setup.
+    #[serde(rename = "mock")]
+    Mock {
+        /// Text to return for every transcription. Default: `"test transcript"`.
+        #[serde(default = "default_mock_transcript")]
+        transcript: String,
+    },
+}
+
+fn default_mock_transcript() -> String {
+    "test transcript".to_string()
+}
+
+/// Configuration for the sherpa-onnx STT provider.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SherpaSttConfig {
+    /// Model family. Each family has a different on-disk layout that
+    /// sherpa-onnx expects; this tells the wrapper which fields to set.
+    pub kind: SherpaSttKind,
+    /// Either a known bundle name (auto-downloaded to the cache dir)
+    /// or an explicit path to an extracted model directory. When both
+    /// `model` and `model_dir` are set, `model_dir` wins.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Explicit path to an extracted model directory. Takes precedence
+    /// over `model` when both are present.
+    #[serde(default)]
+    pub model_dir: Option<String>,
+    /// BCP-47 language hint passed to model families that accept one
+    /// (SenseVoice, Whisper). Ignored by others.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Number of CPU threads used for inference. Default: 2.
+    #[serde(default = "default_sherpa_num_threads")]
+    pub num_threads: i32,
+    /// ONNX runtime provider (`cpu`, `cuda`, `coreml`). Default: `cpu`.
+    #[serde(default = "default_sherpa_provider")]
+    pub provider: String,
+}
+
+fn default_sherpa_num_threads() -> i32 {
+    2
+}
+
+fn default_sherpa_provider() -> String {
+    "cpu".to_string()
+}
+
+/// Model families supported by the sherpa-onnx STT provider.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SherpaSttKind {
+    /// SenseVoice — multilingual (zh/en/ja/ko/yue), recommended default.
+    SenseVoice,
+    /// OpenAI Whisper running on the sherpa-onnx runtime.
+    Whisper,
+}
+
+/// TTS provider definition. Tagged by `type` so we can add `piper_shell`,
+/// `elevenlabs`, etc. without breaking config.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum TtsProviderConfig {
+    /// OpenAI Audio Speech (`POST /v1/audio/speech`). Works against
+    /// OpenAI's public endpoint and any self-hosted server that
+    /// speaks the same request shape (e.g. forks of Irodori-TTS
+    /// exposing an OpenAI-compatible TTS API).
+    #[serde(rename = "openai_tts")]
+    OpenAiTts {
+        /// Environment variable holding the API key. Optional —
+        /// when omitted, no `Authorization` header is sent, which
+        /// is what self-hosted endpoints without auth want. For
+        /// OpenAI's real endpoint this must be set.
+        #[serde(default)]
+        api_key_env: Option<String>,
+        /// Optional base URL override. Defaults to OpenAI's public
+        /// endpoint (`https://api.openai.com`).
+        #[serde(default)]
+        base_url: Option<String>,
+        /// Model name. Defaults to `tts-1` when omitted.
+        #[serde(default)]
+        model: Option<String>,
+        /// Voice name. Defaults to `alloy`. For OpenAI: one of
+        /// `alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`.
+        /// Self-hosted endpoints accept whatever voice id they
+        /// expose (the field is passed through verbatim).
+        #[serde(default)]
+        voice: Option<String>,
+    },
+    /// Synthetic mock — returns a fixed-length sine wave. Useful for
+    /// testing the pipeline plumbing without any model setup.
+    #[serde(rename = "mock")]
+    Mock {
+        /// Duration of the generated tone in milliseconds. Default: 200ms.
+        #[serde(default = "default_mock_duration_ms")]
+        duration_ms: u32,
+        /// Tone frequency in Hz. Default: 440Hz.
+        #[serde(default = "default_mock_freq_hz")]
+        frequency_hz: u32,
+    },
+    /// Local TTS via the official sherpa-onnx Rust crate. Requires
+    /// building with `--features voice-sherpa`. Bundle is auto-downloaded
+    /// from sherpa-onnx GitHub releases when `model` is a known name
+    /// and `model_dir` is absent.
+    #[serde(rename = "sherpa_onnx")]
+    SherpaOnnx(SherpaTtsConfig),
+}
+
+fn default_mock_duration_ms() -> u32 {
+    200
+}
+
+fn default_mock_freq_hz() -> u32 {
+    440
+}
+
+/// Configuration for the sherpa-onnx TTS provider.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SherpaTtsConfig {
+    /// Model family — determines how the on-disk files are wired up.
+    pub kind: SherpaTtsKind,
+    /// Bundle name (auto-downloaded) or path. Either `model` or
+    /// `model_dir` must be set; `model_dir` wins when both are.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_dir: Option<String>,
+    /// Speaker id for multi-speaker models. Default: 0.
+    #[serde(default)]
+    pub speaker_id: i32,
+    /// Synthesis speed (1.0 = normal, <1.0 = slower, >1.0 = faster).
+    #[serde(default = "default_tts_speed")]
+    pub speed: f32,
+    #[serde(default = "default_sherpa_num_threads")]
+    pub num_threads: i32,
+    #[serde(default = "default_sherpa_provider")]
+    pub provider: String,
+}
+
+fn default_tts_speed() -> f32 {
+    1.0
+}
+
+/// Model families supported by the sherpa-onnx TTS provider.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SherpaTtsKind {
+    /// VITS — broad language coverage, single ONNX model file.
+    Vits,
+    /// Matcha — Flow Matching, needs a separate vocoder.
+    Matcha,
+    /// Kokoro — multilingual flow-matching, voice embeddings file.
+    Kokoro,
 }
 
 /// Built-in name of the Anthropic provider — referenced by profiles.
@@ -372,7 +610,13 @@ pub struct DiscordConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicConfig {
-    pub api_key: String,
+    /// Anthropic API key. Optional — when omitted (or commented out)
+    /// the value is read from the `ANTHROPIC_API_KEY` environment
+    /// variable at provider-construction time. Keeping the field
+    /// optional lets test configs sit in the repo with no secret
+    /// material on disk.
+    #[serde(default)]
+    pub api_key: Option<String>,
     #[serde(default = "default_model")]
     pub model: String,
     /// Cheaper model for casual (non-coding) conversations.
@@ -382,6 +626,34 @@ pub struct AnthropicConfig {
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     pub system_prompt: Option<String>,
+}
+
+/// Env var consulted when `[anthropic].api_key` is absent.
+pub const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+
+impl AnthropicConfig {
+    /// Return the effective API key, falling back to
+    /// [`ANTHROPIC_API_KEY_ENV`] when the config field is absent or
+    /// blank. Errors with a clear message when neither is set so the
+    /// failure surfaces at startup rather than as an opaque 401 from
+    /// the API.
+    pub fn resolve_api_key(&self) -> Result<String> {
+        let from_config = self
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(key) = from_config {
+            return Ok(key.to_string());
+        }
+        match std::env::var(ANTHROPIC_API_KEY_ENV) {
+            Ok(v) if !v.trim().is_empty() => Ok(v),
+            _ => Err(anyhow::anyhow!(
+                "no Anthropic API key found: set [anthropic].api_key in config or \
+                 the {ANTHROPIC_API_KEY_ENV} environment variable"
+            )),
+        }
+    }
 }
 
 /// Context compression configuration (provider-agnostic).
@@ -662,6 +934,41 @@ impl Config {
                 ));
             }
         }
+        // Voice pipeline references.
+        for (rp_name, rp) in &self.room_profiles {
+            if let Some(vp) = &rp.voice_pipeline {
+                if !self.voice_pipelines.contains_key(vp) {
+                    errors.push(format!(
+                        "room_profile '{rp_name}' references unknown voice_pipeline '{vp}'"
+                    ));
+                }
+            }
+        }
+        // Global [voice].wake_word_model must point at a real file so
+        // typos surface at server startup rather than as a 500 on the
+        // first satellite voice/config call.
+        if let Some(path) = &self.voice.wake_word_model {
+            let expanded = shellexpand::tilde(path);
+            if !std::path::Path::new(expanded.as_ref()).is_file() {
+                errors.push(format!(
+                    "voice.wake_word_model = '{path}' is not an existing file"
+                ));
+            }
+        }
+        for (vp_name, vp) in &self.voice_pipelines {
+            if !self.stt_providers.contains_key(&vp.stt_provider) {
+                errors.push(format!(
+                    "voice_pipeline '{vp_name}' references unknown stt_provider '{}'",
+                    vp.stt_provider
+                ));
+            }
+            if !self.tts_providers.contains_key(&vp.tts_provider) {
+                errors.push(format!(
+                    "voice_pipeline '{vp_name}' references unknown tts_provider '{}'",
+                    vp.tts_provider
+                ));
+            }
+        }
         errors
     }
 
@@ -789,6 +1096,16 @@ impl Config {
             }
         }
         out.into_iter().collect()
+    }
+
+    /// Voice pipeline preset for the given room profile name, if any.
+    /// Returns `None` when the room profile is unknown or has no
+    /// `voice_pipeline` set.
+    pub fn voice_pipeline_for_room_profile(&self, name: &str) -> Option<&VoicePipelineConfig> {
+        self.room_profiles
+            .get(name)
+            .and_then(|rp| rp.voice_pipeline.as_ref())
+            .and_then(|vp_name| self.voice_pipelines.get(vp_name))
     }
 
     /// Resolve the default config path: `~/.config/sapphire-agent/config.toml`
@@ -987,6 +1304,35 @@ rooms   = ["!x:srv"]
             "validation errors: {:?}",
             cfg.validate_profiles()
         );
+    }
+
+    /// Smoke check that every TOML under `test-configs/` parses and
+    /// validates. These files are documentation templates the user
+    /// copies into place for manual end-to-end runs; if they break
+    /// we want to know before they're copy-pasted, not after.
+    #[test]
+    fn test_configs_parse_and_validate() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-configs");
+        let entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read_dir({}) failed: {e}", dir.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        assert!(
+            !entries.is_empty(),
+            "test-configs/ must contain at least one .toml"
+        );
+        for path in entries {
+            let cfg = Config::load(&path)
+                .unwrap_or_else(|e| panic!("{} failed to parse: {e:#}", path.display()));
+            let errs = cfg.validate_profiles();
+            assert!(
+                errs.is_empty(),
+                "{} validation errors: {:?}",
+                path.display(),
+                errs
+            );
+        }
     }
 
     #[test]
@@ -1233,6 +1579,187 @@ include = ["user"]
         assert!(all.contains(&"default".to_string()));
         assert!(all.contains(&"user".to_string()));
         assert!(all.contains(&"user_nsfw".to_string()));
+    }
+
+    #[test]
+    fn voice_pipeline_config_parses_and_validates() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.casual]
+provider = "anthropic"
+
+[voice_pipeline.default]
+stt_provider = "sense_voice"
+tts_provider = "irodori"
+language     = "ja"
+
+[stt_provider.sense_voice]
+type  = "sherpa_onnx"
+kind  = "sense_voice"
+model = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+
+[tts_provider.irodori]
+type        = "openai_tts"
+base_url    = "https://irodori-tts-api.home.fireturtle.net"
+model       = "tts-1"
+voice       = "alloy"
+
+[room_profile.home]
+profile        = "casual"
+voice_pipeline = "default"
+rooms          = []
+"#,
+        );
+        assert!(
+            cfg.validate_profiles().is_empty(),
+            "errors: {:?}",
+            cfg.validate_profiles()
+        );
+        let vp = cfg
+            .voice_pipeline_for_room_profile("home")
+            .expect("voice pipeline resolved");
+        assert_eq!(vp.stt_provider, "sense_voice");
+        assert_eq!(vp.tts_provider, "irodori");
+        assert_eq!(vp.language.as_deref(), Some("ja"));
+        assert_eq!(vp.capture_max_ms, 30_000); // default
+    }
+
+    #[test]
+    fn sherpa_stt_config_round_trips_with_defaults() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[stt_provider.sense_voice]
+type   = "sherpa_onnx"
+kind   = "sense_voice"
+model  = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+"#,
+        );
+        let stt = cfg
+            .stt_providers
+            .get("sense_voice")
+            .expect("provider parses");
+        match stt {
+            SttProviderConfig::SherpaOnnx(s) => {
+                assert!(matches!(s.kind, SherpaSttKind::SenseVoice));
+                assert_eq!(s.model.as_deref(), Some("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"));
+                assert_eq!(s.num_threads, 2);
+                assert_eq!(s.provider, "cpu");
+                assert!(s.language.is_none());
+            }
+            _ => panic!("expected SherpaOnnx variant"),
+        }
+    }
+
+    #[test]
+    fn sherpa_tts_config_round_trips_with_defaults() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[tts_provider.vits_ja]
+type        = "sherpa_onnx"
+kind        = "vits"
+model       = "vits-someone-2024"
+speaker_id  = 3
+speed       = 1.2
+"#,
+        );
+        let tts = cfg
+            .tts_providers
+            .get("vits_ja")
+            .expect("provider parses");
+        match tts {
+            TtsProviderConfig::SherpaOnnx(s) => {
+                assert!(matches!(s.kind, SherpaTtsKind::Vits));
+                assert_eq!(s.speaker_id, 3);
+                assert_eq!(s.speed, 1.2);
+                assert_eq!(s.num_threads, 2);
+                assert_eq!(s.provider, "cpu");
+            }
+            _ => panic!("expected SherpaOnnx variant"),
+        }
+    }
+
+    #[test]
+    fn voice_pipeline_rejects_unknown_stt() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[voice_pipeline.default]
+stt_provider = "ghost"
+tts_provider = "irodori"
+
+[tts_provider.irodori]
+type     = "openai_tts"
+base_url = "http://localhost:8000"
+"#,
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("ghost")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn room_profile_voice_pipeline_must_exist() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.casual]
+provider = "anthropic"
+
+[room_profile.home]
+profile        = "casual"
+voice_pipeline = "ghost"
+rooms          = []
+"#,
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("ghost")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn voice_wake_word_model_defaults_to_none() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+"#,
+        );
+        assert!(cfg.voice.wake_word_model.is_none());
+    }
+
+    #[test]
+    fn voice_wake_word_model_rejects_missing_file() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[voice]
+wake_word_model = "/nonexistent/saphina.onnx"
+"#,
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("/nonexistent/saphina.onnx")),
+            "got: {errors:?}"
+        );
     }
 
     #[test]

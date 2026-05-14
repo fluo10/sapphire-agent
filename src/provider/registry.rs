@@ -37,7 +37,7 @@ impl ProviderRegistry {
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
         providers.insert(
             ANTHROPIC_PROVIDER_NAME.to_string(),
-            Arc::new(AnthropicProvider::new(&config.anthropic)),
+            Arc::new(AnthropicProvider::new(&config.anthropic)?),
         );
 
         for (name, pcfg) in &config.providers {

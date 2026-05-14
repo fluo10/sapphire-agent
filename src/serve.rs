@@ -11,6 +11,7 @@ use crate::provider::registry::ProviderRegistry;
 use crate::provider::{ChatMessage, ContentPart, Provider};
 use crate::session::{ConversationKey, SessionStore};
 use crate::tools::ToolSet;
+use crate::voice::VoiceProviders;
 use crate::workspace::Workspace;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -34,32 +35,61 @@ const MAX_TOOL_ROUNDS: usize = 10;
 // ---------------------------------------------------------------------------
 
 pub struct ServeState {
-    config: Config,
-    registry: Arc<ProviderRegistry>,
-    workspace: Arc<Workspace>,
-    tools: Arc<ToolSet>,
-    api_session_store: Arc<SessionStore>,
+    pub(crate) config: Config,
+    pub(crate) registry: Arc<ProviderRegistry>,
+    pub(crate) workspace: Arc<Workspace>,
+    pub(crate) tools: Arc<ToolSet>,
+    pub(crate) api_session_store: Arc<SessionStore>,
     /// In-memory conversation history, keyed by session_id.
     /// Lazy-loaded from JSONL on first access.
-    sessions: tokio::sync::Mutex<HashMap<String, Vec<ChatMessage>>>,
+    pub(crate) sessions: tokio::sync::Mutex<HashMap<String, Vec<ChatMessage>>>,
     /// Sessions that have been issued an ID via `initialize` but have not yet
     /// received a message — file creation is deferred until the first chat so
     /// that quitting without sending anything leaves no empty file behind.
     /// Maps internal UUID → reserved public_id (grain-id).
-    pending_sessions: tokio::sync::Mutex<HashMap<String, String>>,
+    pub(crate) pending_sessions: tokio::sync::Mutex<HashMap<String, String>>,
     /// Per-session room_profile pin from `initialize`. Sessions absent
     /// from this map fall through to the background provider. Not
     /// persisted across restarts — clients must re-pass `room_profile`
     /// on resume.
-    session_room_profiles: tokio::sync::Mutex<HashMap<String, String>>,
+    pub(crate) session_room_profiles: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Voice provider registry. `None` when no `[stt_provider.*]` /
+    /// `[tts_provider.*]` blocks are configured — in that case the
+    /// `voice/pipeline_run` method returns a method-not-available error.
+    pub(crate) voice: Option<Arc<VoiceProviders>>,
 }
 
 impl ServeState {
+    /// Construct a runtime ready for both the HTTP API server and
+    /// the in-process channel handlers (Discord voice in particular).
+    /// Shared across both so they read from the same session store /
+    /// in-memory conversation map.
+    pub fn new(
+        config: Config,
+        registry: Arc<ProviderRegistry>,
+        workspace: Arc<Workspace>,
+        tools: Arc<ToolSet>,
+        api_session_store: Arc<SessionStore>,
+        voice: Option<Arc<VoiceProviders>>,
+    ) -> Self {
+        Self {
+            config,
+            registry,
+            workspace,
+            tools,
+            api_session_store,
+            sessions: tokio::sync::Mutex::new(HashMap::new()),
+            pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
+            session_room_profiles: tokio::sync::Mutex::new(HashMap::new()),
+            voice,
+        }
+    }
+
     /// Provider that should serve the given session. Resolves the
     /// session's pinned room_profile to its `profile`, then to a
     /// concrete provider (with optional refusal fallback). Falls back
     /// to the background provider when no room_profile is pinned.
-    async fn provider_for_session(&self, session_id: &str) -> Arc<dyn Provider> {
+    pub(crate) async fn provider_for_session(&self, session_id: &str) -> Arc<dyn Provider> {
         let rp_name = self
             .session_room_profiles
             .lock()
@@ -128,22 +158,8 @@ fn error_event(id: &Value, code: i32, message: &str) -> Event {
 
 pub async fn run(
     addr: String,
-    config: Config,
-    registry: Arc<ProviderRegistry>,
-    workspace: Arc<Workspace>,
-    tools: Arc<ToolSet>,
-    api_session_store: Arc<SessionStore>,
+    state: Arc<ServeState>,
 ) -> anyhow::Result<()> {
-    let state = Arc::new(ServeState {
-        config,
-        registry,
-        workspace,
-        tools,
-        api_session_store,
-        sessions: tokio::sync::Mutex::new(HashMap::new()),
-        pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
-        session_room_profiles: tokio::sync::Mutex::new(HashMap::new()),
-    });
 
     let app = Router::new()
         .route("/mcp", post(mcp_post).get(mcp_get))
@@ -221,6 +237,10 @@ async fn mcp_post(
         "chat" => handle_chat(state, req_id, req.params, session_id).await,
         "list_sessions" => handle_list_sessions(state, req_id).await,
         "get_session" => handle_get_session(state, req_id, session_id).await,
+        "voice/config" => handle_voice_config(state, req_id, req.params).await,
+        "voice/pipeline_run" => {
+            handle_voice_pipeline_run(state, req_id, req.params).await
+        }
         _ => {
             let body = error_response(req_id, -32601, "Method not found");
             body.into_response()
@@ -509,16 +529,471 @@ async fn handle_get_session(
 }
 
 // ---------------------------------------------------------------------------
+// voice/pipeline_run  — STT → LLM turn → TTS, streamed via SSE
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// voice/config — return the room_profile's wake-word + (future)
+// per-session voice settings so satellites can self-configure
+// ---------------------------------------------------------------------------
+
+async fn handle_voice_config(
+    state: Arc<ServeState>,
+    req_id: Value,
+    _params: Option<Value>,
+) -> axum::response::Response {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    // Wake-word config is global — the same Saphina (or whatever)
+    // greets the user across every room_profile. `params` is reserved
+    // for a future per-profile override but currently unused.
+    let mut result = json!({});
+    if let Some(path_str) = &state.config.voice.wake_word_model {
+        let expanded = shellexpand::tilde(path_str).into_owned();
+        match std::fs::read(&expanded) {
+            Ok(bytes) => {
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                let sha = format!("{:x}", hasher.finalize());
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let filename = std::path::Path::new(&expanded)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("wake.onnx")
+                    .to_string();
+                result["wake_word_model"] = json!({
+                    "format": "onnx_inline",
+                    "filename": filename,
+                    "sha256": sha,
+                    "data_b64": b64,
+                });
+            }
+            Err(e) => {
+                error!(
+                    "voice/config: failed to read openWakeWord model '{expanded}': {e}"
+                );
+                let body = error_response(
+                    req_id,
+                    -32603,
+                    &format!("voice.wake_word_model '{expanded}' could not be read: {e}"),
+                );
+                return body.into_response();
+            }
+        }
+    }
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": result,
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+async fn handle_voice_pipeline_run(
+    state: Arc<ServeState>,
+    req_id: Value,
+    params: Option<Value>,
+) -> axum::response::Response {
+    if state.voice.is_none() {
+        let body = error_response(
+            req_id,
+            -32601,
+            "voice/pipeline_run unavailable: no STT/TTS providers configured",
+        );
+        return body.into_response();
+    }
+
+    let params = params.unwrap_or(Value::Null);
+    let audio_b64 = match params["audio"].as_str() {
+        Some(s) => s.to_string(),
+        None => {
+            let body = error_response(req_id, -32602, "Missing params.audio (base64 PCM)");
+            return body.into_response();
+        }
+    };
+    let device_id = match params["device_id"].as_str() {
+        Some(s) => s.to_string(),
+        None => {
+            let body = error_response(req_id, -32602, "Missing params.device_id");
+            return body.into_response();
+        }
+    };
+    let room_profile = match params["room_profile"].as_str() {
+        Some(s) => s.to_string(),
+        None => {
+            let body = error_response(req_id, -32602, "Missing params.room_profile");
+            return body.into_response();
+        }
+    };
+    // Validate room_profile up front so typos surface as a clean
+    // JSON-RPC error rather than as a silent fallback to the
+    // background provider.
+    if state.config.room_profile(&room_profile).is_none() {
+        let body = error_response(
+            req_id,
+            -32602,
+            &format!("Unknown room_profile '{room_profile}'"),
+        );
+        return body.into_response();
+    }
+    let language = params["language"].as_str().map(|s| s.to_string());
+
+    // Derive a deterministic session id from (device_id, room_profile)
+    // so the satellite can resume the conversation thread across
+    // restarts / day boundaries without juggling explicit session
+    // tokens. Pin the room_profile so run_llm_turn picks up the
+    // right LLM profile + memory namespace + voice config.
+    let session_id = voice_session_id(&device_id, &room_profile);
+    state
+        .session_room_profiles
+        .lock()
+        .await
+        .insert(session_id.clone(), room_profile.clone());
+
+    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
+
+    tokio::spawn(async move {
+        run_voice_turn(state, session_id, audio_b64, language, req_id, tx).await;
+    });
+
+    let stream = ReceiverStream::new(rx);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .into_response()
+}
+
+/// Deterministic session id derived from `(device_id, room_profile)`.
+/// Always-same input ⇒ always-same id, so a satellite reconnecting
+/// after a crash or day rollover resumes the same conversation file.
+///
+/// Format: `voice-<first 16 hex chars of SHA-256>`. Filesystem-safe,
+/// unique enough for any realistic deployment.
+fn voice_session_id(device_id: &str, room_profile: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"voice:");
+    hasher.update(device_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(room_profile.as_bytes());
+    let hash = hasher.finalize();
+    let mut s = String::with_capacity(22);
+    s.push_str("voice-");
+    for b in &hash[..8] {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
+async fn run_voice_turn(
+    state: Arc<ServeState>,
+    session_id: String,
+    audio_b64: String,
+    language: Option<String>,
+    req_id: Value,
+    tx: mpsc::Sender<Result<Event, Infallible>>,
+) {
+    use base64::Engine;
+
+    let send = |evt: Event| {
+        let tx = tx.clone();
+        async move {
+            let _ = tx.send(Ok(evt)).await;
+        }
+    };
+
+    // Resolve voice providers from the session's pinned room_profile.
+    let voice_registry = match state.voice.as_ref() {
+        Some(v) => Arc::clone(v),
+        None => {
+            send(error_event(
+                &req_id,
+                -32601,
+                "voice/pipeline_run unavailable: no STT/TTS providers configured",
+            ))
+            .await;
+            return;
+        }
+    };
+
+    let rp_name = state
+        .session_room_profiles
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned();
+    let pipeline = rp_name
+        .as_deref()
+        .and_then(|n| state.config.voice_pipeline_for_room_profile(n));
+    let pipeline = match pipeline {
+        Some(p) => p.clone(),
+        None => {
+            send(error_event(
+                &req_id,
+                -32602,
+                "Session's room_profile has no voice_pipeline configured",
+            ))
+            .await;
+            return;
+        }
+    };
+    let stt = match voice_registry.stt(&pipeline.stt_provider) {
+        Some(p) => p,
+        None => {
+            send(error_event(
+                &req_id,
+                -32603,
+                &format!(
+                    "stt_provider '{}' not instantiated",
+                    pipeline.stt_provider
+                ),
+            ))
+            .await;
+            return;
+        }
+    };
+    let tts = match voice_registry.tts(&pipeline.tts_provider) {
+        Some(p) => p,
+        None => {
+            send(error_event(
+                &req_id,
+                -32603,
+                &format!(
+                    "tts_provider '{}' not instantiated",
+                    pipeline.tts_provider
+                ),
+            ))
+            .await;
+            return;
+        }
+    };
+
+    // Decode audio.
+    let audio_bytes = match base64::engine::general_purpose::STANDARD.decode(audio_b64.as_bytes()) {
+        Ok(b) => b,
+        Err(e) => {
+            send(error_event(
+                &req_id,
+                -32602,
+                &format!("Invalid base64 audio: {e}"),
+            ))
+            .await;
+            return;
+        }
+    };
+    if audio_bytes.len() % 2 != 0 {
+        send(error_event(
+            &req_id,
+            -32602,
+            "Audio byte length is not a multiple of 2 (expected s16le)",
+        ))
+        .await;
+        return;
+    }
+    let pcm: Vec<i16> = audio_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    // Stage: STT
+    info!(
+        "voice/pipeline_run: STT via '{}' ({} samples, lang={:?})",
+        stt.name(),
+        pcm.len(),
+        language.as_deref().or(pipeline.language.as_deref()),
+    );
+    send(notification_event(
+        "notifications/progress",
+        json!({"kind": "stage", "stage": "stt", "status": "start"}),
+    ))
+    .await;
+    let lang = language.as_deref().or(pipeline.language.as_deref());
+    let transcript = match stt.transcribe(&pcm, lang).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!("STT failed: {e:#}");
+            send(error_event(&req_id, -32603, &format!("STT failed: {e}"))).await;
+            return;
+        }
+    };
+    send(notification_event(
+        "notifications/progress",
+        json!({"kind": "stt_final", "text": transcript}),
+    ))
+    .await;
+    send(notification_event(
+        "notifications/progress",
+        json!({"kind": "stage", "stage": "stt", "status": "end"}),
+    ))
+    .await;
+
+    // Stage: LLM (intent)
+    send(notification_event(
+        "notifications/progress",
+        json!({"kind": "stage", "stage": "intent", "status": "start"}),
+    ))
+    .await;
+    let outcome = run_llm_turn(
+        Arc::clone(&state),
+        session_id.clone(),
+        transcript.clone(),
+        req_id.clone(),
+        tx.clone(),
+    )
+    .await;
+    send(notification_event(
+        "notifications/progress",
+        json!({"kind": "stage", "stage": "intent", "status": "end"}),
+    ))
+    .await;
+    let reply_text = match outcome.text {
+        Some(t) => t,
+        None => {
+            // run_llm_turn already emitted a provider error_event.
+            return;
+        }
+    };
+    send(notification_event(
+        "notifications/progress",
+        json!({"kind": "assistant_text", "text": reply_text}),
+    ))
+    .await;
+
+    // Stage: TTS
+    info!(
+        "voice/pipeline_run: TTS via '{}' ({} chars)",
+        tts.name(),
+        reply_text.len(),
+    );
+    send(notification_event(
+        "notifications/progress",
+        json!({"kind": "stage", "stage": "tts", "status": "start"}),
+    ))
+    .await;
+    let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<i16>>(32);
+    let reply_for_tts = reply_text.clone();
+    let synth_handle =
+        tokio::spawn(async move { tts.synthesize_stream(&reply_for_tts, pcm_tx).await });
+    let mut chunks_emitted = 0usize;
+    while let Some(chunk) = pcm_rx.recv().await {
+        let bytes: Vec<u8> = chunk
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        send(notification_event(
+            "notifications/progress",
+            json!({"kind": "audio_chunk", "data": b64}),
+        ))
+        .await;
+        chunks_emitted += 1;
+    }
+    // Surface TTS failures to the client — without this the satellite
+    // saw a silent "no audio_chunks" stream and assumed playback was
+    // empty, which looked like a text-only reply.
+    match synth_handle.await {
+        Ok(Ok(())) => {
+            if chunks_emitted == 0 {
+                warn!(
+                    "TTS returned no audio chunks (provider: {})",
+                    pipeline.tts_provider
+                );
+                send(error_event(
+                    &req_id,
+                    -32603,
+                    &format!(
+                        "TTS provider '{}' produced no audio (check fn_name / payload / audio_field)",
+                        pipeline.tts_provider
+                    ),
+                ))
+                .await;
+                return;
+            }
+        }
+        Ok(Err(e)) => {
+            error!("TTS synthesis error: {e:#}");
+            send(error_event(
+                &req_id,
+                -32603,
+                &format!("TTS synthesis failed: {e:#}"),
+            ))
+            .await;
+            return;
+        }
+        Err(join_err) => {
+            error!("TTS task panicked: {join_err}");
+            send(error_event(
+                &req_id,
+                -32603,
+                &format!("TTS task panicked: {join_err}"),
+            ))
+            .await;
+            return;
+        }
+    }
+    send(notification_event(
+        "notifications/progress",
+        json!({"kind": "stage", "stage": "tts", "status": "end"}),
+    ))
+    .await;
+
+    // Final result: transcript + reply text. Audio was streamed via
+    // progress events; no need to duplicate it here.
+    send(result_event(
+        &req_id,
+        json!({
+            "transcript": transcript,
+            "assistant_text": reply_text,
+        }),
+    ))
+    .await;
+
+    // Title generation on first turn — same as run_turn.
+    if outcome.was_first_turn {
+        let state2 = Arc::clone(&state);
+        let sid = session_id.clone();
+        let user_msg = transcript.clone();
+        let reply = reply_text.clone();
+        tokio::spawn(async move {
+            let p = state2.provider_for_session(&sid).await;
+            if let Some(title) = generate_session_title(&*p, &user_msg, &reply).await {
+                if let Err(e) = state2.api_session_store.set_title(&sid, &title) {
+                    warn!("Failed to store session title: {e}");
+                }
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Turn processing (tool-calling loop)
 // ---------------------------------------------------------------------------
 
-async fn run_turn(
+/// Outcome of [`run_llm_turn`].
+struct LlmTurnOutcome {
+    /// Final assistant text, when the turn completed successfully. `None`
+    /// on provider error or when MAX_TOOL_ROUNDS was hit without resolving.
+    text: Option<String>,
+    /// True iff the session had no prior turns before this one. Used by
+    /// callers to decide whether to spawn a title-generation task.
+    was_first_turn: bool,
+}
+
+/// Execute one full LLM turn for an established session: hydrate history,
+/// run the tool-calling loop, persist user + assistant messages to JSONL,
+/// and emit per-tool `tool_start` / `tool_end` SSE notifications. Does NOT
+/// send the final JSON-RPC result event — the caller is responsible for
+/// shaping the final payload (text reply, voice audio, etc.) and emitting
+/// the appropriate result event.
+async fn run_llm_turn(
     state: Arc<ServeState>,
     session_id: String,
     user_message: String,
     req_id: Value,
     tx: mpsc::Sender<Result<Event, Infallible>>,
-) {
+) -> LlmTurnOutcome {
     let send = |evt: Event| {
         let tx = tx.clone();
         async move {
@@ -539,7 +1014,7 @@ async fn run_turn(
             })
             .clone()
     };
-    let is_first_turn = history.is_empty();
+    let was_first_turn = history.is_empty();
 
     // 2. Ensure JSONL file exists. If this session was deferred at initialize
     //    time, commit it now using the reserved public_id.
@@ -707,8 +1182,44 @@ async fn run_turn(
         }
     };
 
-    // 6. Send final result
-    match &final_text {
+    // Update in-memory sessions map
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), history);
+
+    LlmTurnOutcome {
+        text: final_text,
+        was_first_turn,
+    }
+}
+
+async fn run_turn(
+    state: Arc<ServeState>,
+    session_id: String,
+    user_message: String,
+    req_id: Value,
+    tx: mpsc::Sender<Result<Event, Infallible>>,
+) {
+    let send = |evt: Event| {
+        let tx = tx.clone();
+        async move {
+            let _ = tx.send(Ok(evt)).await;
+        }
+    };
+
+    let outcome = run_llm_turn(
+        Arc::clone(&state),
+        session_id.clone(),
+        user_message.clone(),
+        req_id.clone(),
+        tx.clone(),
+    )
+    .await;
+
+    // Send final result
+    match &outcome.text {
         Some(text) => {
             send(result_event(&req_id, json!({ "content": text }))).await;
         }
@@ -717,16 +1228,9 @@ async fn run_turn(
         }
     }
 
-    // 7. Update in-memory sessions map
-    state
-        .sessions
-        .lock()
-        .await
-        .insert(session_id.clone(), history);
-
-    // 8. Generate and store session title after the first successful turn
-    if is_first_turn {
-        if let Some(text) = final_text {
+    // Generate and store session title after the first successful turn.
+    if outcome.was_first_turn {
+        if let Some(text) = outcome.text {
             let state2 = Arc::clone(&state);
             let sid = session_id.clone();
             let user_msg = user_message.clone();

@@ -1,0 +1,25 @@
+# Example sapphire-call configuration.
+#
+# Place at `~/.config/sapphire-call/config.toml` (XDG) for the
+# satellite to pick up automatically, or pass `--config <path>`.
+#
+# Wake-word configuration intentionally lives server-side under the
+# room_profile — see `[room_profile.<n>].wake_word` on the agent.
+# Every satellite for that room_profile fetches the same phrase via
+# `voice/config` at startup.
+
+[server]
+url          = "https://agent.example.com"
+room_profile = "home_voice"
+# session    = "abc1234"   # 7-char grain id to resume an existing session
+
+[audio]
+# Discover names via `sapphire-call voice --list-devices`. Either or
+# both may be omitted to fall back to the host's defaults.
+# input_device  = "Jabra SPEAK 510 USB"
+# output_device = "Jabra SPEAK 510 USB"
+
+[language]
+# Sent as an STT hint with each utterance. Server's voice_pipeline
+# default applies when omitted.
+# stt = "ja"

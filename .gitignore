@@ -20,3 +20,13 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 .claude
+
+# Local test rigs — bot tokens, API keys, model paths, and the
+# runtime artifacts produced when these configs are used as the
+# agent's workspace_dir all live here. Throwaway by design, never
+# tracked.
+test-configs/
+
+# macOS Finder metadata
+.DS_Store
+**/.DS_Store

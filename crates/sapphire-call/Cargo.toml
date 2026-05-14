@@ -13,8 +13,8 @@ path = "src/main.rs"
 [dependencies]
 sapphire-agent-api = { path = "../sapphire-agent-api", version = "0.5.0" }
 
-# Async runtime
-tokio.workspace = true
+# Async runtime — voice subcommand needs sync, time, and rt features.
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "signal"] }
 
 # CLI
 clap.workspace = true
@@ -24,3 +24,49 @@ anyhow.workspace = true
 
 # Logging
 tracing-subscriber.workspace = true
+
+# Audio I/O for the voice subcommand: mic capture + speaker playback.
+cpal = "0.15"
+
+# HTTP client. The blocking variant is used by the voice satellite for
+# one-shot model downloads during startup (before the tokio runtime is
+# busy with audio I/O).
+reqwest = { workspace = true, features = ["blocking"] }
+
+# Local Silero VAD + (later) keyword spotting via the official sherpa-onnx
+# Rust crate. Statically links the C++ runtime; first build is slow.
+sherpa-onnx = "1.13"
+
+# Model bundle extraction (sherpa-onnx ships tar.bz2 model archives on
+# GitHub releases).
+tar = "0.4"
+bzip2 = "0.5"
+
+# XDG cache dir resolution for downloaded models.
+directories = "6.0"
+
+# Path expansion for ~/...
+shellexpand = "3.1"
+
+# Logging — surface model downloads to the operator.
+tracing = "0.1"
+
+# Config file parsing.
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.0"
+
+# UUID v7 for the per-installation device id.
+uuid = { version = "1", features = ["v7"] }
+
+# openWakeWord runtime: ONNX runtime + ndarray. ort downloads
+# precompiled ONNX runtime binaries from pykeio's hosted mirror; this
+# is independent of sherpa-onnx-sys's statically-linked runtime so
+# the two coexist.
+ort = "2.0.0-rc.12"
+ndarray = "0.17"
+
+# SHA-256 for content-addressing the openWakeWord ONNX cache.
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

@@ -21,3 +21,11 @@ futures-util.workspace = true
 
 # Readline for the REPL (CJK-safe input, history, cursor movement)
 reedline = "0.47"
+
+# Async runtime — only the `sync` feature for mpsc::Sender used by the
+# voice event stream. The agent binary brings in more features; this
+# crate keeps it minimal.
+tokio = { workspace = true, features = ["sync"] }
+
+# Base64 encoding for PCM frames in voice/pipeline_run params.
+base64 = "0.22"
