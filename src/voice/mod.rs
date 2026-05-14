@@ -110,26 +110,17 @@ fn build_tts(name: &str, cfg: &TtsProviderConfig) -> anyhow::Result<Arc<dyn TtsP
             *duration_ms,
             *frequency_hz,
         ))),
-        TtsProviderConfig::Gradio {
+        TtsProviderConfig::OpenAiTts {
+            api_key_env,
             base_url,
-            fn_name,
-            payload,
-            audio_field,
-        } => Ok(Arc::new(providers::GradioTts::new(
+            model,
+            voice,
+        } => Ok(Arc::new(providers::OpenAiTts::new(
             name.to_string(),
-            base_url.clone(),
-            fn_name.clone(),
-            payload.clone(),
-            audio_field.clone(),
-        )?)),
-        TtsProviderConfig::OpenAiTts { .. } => {
-            anyhow::bail!(
-                "tts_provider '{name}': type = \"openai_tts\" is not yet implemented"
-            )
-        }
-        TtsProviderConfig::StyleBertVits2(cfg) => Ok(Arc::new(providers::StyleBertVits2Tts::new(
-            name.to_string(),
-            cfg.clone(),
+            api_key_env.as_deref(),
+            base_url.as_deref(),
+            model.as_deref(),
+            voice.as_deref(),
         )?)),
         TtsProviderConfig::SherpaOnnx(cfg) => {
             #[cfg(feature = "voice-sherpa")]

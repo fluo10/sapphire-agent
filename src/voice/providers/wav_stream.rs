@@ -1,8 +1,9 @@
 //! WAV-decode → mono → 16 kHz resample → 20 ms chunk streamer.
 //!
 //! Shared between every TTS provider that delivers a full WAV blob
-//! at the end of synthesis (Gradio, Style-Bert-VITS2, OpenAI TTS,
-//! etc.). Keeps the per-provider code focused on the network call.
+//! at the end of synthesis (OpenAI TTS + any HTTP TTS that responds
+//! with a WAV body). Keeps the per-provider code focused on the
+//! network call.
 
 use std::io::Cursor;
 

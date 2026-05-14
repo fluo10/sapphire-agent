@@ -232,8 +232,8 @@ impl TtsProvider for SherpaOnnxTts {
     }
 }
 
-/// Linear-interpolation resample to the fixed pipeline rate. Same
-/// approach the Gradio TTS uses — quality is fine for speech.
+/// Linear-interpolation resample to the fixed pipeline rate.
+/// Quality is fine for speech.
 fn resample_to_pipeline(input: &[i16], src_rate: u32) -> Vec<i16> {
     if input.is_empty() || src_rate == PIPELINE_SAMPLE_RATE {
         return input.to_vec();

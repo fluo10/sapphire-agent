@@ -366,52 +366,29 @@ pub enum SherpaSttKind {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum TtsProviderConfig {
-    /// Generic Gradio Web UI client. Works against any Gradio-hosted TTS
-    /// app (Irodori-TTS, Style-Bert-VITS2, etc.) — the user supplies the
-    /// endpoint name and a payload template.
-    #[serde(rename = "gradio")]
-    Gradio {
-        /// Gradio base URL (without the `/gradio_api/...` suffix), e.g.
-        /// `http://localhost:7860`.
-        base_url: String,
-        /// API endpoint name as exposed by the Gradio app. Becomes
-        /// `{base_url}/gradio_api/call/{fn_name}` — a leading `/` is
-        /// stripped. Examples: `generate`, `predict`.
-        fn_name: String,
-        /// Payload template (JSON, serialized as a string). `{{text}}`
-        /// is substituted with the utterance text at call time. Must
-        /// resolve to a `{"data": [...]}` shape per Gradio's API.
-        payload: String,
-        /// RFC 6901 JSON Pointer selecting the audio location in the
-        /// SSE `complete` event's parsed payload.
-        ///
-        /// Gradio 4.x emits a **bare JSON array** (not `{"data": [...]}`),
-        /// where each element is a component update of shape
-        /// `{"__type__": "update", "value": {...}, "visible": ...}`.
-        /// For an Audio component the inner `value` is a FileData
-        /// object with `url`, `path`, `orig_name`, etc.
-        ///
-        /// The pointer must resolve to one of:
-        ///   * a string (treated as URL or path),
-        ///   * an object with a string `url` or `path` field (auto-unwrapped).
-        ///
-        /// Typical values: `/0/value` (lets the resolver auto-unwrap
-        /// the FileData's `url`), `/0/value/url` (explicit).
-        audio_field: String,
-    },
-    /// OpenAI's `audio/speech` endpoint (`tts-1` / `tts-1-hd`).
+    /// OpenAI Audio Speech (`POST /v1/audio/speech`). Works against
+    /// OpenAI's public endpoint and any self-hosted server that
+    /// speaks the same request shape (e.g. forks of Irodori-TTS
+    /// exposing an OpenAI-compatible TTS API).
     #[serde(rename = "openai_tts")]
     OpenAiTts {
-        /// Environment variable holding the API key.
-        api_key_env: String,
-        /// Optional base URL override. Defaults to OpenAI's public endpoint.
+        /// Environment variable holding the API key. Optional —
+        /// when omitted, no `Authorization` header is sent, which
+        /// is what self-hosted endpoints without auth want. For
+        /// OpenAI's real endpoint this must be set.
+        #[serde(default)]
+        api_key_env: Option<String>,
+        /// Optional base URL override. Defaults to OpenAI's public
+        /// endpoint (`https://api.openai.com`).
         #[serde(default)]
         base_url: Option<String>,
         /// Model name. Defaults to `tts-1` when omitted.
         #[serde(default)]
         model: Option<String>,
-        /// Voice name (`alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`).
-        /// Defaults to `alloy`.
+        /// Voice name. Defaults to `alloy`. For OpenAI: one of
+        /// `alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`.
+        /// Self-hosted endpoints accept whatever voice id they
+        /// expose (the field is passed through verbatim).
         #[serde(default)]
         voice: Option<String>,
     },
@@ -432,65 +409,6 @@ pub enum TtsProviderConfig {
     /// and `model_dir` is absent.
     #[serde(rename = "sherpa_onnx")]
     SherpaOnnx(SherpaTtsConfig),
-    /// Style-Bert-VITS2 FastAPI server
-    /// (https://github.com/litagin02/Style-Bert-VITS2). Simpler API
-    /// than Gradio — single `POST /voice` returns a WAV — and the
-    /// training/merging ecosystem is more mature than Irodori-TTS's,
-    /// which makes it the practical choice for custom Japanese voices.
-    #[serde(rename = "style_bert_vits2")]
-    StyleBertVits2(StyleBertVits2Config),
-}
-
-/// Configuration for the Style-Bert-VITS2 TTS provider.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct StyleBertVits2Config {
-    /// Base URL where the SBV2 FastAPI server is reachable, e.g.
-    /// `"http://localhost:5000"`.
-    pub base_url: String,
-    /// Numeric `model_id` registered with the server. See
-    /// `GET /models/info` on the server for the list.
-    #[serde(default)]
-    pub model_id: i32,
-    /// Numeric `speaker_id` within the chosen model.
-    #[serde(default)]
-    pub speaker_id: i32,
-    /// Style name (defaults to the model's default style when omitted).
-    #[serde(default)]
-    pub style: Option<String>,
-    /// Style strength (1.0 = neutral; higher exaggerates).
-    #[serde(default = "default_sbv2_style_weight")]
-    pub style_weight: f32,
-    /// BCP-47 language ("JP", "EN", "ZH" per SBV2 convention).
-    #[serde(default)]
-    pub language: Option<String>,
-    /// Speaking rate (1.0 = normal; <1.0 slower, >1.0 faster).
-    #[serde(default = "default_sbv2_length")]
-    pub length: f32,
-    /// SDP ratio (0.0–1.0). Default 0.2 per SBV2 README.
-    #[serde(default = "default_sbv2_sdp_ratio")]
-    pub sdp_ratio: f32,
-    /// Noise scale (prosody jitter). Default 0.6.
-    #[serde(default = "default_sbv2_noise")]
-    pub noise: f32,
-    /// Noise-w scale (cadence jitter). Default 0.8.
-    #[serde(default = "default_sbv2_noisew")]
-    pub noisew: f32,
-}
-
-fn default_sbv2_style_weight() -> f32 {
-    1.0
-}
-fn default_sbv2_length() -> f32 {
-    1.0
-}
-fn default_sbv2_sdp_ratio() -> f32 {
-    0.2
-}
-fn default_sbv2_noise() -> f32 {
-    0.6
-}
-fn default_sbv2_noisew() -> f32 {
-    0.8
 }
 
 fn default_mock_duration_ms() -> u32 {
@@ -1707,11 +1625,10 @@ kind  = "sense_voice"
 model = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 
 [tts_provider.irodori]
-type        = "gradio"
-base_url    = "http://localhost:7860"
-fn_name     = "/predict"
-payload     = '{"data":["{{text}}"]}'
-audio_field = "/data/0"
+type        = "openai_tts"
+base_url    = "https://irodori-tts-api.home.fireturtle.net"
+model       = "tts-1"
+voice       = "alloy"
 
 [room_profile.home]
 profile        = "casual"
@@ -1805,11 +1722,8 @@ stt_provider = "ghost"
 tts_provider = "irodori"
 
 [tts_provider.irodori]
-type        = "gradio"
-base_url    = "http://localhost:7860"
-fn_name     = "/predict"
-payload     = '{}'
-audio_field = "/data/0"
+type     = "openai_tts"
+base_url = "http://localhost:8000"
 "#,
         );
         let errors = cfg.validate_profiles();

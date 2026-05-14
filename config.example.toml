@@ -177,12 +177,14 @@ system_prompt = "You are a helpful personal assistant."
 #
 # Local STT and TTS require the `voice-sherpa` cargo feature:
 #     cargo build --release --features voice-sherpa
-# Gradio TTS (Irodori-TTS, Style-Bert-VITS2, etc.) works without it —
-# pure HTTP, no native build.
+# OpenAI TTS works without it — pure HTTP, no native build. The
+# `openai_tts` provider talks to OpenAI's `/v1/audio/speech` endpoint
+# and to any self-hosted server that speaks the same shape (e.g. an
+# Irodori-TTS fork with an OpenAI-compatible shim).
 #
 # [voice_pipeline.default]
 # stt_provider   = "sense_voice"
-# tts_provider   = "irodori"
+# tts_provider   = "openai_remote"
 # language       = "ja"             # BCP-47 hint; client param overrides
 # capture_max_ms = 30000            # server-side hard cap, default 30s
 #
@@ -197,22 +199,18 @@ system_prompt = "You are a helpful personal assistant."
 # type       = "mock"
 # transcript = "test transcript"
 #
-# [tts_provider.irodori]            # any Gradio Web UI TTS works here
-# type        = "gradio"
-# base_url    = "http://localhost:7860"
-# fn_name     = "generate"
-# # JSON template — {{text}} is substituted with the LLM reply, escaped
-# # for JSON string context. The shape must match the Gradio app's API
-# # (check /info on the Gradio host for the exact arg list).
-# payload     = '''
-# {"data": ["{{text}}", null, 40, 1, "", "independent", 3.0, 5.0, "", 0.5, 1.0, true, "", "", "", "", "0.9", ""]}
-# '''
-# # RFC 6901 JSON Pointer into the SSE `complete` event's bare array
-# # (note: bare array — Gradio 4.x doesn't wrap in {"data": ...}).
-# # Each element is {"__type__":"update","value":{...},"visible":...};
-# # for Audio outputs the inner `value` is {url, path, orig_name, ...}
-# # and our resolver auto-unwraps `url` from objects with that field.
-# audio_field = "/0/value"
+# [tts_provider.openai_remote]      # OpenAI public endpoint
+# type        = "openai_tts"
+# api_key_env = "OPENAI_API_KEY"    # required for the public endpoint
+# # base_url defaults to https://api.openai.com
+# # model    = "tts-1"              # or "tts-1-hd"
+# # voice    = "alloy"              # alloy / echo / fable / onyx / nova / shimmer
+#
+# [tts_provider.openai_selfhosted]  # any OpenAI-compatible self-hosted shim
+# type     = "openai_tts"
+# base_url = "https://irodori-tts-api.example.net"
+# # api_key_env omitted → no Authorization header sent
+# # model / voice: pass through whatever the fork's catalogue defines
 #
 # [tts_provider.vits_ja]            # local TTS, requires --features voice-sherpa
 # type   = "sherpa_onnx"
@@ -220,19 +218,6 @@ system_prompt = "You are a helpful personal assistant."
 # model  = "vits-melo-tts-zh_en"    # placeholder — pick a ja-capable VITS bundle
 # speaker_id = 0
 # speed      = 1.0
-#
-# [tts_provider.sbv2]               # Style-Bert-VITS2 (https://github.com/litagin02/Style-Bert-VITS2)
-# type        = "style_bert_vits2"  # simple REST API; no Gradio shenanigans
-# base_url    = "http://localhost:5000"
-# model_id    = 0                   # check GET /models/info on the server
-# speaker_id  = 0
-# # style       = "Neutral"         # optional; defaults to model's default style
-# # style_weight = 1.0
-# # language    = "JP"              # JP / EN / ZH per SBV2 convention
-# # length      = 1.0               # speaking rate (<1 slower, >1 faster)
-# # sdp_ratio   = 0.2
-# # noise       = 0.6
-# # noisew      = 0.8
 #
 # [tts_provider.mock_tts]           # synthetic sine wave; testing only
 # type         = "mock"
