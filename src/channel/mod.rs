@@ -1,5 +1,4 @@
 pub mod discord;
-pub mod discord_voice;
 pub mod matrix;
 
 use anyhow::{Result, anyhow};
