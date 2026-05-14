@@ -376,6 +376,13 @@ enum DeviceKind {
 
 /// Resolve a cpal device by exact name match, or fall back to the
 /// host's default for the requested kind.
+///
+/// Enumerates the host's device list **once** and uses that single
+/// snapshot for both the match attempt and the error report. ALSA's
+/// device probing isn't idempotent (`plughw:*` and friends open the
+/// underlying PCM during enumeration, which can fail transiently), so
+/// enumerating twice — once to match, once to report — can produce
+/// a list in the error that the matcher never actually saw.
 fn pick_device(
     host: &cpal::Host,
     name: Option<&str>,
@@ -386,18 +393,14 @@ fn pick_device(
             DeviceKind::Input => host.input_devices()?.collect(),
             DeviceKind::Output => host.output_devices()?.collect(),
         };
+        let mut seen: Vec<String> = Vec::with_capacity(candidates.len());
         for d in candidates {
-            if d.name().ok().as_deref() == Some(want) {
-                return Ok(d);
+            match d.name() {
+                Ok(n) if n == want => return Ok(d),
+                Ok(n) => seen.push(n),
+                Err(_) => {}
             }
         }
-        // Not found — list what we did see so the user can re-issue.
-        let mut seen: Vec<String> = match kind {
-            DeviceKind::Input => host.input_devices()?,
-            DeviceKind::Output => host.output_devices()?,
-        }
-        .filter_map(|d| d.name().ok())
-        .collect();
         seen.sort();
         anyhow::bail!(
             "no {} device named '{}'. Available: {}",
