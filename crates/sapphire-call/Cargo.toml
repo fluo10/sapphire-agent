@@ -26,7 +26,7 @@ anyhow.workspace = true
 tracing-subscriber.workspace = true
 
 # Audio I/O for the voice subcommand: mic capture + speaker playback.
-cpal = "0.15"
+cpal = "0.17"
 
 # HTTP client. The blocking variant is used by the voice satellite for
 # one-shot model downloads during startup (before the tokio runtime is
