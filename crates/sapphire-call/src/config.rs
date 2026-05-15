@@ -25,6 +25,13 @@ pub struct CallConfig {
     pub audio: AudioConfig,
     #[serde(default)]
     pub language: LanguageConfig,
+    /// Optional device identity sent to the agent on every session.
+    /// The agent uses these strings to tell the model "you are speaking
+    /// through the living-room speakerphone; STT may have introduced
+    /// typos" — keeps that knowledge out of AGENTS.md and lets each
+    /// satellite host describe itself.
+    #[serde(default)]
+    pub device: DeviceConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -57,6 +64,35 @@ pub struct LanguageConfig {
     /// BCP-47 hint sent to STT. Server's voice_pipeline default
     /// applies when both this and the CLI flag are absent.
     pub stt: Option<String>,
+}
+
+/// Device-identity block. Both fields are optional; when `name` is set
+/// the agent renders the session's room name as
+/// `"voice channel with <name>"` and uses `description` as the topic.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceConfig {
+    /// Short handle for this device, e.g. `"living-room-speaker"`.
+    /// The agent prefixes "voice channel with " server-side.
+    pub name: Option<String>,
+    /// Free-form description: physical location, who uses it, any
+    /// quirks (STT noise, ambient music) the agent should keep in
+    /// mind. Becomes the "room description" in the system prompt.
+    pub description: Option<String>,
+}
+
+impl DeviceConfig {
+    /// Convert into the API crate's wire-format struct. Empty when no
+    /// field is set so we don't send a meaningless `device: {}` block.
+    pub fn to_api(&self) -> Option<sapphire_agent_api::DeviceMetadata> {
+        if self.name.is_none() && self.description.is_none() {
+            return None;
+        }
+        Some(sapphire_agent_api::DeviceMetadata {
+            name: self.name.clone(),
+            description: self.description.clone(),
+        })
+    }
 }
 
 impl CallConfig {
@@ -109,6 +145,10 @@ output_device = "Jabra SPEAK 510 USB"
 
 [language]
 stt = "ja"
+
+[device]
+name = "living-room-speaker"
+description = "Speakerphone in the living room; STT may produce typos"
 "#;
         let cfg: CallConfig = toml::from_str(raw).unwrap();
         assert_eq!(cfg.server.room_profile.as_deref(), Some("home_voice"));
@@ -117,6 +157,8 @@ stt = "ja"
             Some("Jabra SPEAK 510 USB")
         );
         assert_eq!(cfg.language.stt.as_deref(), Some("ja"));
+        assert_eq!(cfg.device.name.as_deref(), Some("living-room-speaker"));
+        assert!(cfg.device.description.is_some());
     }
 
     #[test]

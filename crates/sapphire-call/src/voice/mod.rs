@@ -57,6 +57,9 @@ pub struct VoiceOptions {
     /// Pin playback to the cpal device with this exact name; None ⇒
     /// `default_output_device()`.
     pub output_device: Option<String>,
+    /// Optional device identity sent in every `voice/pipeline_run` so the
+    /// agent can render "voice channel with <name>" in the system prompt.
+    pub device: Option<sapphire_agent_api::DeviceMetadata>,
 }
 
 /// Entry point for `sapphire-call voice`.
@@ -199,6 +202,7 @@ pub async fn run(
         device_id,
         room_profile,
         language: options.language,
+        device: options.device,
         shutdown,
         vad,
         wake: wake_detector,
@@ -221,6 +225,7 @@ struct ListenCtx {
     device_id: String,
     room_profile: String,
     language: Option<String>,
+    device: Option<sapphire_agent_api::DeviceMetadata>,
     shutdown: Arc<AtomicBool>,
     vad: VoiceActivityDetector,
     /// `Some` enables wake-word mode; the satellite gates VAD behind
@@ -301,6 +306,7 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
                 &ctx.room_profile,
                 &utterance,
                 ctx.language.as_deref(),
+                ctx.device.as_ref(),
                 Arc::clone(&ctx.playback_queue),
                 ctx.output_rate,
             )
@@ -673,6 +679,7 @@ async fn process_utterance(
     room_profile: &str,
     pcm_16khz: &[i16],
     language: Option<&str>,
+    device_meta: Option<&sapphire_agent_api::DeviceMetadata>,
     playback_queue: Arc<std::sync::Mutex<VecDeque<i16>>>,
     output_rate: u32,
 ) -> Result<()> {
@@ -688,6 +695,7 @@ async fn process_utterance(
         let room = room_profile.to_string();
         let pcm = pcm_16khz.to_vec();
         let lang = language.map(String::from);
+        let device_meta = device_meta.cloned();
         async move {
             voice_pipeline_run(
                 &client,
@@ -696,6 +704,7 @@ async fn process_utterance(
                 &room,
                 &pcm,
                 lang.as_deref(),
+                device_meta.as_ref(),
                 event_tx,
             )
             .await

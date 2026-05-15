@@ -7,6 +7,7 @@
 //! `/mcp` endpoint is reserved for the future MCP server (issue #80,
 //! #79) and is intentionally not served here.
 
+use crate::channel::RoomInfo;
 use crate::config::Config;
 use crate::context_compression::{generate_summary, maybe_compress};
 use crate::provider::registry::ProviderRegistry;
@@ -55,6 +56,14 @@ pub struct ServeState {
     /// persisted across restarts — clients must re-pass `room_profile`
     /// on resume.
     pub(crate) session_room_profiles: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Per-session room metadata supplied by the client at `initialize`
+    /// (sapphire-call's `[device]` block, principally). Mirrors the
+    /// channel-side `Channel::room_info()` lookup so the agent can tell
+    /// the model "you are speaking through the living-room speaker; STT
+    /// may have introduced typos" without baking that into AGENTS.md.
+    /// Not persisted across restarts — clients must re-pass `device` on
+    /// resume.
+    pub(crate) session_room_metadata: tokio::sync::Mutex<HashMap<String, RoomInfo>>,
     /// Voice provider registry. `None` when no `[stt_provider.*]` /
     /// `[tts_provider.*]` blocks are configured — in that case the
     /// `voice/pipeline_run` method returns a method-not-available error.
@@ -83,6 +92,7 @@ impl ServeState {
             sessions: tokio::sync::Mutex::new(HashMap::new()),
             pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
             session_room_profiles: tokio::sync::Mutex::new(HashMap::new()),
+            session_room_metadata: tokio::sync::Mutex::new(HashMap::new()),
             voice,
         }
     }
@@ -215,6 +225,12 @@ async fn summarize_all_sessions(state: &Arc<ServeState>) {
                     .append_summary(&session_id, &summary)
                 {
                     warn!("Failed to persist shutdown summary for {session_id}: {e}");
+                }
+                if let Err(e) = state
+                    .api_session_store
+                    .append_intraday_digest(&session_id, &summary, None)
+                {
+                    warn!("Failed to persist shutdown intra-day digest for {session_id}: {e}");
                 }
             }
             Ok(_) => warn!("Shutdown summary for {session_id} was empty; skipping"),
@@ -368,6 +384,34 @@ async fn handle_initialize(
             .lock()
             .await
             .insert(session_id.clone(), name);
+    }
+
+    // Optional `params.device = { name, description }` from sapphire-call /
+    // other voice clients. We treat `name` as the device handle (e.g.
+    // "living-room-speaker") and render the full room name server-side
+    // — that way every voice client doesn't have to agree on a template
+    // and the agent stays in control of how the metadata is presented.
+    if let Some(device) = params.as_ref().and_then(|p| p.get("device")) {
+        let device_name = device
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let device_description = device
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if let Some(name) = device_name {
+            let room_info = RoomInfo {
+                name: format!("voice channel with {name}"),
+                description: device_description,
+                kind: "voice".to_string(),
+            };
+            state
+                .session_room_metadata
+                .lock()
+                .await
+                .insert(session_id.clone(), room_info);
+        }
     }
 
     let mut result = json!({
@@ -658,6 +702,29 @@ async fn handle_voice_pipeline_run(
         .lock()
         .await
         .insert(session_id.clone(), room_profile.clone());
+
+    // Same `device` block accepted by `initialize` — refreshed on every
+    // pipeline_run so satellites can update their description without a
+    // separate handshake. Treated as room metadata for the session.
+    if let Some(device) = params.get("device") {
+        let device_name = device.get("name").and_then(|v| v.as_str()).map(str::to_string);
+        let device_description = device
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if let Some(name) = device_name {
+            let room_info = RoomInfo {
+                name: format!("voice channel with {name}"),
+                description: device_description,
+                kind: "voice".to_string(),
+            };
+            state
+                .session_room_metadata
+                .lock()
+                .await
+                .insert(session_id.clone(), room_info);
+        }
+    }
 
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
@@ -1023,30 +1090,40 @@ async fn run_llm_turn(
     };
     let was_first_turn = history.is_empty();
 
-    // 2. Ensure JSONL file exists. If this session was deferred at initialize
-    //    time, commit it now using the reserved public_id.
-    let key: ConversationKey = (session_id.clone(), None);
-    let pending_pub_id = state.pending_sessions.lock().await.remove(&session_id);
-    if let Err(e) = state
-        .api_session_store
-        .ensure_session(&session_id, &key, "api", pending_pub_id)
-        .map(|_| ())
-    {
-        warn!("Failed to ensure session file: {e}");
-    }
-
-    // 3. Resolve provider once per turn — sessions can pin a profile at
+    // 2. Resolve provider once per turn — sessions can pin a profile at
     //    initialize-time; absent that, the background provider is used.
     let provider = state.provider_for_session(&session_id).await;
 
-    // 3a. System prompt (rebuilt fresh per request). Namespace chain
-    //     follows the session's pinned room_profile when set; otherwise
-    //     the implicit default namespace.
+    // 2a. Namespace chain follows the session's pinned room_profile when
+    //     set; otherwise the implicit default namespace. Resolved here
+    //     so it can be recorded in the session metadata on first chat
+    //     (used by the today-digest builder to route NSFW digests away
+    //     from default-namespace rooms).
     let namespace = match state.session_room_profiles.lock().await.get(&session_id) {
         Some(rp_name) => state.config.namespace_for_room_profile(rp_name).to_string(),
         None => crate::config::DEFAULT_NAMESPACE_NAME.to_string(),
     };
     let namespace_chain = state.config.resolve_namespace_chain(&namespace);
+
+    // 2b. Ensure JSONL file exists. If this session was deferred at initialize
+    //     time, commit it now using the reserved public_id.
+    let key: ConversationKey = (session_id.clone(), None);
+    let pending_pub_id = state.pending_sessions.lock().await.remove(&session_id);
+    if let Err(e) = state
+        .api_session_store
+        .ensure_session(&session_id, &key, "api", pending_pub_id, &namespace)
+        .map(|_| ())
+    {
+        warn!("Failed to ensure session file: {e}");
+    }
+
+    // 3a. System prompt (rebuilt fresh per request).
+    let room_info = state
+        .session_room_metadata
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned();
     let system = {
         let sp = state
             .workspace
@@ -1054,6 +1131,7 @@ async fn run_llm_turn(
                 state.config.anthropic.system_prompt.as_deref(),
                 state.config.day_boundary_hour,
                 &namespace_chain,
+                room_info.as_ref(),
             )
             .await;
         if sp.is_empty() { None } else { Some(sp) }

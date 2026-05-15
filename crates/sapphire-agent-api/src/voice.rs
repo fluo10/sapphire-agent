@@ -167,6 +167,7 @@ pub async fn voice_pipeline_run(
     room_profile: &str,
     pcm: &[i16],
     language: Option<&str>,
+    device: Option<&crate::DeviceMetadata>,
     event_tx: mpsc::Sender<VoiceEvent>,
 ) -> Result<()> {
     let base = base.trim_end_matches('/');
@@ -185,6 +186,9 @@ pub async fn voice_pipeline_run(
     });
     if let Some(l) = language {
         params["language"] = json!(l);
+    }
+    if let Some(d) = device.and_then(crate::DeviceMetadata::to_params) {
+        params["device"] = d;
     }
     let body = json!({
         "jsonrpc": "2.0",

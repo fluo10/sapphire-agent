@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
     let session = cli.session.clone().or(file_cfg.server.session);
     let room_profile = cli.room_profile.clone().or(file_cfg.server.room_profile);
+    let device = file_cfg.device.to_api();
 
     if let Some(Command::Voice {
         language,
@@ -139,6 +140,7 @@ async fn main() -> Result<()> {
                 list_devices,
                 input_device: input_device.or(file_cfg.audio.input_device),
                 output_device: output_device.or(file_cfg.audio.output_device),
+                device,
             },
         )
         .await;
@@ -152,6 +154,7 @@ async fn main() -> Result<()> {
         cli.history,
         cli.json,
         room_profile,
+        device,
     )
     .await
 }

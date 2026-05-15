@@ -102,6 +102,17 @@ pub struct Config {
     /// `SyncConfig` for the same reason in sapphire-workspace 0.10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_interval_minutes: Option<u32>,
+    /// How many minutes of inactivity (no incoming user message) before
+    /// the agent emits a same-day digest line summarising the session
+    /// so far. The digest is read back across sessions and injected
+    /// into the system prompt of newly opened rooms in the same memory
+    /// namespace — this is what makes a morning voice chat visible in
+    /// an afternoon text chat without waiting for the day-boundary
+    /// daily log.
+    ///
+    /// `None` (default 30) keeps the feature on; explicit `0` disables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intraday_idle_minutes: Option<u32>,
     /// Periodic log digest configuration (weekly / monthly / yearly).
     #[serde(default)]
     pub digest: DigestConfig,
@@ -833,6 +844,17 @@ impl Config {
         self.room_profile_for(room_id)
             .and_then(|(_, rp)| rp.session_policy)
             .unwrap_or(self.session_policy)
+    }
+
+    /// Effective idle threshold (in minutes) before a same-day digest
+    /// flush fires. `None` means the feature is disabled — either by an
+    /// explicit `0` or by future per-profile opt-out.
+    pub fn intraday_idle_threshold_minutes(&self) -> Option<u32> {
+        match self.intraday_idle_minutes {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => Some(30),
+        }
     }
 
     /// Resolve the LLM profile name for a given `room_id`.

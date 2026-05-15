@@ -8,6 +8,7 @@
 //! {"meta": {"session_id":"01JX...","room_id":"!abc:m.org","thread_id":null,"channel":"matrix","created_at":"2026-04-06T10:00:00Z"}}
 //! {"timestamp":"2026-04-06T10:00:01Z","role":"user","parts":[{"Text":"hello"}]}
 //! {"timestamp":"2026-04-06T10:00:05Z","role":"assistant","parts":[{"Text":"hi"}]}
+//! {"digest_at":"2026-04-06T10:30:00Z","since":"2026-04-06T04:00:00Z","digest":"..."}  ← intra-day flush
 //! {"closed_at":"2026-04-06T11:00:00Z"}   ← optional, appended on reset/close
 //! ```
 //!
@@ -44,6 +45,14 @@ pub struct SessionMeta {
     /// Human-readable alias (grain-id, 7 chars). Only set for API sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_id: Option<String>,
+    /// Memory namespace this session writes/reads under, captured at
+    /// session creation so cross-session digest builders can route digests
+    /// to the correct namespace even for sessions where the namespace is
+    /// not derivable from `room_id` (e.g. API/voice sessions pinning a
+    /// non-default room_profile). `None` for legacy files predating this
+    /// field; consumers fall back to room-id derivation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// Short auto-generated title, populated from a later `session_title` line.
     #[serde(skip)]
     pub title: Option<String>,
@@ -103,34 +112,113 @@ pub struct SummaryLine {
     pub up_to_timestamp: Option<DateTime<Utc>>,
 }
 
+/// A short summary describing what happened in a single session during the
+/// current local day. Emitted on idle-flush and graceful shutdown. Distinct
+/// from `SummaryLine` because its scope is "today only" — `SessionPolicy::
+/// Compact` sessions can carry context across the day boundary, so their
+/// cumulative `SummaryLine` is not safe to splice into another room's
+/// system prompt as "what happened today."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntradayDigestLine {
+    pub digest_at: DateTime<Utc>,
+    pub digest: String,
+    /// Informational lower bound on the timestamps covered by this digest;
+    /// when set, consumers may reject digests whose `since` predates the
+    /// current local day. Not currently used for filtering — `digest_at`
+    /// is the canonical "today?" predicate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+}
+
 // ---------------------------------------------------------------------------
 // SessionStore
 // ---------------------------------------------------------------------------
 
 pub struct SessionStore {
-    pub sessions_dir: PathBuf,
+    /// Base sessions directory (e.g. `<workspace>/sessions`). Per-session
+    /// files live under `<base_dir>/<namespace>/<kind>/<session_id>.jsonl`
+    /// — the namespace split is mechanical (matches `memory/<namespace>/`)
+    /// so retrieve indexing can scope itself by directory and never
+    /// accidentally mix NSFW sessions with default-namespace ones.
+    pub base_dir: PathBuf,
+    /// Second-level subdirectory: `"channel"` for Matrix/Discord, `"api"`
+    /// for HTTP. Lets the Agent and ServeState keep separate
+    /// `SessionStore` instances while sharing one base dir.
+    pub kind: &'static str,
     /// Optional sapphire-workspace state. When set, file modifications notify
     /// the workspace so the index/cache and git staging stay in sync.
     ws_state: Option<Arc<Mutex<WorkspaceState>>>,
+    /// `session_id → absolute path` cache. Populated lazily by
+    /// `resolve_path` (filesystem scan) and eagerly by `create_session` /
+    /// `ensure_session`. Avoids re-scanning per `append` call.
+    path_cache: Mutex<HashMap<String, PathBuf>>,
 }
 
 impl SessionStore {
-    pub fn new(sessions_dir: PathBuf) -> Self {
+    pub fn new(base_dir: PathBuf, kind: &'static str) -> Self {
         Self {
-            sessions_dir,
+            base_dir,
+            kind,
             ws_state: None,
+            path_cache: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn with_workspace(sessions_dir: PathBuf, ws_state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn with_workspace(
+        base_dir: PathBuf,
+        kind: &'static str,
+        ws_state: Arc<Mutex<WorkspaceState>>,
+    ) -> Self {
         Self {
-            sessions_dir,
+            base_dir,
+            kind,
             ws_state: Some(ws_state),
+            path_cache: Mutex::new(HashMap::new()),
         }
     }
 
-    fn session_path(&self, session_id: &str) -> PathBuf {
-        self.sessions_dir.join(format!("{session_id}.jsonl"))
+    /// Compute (without filesystem checks) the path a new session file
+    /// should live at. Used by `create_session` / `ensure_session`. Also
+    /// seeds the path cache so subsequent `append` calls hit it directly.
+    fn path_for_new(&self, session_id: &str, namespace: &str) -> PathBuf {
+        let p = self
+            .base_dir
+            .join(namespace)
+            .join(self.kind)
+            .join(format!("{session_id}.jsonl"));
+        if let Ok(mut cache) = self.path_cache.lock() {
+            cache.insert(session_id.to_string(), p.clone());
+        }
+        p
+    }
+
+    /// Public accessor exposing the cached path of an existing session.
+    /// Used by callers that need to read raw bytes (e.g. parsing the meta
+    /// line for `read_session_date`) rather than going through the
+    /// `SessionStore` write methods.
+    pub fn absolute_path_for(&self, session_id: &str) -> Option<PathBuf> {
+        self.resolve_path(session_id)
+    }
+
+    /// Locate an existing session file by id, scanning every namespace
+    /// subdirectory under `<base_dir>/<*>/<kind>/`. Returns `None` if the
+    /// file isn't found. Hot path for `append`-style methods, so cached.
+    fn resolve_path(&self, session_id: &str) -> Option<PathBuf> {
+        if let Ok(cache) = self.path_cache.lock()
+            && let Some(p) = cache.get(session_id)
+        {
+            return Some(p.clone());
+        }
+        let target = format!("{session_id}.jsonl");
+        for path in collect_session_files(&self.base_dir, self.kind) {
+            if path.file_name().and_then(|s| s.to_str()) == Some(target.as_str()) {
+                if let Ok(mut cache) = self.path_cache.lock() {
+                    cache.insert(session_id.to_string(), path.clone());
+                }
+                return Some(path);
+            }
+        }
+        None
     }
 
     /// Notify sapphire-workspace that a session file was created or modified.
@@ -178,18 +266,30 @@ impl SessionStore {
 
     /// Delete a session file (used when an empty session is discarded).
     pub fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
-        let path = self.session_path(session_id);
-        if path.exists() {
-            fs::remove_file(&path)?;
-            self.notify_deleted(&path);
+        if let Some(path) = self.resolve_path(session_id) {
+            if path.exists() {
+                fs::remove_file(&path)?;
+                self.notify_deleted(&path);
+            }
+            if let Ok(mut cache) = self.path_cache.lock() {
+                cache.remove(session_id);
+            }
         }
         Ok(())
     }
 
     /// Create a new session file for `key`. Returns the new session_id (ULID string).
-    pub fn create_session(&self, key: &ConversationKey, channel: &str) -> anyhow::Result<String> {
-        fs::create_dir_all(&self.sessions_dir)?;
+    pub fn create_session(
+        &self,
+        key: &ConversationKey,
+        channel: &str,
+        namespace: &str,
+    ) -> anyhow::Result<String> {
         let session_id = Uuid::now_v7().to_string();
+        let path = self.path_for_new(&session_id, namespace);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let meta = SessionMeta {
             session_id: session_id.clone(),
             room_id: key.0.clone(),
@@ -197,10 +297,10 @@ impl SessionStore {
             channel: channel.to_string(),
             created_at: Utc::now(),
             public_id: None,
+            namespace: Some(namespace.to_string()),
             title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta })?;
-        let path = self.session_path(&session_id);
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;
         drop(file);
@@ -212,7 +312,9 @@ impl SessionStore {
     pub fn append(&self, session_id: &str, msg: &ChatMessage) -> anyhow::Result<()> {
         let stored = StoredMessage::from_chat(msg);
         let line = serde_json::to_string(&stored)?;
-        let path = self.session_path(session_id);
+        let path = self
+            .resolve_path(session_id)
+            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;
         drop(file);
@@ -227,12 +329,73 @@ impl SessionStore {
             summary: summary.to_string(),
             up_to_timestamp: None,
         })?;
-        let path = self.session_path(session_id);
+        let path = self
+            .resolve_path(session_id)
+            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;
         drop(file);
         self.notify_updated(&path);
         Ok(())
+    }
+
+    /// Append a same-day digest line. Used by the idle-flush task and the
+    /// graceful-shutdown path to publish "what this session has covered
+    /// today" for cross-session injection into other rooms.
+    pub fn append_intraday_digest(
+        &self,
+        session_id: &str,
+        digest: &str,
+        since: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<()> {
+        let line = serde_json::to_string(&IntradayDigestLine {
+            digest_at: Utc::now(),
+            digest: digest.to_string(),
+            since,
+        })?;
+        let path = self
+            .resolve_path(session_id)
+            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(file, "{line}")?;
+        drop(file);
+        self.notify_updated(&path);
+        Ok(())
+    }
+
+    /// Walk every session file under `sessions_dir` and return the latest
+    /// `IntradayDigestLine` per session whose `digest_at` falls inside the
+    /// local-time `date` window (under `boundary_hour`), paired with the
+    /// session's metadata. Used to assemble the cross-session "today
+    /// digest" injected into the system prompt of newly opened rooms.
+    pub fn intraday_digests_for_day(
+        &self,
+        date: NaiveDate,
+        boundary_hour: u8,
+    ) -> Vec<(SessionMeta, IntradayDigestLine)> {
+        let (day_start, day_end) = day_window(date, boundary_hour);
+        let mut out = Vec::new();
+        for path in collect_session_files(&self.base_dir, self.kind) {
+            // mtime pre-filter: a file last touched before day_start can't
+            // possibly carry a digest in this window.
+            if let Ok(meta_fs) = path.metadata()
+                && let Ok(mtime) = meta_fs.modified()
+            {
+                let mtime_utc: DateTime<Utc> = mtime.into();
+                if mtime_utc < day_start {
+                    continue;
+                }
+            }
+            let Some((meta, digest)) = load_meta_and_latest_intraday_digest(&path) else {
+                continue;
+            };
+            let Some(d) = digest else { continue };
+            if d.digest_at >= day_start && d.digest_at < day_end {
+                out.push((meta, d));
+            }
+        }
+        out.sort_by_key(|(meta, _)| meta.created_at);
+        out
     }
 
     /// Close a session by appending a `closed_at` marker.
@@ -241,7 +404,9 @@ impl SessionStore {
         let line = serde_json::to_string(&ClosedLine {
             closed_at: Utc::now(),
         })?;
-        let path = self.session_path(session_id);
+        let path = self
+            .resolve_path(session_id)
+            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;
         drop(file);
@@ -280,23 +445,20 @@ impl SessionStore {
         );
         let mut entries: Vec<SessionEntry> = Vec::new();
 
-        let dir = match fs::read_dir(&self.sessions_dir) {
-            Ok(d) => d,
-            Err(_) => return (HashMap::new(), HashMap::new(), HashMap::new()),
-        };
-
-        for entry in dir.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
+        for path in collect_session_files(&self.base_dir, self.kind) {
             let stem = match path.file_stem().and_then(|s| s.to_str()) {
                 Some(s) => s.to_string(),
                 None => continue,
             };
-
             if let Some((meta, messages, is_closed, summary)) = load_session_file(&path) {
                 let key: ConversationKey = (meta.room_id.clone(), meta.thread_id.clone());
+                if !is_closed {
+                    // Seed the path cache for active sessions so the first
+                    // `append` after bootstrap doesn't pay a scan.
+                    if let Ok(mut cache) = self.path_cache.lock() {
+                        cache.insert(stem.clone(), path.clone());
+                    }
+                }
                 entries.push((stem, key, messages, is_closed, summary.map(|s| s.summary)));
             }
         }
@@ -336,14 +498,9 @@ impl SessionStore {
 
     /// List metadata for all sessions in this store (used by API for session listing).
     pub fn list_sessions(&self) -> Vec<SessionMeta> {
-        let dir = match fs::read_dir(&self.sessions_dir) {
-            Ok(d) => d,
-            Err(_) => return vec![],
-        };
-        let mut metas: Vec<SessionMeta> = dir
-            .flatten()
-            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
-            .filter_map(|e| load_session_file(&e.path()).map(|(meta, _, _, _)| meta))
+        let mut metas: Vec<SessionMeta> = collect_session_files(&self.base_dir, self.kind)
+            .into_iter()
+            .filter_map(|p| load_session_file(&p).map(|(meta, _, _, _)| meta))
             .collect();
         metas.sort_by_key(|m| m.created_at);
         metas
@@ -352,7 +509,7 @@ impl SessionStore {
     /// Load a single session's conversation history by ID.
     /// Returns None if the file doesn't exist or is malformed.
     pub fn load_session(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
-        let path = self.session_path(session_id);
+        let path = self.resolve_path(session_id)?;
         let (_, messages, _, _) = load_session_file(&path)?;
         Some(
             messages
@@ -374,13 +531,16 @@ impl SessionStore {
         key: &ConversationKey,
         channel: &str,
         public_id_override: Option<String>,
+        namespace: &str,
     ) -> anyhow::Result<Option<String>> {
-        fs::create_dir_all(&self.sessions_dir)?;
-        let path = self.session_path(session_id);
-        if path.exists() {
+        if let Some(existing) = self.resolve_path(session_id) {
             // Return existing public_id if the file already existed
-            let pub_id = load_session_file(&path).and_then(|(meta, _, _, _)| meta.public_id);
+            let pub_id = load_session_file(&existing).and_then(|(meta, _, _, _)| meta.public_id);
             return Ok(pub_id);
+        }
+        let path = self.path_for_new(session_id, namespace);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
         }
         let public_id = if channel == "api" {
             Some(public_id_override.unwrap_or_else(|| grain_id::GrainId::random().to_string()))
@@ -394,6 +554,7 @@ impl SessionStore {
             channel: channel.to_string(),
             created_at: Utc::now(),
             public_id: public_id.clone(),
+            namespace: Some(namespace.to_string()),
             title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta })?;
@@ -409,7 +570,9 @@ impl SessionStore {
         let line = serde_json::to_string(&TitleLine {
             session_title: title.to_string(),
         })?;
-        let path = self.session_path(session_id);
+        let path = self
+            .resolve_path(session_id)
+            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;
         drop(file);
@@ -420,12 +583,7 @@ impl SessionStore {
     /// Find a session by its human-readable `public_id` (grain-id).
     /// Returns the internal UUID `session_id` if found.
     pub fn find_by_public_id(&self, public_id: &str) -> Option<String> {
-        let dir = fs::read_dir(&self.sessions_dir).ok()?;
-        for entry in dir.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
+        for path in collect_session_files(&self.base_dir, self.kind) {
             if let Some((meta, _, _, _)) = load_session_file(&path) {
                 if meta.public_id.as_deref() == Some(public_id) {
                     return Some(meta.session_id);
@@ -445,27 +603,16 @@ impl SessionStore {
         boundary_hour: u8,
     ) -> Vec<(SessionMeta, Vec<StoredMessage>)> {
         let (day_start, day_end) = day_window(date, boundary_hour);
-
-        let dir = match fs::read_dir(&self.sessions_dir) {
-            Ok(d) => d,
-            Err(_) => return vec![],
-        };
-
         let mut results = Vec::new();
 
-        for entry in dir.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-
+        for path in collect_session_files(&self.base_dir, self.kind) {
             // mtime pre-filter: skip files last modified before day_start - 1 day
-            if let Ok(meta_fs) = path.metadata() {
-                if let Ok(mtime) = meta_fs.modified() {
-                    let mtime_utc: DateTime<Utc> = mtime.into();
-                    if mtime_utc < day_start - Duration::days(1) {
-                        continue;
-                    }
+            if let Ok(meta_fs) = path.metadata()
+                && let Ok(mtime) = meta_fs.modified()
+            {
+                let mtime_utc: DateTime<Utc> = mtime.into();
+                if mtime_utc < day_start - Duration::days(1) {
+                    continue;
                 }
             }
 
@@ -481,7 +628,6 @@ impl SessionStore {
             }
         }
 
-        // Sort by session created_at for chronological ordering
         results.sort_by_key(|(meta, _)| meta.created_at);
         results
     }
@@ -516,19 +662,9 @@ impl SessionStore {
     where
         F: Fn(&SessionMeta) -> bool,
     {
-        let dir = match fs::read_dir(&self.sessions_dir) {
-            Ok(d) => d,
-            Err(_) => return vec![],
-        };
-
         let mut dates = std::collections::HashSet::new();
 
-        for entry in dir.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-
+        for path in collect_session_files(&self.base_dir, self.kind) {
             if let Some((meta, messages, _, _)) = load_session_file(&path) {
                 if !predicate(&meta) {
                     continue;
@@ -549,19 +685,9 @@ impl SessionStore {
     /// Return all local dates for which at least one session message exists.
     /// Used by daily_log to find dates that need a log generated.
     pub fn all_session_dates(&self, boundary_hour: u8) -> Vec<NaiveDate> {
-        let dir = match fs::read_dir(&self.sessions_dir) {
-            Ok(d) => d,
-            Err(_) => return vec![],
-        };
-
         let mut dates = std::collections::HashSet::new();
 
-        for entry in dir.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-
+        for path in collect_session_files(&self.base_dir, self.kind) {
             if let Some((_, messages, _, _)) = load_session_file(&path) {
                 for msg in messages {
                     let local_ts = msg.timestamp.with_timezone(&Local);
@@ -575,6 +701,37 @@ impl SessionStore {
         sorted.sort();
         sorted
     }
+}
+
+// ---------------------------------------------------------------------------
+// Namespace-scoped filesystem walking
+// ---------------------------------------------------------------------------
+
+/// Enumerate `<base_dir>/<namespace>/<kind>/*.jsonl` across every namespace
+/// directory. Returns an empty Vec when `base_dir` doesn't exist yet (fresh
+/// install) or has no namespace subdirs. Each returned path is absolute.
+fn collect_session_files(base_dir: &Path, kind: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(base_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let ns_dir = entry.path();
+        if !ns_dir.is_dir() {
+            continue;
+        }
+        let kind_dir = ns_dir.join(kind);
+        let Ok(kind_entries) = fs::read_dir(&kind_dir) else {
+            continue;
+        };
+        for k_entry in kind_entries.flatten() {
+            let path = k_entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +823,10 @@ fn load_session_file(
                     warn!("Skipping malformed summary in {}: {e}", path.display());
                 }
             }
+        } else if value.get("digest_at").is_some() {
+            // Intra-day digest lines are not returned by this loader;
+            // `intraday_digests_for_day` reads them through its own helper.
+            continue;
         } else if value.get("timestamp").is_some() {
             match serde_json::from_value::<StoredMessage>(value) {
                 Ok(stored) => messages.push(stored),
@@ -677,4 +838,35 @@ fn load_session_file(
     }
 
     Some((meta, messages, is_closed, latest_summary))
+}
+
+/// Minimal-cost variant of `load_session_file`: returns just the metadata
+/// and the latest `IntradayDigestLine`, skipping message accumulation.
+fn load_meta_and_latest_intraday_digest(
+    path: &Path,
+) -> Option<(SessionMeta, Option<IntradayDigestLine>)> {
+    let file = fs::File::open(path).ok()?;
+    let mut lines = BufReader::new(file).lines();
+
+    let first = lines.next()?.ok()?;
+    let meta_line: MetaLine = serde_json::from_str(first.trim()).ok()?;
+    let meta = meta_line.meta;
+
+    let mut latest: Option<IntradayDigestLine> = None;
+    for raw in lines.flatten() {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if value.get("digest_at").is_some() {
+            if let Ok(d) = serde_json::from_value::<IntradayDigestLine>(value) {
+                latest = Some(d);
+            }
+        }
+    }
+    Some((meta, latest))
 }

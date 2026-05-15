@@ -20,6 +20,7 @@ use crate::provider::{ChatMessage, ContentPart, Provider, Role};
 use crate::session::{SessionMeta, SessionStore, StoredMessage};
 use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
 use sapphire_workspace::WorkspaceState;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -1144,6 +1145,110 @@ pub async fn catchup_pending_yearly_logs(
         }
     }
     generated
+}
+
+// ---------------------------------------------------------------------------
+// Today's cross-session digest
+// ---------------------------------------------------------------------------
+
+/// Render the bullet block that goes under `# Today's Cross-Session Notes`
+/// for `namespace`. Walks `channel_store` and `api_store` for digests
+/// whose `digest_at` falls inside `today`'s local window, keeping only
+/// the latest per session that maps to `namespace` via `room_to_namespace`.
+///
+/// Returns `None` when no qualifying digest exists, so the caller can
+/// omit the namespace from the cache map and the system prompt block.
+pub fn build_today_digest_for_namespace<F>(
+    namespace: &str,
+    today: NaiveDate,
+    boundary_hour: u8,
+    channel_store: &SessionStore,
+    api_store: Option<&SessionStore>,
+    room_to_namespace: F,
+) -> Option<String>
+where
+    F: Fn(&str) -> String,
+{
+    let mut entries: Vec<(SessionMeta, crate::session::IntradayDigestLine)> = Vec::new();
+    entries.extend(channel_store.intraday_digests_for_day(today, boundary_hour));
+    if let Some(api) = api_store {
+        entries.extend(api.intraday_digests_for_day(today, boundary_hour));
+    }
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for (meta, digest) in entries {
+        let ns = if meta.channel == "api" {
+            crate::config::DEFAULT_NAMESPACE_NAME.to_string()
+        } else {
+            room_to_namespace(&meta.room_id)
+        };
+        if ns != namespace {
+            continue;
+        }
+        let room_label = if meta.channel == "api" {
+            meta.title
+                .clone()
+                .unwrap_or_else(|| format!("api/{}", short_id(&meta.session_id)))
+        } else {
+            format!("{}/{}", meta.channel, short_id(&meta.room_id))
+        };
+        let local_ts = digest.digest_at.with_timezone(&Local);
+        lines.push(format!(
+            "- [{}, {}] {}",
+            local_ts.format("%H:%M"),
+            room_label,
+            digest.digest.trim()
+        ));
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+/// Convenience wrapper that produces the full `HashMap<namespace, block>`
+/// suitable for `Workspace::replace_today_digests`. Each namespace is
+/// rendered independently so a multi-namespace deployment doesn't leak
+/// rooms across the chain.
+pub fn build_all_today_digests<F>(
+    namespaces: &[String],
+    today: NaiveDate,
+    boundary_hour: u8,
+    channel_store: &SessionStore,
+    api_store: Option<&SessionStore>,
+    room_to_namespace: F,
+) -> HashMap<String, String>
+where
+    F: Fn(&str) -> String + Copy,
+{
+    let mut out = HashMap::new();
+    for ns in namespaces {
+        if let Some(text) = build_today_digest_for_namespace(
+            ns,
+            today,
+            boundary_hour,
+            channel_store,
+            api_store,
+            room_to_namespace,
+        ) {
+            out.insert(ns.clone(), text);
+        }
+    }
+    out
+}
+
+/// Display-friendly truncation for an arbitrary id (room_id / session_id):
+/// keeps the first 8 chars, used purely for readability in injected bullets.
+fn short_id(id: &str) -> String {
+    if id.chars().count() <= 8 {
+        id.to_string()
+    } else {
+        id.chars().take(8).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

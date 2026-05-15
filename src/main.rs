@@ -24,8 +24,8 @@ use clap::{Parser, Subcommand};
 use config::Config;
 use heartbeat::Heartbeat;
 use periodic_log::{
-    catchup_missing_daily_digests, catchup_pending_daily_logs, catchup_pending_monthly_logs,
-    catchup_pending_weekly_logs, catchup_pending_yearly_logs,
+    build_all_today_digests, catchup_missing_daily_digests, catchup_pending_daily_logs,
+    catchup_pending_monthly_logs, catchup_pending_weekly_logs, catchup_pending_yearly_logs,
 };
 use provider::registry::ProviderRegistry;
 use sapphire_workspace::{AppContext, DeviceDefaults, Workspace as SwWorkspace, WorkspaceState};
@@ -148,7 +148,11 @@ async fn main() -> Result<()> {
         room_profile,
     }) = cli.command
     {
-        return call::run(server, session, list, message, history, json, room_profile).await;
+        // The in-tree `sapphire-agent call` CLI has no per-device config
+        // file, so no DeviceMetadata is forwarded; standalone callers
+        // (sapphire-call) plumb their own `[device]` block through.
+        return call::run(server, session, list, message, history, json, room_profile, None)
+            .await;
     }
 
     let config_path = cli.config.unwrap_or_else(Config::default_path);
@@ -216,6 +220,14 @@ async fn main() -> Result<()> {
             if let Err(e) = migrate_per_channel_sessions(&sessions_base_for_migration) {
                 anyhow::bail!("Session layout migration failed: {e:#}");
             }
+            // ── Move sessions/<kind>/* into sessions/<namespace>/<kind>/* ──
+            // Reads each session's meta.namespace (falling back to "default")
+            // and slots the file under the matching namespace directory so
+            // sapphire-retrieve can scope indexing by directory rather than
+            // by reading each file's frontmatter.
+            if let Err(e) = migrate_sessions_to_namespaced_layout(&sessions_base_for_migration) {
+                anyhow::bail!("Session namespace migration failed: {e:#}");
+            }
 
             // ── Bootstrap file loader (AGENTS.md, SOUL.md, MEMORY.md …) ────
             let workspace = Arc::new(Workspace::new(workspace_dir.clone(), config.digest.clone()));
@@ -243,13 +255,16 @@ async fn main() -> Result<()> {
             }
             let ws_state = Arc::new(Mutex::new(ws_state));
 
-            // ── Periodic workspace sync (if enabled in workspace config) ────
-            if let Some(dur) = ws_sync_interval {
+            // Standby mode runs a minimal periodic-sync loop. The
+            // with-channels code path replaces this with a richer loop
+            // below that also rebuilds today_digests on the same tick
+            // (so we don't pay periodic_sync twice per interval).
+            if config.standby_mode && let Some(dur) = ws_sync_interval {
                 tracing::info!("Periodic workspace sync enabled: every {}s", dur.as_secs());
                 let ws = Arc::clone(&ws_state);
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(dur);
-                    tick.tick().await; // skip immediate fire
+                    tick.tick().await;
                     loop {
                         tick.tick().await;
                         let state = ws.lock().expect("ws_state mutex poisoned");
@@ -284,9 +299,10 @@ async fn main() -> Result<()> {
                     .context("Failed to build provider registry")?,
             );
 
-            // ── API session store (sessions/api/) ───────────────────────────
+            // ── API session store (sessions/<namespace>/api/) ──────────────
             let api_session_store = Arc::new(SessionStore::with_workspace(
-                sessions_base.join("api"),
+                sessions_base.clone(),
+                "api",
                 Arc::clone(&ws_state),
             ));
 
@@ -304,13 +320,12 @@ async fn main() -> Result<()> {
 
             // ── Channel + Agent (Matrix and/or Discord, if configured) ──────
             if !config.standby_mode && (config.matrix.is_some() || config.discord.is_some()) {
-                // Sessions from every chat channel land in one shared
-                // directory now that both Matrix and Discord can run
-                // concurrently. The originating channel name is still
-                // recorded in each session's metadata. See
-                // `migrate_per_channel_sessions` for the one-time move.
+                // Sessions from every chat channel land under
+                // `sessions/<namespace>/channel/<uuid>.jsonl`. Each session
+                // still records its originating channel name in metadata.
                 let channel_session_store = Arc::new(SessionStore::with_workspace(
-                    sessions_base.join("channel"),
+                    sessions_base.clone(),
+                    "channel",
                     Arc::clone(&ws_state),
                 ));
 
@@ -415,6 +430,64 @@ async fn main() -> Result<()> {
                 ));
                 agent.bootstrap().await;
 
+                // ── Periodic workspace sync + today-digest rebuild ──────
+                // Same cadence drives both: when `periodic_sync` pulls
+                // session JSONLs from another device via git, the digest
+                // builder picks them up on the same tick so cross-device
+                // "today's notes" become visible without waiting for the
+                // next day-boundary daily-log generation.
+                if let Some(dur) = ws_sync_interval {
+                    tracing::info!(
+                        "Periodic workspace sync enabled: every {}s",
+                        dur.as_secs()
+                    );
+                    let ws = Arc::clone(&ws_state);
+                    let cfg_for_loop = config.clone();
+                    let workspace_for_loop = Arc::clone(&workspace);
+                    let workspace_dir_for_loop = workspace_dir.clone();
+                    let channel_store_for_loop = Arc::clone(&channel_session_store);
+                    let api_store_for_loop = Arc::clone(&api_session_store);
+                    let agent_for_loop = Arc::clone(&agent);
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(dur);
+                        tick.tick().await; // skip immediate fire
+                        loop {
+                            tick.tick().await;
+                            {
+                                let state = ws.lock().expect("ws_state mutex poisoned");
+                                match state.periodic_sync() {
+                                    Ok((u, r)) => tracing::info!(
+                                        "Periodic ws sync: {u} upserted, {r} removed"
+                                    ),
+                                    Err(e) => tracing::warn!("Periodic ws sync failed: {e:#}"),
+                                }
+                            }
+                            rebuild_today_digests(
+                                &cfg_for_loop,
+                                &workspace_for_loop,
+                                &workspace_dir_for_loop,
+                                &channel_store_for_loop,
+                                &api_store_for_loop,
+                                &agent_for_loop,
+                            )
+                            .await;
+                        }
+                    });
+                } else {
+                    // Even without periodic sync, populate today's
+                    // cache once at startup so the first turn after
+                    // restart sees prior intra-day flushes.
+                    rebuild_today_digests(
+                        &config,
+                        &workspace,
+                        &workspace_dir,
+                        &channel_session_store,
+                        &api_session_store,
+                        &agent,
+                    )
+                    .await;
+                }
+
                 // ── Heartbeat (day-boundary + cron loops) ───────────────────
                 let default_room_id = config
                     .matrix
@@ -511,6 +584,131 @@ async fn main() -> Result<()> {
         Command::Call { .. } => unreachable!(),
     }
 
+    Ok(())
+}
+
+/// Rebuild Workspace's per-namespace "today's digest" cache from the
+/// session JSONLs on disk and notify the agent that its cached system
+/// prompts are now stale. Invoked from the periodic-sync loop so a git
+/// pull on one machine becomes visible on the other within one tick.
+///
+/// Cheap when there are no fresh digests: each store walks `sessions/*`
+/// once with an mtime pre-filter that rejects files untouched before
+/// today's local-day window.
+async fn rebuild_today_digests(
+    config: &Config,
+    workspace: &Arc<Workspace>,
+    workspace_dir: &std::path::Path,
+    channel_store: &Arc<SessionStore>,
+    api_store: &Arc<SessionStore>,
+    agent: &Arc<Agent>,
+) {
+    let today = session::local_date_for_timestamp(
+        chrono::Local::now(),
+        config.day_boundary_hour,
+    );
+    let namespaces = config.all_memory_namespaces();
+    let cfg = config.clone();
+    let map = build_all_today_digests(
+        &namespaces,
+        today,
+        config.day_boundary_hour,
+        channel_store,
+        Some(api_store.as_ref()),
+        |room_id: &str| cfg.namespace_for_room(room_id).to_string(),
+    );
+    let had_content = !map.is_empty();
+    workspace.replace_today_digests(map).await;
+    let _ = workspace_dir; // currently unused but kept for symmetry
+    if had_content {
+        agent.invalidate_system_prompts().await;
+    }
+}
+
+/// Migrate flat `sessions/<kind>/<uuid>.jsonl` layouts to the namespaced
+/// `sessions/<namespace>/<kind>/<uuid>.jsonl` form. Each session's
+/// namespace is read from `meta.namespace` (newer files), falling back
+/// to `"default"` for legacy files that predate that field.
+///
+/// Idempotent: skips silently when no flat `sessions/<kind>/*.jsonl`
+/// files exist. Refuses to run when a target path is already occupied
+/// (extremely unlikely with ULID/UUID file names but handled for
+/// safety).
+fn migrate_sessions_to_namespaced_layout(
+    sessions_base: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader};
+
+    for kind in ["channel", "api"] {
+        let kind_dir = sessions_base.join(kind);
+        if !kind_dir.is_dir() {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&kind_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("Skipping {}: {e}", kind_dir.display());
+                continue;
+            }
+        };
+        let mut moved = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            // Read just the first line to extract meta.namespace.
+            let namespace = match std::fs::File::open(&path) {
+                Ok(f) => {
+                    let mut first = String::new();
+                    let _ = BufReader::new(f).read_line(&mut first);
+                    serde_json::from_str::<serde_json::Value>(first.trim())
+                        .ok()
+                        .and_then(|v| {
+                            v.get("meta")
+                                .and_then(|m| m.get("namespace"))
+                                .and_then(|n| n.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| config::DEFAULT_NAMESPACE_NAME.to_string())
+                }
+                Err(_) => config::DEFAULT_NAMESPACE_NAME.to_string(),
+            };
+
+            let Some(file_name) = path.file_name() else {
+                continue;
+            };
+            let dst_dir = sessions_base.join(&namespace).join(kind);
+            std::fs::create_dir_all(&dst_dir)
+                .with_context(|| format!("create {}", dst_dir.display()))?;
+            let dst = dst_dir.join(file_name);
+            if dst.exists() {
+                anyhow::bail!(
+                    "Refusing to migrate {}: destination {} already exists. \
+                     Reconcile manually before starting.",
+                    path.display(),
+                    dst.display(),
+                );
+            }
+            std::fs::rename(&path, &dst).with_context(|| {
+                format!("rename {} -> {}", path.display(), dst.display())
+            })?;
+            moved += 1;
+        }
+        // Remove the now-empty flat directory; non-fatal if it still has
+        // unexpected leftovers (e.g. user dropped files).
+        let _ = std::fs::remove_dir(&kind_dir);
+        if moved > 0 {
+            tracing::info!(
+                "Migrated {} session file(s) from {} into namespaced layout",
+                moved,
+                kind_dir.display()
+            );
+        }
+    }
     Ok(())
 }
 
