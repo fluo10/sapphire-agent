@@ -2,10 +2,14 @@
 //!
 //! Endpoint: POST /rpc  (chat, initialize, list_sessions, get_session, voice/*)
 //!           GET  /rpc  (Phase 2: server→client SSE push, currently 405)
+//!           POST /a2a  (Agent2Agent Protocol; gated by [a2a].enabled)
+//!           GET  /.well-known/agent-card.json
 //!
 //! Session management uses a `Session-Id` request/response header. The
 //! `/mcp` endpoint is reserved for the future MCP server (issue #80,
 //! #79) and is intentionally not served here.
+
+pub mod a2a;
 
 use crate::channel::RoomInfo;
 use crate::config::Config;
@@ -192,12 +196,19 @@ pub async fn run(
 ) -> anyhow::Result<()> {
 
     // Routes are intentionally separated so future protocol endpoints
-    // (`/mcp` for the MCP server in #79/#80, an eventual `/a2a` for the
-    // Agent-to-Agent protocol) can be mounted alongside `/rpc` without
-    // colliding with the control API methods (`chat`, `initialize`,
-    // `voice/*`, …) that live here.
+    // (`/mcp` for the MCP server in #79/#80) can be mounted alongside
+    // `/rpc` without colliding with the control API methods (`chat`,
+    // `initialize`, `voice/*`, …) that live here. The A2A protocol
+    // endpoints below are mounted unconditionally — the handler refuses
+    // requests when `[a2a].enabled = false` so we don't pay a route
+    // table conditional but still preserve the opt-in semantic.
     let app = Router::new()
         .route("/rpc", post(rpc_post).get(rpc_get))
+        .route("/a2a", post(a2a::handle_a2a_post))
+        .route(
+            "/.well-known/agent-card.json",
+            axum::routing::get(a2a::handle_agent_card),
+        )
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(Arc::clone(&state));
 

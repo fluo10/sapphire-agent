@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A2A (Agent2Agent Protocol) server** — minimal v1 implementation
+  exposing `POST /a2a` (JSON-RPC 2.0, `SendMessage` only) and
+  `GET /.well-known/agent-card.json` on the existing HTTP server. Off
+  by default; enable via `[a2a].enabled = true`. Auth is per-room
+  profile: `[room_profile.<n>].api_keys` declares bearer tokens, and an
+  incoming `Authorization: Bearer <token>` reverse-looks-up the owning
+  profile so clients (e.g. sapphire-world) never name `room_profile`
+  themselves. Streaming, `tasks/*`, push notifications, and vision
+  parts are deferred. (#78; partial #73 in the form of the `api_keys`
+  field.)
+
 ### Breaking
 
 - **Control API endpoint renamed `/mcp` → `/rpc`** — the existing
@@ -15,8 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an MCP server, so it moves to a neutral path. The session header is
   likewise renamed `Mcp-Session-Id` → `Session-Id`. `sapphire-call` is
   updated in lockstep. `/mcp` is now unbound and reserved for a real
-  MCP server (#79, #80); `/a2a` is reserved for a future Agent-to-Agent
-  endpoint.
+  MCP server (#79, #80); `/a2a` is now implemented (see "Added" above).
 
 ## [0.5.0] - 2026-04-22
 
