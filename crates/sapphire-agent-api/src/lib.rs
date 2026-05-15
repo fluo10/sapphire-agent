@@ -19,6 +19,36 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use voice::{VoiceEvent, WakeWordConfig, WakeWordModel, voice_config, voice_pipeline_run};
 
+/// Client-side description of the device running this satellite. Sent
+/// to the agent via the `device` block on `initialize` and
+/// `voice/pipeline_run` so the agent's system prompt can mention
+/// "you are speaking through the living-room speakerphone" without
+/// duplicating that knowledge in AGENTS.md.
+///
+/// `name` is the only required field — the agent server-side renders
+/// the full room name as `"voice channel with <name>"`. `description`
+/// is free-form: a good place to flag "STT may produce typos," the
+/// physical location, who typically uses it, etc.
+#[derive(Debug, Clone, Default)]
+pub struct DeviceMetadata {
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
+impl DeviceMetadata {
+    /// Render into the JSON shape the agent's `/rpc` methods expect, or
+    /// `None` when both fields are absent (so we don't send empty blocks).
+    pub(crate) fn to_params(&self) -> Option<Value> {
+        let name = self.name.as_ref().filter(|s| !s.trim().is_empty())?;
+        let mut obj = serde_json::Map::new();
+        obj.insert("name".to_string(), Value::String(name.clone()));
+        if let Some(desc) = self.description.as_ref().filter(|s| !s.trim().is_empty()) {
+            obj.insert("description".to_string(), Value::String(desc.clone()));
+        }
+        Some(Value::Object(obj))
+    }
+}
+
 /// Initialize an RPC session against `base`. Returns the internal
 /// session id (UUID, sent back on subsequent requests via the
 /// `Session-Id` header), the human-readable display id, and whether
@@ -29,8 +59,9 @@ pub async fn initialize(
     base: &str,
     session: Option<String>,
     room_profile: Option<&str>,
+    device: Option<&DeviceMetadata>,
 ) -> Result<(String, String, bool)> {
-    initialize_session(client, base, session, room_profile).await
+    initialize_session(client, base, session, room_profile, device).await
 }
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -82,20 +113,28 @@ pub async fn run(
     history: bool,
     json: bool,
     room_profile: Option<String>,
+    device: Option<DeviceMetadata>,
 ) -> Result<()> {
     let base = server.trim_end_matches('/').to_string();
     let client = reqwest::Client::new();
 
     // -- --list mode ----------------------------------------------------------
     if list {
-        let (session_id, _, _) = initialize_session(&client, &base, session, None).await?;
+        let (session_id, _, _) =
+            initialize_session(&client, &base, session, None, device.as_ref()).await?;
         list_sessions(&client, &base, &session_id, json).await?;
         return Ok(());
     }
 
     // -- Initialize session ---------------------------------------------------
-    let (mut session_id, display_id, is_new) =
-        initialize_session(&client, &base, session, room_profile.as_deref()).await?;
+    let (mut session_id, display_id, is_new) = initialize_session(
+        &client,
+        &base,
+        session,
+        room_profile.as_deref(),
+        device.as_ref(),
+    )
+    .await?;
 
     // -- --history dump-only mode ---------------------------------------------
     if history {
@@ -151,7 +190,15 @@ pub async fn run(
                 continue;
             }
             "/clear" => {
-                match initialize_session(&client, &base, None, room_profile.as_deref()).await {
+                match initialize_session(
+                    &client,
+                    &base,
+                    None,
+                    room_profile.as_deref(),
+                    device.as_ref(),
+                )
+                .await
+                {
                     Ok((new_sid, new_display_id, _)) => {
                         session_id = new_sid;
                         println!("[new session: {new_display_id}]");
@@ -182,11 +229,15 @@ async fn initialize_session(
     base: &str,
     session: Option<String>,
     room_profile: Option<&str>,
+    device: Option<&DeviceMetadata>,
 ) -> Result<(String, String, bool)> {
     let session_id_req = session.as_deref().unwrap_or("new");
     let mut params = json!({ "session_id": session_id_req });
     if let Some(p) = room_profile {
         params["room_profile"] = json!(p);
+    }
+    if let Some(d) = device.and_then(DeviceMetadata::to_params) {
+        params["device"] = d;
     }
     let body = json!({
         "jsonrpc": "2.0",

@@ -61,6 +61,26 @@ impl OutgoingMessage {
     }
 }
 
+/// Channel-side description of a room, surfaced to the agent so the
+/// system prompt can tell the model **where it is talking**. Useful for
+/// rooms whose communication conventions differ (e.g. a voice channel
+/// fed by STT contains transcription errors; a dedicated work-mode room
+/// expects different tone).
+#[derive(Debug, Clone)]
+pub struct RoomInfo {
+    /// Display name. For Matrix it's `room.name()` (display name, or DM
+    /// recipient); for Discord it's `GuildChannel.name`; for API/voice
+    /// it's a server-side template like `"voice channel with <device>"`.
+    pub name: String,
+    /// Free-form description / topic. `None` when the channel side has
+    /// nothing to offer (e.g. Matrix DM with no topic).
+    pub description: Option<String>,
+    /// Originating channel name: `"matrix"`, `"discord"`, `"api"`,
+    /// or `"voice"`. Lets the system prompt tell the model whether
+    /// transcripts may contain STT errors etc.
+    pub kind: String,
+}
+
 /// Core channel trait.
 #[async_trait]
 pub trait Channel: Send + Sync {
@@ -77,6 +97,12 @@ pub trait Channel: Send + Sync {
 
     async fn stop_typing(&self, _room_id: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Display metadata for `room_id`, when the channel can look it up
+    /// cheaply (Matrix room state, Discord channel cache). Default: `None`.
+    async fn room_info(&self, _room_id: &str) -> Option<RoomInfo> {
+        None
     }
 }
 
@@ -151,6 +177,14 @@ impl Channels {
             ch.start_typing(room_id).await?;
         }
         Ok(())
+    }
+
+    /// Resolve `RoomInfo` for `room_id` through whichever channel owns
+    /// the room. Returns `None` if no channel is registered for the room
+    /// or the channel has nothing to say about it.
+    pub async fn room_info(&self, room_id: &str) -> Option<RoomInfo> {
+        let ch = self.channel_for_room_or_first(room_id).await?;
+        ch.room_info(room_id).await
     }
 
     pub async fn stop_typing(&self, room_id: &str) -> Result<()> {

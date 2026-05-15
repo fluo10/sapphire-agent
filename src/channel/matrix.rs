@@ -1,4 +1,6 @@
-use crate::channel::{Attachment, Channel, IncomingMessage, MAX_ATTACHMENT_BYTES, OutgoingMessage};
+use crate::channel::{
+    Attachment, Channel, IncomingMessage, MAX_ATTACHMENT_BYTES, OutgoingMessage, RoomInfo,
+};
 use crate::config::MatrixConfig;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -374,5 +376,16 @@ impl Channel for MatrixChannel {
             .await
             .context("Failed to stop typing notice")?;
         Ok(())
+    }
+
+    async fn room_info(&self, room_id: &str) -> Option<RoomInfo> {
+        let room = self.get_room(room_id).await.ok()?;
+        let name = room.name().unwrap_or_else(|| room_id.to_string());
+        let description = room.topic();
+        Some(RoomInfo {
+            name,
+            description,
+            kind: "matrix".to_string(),
+        })
     }
 }

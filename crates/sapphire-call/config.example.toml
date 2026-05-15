@@ -23,3 +23,12 @@ room_profile = "home_voice"
 # Sent as an STT hint with each utterance. Server's voice_pipeline
 # default applies when omitted.
 # stt = "ja"
+
+[device]
+# Identity sent to the agent on every session. The agent renders the
+# system prompt's "# Current Room" block as "voice channel with <name>"
+# using the description as the topic — so the model knows where it's
+# speaking without that fact being baked into AGENTS.md. Both fields
+# are optional; the block is only emitted when `name` is set.
+# name        = "living-room-speaker"
+# description = "Speakerphone in the living room; STT may produce typos due to ambient noise"

@@ -1,4 +1,6 @@
-use crate::channel::{Attachment, Channel, IncomingMessage, MAX_ATTACHMENT_BYTES, OutgoingMessage};
+use crate::channel::{
+    Attachment, Channel, IncomingMessage, MAX_ATTACHMENT_BYTES, OutgoingMessage, RoomInfo,
+};
 use crate::config::DiscordConfig;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -213,6 +215,35 @@ impl Channel for DiscordChannel {
     }
 
     // stop_typing is a no-op: Discord typing expires automatically.
+
+    async fn room_info(&self, room_id: &str) -> Option<RoomInfo> {
+        use serenity::all::{Channel as SerenityChannel, ChannelType};
+        let channel_id: u64 = room_id.parse().ok()?;
+        let http = self.get_http_or_new();
+        let channel = ChannelId::new(channel_id)
+            .to_channel(http.as_ref())
+            .await
+            .ok()?;
+        match channel {
+            SerenityChannel::Guild(gc) => {
+                let kind = match gc.kind {
+                    ChannelType::Voice | ChannelType::Stage => "discord-voice",
+                    _ => "discord",
+                };
+                Some(RoomInfo {
+                    name: gc.name.clone(),
+                    description: gc.topic.clone().filter(|t| !t.is_empty()),
+                    kind: kind.to_string(),
+                })
+            }
+            SerenityChannel::Private(pc) => Some(RoomInfo {
+                name: format!("DM with {}", pc.recipient.name),
+                description: None,
+                kind: "discord-dm".to_string(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

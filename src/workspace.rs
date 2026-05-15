@@ -1,5 +1,7 @@
+use crate::channel::RoomInfo;
 use crate::config::DigestConfig;
 use crate::periodic_log::{self, LogKind};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tokio::sync::Mutex;
@@ -78,7 +80,13 @@ struct CachedFile {
 pub struct Workspace {
     dir: PathBuf,
     digest_cfg: DigestConfig,
-    cache: Mutex<std::collections::HashMap<PathBuf, CachedFile>>,
+    cache: Mutex<HashMap<PathBuf, CachedFile>>,
+    /// Pre-rendered "today's cross-session digest" per memory namespace.
+    /// Populated by an external builder (`main.rs` rebuilds it after the
+    /// periodic workspace sync), consumed by `build_system_prompt` to
+    /// inject same-day context that the heartbeat daily-log path can't
+    /// surface until 04:00 the next morning.
+    today_digests: Mutex<HashMap<String, String>>,
 }
 
 impl Workspace {
@@ -87,8 +95,16 @@ impl Workspace {
         Self {
             dir,
             digest_cfg,
-            cache: Mutex::new(std::collections::HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
+            today_digests: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Replace the cached "today's digest" map. Caller is responsible for
+    /// computing the map (which walks every relevant session JSONL); this
+    /// method just swaps the cache atomically.
+    pub async fn replace_today_digests(&self, digests: HashMap<String, String>) {
+        *self.today_digests.lock().await = digests;
     }
 
     /// Build the full system prompt:
@@ -107,6 +123,7 @@ impl Workspace {
         base: Option<&str>,
         boundary_hour: u8,
         namespace_chain: &[String],
+        room_info: Option<&RoomInfo>,
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
 
@@ -122,6 +139,14 @@ impl Workspace {
             now_local.format("%Y-%m-%d %H:%M:%S %z"),
             now_local.format("%A")
         ));
+
+        // Channel-side room metadata (Matrix room.name+topic, Discord
+        // channel.name+topic, or device-supplied "voice channel with X").
+        // Injected near the top so the model knows where it's speaking
+        // before reading any other instructions.
+        if let Some(info) = room_info {
+            parts.push(render_room_info(info));
+        }
 
         for def in WORKSPACE_FILES {
             if let Some((filename, content)) = self.read_first_existing(def.candidates).await {
@@ -140,7 +165,33 @@ impl Workspace {
         let today = crate::session::local_date_for_timestamp(now_local, boundary_hour);
         self.inject_periodic_logs(&mut parts, today, namespace_chain);
 
+        // Same-day cross-session digest. Injected last so the most recent
+        // context lands closest to the conversation history.
+        if let Some(block) = self.build_today_digest_block(namespace_chain).await {
+            parts.push(block);
+        }
+
         parts.join("\n\n---\n\n")
+    }
+
+    async fn build_today_digest_block(&self, namespace_chain: &[String]) -> Option<String> {
+        let cache = self.today_digests.lock().await;
+        let mut subsections = Vec::new();
+        for ns in namespace_chain {
+            if let Some(text) = cache.get(ns)
+                && !text.trim().is_empty()
+            {
+                subsections.push(format!("## {ns}\n\n{}", text.trim()));
+            }
+        }
+        if subsections.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "# Today's Cross-Session Notes\n\n{}",
+                subsections.join("\n\n")
+            ))
+        }
     }
 
     /// Read MEMORY.md from each namespace in the chain (closest first) and
@@ -363,6 +414,17 @@ fn build_chained_digest_block(
         debug!("Injecting {heading} ({} subsection(s))", subsections.len());
         Some(format!("{heading}\n\n{}", subsections.join("\n\n")))
     }
+}
+
+/// Render `RoomInfo` into a Markdown block injected into the system prompt.
+/// Kept free-standing (not a method on `RoomInfo`) so the channel module
+/// stays unaware of system-prompt formatting.
+fn render_room_info(info: &RoomInfo) -> String {
+    let mut body = format!("- Channel: {}\n- Name: {}", info.kind, info.name);
+    if let Some(desc) = info.description.as_ref().filter(|s| !s.trim().is_empty()) {
+        body.push_str(&format!("\n- Description: {}", desc.trim()));
+    }
+    format!("# Current Room\n\n{body}")
 }
 
 /// Truncate `s` to at most `max_chars` Unicode scalar values.
