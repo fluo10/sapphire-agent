@@ -141,6 +141,7 @@ async fn main() -> Result<()> {
                 input_device: input_device.or(file_cfg.audio.input_device),
                 output_device: output_device.or(file_cfg.audio.output_device),
                 device,
+                behavior: file_cfg.behavior,
             },
         )
         .await;

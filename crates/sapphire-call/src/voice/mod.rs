@@ -20,15 +20,31 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use sapphire_agent_api::{VoiceEvent, voice::PIPELINE_SAMPLE_RATE, voice_pipeline_run};
+use sapphire_agent_api::{
+    VoiceEvent, VoicePushEvent, voice::PIPELINE_SAMPLE_RATE, voice_pipeline_run, voice_subscribe,
+};
 use sherpa_onnx::{
     SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
 };
 use tokio::sync::mpsc;
+
+/// Command sent from the `voice/subscribe` consumer task into the
+/// listen loop so server-initiated pushes (heartbeat fires) can route
+/// audio through the same playback gate the regular reply path uses.
+enum ListenCommand {
+    /// One PCM chunk from the server push, at [`PIPELINE_SAMPLE_RATE`].
+    /// The listen loop mutes the mic on the first chunk of a push and
+    /// appends to the playback queue.
+    PushAudio(Vec<i16>),
+    /// Server has finished pushing; listen loop should drain playback
+    /// and arm the follow-up listening window.
+    PushDone,
+}
 
 /// Silero VAD frame size in samples. Required by the model.
 const VAD_WINDOW_SAMPLES: usize = 512;
@@ -60,7 +76,17 @@ pub struct VoiceOptions {
     /// Optional device identity sent in every `voice/pipeline_run` so the
     /// agent can render "voice channel with <name>" in the system prompt.
     pub device: Option<sapphire_agent_api::DeviceMetadata>,
+    /// Listen-state UX: confirmation beeps + post-reply follow-up
+    /// listening window. See [`crate::config::BehaviorConfig`].
+    pub behavior: crate::config::BehaviorConfig,
 }
+
+/// Frequency / duration of the confirmation beeps. Picked to be
+/// distinct (rising vs falling) and short enough not to clip the start
+/// of a quick command.
+const BEEP_DURATION_MS: u32 = 150;
+const BEEP_WAKE_HZ: f32 = 880.0;
+const BEEP_CAPTURE_END_HZ: f32 = 660.0;
 
 /// Entry point for `sapphire-call voice`.
 pub async fn run(
@@ -189,8 +215,22 @@ pub async fn run(
         });
     }
 
+    // ── Background voice/subscribe consumer ──────────────────────────────
+    // Heartbeat pushes (morning calls etc.) land here. The consumer
+    // translates push events into ListenCommands so the listen loop
+    // owns the playback queue / mic gate as it does for regular replies.
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ListenCommand>();
+    let subscribe_handle = tokio::spawn(subscribe_loop(
+        client.clone(),
+        base.clone(),
+        device_id.clone(),
+        room_profile.clone(),
+        cmd_tx,
+        Arc::clone(&shutdown),
+    ));
+
     let awaiting_wake = wake_detector.is_some();
-    listen_loop(ListenCtx {
+    let listen_result = listen_loop(ListenCtx {
         audio_rx,
         input_rate,
         input_channels,
@@ -207,8 +247,14 @@ pub async fn run(
         vad,
         wake: wake_detector,
         awaiting_wake,
+        behavior: options.behavior,
+        follow_up_until: None,
+        cmd_rx,
+        push_active: false,
     })
-    .await?;
+    .await;
+    subscribe_handle.abort();
+    listen_result?;
 
     Ok(())
 }
@@ -235,13 +281,79 @@ struct ListenCtx {
     /// trigger, false once it fires and we're capturing the utterance.
     /// Always false in VAD-only mode.
     awaiting_wake: bool,
+    /// Listen-state UX (beeps + follow-up window).
+    behavior: crate::config::BehaviorConfig,
+    /// In wake-word mode, when set, the satellite is in the post-reply
+    /// follow-up window: VAD is active without requiring another wake
+    /// word until this deadline. Cleared when a follow-up utterance
+    /// starts being processed (and re-armed once that turn finishes)
+    /// or when the deadline elapses without speech.
+    follow_up_until: Option<Instant>,
+    /// Server-initiated push commands (heartbeat fires) from the
+    /// `voice/subscribe` consumer task. Multiplexed alongside
+    /// `audio_rx` via `tokio::select!` so the listen loop stays the
+    /// single owner of the mic gate and playback queue.
+    cmd_rx: mpsc::UnboundedReceiver<ListenCommand>,
+    /// True between the first `PushAudio` of a server push and the
+    /// matching `PushDone`. While set, the listen loop has muted the
+    /// mic and is buffering the pushed PCM in the playback queue.
+    push_active: bool,
 }
 
 async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
     let mut window_buf: Vec<f32> = Vec::with_capacity(VAD_WINDOW_SAMPLES);
     while !ctx.shutdown.load(Ordering::SeqCst) {
-        let Some(raw) = ctx.audio_rx.recv().await else {
-            break;
+        // Race the mic stream against any pending server push command
+        // (heartbeat fires from voice/subscribe). In the post-reply
+        // follow-up window, the recv branch is wrapped in a deadline
+        // so silence eventually drops us back into wake-listening mode.
+        let event = match ctx.follow_up_until {
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    expire_follow_up(&mut ctx, &mut window_buf);
+                    continue;
+                }
+                let remaining = deadline - now;
+                tokio::select! {
+                    biased;
+                    cmd = ctx.cmd_rx.recv() => match cmd {
+                        Some(c) => ListenEvent::Command(c),
+                        None => ListenEvent::CommandClosed,
+                    },
+                    audio = tokio::time::timeout(remaining, ctx.audio_rx.recv()) => match audio {
+                        Ok(Some(buf)) => ListenEvent::Audio(buf),
+                        Ok(None) => break,
+                        Err(_) => {
+                            expire_follow_up(&mut ctx, &mut window_buf);
+                            continue;
+                        }
+                    },
+                }
+            }
+            None => tokio::select! {
+                biased;
+                cmd = ctx.cmd_rx.recv() => match cmd {
+                    Some(c) => ListenEvent::Command(c),
+                    None => ListenEvent::CommandClosed,
+                },
+                audio = ctx.audio_rx.recv() => match audio {
+                    Some(buf) => ListenEvent::Audio(buf),
+                    None => break,
+                },
+            },
+        };
+
+        let raw = match event {
+            ListenEvent::Audio(buf) => buf,
+            ListenEvent::Command(cmd) => {
+                handle_push_command(&mut ctx, cmd, &mut window_buf).await;
+                continue;
+            }
+            // Subscribe loop ended (it errored / was aborted). Carry
+            // on listening normally — the satellite still works as a
+            // pure command station.
+            ListenEvent::CommandClosed => continue,
         };
         if !ctx.mic_enabled.load(Ordering::SeqCst) {
             continue;
@@ -263,6 +375,19 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
                     // the VAD starts on the post-wake utterance.
                     ctx.vad.reset();
                     window_buf.clear();
+                    if ctx.behavior.beep_on_wake {
+                        // Mute, play the rising tone, drain anything
+                        // already in flight, then re-open. A residual
+                        // input frame queued before the mute would
+                        // otherwise be re-processed as part of the
+                        // command itself.
+                        ctx.mic_enabled.store(false, Ordering::SeqCst);
+                        while ctx.audio_rx.try_recv().is_ok() {}
+                        enqueue_beep(&ctx.playback_queue, BEEP_WAKE_HZ, ctx.output_rate);
+                        wait_for_playback_drain(&ctx.playback_queue).await;
+                        while ctx.audio_rx.try_recv().is_ok() {}
+                        ctx.mic_enabled.store(true, Ordering::SeqCst);
+                    }
                 }
             }
             continue;
@@ -293,6 +418,17 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
             while ctx.audio_rx.try_recv().is_ok() {}
             ctx.vad.reset();
             window_buf.clear();
+            // Capturing this utterance means any pending follow-up window
+            // is being consumed; clear it so it can't fire mid-process.
+            // It will be re-armed after playback if behavior allows.
+            ctx.follow_up_until = None;
+
+            // Capture-end beep: queued onto the playback path so it plays
+            // before the TTS reply that arrives a moment later. No drain
+            // wait here — the inevitable post-reply drain covers both.
+            if ctx.behavior.beep_on_capture_end {
+                enqueue_beep(&ctx.playback_queue, BEEP_CAPTURE_END_HZ, ctx.output_rate);
+            }
 
             eprintln!(
                 "→ uploading {} samples ({:.2}s)",
@@ -318,19 +454,184 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
             while ctx.audio_rx.try_recv().is_ok() {}
             ctx.vad.reset();
             window_buf.clear();
-            // In wake-word mode, return to wake-listening for the next
-            // command. In VAD-only mode, stay in capture mode.
-            if let Some(ref mut wake) = ctx.wake {
-                wake.reset();
-                ctx.awaiting_wake = true;
-                eprintln!("Waiting for wake word.");
-            } else {
-                eprintln!("Listening.");
+            // In wake-word mode, optionally stay in a short follow-up
+            // window so the user can reply without re-waking; otherwise
+            // (or in VAD-only mode) keep the existing behaviour.
+            match (ctx.wake.as_mut(), ctx.behavior.follow_up_listen_seconds) {
+                (Some(wake), 0) => {
+                    wake.reset();
+                    ctx.awaiting_wake = true;
+                    eprintln!("Waiting for wake word.");
+                }
+                (Some(_), secs) => {
+                    ctx.awaiting_wake = false;
+                    ctx.follow_up_until =
+                        Some(Instant::now() + Duration::from_secs(secs as u64));
+                    eprintln!("Listening for follow-up... ({secs}s)");
+                }
+                (None, _) => {
+                    eprintln!("Listening.");
+                }
             }
             ctx.mic_enabled.store(true, Ordering::SeqCst);
         }
     }
     Ok(())
+}
+
+/// What the listen loop's main `select!` produced this iteration.
+enum ListenEvent {
+    Audio(Vec<i16>),
+    Command(ListenCommand),
+    CommandClosed,
+}
+
+/// Apply a server push command. The first `PushAudio` of a push mutes
+/// the mic and starts buffering pushed PCM in the playback queue;
+/// `PushDone` waits for the queue to drain and arms the follow-up
+/// listening window so the user can reply without re-waking.
+async fn handle_push_command(
+    ctx: &mut ListenCtx,
+    cmd: ListenCommand,
+    window_buf: &mut Vec<f32>,
+) {
+    match cmd {
+        ListenCommand::PushAudio(pcm) => {
+            if !ctx.push_active {
+                ctx.push_active = true;
+                // Mute mic for the duration of the push so the AI's
+                // own audio doesn't feed back into VAD as a new
+                // utterance. Drain anything already queued in
+                // audio_rx — that's pre-mute audio that would
+                // otherwise pollute the next VAD window.
+                ctx.mic_enabled.store(false, Ordering::SeqCst);
+                while ctx.audio_rx.try_recv().is_ok() {}
+                ctx.vad.reset();
+                window_buf.clear();
+            }
+            let upsampled = resample_to(&pcm, PIPELINE_SAMPLE_RATE, ctx.output_rate);
+            if let Ok(mut q) = ctx.playback_queue.lock() {
+                q.extend(upsampled);
+            }
+        }
+        ListenCommand::PushDone => {
+            wait_for_playback_drain(&ctx.playback_queue).await;
+            while ctx.audio_rx.try_recv().is_ok() {}
+            ctx.vad.reset();
+            window_buf.clear();
+            ctx.push_active = false;
+            // Same follow-up arming as the regular reply path: in
+            // wake-word mode, give the user a window to reply
+            // without re-waking; otherwise just keep listening.
+            match (ctx.wake.as_mut(), ctx.behavior.follow_up_listen_seconds) {
+                (Some(wake), 0) => {
+                    wake.reset();
+                    ctx.awaiting_wake = true;
+                    ctx.follow_up_until = None;
+                    eprintln!("Push complete. Waiting for wake word.");
+                }
+                (Some(_), secs) => {
+                    ctx.awaiting_wake = false;
+                    ctx.follow_up_until =
+                        Some(Instant::now() + Duration::from_secs(secs as u64));
+                    eprintln!("Push complete. Listening for follow-up... ({secs}s)");
+                }
+                (None, _) => {
+                    eprintln!("Push complete. Listening.");
+                }
+            }
+            ctx.mic_enabled.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Background task: keep a `voice/subscribe` SSE stream open and
+/// translate incoming push events into [`ListenCommand`]s for the
+/// listen loop. Reconnects with a small backoff on disconnection so a
+/// flaky network doesn't permanently silence heartbeat notifications.
+async fn subscribe_loop(
+    client: reqwest::Client,
+    base: String,
+    device_id: String,
+    room_profile: String,
+    cmd_tx: mpsc::UnboundedSender<ListenCommand>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut backoff_secs: u64 = 1;
+    while !shutdown.load(Ordering::SeqCst) {
+        let (push_tx, mut push_rx) = mpsc::channel::<VoicePushEvent>(32);
+        let conn = voice_subscribe(
+            &client,
+            &base,
+            &device_id,
+            &room_profile,
+            push_tx,
+        );
+        // Forward push events as ListenCommands while the subscribe
+        // call runs to completion in parallel.
+        let forwarder = {
+            let cmd_tx = cmd_tx.clone();
+            tokio::spawn(async move {
+                while let Some(evt) = push_rx.recv().await {
+                    match evt {
+                        VoicePushEvent::PushStart { task } => {
+                            eprintln!(
+                                "[push start{}]",
+                                task.as_deref().map(|t| format!(": {t}")).unwrap_or_default()
+                            );
+                        }
+                        VoicePushEvent::AssistantText { text } => {
+                            eprintln!("(push) {text}");
+                        }
+                        VoicePushEvent::AudioChunk { pcm } => {
+                            if cmd_tx.send(ListenCommand::PushAudio(pcm)).is_err() {
+                                break;
+                            }
+                        }
+                        VoicePushEvent::PushDone => {
+                            let _ = cmd_tx.send(ListenCommand::PushDone);
+                        }
+                        VoicePushEvent::Error { message } => {
+                            eprintln!("[push error: {message}]");
+                            // Still emit PushDone so the listen loop
+                            // can flush any partial playback and reset.
+                            let _ = cmd_tx.send(ListenCommand::PushDone);
+                        }
+                    }
+                }
+            })
+        };
+
+        match conn.await {
+            Ok(()) => {
+                // Server closed cleanly. Reset backoff and reconnect.
+                backoff_secs = 1;
+            }
+            Err(e) => {
+                eprintln!("voice/subscribe disconnected: {e:#}");
+            }
+        }
+        forwarder.abort();
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(30);
+    }
+}
+
+/// Time-out hook for the follow-up window: silence elapsed without a
+/// new utterance, so reset transcription state and return to
+/// wake-listening. Caller `continue`s after this.
+fn expire_follow_up(ctx: &mut ListenCtx, window_buf: &mut Vec<f32>) {
+    ctx.follow_up_until = None;
+    ctx.vad.reset();
+    window_buf.clear();
+    if let Some(ref mut wake) = ctx.wake {
+        wake.reset();
+        ctx.awaiting_wake = true;
+        eprintln!("Follow-up window elapsed. Waiting for wake word.");
+    }
 }
 
 async fn wait_for_playback_drain(queue: &Arc<std::sync::Mutex<VecDeque<i16>>>) {
@@ -683,9 +984,10 @@ async fn process_utterance(
     playback_queue: Arc<std::sync::Mutex<VecDeque<i16>>>,
     output_rate: u32,
 ) -> Result<()> {
-    if let Ok(mut q) = playback_queue.lock() {
-        q.clear();
-    }
+    // Note: the playback queue is intentionally NOT cleared here. The
+    // listen loop wait_for_playback_drain'd the previous reply before
+    // calling us, and a capture-end beep may have been enqueued in the
+    // meantime — it must survive until the cpal callback consumes it.
 
     let (event_tx, mut event_rx) = mpsc::channel::<VoiceEvent>(64);
     let server_call = tokio::spawn({
@@ -748,6 +1050,49 @@ async fn process_utterance(
     Ok(())
 }
 
+// ── Beep helpers ────────────────────────────────────────────────────────
+
+/// Synthesise a short sine-wave beep at the pipeline rate. Amplitude
+/// is intentionally modest (0.4 of full-scale) — confirmation tones
+/// shouldn't blow ears even on a turned-up speakerphone — and the
+/// envelope tapers in/out over 8 ms to avoid the click an abrupt
+/// square-edge waveform would produce.
+fn generate_beep(freq_hz: f32, duration_ms: u32) -> Vec<i16> {
+    let sr = PIPELINE_SAMPLE_RATE as f32;
+    let total = (sr * duration_ms as f32 / 1000.0) as usize;
+    let fade = ((sr * 0.008) as usize).min(total / 2);
+    let amp = 0.4;
+    let mut out = Vec::with_capacity(total);
+    for i in 0..total {
+        let t = i as f32 / sr;
+        let env = if i < fade {
+            i as f32 / fade as f32
+        } else if i >= total - fade {
+            (total - i) as f32 / fade as f32
+        } else {
+            1.0
+        };
+        let v = (2.0 * std::f32::consts::PI * freq_hz * t).sin() * amp * env;
+        out.push((v * i16::MAX as f32) as i16);
+    }
+    out
+}
+
+/// Generate a beep at the pipeline rate and append it to the playback
+/// queue, resampling to the output rate so the cpal callback can
+/// consume it without a per-sample rate convert.
+fn enqueue_beep(
+    queue: &Arc<std::sync::Mutex<VecDeque<i16>>>,
+    freq_hz: f32,
+    output_rate: u32,
+) {
+    let pcm = generate_beep(freq_hz, BEEP_DURATION_MS);
+    let upsampled = resample_to(&pcm, PIPELINE_SAMPLE_RATE, output_rate);
+    if let Ok(mut q) = queue.lock() {
+        q.extend(upsampled);
+    }
+}
+
 // ── Format helpers ──────────────────────────────────────────────────────
 
 fn to_mono(samples: &[i16], channels: u16) -> Vec<i16> {
@@ -804,5 +1149,48 @@ mod tests {
     fn resample_no_op_on_equal_rates() {
         let frames: Vec<i16> = vec![1, 2, 3];
         assert_eq!(resample_to(&frames, 16000, 16000), frames);
+    }
+
+    #[test]
+    fn beep_length_matches_duration() {
+        let pcm = generate_beep(880.0, 150);
+        // 150 ms @ 16 kHz = 2400 samples.
+        assert_eq!(pcm.len(), (PIPELINE_SAMPLE_RATE as usize) * 150 / 1000);
+    }
+
+    #[test]
+    fn beep_envelope_starts_and_ends_silent() {
+        let pcm = generate_beep(880.0, 150);
+        // First and last samples should be near zero — the linear
+        // fade-in/out reaches the edge of the envelope. Tolerance
+        // accounts for the final sample landing 1/fade short of 0.
+        let edge_limit = i16::MAX / 200;
+        assert!(
+            pcm.first().copied().unwrap_or(0).abs() < edge_limit,
+            "first sample too loud: {:?}",
+            pcm.first()
+        );
+        assert!(
+            pcm.last().copied().unwrap_or(0).abs() < edge_limit,
+            "last sample too loud: {:?}",
+            pcm.last()
+        );
+        // Plateau region should swing through real amplitude. Look at
+        // peak magnitude over the central third instead of one sample
+        // (zero-crossings of the sine land on individual samples at
+        // certain frequency/rate combos).
+        let lo = pcm.len() / 3;
+        let hi = pcm.len() * 2 / 3;
+        let peak = pcm[lo..hi].iter().map(|s| s.abs()).max().unwrap_or(0);
+        assert!(peak > i16::MAX / 4, "plateau peak too quiet: {peak}");
+    }
+
+    #[test]
+    fn enqueue_beep_appends_to_queue() {
+        let q = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        enqueue_beep(&q, 660.0, PIPELINE_SAMPLE_RATE);
+        let len = q.lock().unwrap().len();
+        // Equal sample rates → no resample → exact pipeline-rate length.
+        assert_eq!(len, generate_beep(660.0, BEEP_DURATION_MS).len());
     }
 }

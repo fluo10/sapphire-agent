@@ -32,3 +32,11 @@ room_profile = "home_voice"
 # are optional; the block is only emitted when `name` is set.
 # name        = "living-room-speaker"
 # description = "Speakerphone in the living room; STT may produce typos due to ambient noise"
+
+[behavior]
+# Confirmation beeps and follow-up listening window. Defaults shown.
+# beep_on_wake          = true   # rising tone right after the wake word fires
+# beep_on_capture_end   = true   # falling tone when the VAD ships an utterance to STT
+# follow_up_listen_seconds = 5   # keep the mic open this long after the AI finishes
+#                                  speaking, so the user can reply without re-waking.
+#                                  Set to 0 to require a wake word for every turn.

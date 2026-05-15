@@ -32,6 +32,12 @@ pub struct CallConfig {
     /// satellite host describe itself.
     #[serde(default)]
     pub device: DeviceConfig,
+    /// Listen-state UX knobs: confirmation beeps and the post-reply
+    /// follow-up listening window. All defaults are on / 5 seconds so
+    /// fresh installs get the conversational behaviour described in
+    /// issue #83 without explicit opt-in.
+    #[serde(default)]
+    pub behavior: BehaviorConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -95,6 +101,45 @@ impl DeviceConfig {
     }
 }
 
+/// Listen-state UX behaviour. See issue #83.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorConfig {
+    /// Play a short rising beep right after the wake word fires so the
+    /// user knows the satellite is now capturing their command.
+    #[serde(default = "default_true")]
+    pub beep_on_wake: bool,
+    /// Play a short falling beep when the VAD detects the end of an
+    /// utterance and ships it to STT. Confirms "I heard you, processing".
+    #[serde(default = "default_true")]
+    pub beep_on_capture_end: bool,
+    /// After the assistant's TTS reply finishes playing, keep the mic
+    /// open for this many seconds without requiring the wake word —
+    /// captures conversational follow-ups. Set to `0` to disable
+    /// (every turn requires re-waking). Only takes effect in
+    /// wake-word mode; VAD-only mode is always continuously listening.
+    #[serde(default = "default_follow_up_seconds")]
+    pub follow_up_listen_seconds: u32,
+}
+
+impl Default for BehaviorConfig {
+    fn default() -> Self {
+        Self {
+            beep_on_wake: default_true(),
+            beep_on_capture_end: default_true(),
+            follow_up_listen_seconds: default_follow_up_seconds(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_follow_up_seconds() -> u32 {
+    5
+}
+
 impl CallConfig {
     /// Load a config file from `path`. The caller is expected to
     /// short-circuit when the file doesn't exist — missing-config is
@@ -149,6 +194,11 @@ stt = "ja"
 [device]
 name = "living-room-speaker"
 description = "Speakerphone in the living room; STT may produce typos"
+
+[behavior]
+beep_on_wake = false
+beep_on_capture_end = true
+follow_up_listen_seconds = 8
 "#;
         let cfg: CallConfig = toml::from_str(raw).unwrap();
         assert_eq!(cfg.server.room_profile.as_deref(), Some("home_voice"));
@@ -159,6 +209,17 @@ description = "Speakerphone in the living room; STT may produce typos"
         assert_eq!(cfg.language.stt.as_deref(), Some("ja"));
         assert_eq!(cfg.device.name.as_deref(), Some("living-room-speaker"));
         assert!(cfg.device.description.is_some());
+        assert!(!cfg.behavior.beep_on_wake);
+        assert!(cfg.behavior.beep_on_capture_end);
+        assert_eq!(cfg.behavior.follow_up_listen_seconds, 8);
+    }
+
+    #[test]
+    fn behavior_defaults_when_block_omitted() {
+        let cfg: CallConfig = toml::from_str("").unwrap();
+        assert!(cfg.behavior.beep_on_wake);
+        assert!(cfg.behavior.beep_on_capture_end);
+        assert_eq!(cfg.behavior.follow_up_listen_seconds, 5);
     }
 
     #[test]

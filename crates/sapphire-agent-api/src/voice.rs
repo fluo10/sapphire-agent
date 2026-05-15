@@ -149,6 +149,31 @@ pub enum VoiceEvent {
     Error { message: String },
 }
 
+/// Server-initiated push delivered over `voice/subscribe`. One push
+/// represents a single TTS-able message (typically a heartbeat fire) —
+/// it begins with `PushStart`, streams `AudioChunk`s, optionally
+/// includes an `AssistantText` for transcript logging, and ends with
+/// `PushDone`. The subscription stays open across multiple pushes; the
+/// satellite uses `PushDone` to flush playback and re-enter listening
+/// state.
+#[derive(Debug, Clone)]
+pub enum VoicePushEvent {
+    /// A new push is starting; `task` is the heartbeat task name when
+    /// the push originates from cron, or `None` for ad-hoc pushes.
+    PushStart { task: Option<String> },
+    /// Assistant's text reply (echo of what gets synthesized to audio).
+    AssistantText { text: String },
+    /// One chunk of synthesized speech (mono s16le @ 16 kHz).
+    AudioChunk { pcm: Vec<i16> },
+    /// Push completed. The satellite should drain the playback queue
+    /// and enter follow-up listening (so the user can reply to the
+    /// notification without uttering the wake word).
+    PushDone,
+    /// Push failed. The satellite should log and continue waiting for
+    /// the next push.
+    Error { message: String },
+}
+
 /// Run one voice pipeline pass: upload `pcm` as a single utterance,
 /// stream progress events into `event_tx`, and return when the
 /// server emits its final JSON-RPC result. Closing `event_tx` is the
@@ -226,6 +251,119 @@ fn parse_sse_data(raw: &str) -> Option<Value> {
     let data_line = raw.lines().find(|l| l.starts_with("data:"))?;
     let data = data_line.strip_prefix("data:").unwrap_or("").trim();
     serde_json::from_str(data).ok()
+}
+
+/// Open a long-lived subscription for server-initiated voice pushes.
+/// `event_tx` receives one [`VoicePushEvent`] per server notification
+/// until the connection closes. Caller is expected to spawn this on a
+/// background task and reconnect (with backoff) when the future
+/// returns — the typical flow is "until satellite shuts down."
+///
+/// Routing is by `(device_id, room_profile)` — the same key
+/// `voice/pipeline_run` uses to derive its session id. A new
+/// subscription supersedes any prior subscription for the same key, so
+/// reconnecting after a network blip just re-binds the channel.
+pub async fn voice_subscribe(
+    client: &reqwest::Client,
+    base: &str,
+    device_id: &str,
+    room_profile: &str,
+    event_tx: mpsc::Sender<VoicePushEvent>,
+) -> Result<()> {
+    let base = base.trim_end_matches('/');
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": next_id(),
+        "method": "voice/subscribe",
+        "params": {
+            "device_id": device_id,
+            "room_profile": room_profile,
+        },
+    });
+
+    let resp = client
+        .post(format!("{base}/rpc"))
+        .header("accept", "text/event-stream")
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    while let Some(chunk) = stream.next().await {
+        buf.push_str(&String::from_utf8_lossy(&chunk?));
+        while let Some(pos) = buf.find("\n\n") {
+            let raw: String = buf.drain(..pos + 2).collect();
+            let Some(value) = parse_sse_data(&raw) else {
+                continue;
+            };
+            if dispatch_push_event(&value, &event_tx).await {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Map one parsed JSON-RPC frame on the subscribe stream to a
+/// [`VoicePushEvent`]. Returns `true` when the stream should be
+/// considered closed (final result / error / `unsubscribe` notice).
+async fn dispatch_push_event(val: &Value, tx: &mpsc::Sender<VoicePushEvent>) -> bool {
+    if let Some(method) = val["method"].as_str() {
+        let params = &val["params"];
+        let evt = match method {
+            "notifications/voice_push" => {
+                let kind = params["kind"].as_str().unwrap_or("");
+                match kind {
+                    "push_start" => Some(VoicePushEvent::PushStart {
+                        task: params["task"].as_str().map(String::from),
+                    }),
+                    "assistant_text" => params["text"]
+                        .as_str()
+                        .map(|s| VoicePushEvent::AssistantText { text: s.to_string() }),
+                    "audio_chunk" => params["data"].as_str().and_then(decode_push_audio_chunk),
+                    "push_done" => Some(VoicePushEvent::PushDone),
+                    "error" => Some(VoicePushEvent::Error {
+                        message: params["message"]
+                            .as_str()
+                            .unwrap_or("unknown error")
+                            .to_string(),
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(evt) = evt {
+            let _ = tx.send(evt).await;
+        }
+        return false;
+    }
+    if let Some(err) = val.get("error") {
+        let message = err["message"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string();
+        let _ = tx.send(VoicePushEvent::Error { message }).await;
+        return true;
+    }
+    // Final result on the subscribe channel means the server is closing us.
+    val.get("result").is_some()
+}
+
+fn decode_push_audio_chunk(b64: &str) -> Option<VoicePushEvent> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .ok()?;
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let pcm: Vec<i16> = bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    Some(VoicePushEvent::AudioChunk { pcm })
 }
 
 /// Map one parsed JSON-RPC frame to a `VoiceEvent` and push it. Returns

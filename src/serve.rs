@@ -37,6 +37,19 @@ const MAX_TOOL_ROUNDS: usize = 10;
 // Shared server state
 // ---------------------------------------------------------------------------
 
+/// Map of `device_id` → (`room_profile`, push channel), populated by
+/// `voice/subscribe`. Heartbeat (and any future server-initiated voice
+/// notifier) looks up subscribers here to deliver TTS audio.
+///
+/// Keyed by `device_id` alone because a single satellite only ever
+/// holds one active voice session at a time — the satellite tells us
+/// which room_profile it's bound to when it subscribes, and we keep
+/// that around as the reverse index so heartbeat tasks don't have to
+/// duplicate the value.
+pub type VoiceSubscribers = tokio::sync::Mutex<
+    HashMap<String, (String, mpsc::Sender<crate::voice::VoicePushItem>)>,
+>;
+
 pub struct ServeState {
     pub(crate) config: Config,
     pub(crate) registry: Arc<ProviderRegistry>,
@@ -68,6 +81,10 @@ pub struct ServeState {
     /// `[tts_provider.*]` blocks are configured — in that case the
     /// `voice/pipeline_run` method returns a method-not-available error.
     pub(crate) voice: Option<Arc<VoiceProviders>>,
+    /// Active satellites, keyed by `(device_id, room_profile)`. Inserted
+    /// by `voice/subscribe`, removed by the per-subscription writer task
+    /// when its SSE channel closes (i.e. satellite disconnects).
+    pub(crate) voice_subscribers: Arc<VoiceSubscribers>,
 }
 
 impl ServeState {
@@ -94,6 +111,7 @@ impl ServeState {
             session_room_profiles: tokio::sync::Mutex::new(HashMap::new()),
             session_room_metadata: tokio::sync::Mutex::new(HashMap::new()),
             voice,
+            voice_subscribers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -264,6 +282,7 @@ async fn rpc_post(
         "voice/pipeline_run" => {
             handle_voice_pipeline_run(state, req_id, req.params).await
         }
+        "voice/subscribe" => handle_voice_subscribe(state, req_id, req.params).await,
         _ => {
             let body = error_response(req_id, -32601, "Method not found");
             body.into_response()
@@ -738,13 +757,134 @@ async fn handle_voice_pipeline_run(
         .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// voice/subscribe — long-lived SSE for server→satellite voice pushes
+// ---------------------------------------------------------------------------
+
+async fn handle_voice_subscribe(
+    state: Arc<ServeState>,
+    req_id: Value,
+    params: Option<Value>,
+) -> axum::response::Response {
+    let params = params.unwrap_or(Value::Null);
+    let device_id = match params["device_id"].as_str() {
+        Some(s) => s.to_string(),
+        None => {
+            let body = error_response(req_id, -32602, "Missing params.device_id");
+            return body.into_response();
+        }
+    };
+    let room_profile = match params["room_profile"].as_str() {
+        Some(s) => s.to_string(),
+        None => {
+            let body = error_response(req_id, -32602, "Missing params.room_profile");
+            return body.into_response();
+        }
+    };
+    if state.config.room_profile(&room_profile).is_none() {
+        let body = error_response(
+            req_id,
+            -32602,
+            &format!("Unknown room_profile '{room_profile}'"),
+        );
+        return body.into_response();
+    }
+
+    // Replace any prior subscription for this device (typical case:
+    // the same satellite reconnects after a brief network blip). The
+    // old sender is dropped; its writer task exits on the first
+    // failed send. The room_profile may also have changed across
+    // reconnect, so the freshest value wins — that's the satellite's
+    // current binding.
+    let (push_tx, push_rx) = mpsc::channel::<crate::voice::VoicePushItem>(32);
+    {
+        let mut subs = state.voice_subscribers.lock().await;
+        subs.insert(device_id.clone(), (room_profile.clone(), push_tx));
+    }
+    info!(
+        "voice/subscribe: registered (device={device_id}, room_profile={room_profile})"
+    );
+
+    let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(32);
+    let cleanup_state = Arc::clone(&state);
+    let cleanup_device = device_id.clone();
+    tokio::spawn(async move {
+        translate_voice_pushes(push_rx, sse_tx).await;
+        // SSE writer exited (satellite disconnected or push channel
+        // closed). Remove the subscriber entry — but only if it still
+        // points at our (now-dropped) sender, since a subsequent
+        // reconnect may have already replaced it.
+        let mut subs = cleanup_state.voice_subscribers.lock().await;
+        if subs
+            .get(&cleanup_device)
+            .map(|(_, tx)| tx.is_closed())
+            .unwrap_or(false)
+        {
+            if let Some((rp, _)) = subs.remove(&cleanup_device) {
+                info!(
+                    "voice/subscribe: unregistered (device={cleanup_device}, room_profile={rp})"
+                );
+            }
+        }
+    });
+
+    let stream = ReceiverStream::new(sse_rx);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .into_response()
+}
+
+/// Forward [`VoicePushItem`]s from the per-subscriber mpsc channel into
+/// SSE notification events. Exits when either the push channel closes
+/// (server cleanup) or the SSE channel closes (client disconnect).
+async fn translate_voice_pushes(
+    mut push_rx: mpsc::Receiver<crate::voice::VoicePushItem>,
+    sse_tx: mpsc::Sender<Result<Event, Infallible>>,
+) {
+    use base64::Engine;
+    while let Some(item) = push_rx.recv().await {
+        let evt = match item {
+            crate::voice::VoicePushItem::Start { task } => {
+                let mut params = json!({"kind": "push_start"});
+                if let Some(t) = task {
+                    params["task"] = json!(t);
+                }
+                notification_event("notifications/voice_push", params)
+            }
+            crate::voice::VoicePushItem::AssistantText(text) => notification_event(
+                "notifications/voice_push",
+                json!({"kind": "assistant_text", "text": text}),
+            ),
+            crate::voice::VoicePushItem::AudioChunk(pcm) => {
+                let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                notification_event(
+                    "notifications/voice_push",
+                    json!({"kind": "audio_chunk", "data": b64}),
+                )
+            }
+            crate::voice::VoicePushItem::Done => notification_event(
+                "notifications/voice_push",
+                json!({"kind": "push_done"}),
+            ),
+            crate::voice::VoicePushItem::Error(message) => notification_event(
+                "notifications/voice_push",
+                json!({"kind": "error", "message": message}),
+            ),
+        };
+        if sse_tx.send(Ok(evt)).await.is_err() {
+            break;
+        }
+    }
+}
+
 /// Deterministic session id derived from `(device_id, room_profile)`.
 /// Always-same input ⇒ always-same id, so a satellite reconnecting
 /// after a crash or day rollover resumes the same conversation file.
 ///
 /// Format: `voice-<first 16 hex chars of SHA-256>`. Filesystem-safe,
 /// unique enough for any realistic deployment.
-fn voice_session_id(device_id: &str, room_profile: &str) -> String {
+pub(crate) fn voice_session_id(device_id: &str, room_profile: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"voice:");
@@ -778,10 +918,10 @@ async fn run_voice_turn(
         }
     };
 
-    // Resolve voice providers from the session's pinned room_profile.
-    let voice_registry = match state.voice.as_ref() {
-        Some(v) => Arc::clone(v),
-        None => {
+    // Resolve voice pipeline (need STT here; from_text resolves TTS again).
+    let pipeline = match resolve_voice_pipeline(&state, &session_id).await {
+        Ok(p) => p,
+        Err(VoicePipelineLookup::NoVoice) => {
             send(error_event(
                 &req_id,
                 -32601,
@@ -790,20 +930,7 @@ async fn run_voice_turn(
             .await;
             return;
         }
-    };
-
-    let rp_name = state
-        .session_room_profiles
-        .lock()
-        .await
-        .get(&session_id)
-        .cloned();
-    let pipeline = rp_name
-        .as_deref()
-        .and_then(|n| state.config.voice_pipeline_for_room_profile(n));
-    let pipeline = match pipeline {
-        Some(p) => p.clone(),
-        None => {
+        Err(VoicePipelineLookup::NotConfigured) => {
             send(error_event(
                 &req_id,
                 -32602,
@@ -813,6 +940,7 @@ async fn run_voice_turn(
             return;
         }
     };
+    let voice_registry = state.voice.as_ref().expect("checked above").clone();
     let stt = match voice_registry.stt(&pipeline.stt_provider) {
         Some(p) => p,
         None => {
@@ -822,21 +950,6 @@ async fn run_voice_turn(
                 &format!(
                     "stt_provider '{}' not instantiated",
                     pipeline.stt_provider
-                ),
-            ))
-            .await;
-            return;
-        }
-    };
-    let tts = match voice_registry.tts(&pipeline.tts_provider) {
-        Some(p) => p,
-        None => {
-            send(error_event(
-                &req_id,
-                -32603,
-                &format!(
-                    "tts_provider '{}' not instantiated",
-                    pipeline.tts_provider
                 ),
             ))
             .await;
@@ -903,6 +1016,93 @@ async fn run_voice_turn(
     ))
     .await;
 
+    // Hand off to the from-text path for everything past STT.
+    run_voice_turn_from_text_sse(state, session_id, transcript, req_id, tx).await;
+}
+
+/// Voice pipeline failure when looking up the per-session config.
+enum VoicePipelineLookup {
+    NoVoice,
+    NotConfigured,
+}
+
+async fn resolve_voice_pipeline(
+    state: &Arc<ServeState>,
+    session_id: &str,
+) -> Result<crate::config::VoicePipelineConfig, VoicePipelineLookup> {
+    if state.voice.is_none() {
+        return Err(VoicePipelineLookup::NoVoice);
+    }
+    let rp_name = state
+        .session_room_profiles
+        .lock()
+        .await
+        .get(session_id)
+        .cloned();
+    rp_name
+        .as_deref()
+        .and_then(|n| state.config.voice_pipeline_for_room_profile(n))
+        .cloned()
+        .ok_or(VoicePipelineLookup::NotConfigured)
+}
+
+/// LLM turn + TTS streaming, with progress emitted as SSE notifications
+/// for the original `voice/pipeline_run` caller. The final JSON-RPC
+/// result event ends the stream.
+async fn run_voice_turn_from_text_sse(
+    state: Arc<ServeState>,
+    session_id: String,
+    user_text: String,
+    req_id: Value,
+    tx: mpsc::Sender<Result<Event, Infallible>>,
+) {
+    use base64::Engine;
+
+    let send = |evt: Event| {
+        let tx = tx.clone();
+        async move {
+            let _ = tx.send(Ok(evt)).await;
+        }
+    };
+
+    let pipeline = match resolve_voice_pipeline(&state, &session_id).await {
+        Ok(p) => p,
+        Err(VoicePipelineLookup::NoVoice) => {
+            send(error_event(
+                &req_id,
+                -32601,
+                "voice unavailable: no STT/TTS providers configured",
+            ))
+            .await;
+            return;
+        }
+        Err(VoicePipelineLookup::NotConfigured) => {
+            send(error_event(
+                &req_id,
+                -32602,
+                "Session's room_profile has no voice_pipeline configured",
+            ))
+            .await;
+            return;
+        }
+    };
+    let voice_registry = state.voice.as_ref().expect("checked above").clone();
+    let tts = match voice_registry.tts(&pipeline.tts_provider) {
+        Some(p) => p,
+        None => {
+            send(error_event(
+                &req_id,
+                -32603,
+                &format!(
+                    "tts_provider '{}' not instantiated",
+                    pipeline.tts_provider
+                ),
+            ))
+            .await;
+            return;
+        }
+    };
+
     // Stage: LLM (intent)
     send(notification_event(
         "notifications/progress",
@@ -912,7 +1112,7 @@ async fn run_voice_turn(
     let outcome = run_llm_turn(
         Arc::clone(&state),
         session_id.clone(),
-        transcript.clone(),
+        user_text.clone(),
         req_id.clone(),
         tx.clone(),
     )
@@ -1018,7 +1218,7 @@ async fn run_voice_turn(
     send(result_event(
         &req_id,
         json!({
-            "transcript": transcript,
+            "transcript": user_text,
             "assistant_text": reply_text,
         }),
     ))
@@ -1028,17 +1228,180 @@ async fn run_voice_turn(
     if outcome.was_first_turn {
         let state2 = Arc::clone(&state);
         let sid = session_id.clone();
-        let user_msg = transcript.clone();
         let reply = reply_text.clone();
         tokio::spawn(async move {
             let p = state2.provider_for_session(&sid).await;
-            if let Some(title) = generate_session_title(&*p, &user_msg, &reply).await {
+            if let Some(title) = generate_session_title(&*p, &user_text, &reply).await {
                 if let Err(e) = state2.api_session_store.set_title(&sid, &title) {
                     warn!("Failed to store session title: {e}");
                 }
             }
         });
     }
+}
+
+/// Failure modes for [`push_voice_text_to_subscriber`]. `Offline` lets
+/// the heartbeat caller decide whether to fall back to a chat room.
+pub enum VoicePushError {
+    /// The server has no `[stt_provider.*]` / `[tts_provider.*]` blocks
+    /// configured at all — voice push is fundamentally unavailable.
+    NoVoice,
+    /// The room_profile is unknown or has no `voice_pipeline` set.
+    NotConfigured,
+    /// No satellite is currently subscribed for this `(device_id,
+    /// room_profile)` pair. Caller should fall back to chat if the
+    /// heartbeat task has a `room_id`, or log and skip otherwise.
+    Offline,
+    /// Any other failure (TTS, LLM, etc.) surfaced for logging.
+    Other(String),
+}
+
+/// Server-initiated voice push: run the LLM turn against the voice
+/// session bound to `device_id` and stream the TTS audio to the
+/// satellite subscribed via `voice/subscribe`.
+///
+/// The satellite supplied its current `room_profile` when it
+/// subscribed — that value is the authoritative reverse index, so the
+/// caller never has to duplicate it (a satellite's room_profile can
+/// only change via a fresh subscription, which atomically replaces
+/// the binding).
+///
+/// `task_name` becomes the heartbeat task identifier echoed in the
+/// `PushStart` event so the satellite can label notifications.
+pub(crate) async fn push_voice_text_to_subscriber(
+    state: Arc<ServeState>,
+    device_id: String,
+    task_name: Option<String>,
+    user_text: String,
+) -> Result<(), VoicePushError> {
+    // Look up the active subscription up front — if the satellite is
+    // offline, surface that without burning an LLM call. The map also
+    // tells us which room_profile the satellite is bound to.
+    let (room_profile, push_tx) = {
+        let subs = state.voice_subscribers.lock().await;
+        match subs.get(&device_id) {
+            Some((rp, tx)) => (rp.clone(), tx.clone()),
+            None => return Err(VoicePushError::Offline),
+        }
+    };
+    if state.config.room_profile(&room_profile).is_none() {
+        return Err(VoicePushError::NotConfigured);
+    }
+
+    // Pin the room_profile on the synthetic session id so
+    // `resolve_voice_pipeline` and `run_llm_turn` find the right config.
+    let session_id = voice_session_id(&device_id, &room_profile);
+    state
+        .session_room_profiles
+        .lock()
+        .await
+        .insert(session_id.clone(), room_profile.clone());
+
+    let pipeline = match resolve_voice_pipeline(&state, &session_id).await {
+        Ok(p) => p,
+        Err(VoicePipelineLookup::NoVoice) => return Err(VoicePushError::NoVoice),
+        Err(VoicePipelineLookup::NotConfigured) => return Err(VoicePushError::NotConfigured),
+    };
+    let voice_registry = state.voice.as_ref().ok_or(VoicePushError::NoVoice)?.clone();
+    let tts = voice_registry.tts(&pipeline.tts_provider).ok_or_else(|| {
+        VoicePushError::Other(format!(
+            "tts_provider '{}' not instantiated",
+            pipeline.tts_provider
+        ))
+    })?;
+
+    // Notify the satellite that a push is starting so it can mute the
+    // mic before the first audio chunk lands.
+    let _ = push_tx
+        .send(crate::voice::VoicePushItem::Start {
+            task: task_name.clone(),
+        })
+        .await;
+
+    // LLM turn (no SSE response channel — discard tool_start/tool_end
+    // notifications by draining the sink in a background task).
+    let (sink_tx, mut sink_rx) = mpsc::channel::<Result<Event, Infallible>>(32);
+    let drain_handle = tokio::spawn(async move {
+        while sink_rx.recv().await.is_some() {}
+    });
+    let outcome = run_llm_turn(
+        Arc::clone(&state),
+        session_id.clone(),
+        user_text.clone(),
+        Value::Null,
+        sink_tx,
+    )
+    .await;
+    drain_handle.abort();
+    let reply_text = match outcome.text {
+        Some(t) => t,
+        None => {
+            let msg = "LLM turn produced no text".to_string();
+            let _ = push_tx
+                .send(crate::voice::VoicePushItem::Error(msg.clone()))
+                .await;
+            let _ = push_tx.send(crate::voice::VoicePushItem::Done).await;
+            return Err(VoicePushError::Other(msg));
+        }
+    };
+    let _ = push_tx
+        .send(crate::voice::VoicePushItem::AssistantText(reply_text.clone()))
+        .await;
+
+    // TTS: stream chunks to the subscriber as soon as they're synthesised.
+    let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<i16>>(32);
+    let reply_for_tts = reply_text.clone();
+    let synth_handle =
+        tokio::spawn(async move { tts.synthesize_stream(&reply_for_tts, pcm_tx).await });
+    let mut chunks_emitted = 0usize;
+    while let Some(chunk) = pcm_rx.recv().await {
+        if push_tx
+            .send(crate::voice::VoicePushItem::AudioChunk(chunk))
+            .await
+            .is_err()
+        {
+            // Satellite disconnected mid-stream; abort the synth task.
+            synth_handle.abort();
+            return Err(VoicePushError::Offline);
+        }
+        chunks_emitted += 1;
+    }
+    match synth_handle.await {
+        Ok(Ok(())) if chunks_emitted == 0 => {
+            let msg = format!(
+                "TTS provider '{}' produced no audio",
+                pipeline.tts_provider
+            );
+            warn!("{msg}");
+            let _ = push_tx
+                .send(crate::voice::VoicePushItem::Error(msg.clone()))
+                .await;
+            let _ = push_tx.send(crate::voice::VoicePushItem::Done).await;
+            return Err(VoicePushError::Other(msg));
+        }
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let msg = format!("TTS synthesis failed: {e:#}");
+            error!("{msg}");
+            let _ = push_tx
+                .send(crate::voice::VoicePushItem::Error(msg.clone()))
+                .await;
+            let _ = push_tx.send(crate::voice::VoicePushItem::Done).await;
+            return Err(VoicePushError::Other(msg));
+        }
+        Err(join_err) => {
+            let msg = format!("TTS task panicked: {join_err}");
+            error!("{msg}");
+            let _ = push_tx
+                .send(crate::voice::VoicePushItem::Error(msg.clone()))
+                .await;
+            let _ = push_tx.send(crate::voice::VoicePushItem::Done).await;
+            return Err(VoicePushError::Other(msg));
+        }
+    }
+
+    let _ = push_tx.send(crate::voice::VoicePushItem::Done).await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
