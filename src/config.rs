@@ -25,6 +25,11 @@ pub struct Config {
     /// HTTP API server configuration.
     #[serde(default)]
     pub serve: Option<ServeConfig>,
+    /// A2A (Agent2Agent Protocol) server configuration. Mounted on the
+    /// same axum app as `serve`; `enabled = false` (or absent) leaves
+    /// the `/a2a` and `/.well-known/agent-card.json` routes off.
+    #[serde(default)]
+    pub a2a: Option<A2aConfig>,
     /// Directory containing AGENT.md and MEMORY.md.
     /// Defaults to the config file's parent directory.
     pub workspace_dir: Option<String>,
@@ -160,13 +165,6 @@ pub enum SessionPolicy {
 /// don't appear in any room profile fall back to `[room_profile.default]`
 /// if defined, otherwise the built-in defaults (Anthropic provider,
 /// `"default"` namespace, global `session_policy`).
-///
-/// Future-extension fields (planned for a follow-up release):
-///   - `api_enabled: bool` — gate API access per room profile
-///   - `api_keys: Vec<String>` — bearer tokens accepted by the API for
-///     this room profile
-///
-/// See https://github.com/fluo10/sapphire-agent/issues/73
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct RoomProfileConfig {
     /// Name of the LLM profile (in `[profiles.<n>]`) that drives chat
@@ -190,6 +188,46 @@ pub struct RoomProfileConfig {
     /// Absent means voice is disabled for this room profile.
     #[serde(default)]
     pub voice_pipeline: Option<String>,
+    /// Bearer tokens that grant access to this room profile via the A2A
+    /// server. Each token is unique across all room profiles — at
+    /// startup the inverse map (token → profile name) is built so an
+    /// incoming `Authorization: Bearer <token>` resolves to a profile
+    /// without the client having to name it. Empty (the default) means
+    /// the profile is not reachable via A2A. Future scope (#73): same
+    /// field will gate the legacy `/rpc` API too.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+}
+
+/// A2A (Agent2Agent Protocol) server settings.
+///
+/// The A2A endpoints (`/a2a` JSON-RPC and `/.well-known/agent-card.json`)
+/// are mounted on the same axum app as the legacy `/rpc` API server
+/// (driven by `[serve]`). Disabled by default — set `enabled = true` to
+/// turn the routes on. Per-profile bearer tokens live in
+/// `[room_profile.<n>].api_keys`; the A2A handler reverse-looks-up
+/// `Authorization: Bearer <token>` to determine which profile (and
+/// therefore which provider/memory_namespace) the request runs under.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct A2aConfig {
+    /// Whether to mount the A2A routes on the axum app. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Public URL of this agent's A2A endpoint, published in the Agent
+    /// Card under `supportedInterfaces[].url`. When absent, the card
+    /// emits an empty URL and clients have to know the endpoint out of
+    /// band. Set this to e.g. `"https://agent.example/a2a"` once you
+    /// know the externally-visible address.
+    #[serde(default)]
+    pub public_url: Option<String>,
+    /// Human-readable name of this agent in the Agent Card. Default:
+    /// `"sapphire-agent"`.
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    /// One-line description of this agent in the Agent Card. Default:
+    /// a generic personal-assistant description.
+    #[serde(default)]
+    pub agent_description: Option<String>,
 }
 
 /// Voice-mode global settings — everything that's the same for every
@@ -838,6 +876,26 @@ impl Config {
         self.room_profiles.get(name)
     }
 
+    /// Reverse-lookup: which room profile owns this bearer token?
+    ///
+    /// Returns the profile name on a match, or `None` when the token is
+    /// not registered under any `[room_profile.<n>].api_keys`. The A2A
+    /// handler uses this to pin a profile (and therefore a provider /
+    /// memory namespace) to a request without the client having to name
+    /// it explicitly. Token uniqueness across profiles is enforced by
+    /// `validate_profiles`.
+    pub fn resolve_a2a_token(&self, token: &str) -> Option<&str> {
+        if token.is_empty() {
+            return None;
+        }
+        for (name, rp) in &self.room_profiles {
+            if rp.api_keys.iter().any(|k| k == token) {
+                return Some(name.as_str());
+            }
+        }
+        None
+    }
+
     /// Resolve the session policy for a given `room_id`, falling back to
     /// the global default when no room profile sets one.
     pub fn session_policy_for(&self, room_id: &str) -> SessionPolicy {
@@ -907,6 +965,7 @@ impl Config {
         }
         // Room profile references and uniqueness of room_ids across profiles.
         let mut seen_rooms: HashMap<String, String> = HashMap::new();
+        let mut seen_api_keys: HashMap<String, String> = HashMap::new();
         for (rp_name, rp) in &self.room_profiles {
             if !self.profiles.contains_key(&rp.profile) {
                 errors.push(format!(
@@ -928,6 +987,21 @@ impl Config {
                     ));
                 } else {
                     seen_rooms.insert(room.clone(), rp_name.clone());
+                }
+            }
+            for key in &rp.api_keys {
+                if key.is_empty() {
+                    errors.push(format!(
+                        "room_profile '{rp_name}' has an empty api_keys entry"
+                    ));
+                    continue;
+                }
+                if let Some(prev) = seen_api_keys.get(key) {
+                    errors.push(format!(
+                        "api_keys token reused across room_profiles '{prev}' and '{rp_name}'"
+                    ));
+                } else {
+                    seen_api_keys.insert(key.clone(), rp_name.clone());
                 }
             }
         }
@@ -1312,6 +1386,98 @@ rooms   = ["!x:srv"]
             errors.iter().any(|e| e.contains("missing")),
             "got: {errors:?}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_api_keys_across_profiles() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.a]
+provider = "anthropic"
+
+[profiles.b]
+provider = "anthropic"
+
+[room_profile.alpha]
+profile  = "a"
+rooms    = []
+api_keys = ["sa-a2a-shared"]
+
+[room_profile.beta]
+profile  = "b"
+rooms    = []
+api_keys = ["sa-a2a-shared"]
+"#,
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("token reused")),
+            "expected duplicate-api_keys error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_api_key() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.a]
+provider = "anthropic"
+
+[room_profile.alpha]
+profile  = "a"
+rooms    = []
+api_keys = [""]
+"#,
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("empty api_keys")),
+            "expected empty-token error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_a2a_token_finds_owning_profile() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.world]
+provider = "anthropic"
+
+[profiles.dev]
+provider = "anthropic"
+
+[room_profile.sapphire_world]
+profile  = "world"
+rooms    = []
+api_keys = ["sa-a2a-world-1", "sa-a2a-world-2"]
+
+[room_profile.developer]
+profile  = "dev"
+rooms    = []
+api_keys = ["sa-a2a-dev"]
+"#,
+        );
+        assert!(cfg.validate_profiles().is_empty());
+        assert_eq!(
+            cfg.resolve_a2a_token("sa-a2a-world-1"),
+            Some("sapphire_world")
+        );
+        assert_eq!(
+            cfg.resolve_a2a_token("sa-a2a-world-2"),
+            Some("sapphire_world")
+        );
+        assert_eq!(cfg.resolve_a2a_token("sa-a2a-dev"), Some("developer"));
+        assert_eq!(cfg.resolve_a2a_token("nope"), None);
+        assert_eq!(cfg.resolve_a2a_token(""), None);
     }
 
     #[test]

@@ -163,10 +163,38 @@ system_prompt = "You are a helpful personal assistant."
 # session_policy   = "compact"
 # rooms            = ["!nsfw:example.com"]
 #
+# A2A (Agent2Agent Protocol) clients reach a room_profile through
+# bearer tokens declared here. Each token must be unique across all
+# room profiles — startup fails if two profiles share one — and an
+# incoming `Authorization: Bearer <token>` resolves implicitly to the
+# owning profile, so A2A clients never name room_profile themselves.
+# Leave `api_keys = []` (or omit) to deny A2A access to a profile.
+#
+# [room_profile.sapphire_world]
+# profile          = "default"
+# memory_namespace = "sapphire_world"
+# rooms            = []                       # A2A-only; no chat rooms map here
+# api_keys         = ["sa-a2a-<long random>"] # one token per allowed client
+#
 # Caveat: workspace retrieve (FTS / vector search) currently spans every
 # namespace because sapphire-workspace 0.10.x has no path_prefix filter.
 # Contamination prevention is digest- and MEMORY.md-only in this
 # release; retrieve hits may still leak across namespaces.
+
+# ─────────────────────────────────────────────────────────────────────
+# A2A (Agent2Agent Protocol) server (optional)
+# ─────────────────────────────────────────────────────────────────────
+# Mounts `/a2a` (JSON-RPC) and `/.well-known/agent-card.json` on the
+# same HTTP server as `/rpc`. Disabled by default — flip `enabled` to
+# turn the routes on. Auth is per-room_profile bearer tokens in
+# `[room_profile.<n>].api_keys`; this section configures only the
+# public face of the agent.
+#
+# [a2a]
+# enabled           = true
+# public_url        = "https://agent.example.com/a2a"
+# agent_name        = "Sapphire"
+# agent_description = "Personal partner AI with persistent character and memory."
 
 # ─────────────────────────────────────────────────────────────────────
 # Voice pipeline (optional)

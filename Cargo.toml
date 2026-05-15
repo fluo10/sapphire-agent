@@ -171,5 +171,10 @@ bzip2 = { version = "0.5", optional = true }
 # WAV decoding for TTS providers that return audio files (e.g. Gradio Web UI).
 hound = "3.5"
 
+# A2A protocol v1 types (Message, Task, Part, AgentCard, JSON-RPC).
+# Official Linux Foundation SDK; we use the types crate only and roll our
+# own JSON-RPC dispatch on the existing axum app in src/serve.
+a2a = { package = "a2a-lf", version = "0.3" }
+
 [dev-dependencies]
 tempfile = "3"
