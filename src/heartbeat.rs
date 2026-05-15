@@ -9,7 +9,7 @@
 
 use crate::agent::Agent;
 use crate::config::{Config, DigestConfig};
-use crate::heartbeat_config::{load_heartbeat_dir, next_due};
+use crate::heartbeat_config::{HeartbeatVoiceTarget, load_heartbeat_dir, next_due};
 use crate::memory_compaction::compact_memory;
 use crate::periodic_log::{
     catchup_missing_daily_digests, catchup_pending_daily_logs, catchup_pending_monthly_logs,
@@ -29,6 +29,17 @@ use tracing::{info, warn};
 /// How often the catchup loop scans for missing daily logs.
 const CATCHUP_INTERVAL: StdDuration = StdDuration::from_secs(60 * 60);
 
+/// A heartbeat task that's due to fire on this tick.
+struct DueTask {
+    name: String,
+    body: String,
+    /// Per-task chat room override; falls through to `default_room_id`.
+    room_id: Option<String>,
+    /// Voice satellite target, when this task should be delivered as
+    /// TTS audio instead of (or in addition to, on failure) chat.
+    voice: Option<HeartbeatVoiceTarget>,
+}
+
 pub struct Heartbeat {
     pub workspace_dir: PathBuf,
     pub ws_state: Arc<Mutex<WorkspaceState>>,
@@ -47,6 +58,11 @@ pub struct Heartbeat {
     /// Config snapshot used to enumerate memory namespaces and resolve
     /// per-room namespace assignment for periodic-log catch-up.
     pub config: Config,
+    /// Shared API server state, when voice is configured. Cron tasks
+    /// targeting a `voice:` satellite go through `serve.rs`'s push
+    /// helper; absent (no voice providers, or chat-only build) the
+    /// voice path is skipped and `room_id` is used as the only target.
+    pub serve_state: Option<Arc<crate::serve::ServeState>>,
 }
 
 impl Heartbeat {
@@ -301,9 +317,9 @@ impl Heartbeat {
             let enabled: Vec<_> = tasks.into_iter().filter(|t| t.meta.enabled).collect();
 
             let now = Local::now();
-            let (next_at, due_names): (
+            let (next_at, due_tasks): (
                 chrono::DateTime<Local>,
-                Vec<(String, String, Option<String>)>,
+                Vec<DueTask>,
             ) = match next_due(&enabled, now) {
                 None => {
                     // No tasks (or none with valid schedules); poll the
@@ -314,7 +330,12 @@ impl Heartbeat {
                 Some((at, due)) => {
                     let extracted = due
                         .into_iter()
-                        .map(|t| (t.name.clone(), t.body.clone(), t.meta.room_id.clone()))
+                        .map(|t| DueTask {
+                            name: t.name.clone(),
+                            body: t.body.clone(),
+                            room_id: t.meta.room_id.clone(),
+                            voice: t.meta.voice.clone(),
+                        })
                         .collect();
                     (at, extracted)
                 }
@@ -326,25 +347,86 @@ impl Heartbeat {
             info!(
                 "Heartbeat cron: next fire in {:.0}s ({} task(s))",
                 wait.as_secs_f64(),
-                due_names.len()
+                due_tasks.len()
             );
             tokio::time::sleep(wait).await;
 
-            for (name, body, task_room) in due_names {
-                let room = task_room.or_else(|| self.default_room_id.clone());
-                match room {
-                    Some(room) => {
-                        info!("Heartbeat cron: firing task {name} -> {room}");
-                        if let Err(e) = self.agent.trigger(&name, &body, &room).await {
-                            warn!("Heartbeat cron: task {name} failed: {e:#}");
-                        }
-                    }
-                    None => {
+            for task in due_tasks {
+                self.fire_task(task).await;
+            }
+        }
+    }
+
+    /// Dispatch a single fired task to the right channel — voice push
+    /// when configured and a satellite is online, with a chat-room
+    /// fallback when the satellite is offline (per issue #83 4(b)).
+    async fn fire_task(self: &Arc<Self>, task: DueTask) {
+        let DueTask {
+            name,
+            body,
+            room_id,
+            voice,
+        } = task;
+
+        // Voice path: only attempted when a `voice:` target was set on
+        // the task AND the server has voice providers configured.
+        if let (Some(voice), Some(serve_state)) = (voice, self.serve_state.as_ref()) {
+            info!(
+                "Heartbeat cron: firing voice task {name} -> device={}",
+                voice.device_id
+            );
+            let prompt = format!("[Heartbeat: {name}]\n\n{body}");
+            match crate::serve::push_voice_text_to_subscriber(
+                Arc::clone(serve_state),
+                voice.device_id.clone(),
+                Some(name.clone()),
+                prompt,
+            )
+            .await
+            {
+                Ok(()) => return,
+                Err(crate::serve::VoicePushError::Offline) => {
+                    if room_id.is_some() || self.default_room_id.is_some() {
                         warn!(
-                            "Heartbeat cron: task {name} has no room_id and no default; skipping"
+                            "Heartbeat cron: voice satellite offline (device={}); falling back to chat",
+                            voice.device_id
                         );
+                    } else {
+                        warn!(
+                            "Heartbeat cron: voice satellite offline (device={}); no chat fallback configured, dropping",
+                            voice.device_id
+                        );
+                        return;
                     }
                 }
+                Err(crate::serve::VoicePushError::NoVoice) => {
+                    warn!(
+                        "Heartbeat cron: voice push unavailable (no STT/TTS providers); falling back to chat for {name}"
+                    );
+                }
+                Err(crate::serve::VoicePushError::NotConfigured) => {
+                    warn!(
+                        "Heartbeat cron: subscribed satellite's room_profile has no voice_pipeline; falling back to chat for {name}"
+                    );
+                }
+                Err(crate::serve::VoicePushError::Other(msg)) => {
+                    warn!("Heartbeat cron: voice push failed for {name}: {msg}; falling back to chat");
+                }
+            }
+        }
+
+        // Chat path: original behaviour. Used both when no voice target
+        // is set and when the voice push fell through.
+        let room = room_id.or_else(|| self.default_room_id.clone());
+        match room {
+            Some(room) => {
+                info!("Heartbeat cron: firing task {name} -> {room}");
+                if let Err(e) = self.agent.trigger(&name, &body, &room).await {
+                    warn!("Heartbeat cron: task {name} failed: {e:#}");
+                }
+            }
+            None => {
+                warn!("Heartbeat cron: task {name} has no room_id and no default; skipping");
             }
         }
     }

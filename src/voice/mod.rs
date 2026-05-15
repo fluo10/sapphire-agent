@@ -32,6 +32,25 @@ pub use tts::TtsProvider;
 /// Fixed pipeline sample rate. Providers must produce/consume at this rate.
 pub const PIPELINE_SAMPLE_RATE: u32 = 16_000;
 
+/// Server-internal push event delivered to a `voice/subscribe` writer
+/// task, which translates to wire-format SSE notifications. Mirrors the
+/// public `sapphire_agent_api::VoicePushEvent` plus enough metadata to
+/// reconstruct the heartbeat task name on the wire.
+#[derive(Debug, Clone)]
+pub enum VoicePushItem {
+    /// Begin a new push (e.g. heartbeat fire).
+    Start { task: Option<String> },
+    /// Assistant text reply (echo of synthesized audio, for transcript).
+    AssistantText(String),
+    /// One synthesized audio chunk at [`PIPELINE_SAMPLE_RATE`].
+    AudioChunk(Vec<i16>),
+    /// Push complete; satellite should drain playback and enter
+    /// follow-up listen.
+    Done,
+    /// Push failed.
+    Error(String),
+}
+
 /// Holds every voice provider instantiated from config, keyed by the
 /// user-chosen name (e.g. `"whisper_local"`, `"irodori"`).
 pub struct VoiceProviders {

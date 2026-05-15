@@ -17,7 +17,10 @@ use std::borrow::Cow;
 use std::io::{Write, stderr, stdout};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use voice::{VoiceEvent, WakeWordConfig, WakeWordModel, voice_config, voice_pipeline_run};
+pub use voice::{
+    VoiceEvent, VoicePushEvent, WakeWordConfig, WakeWordModel, voice_config, voice_pipeline_run,
+    voice_subscribe,
+};
 
 /// Client-side description of the device running this satellite. Sent
 /// to the agent via the `device` block on `initialize` and

@@ -5,7 +5,9 @@
 //! ```markdown
 //! ---
 //! schedule: "0 8 * * *"
-//! room_id: "..."          # optional, defaults to channel default
+//! room_id: "..."          # optional chat target, defaults to channel default
+//! voice:                   # optional voice satellite target
+//!   device_id: "01J..."   # the satellite's device id (see sapphire-call)
 //! enabled: true            # optional, default true
 //! ---
 //!
@@ -13,7 +15,10 @@
 //! ...body...
 //! ```
 //!
-//! The body is used verbatim as the trigger prompt fed to the agent.
+//! When both `voice:` and `room_id` are set, the cron loop tries the
+//! voice satellite first and falls back to the chat room if the
+//! satellite is offline. The body is used verbatim as the trigger
+//! prompt fed to the agent.
 
 use chrono::{DateTime, Local};
 use cron::Schedule;
@@ -31,6 +36,23 @@ pub struct HeartbeatTaskMeta {
     pub room_id: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Optional voice satellite target. When set, the cron loop tries
+    /// to push the rendered TTS audio to the matching `voice/subscribe`
+    /// subscriber. A satellite that's offline causes a fall-through to
+    /// `room_id` when both are set; otherwise the fire is logged and
+    /// dropped.
+    #[serde(default)]
+    pub voice: Option<HeartbeatVoiceTarget>,
+}
+
+/// Voice satellite target, identified by `device_id`. The
+/// `room_profile` to use is reverse-looked-up from the active
+/// `voice/subscribe` registration, so heartbeat tasks don't have to
+/// duplicate it. A device only ever has one active voice session at a
+/// time, which makes the lookup unambiguous.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HeartbeatVoiceTarget {
+    pub device_id: String,
 }
 
 fn default_true() -> bool {
@@ -185,6 +207,26 @@ mod tests {
         let task = parse_task("t".to_string(), raw).unwrap();
         assert_eq!(task.meta.room_id.as_deref(), Some("!room:example"));
         assert!(!task.meta.enabled);
+        assert!(task.meta.voice.is_none());
+    }
+
+    #[test]
+    fn parse_with_voice_target() {
+        // NB: raw string — line-continuation `\` would otherwise eat
+        // the leading indentation under `voice:` and reparent the
+        // fields to the top level.
+        let raw = r#"---
+schedule: "0 7 * * *"
+room_id: "!chat:example"
+voice:
+  device_id: "01J..."
+---
+body"#;
+        let task = parse_task("morning".to_string(), raw).unwrap();
+        let voice = task.meta.voice.as_ref().unwrap();
+        assert_eq!(voice.device_id, "01J...");
+        // room_id remains as the chat fallback target.
+        assert_eq!(task.meta.room_id.as_deref(), Some("!chat:example"));
     }
 
     #[test]
