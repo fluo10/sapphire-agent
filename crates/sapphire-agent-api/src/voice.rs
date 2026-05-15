@@ -1,4 +1,5 @@
-//! Client-side helpers for the `voice/pipeline_run` MCP method.
+//! Client-side helpers for the `voice/pipeline_run` JSON-RPC method
+//! exposed on the sapphire-agent control endpoint (`/rpc`).
 //!
 //! Wraps the request/response shape used by the server in `serve.rs`:
 //! audio in (base64 s16le mono 16 kHz) → SSE progress events
@@ -54,8 +55,8 @@ pub struct WakeWordModel {
 /// Fetch the server's global wake-word configuration. Returns an
 /// empty `WakeWordConfig` when `[voice].wake_word_model` is unset.
 ///
-/// No session or MCP token needed — wake-word config is the same for
-/// every satellite regardless of room_profile, so this is a stateless
+/// No session token needed — wake-word config is the same for every
+/// satellite regardless of room_profile, so this is a stateless
 /// GET-like call.
 pub async fn voice_config(
     client: &reqwest::Client,
@@ -69,7 +70,7 @@ pub async fn voice_config(
         "params": {},
     });
     let val: Value = client
-        .post(format!("{base}/mcp"))
+        .post(format!("{base}/rpc"))
         .json(&body)
         .send()
         .await?
@@ -193,7 +194,7 @@ pub async fn voice_pipeline_run(
     });
 
     let resp = client
-        .post(format!("{base}/mcp"))
+        .post(format!("{base}/rpc"))
         .header("accept", "text/event-stream")
         .json(&body)
         .send()

@@ -16,7 +16,7 @@ A personal AI assistant agent that lives in a [`sapphire-workspace`](https://cra
 - **Background**: heartbeat cron tasks, periodic memory compaction, periodic workspace sync, daily logs.
 - **Commands**:
   - `call` — interactive REPL (reedline)
-  - `serve` — MCP Streamable HTTP API
+  - `serve` — JSON-RPC over HTTP control API (`/rpc`)
   - `run` — start the channel listeners
   - `verify` — validate config and report loaded workspace files
 

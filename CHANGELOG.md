@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- **Control API endpoint renamed `/mcp` → `/rpc`** — the existing
+  JSON-RPC control surface (`initialize`, `chat`, `get_session`,
+  `list_sessions`, `voice/*`) is sapphire-agent's own control API, not
+  an MCP server, so it moves to a neutral path. The session header is
+  likewise renamed `Mcp-Session-Id` → `Session-Id`. `sapphire-call` is
+  updated in lockstep. `/mcp` is now unbound and reserved for a real
+  MCP server (#79, #80); `/a2a` is reserved for a future Agent-to-Agent
+  endpoint.
+
 ## [0.5.0] - 2026-04-22
 
 ### Changed

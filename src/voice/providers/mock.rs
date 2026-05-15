@@ -1,8 +1,8 @@
 //! Deterministic mock STT/TTS providers.
 //!
-//! Useful for end-to-end pipeline tests and for exercising the MCP
-//! `voice/pipeline_run` method without setting up a real model or
-//! external service. Selected via TOML config:
+//! Useful for end-to-end pipeline tests and for exercising the
+//! `voice/pipeline_run` JSON-RPC method without setting up a real
+//! model or external service. Selected via TOML config:
 //!
 //! ```toml
 //! [stt_provider.test]
