@@ -40,7 +40,7 @@ sherpa-onnx = "1.13"
 # Model bundle extraction (sherpa-onnx ships tar.bz2 model archives on
 # GitHub releases).
 tar = "0.4"
-bzip2 = "0.5"
+bzip2 = "0.6"
 
 # XDG cache dir resolution for downloaded models.
 directories = "6.0"
