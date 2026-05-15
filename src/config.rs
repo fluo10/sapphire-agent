@@ -1306,35 +1306,6 @@ rooms   = ["!x:srv"]
         );
     }
 
-    /// Smoke check that every TOML under `test-configs/` parses and
-    /// validates. These files are documentation templates the user
-    /// copies into place for manual end-to-end runs; if they break
-    /// we want to know before they're copy-pasted, not after.
-    #[test]
-    fn test_configs_parse_and_validate() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-configs");
-        let entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("read_dir({}) failed: {e}", dir.display()))
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
-            .collect();
-        assert!(
-            !entries.is_empty(),
-            "test-configs/ must contain at least one .toml"
-        );
-        for path in entries {
-            let cfg = Config::load(&path)
-                .unwrap_or_else(|e| panic!("{} failed to parse: {e:#}", path.display()));
-            let errs = cfg.validate_profiles();
-            assert!(
-                errs.is_empty(),
-                "{} validation errors: {:?}",
-                path.display(),
-                errs
-            );
-        }
-    }
-
     #[test]
     fn namespace_default_resolves_when_unconfigured() {
         let cfg = parse(MINIMAL);

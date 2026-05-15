@@ -1,9 +1,11 @@
-//! HTTP API server implementing MCP Streamable HTTP transport + JSON-RPC 2.0.
+//! HTTP API server for sapphire-agent control API (JSON-RPC 2.0 over HTTP).
 //!
-//! Endpoint: POST /mcp  (chat, initialize, list_sessions)
-//!           GET  /mcp  (Phase 2: server→client SSE push, currently 405)
+//! Endpoint: POST /rpc  (chat, initialize, list_sessions, get_session, voice/*)
+//!           GET  /rpc  (Phase 2: server→client SSE push, currently 405)
 //!
-//! Session management follows the MCP standard: `Mcp-Session-Id` request header.
+//! Session management uses a `Session-Id` request/response header. The
+//! `/mcp` endpoint is reserved for the future MCP server (issue #80,
+//! #79) and is intentionally not served here.
 
 use crate::config::Config;
 use crate::context_compression::{generate_summary, maybe_compress};
@@ -161,8 +163,13 @@ pub async fn run(
     state: Arc<ServeState>,
 ) -> anyhow::Result<()> {
 
+    // Routes are intentionally separated so future protocol endpoints
+    // (`/mcp` for the MCP server in #79/#80, an eventual `/a2a` for the
+    // Agent-to-Agent protocol) can be mounted alongside `/rpc` without
+    // colliding with the control API methods (`chat`, `initialize`,
+    // `voice/*`, …) that live here.
     let app = Router::new()
-        .route("/mcp", post(mcp_post).get(mcp_get))
+        .route("/rpc", post(rpc_post).get(rpc_get))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(Arc::clone(&state));
 
@@ -217,16 +224,16 @@ async fn summarize_all_sessions(state: &Arc<ServeState>) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /mcp  — dispatch JSON-RPC methods
+// POST /rpc  — dispatch JSON-RPC methods
 // ---------------------------------------------------------------------------
 
-async fn mcp_post(
+async fn rpc_post(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     Json(req): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
     let session_id = headers
-        .get("mcp-session-id")
+        .get("session-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
@@ -249,13 +256,13 @@ async fn mcp_post(
 }
 
 // ---------------------------------------------------------------------------
-// GET /mcp  — Phase 2 placeholder (server→client push)
+// GET /rpc  — Phase 2 placeholder (server→client push)
 // ---------------------------------------------------------------------------
 
-async fn mcp_get() -> impl IntoResponse {
+async fn rpc_get() -> impl IntoResponse {
     (
         StatusCode::METHOD_NOT_ALLOWED,
-        "GET /mcp is reserved for Phase 2 server-initiated tool requests",
+        "GET /rpc is reserved for Phase 2 server-initiated tool requests",
     )
 }
 
@@ -286,7 +293,7 @@ async fn handle_initialize(
     }
 
     // Resolve to an internal UUID session_id.
-    // - Mcp-Session-Id header: already a UUID (internal), use directly.
+    // - Session-Id header: already a UUID (internal), use directly.
     // - params.session_id: must be a 7-char grain-id (public) or "new"/absent.
     let resolved: Option<String> = if let Some(uuid) = existing_header_session {
         // Header carries the internal UUID we issued — trust it directly.
@@ -384,15 +391,15 @@ async fn handle_initialize(
         .status(StatusCode::OK)
         .header("content-type", "application/json")
         .header(
-            "mcp-session-id",
+            "session-id",
             HeaderValue::from_str(&session_id).unwrap_or_else(|_| HeaderValue::from_static("")),
         )
         .body(axum::body::Body::from(body.to_string()))
         .unwrap();
 
-    // Also set Mcp-Session-Id in the response headers (accessible via response)
+    // Also set Session-Id in the response headers (accessible via response)
     response.headers_mut().insert(
-        "mcp-session-id",
+        "session-id",
         HeaderValue::from_str(&session_id).unwrap_or_else(|_| HeaderValue::from_static("")),
     );
 
@@ -413,7 +420,7 @@ async fn handle_chat(
         Some(id) => id,
         None => {
             // No session: return JSON error
-            let body = error_response(req_id, -32602, "Missing Mcp-Session-Id header");
+            let body = error_response(req_id, -32602, "Missing Session-Id header");
             return body.into_response();
         }
     };
@@ -482,7 +489,7 @@ async fn handle_get_session(
     let session_id = match session_id {
         Some(id) => id,
         None => {
-            let body = error_response(req_id, -32602, "Missing Mcp-Session-Id header");
+            let body = error_response(req_id, -32602, "Missing Session-Id header");
             return body.into_response();
         }
     };

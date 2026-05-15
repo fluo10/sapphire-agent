@@ -1,8 +1,9 @@
 //! Client library for `sapphire-agent`.
 //!
-//! Provides an HTTP client for the sapphire-agent JSON-RPC 2.0 API and an
-//! interactive REPL that can be embedded in any binary (`sapphire-agent call`
-//! or the standalone `sapphire-call`).
+//! Provides an HTTP client for the sapphire-agent control API
+//! (`/rpc`, JSON-RPC 2.0) and an interactive REPL that can be embedded
+//! in any binary (`sapphire-agent call` or the standalone
+//! `sapphire-call`).
 
 pub mod voice;
 
@@ -18,10 +19,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use voice::{VoiceEvent, WakeWordConfig, WakeWordModel, voice_config, voice_pipeline_run};
 
-/// Initialize an MCP session against `base`. Returns the internal
-/// `Mcp-Session-Id`, the human-readable display id, and whether the
-/// session is brand-new. Exposed so out-of-tree clients (e.g. the voice
-/// satellite) can reuse the same session-setup flow as the REPL.
+/// Initialize an RPC session against `base`. Returns the internal
+/// session id (UUID, sent back on subsequent requests via the
+/// `Session-Id` header), the human-readable display id, and whether
+/// the session is brand-new. Exposed so out-of-tree clients (e.g. the
+/// voice satellite) can reuse the same session-setup flow as the REPL.
 pub async fn initialize(
     client: &reqwest::Client,
     base: &str,
@@ -86,18 +88,18 @@ pub async fn run(
 
     // -- --list mode ----------------------------------------------------------
     if list {
-        let (mcp_session_id, _, _) = initialize_session(&client, &base, session, None).await?;
-        list_sessions(&client, &base, &mcp_session_id, json).await?;
+        let (session_id, _, _) = initialize_session(&client, &base, session, None).await?;
+        list_sessions(&client, &base, &session_id, json).await?;
         return Ok(());
     }
 
     // -- Initialize session ---------------------------------------------------
-    let (mut mcp_session_id, actual_session_id, is_new) =
+    let (mut session_id, display_id, is_new) =
         initialize_session(&client, &base, session, room_profile.as_deref()).await?;
 
     // -- --history dump-only mode ---------------------------------------------
     if history {
-        dump_history(&client, &base, &mcp_session_id, json, true).await?;
+        dump_history(&client, &base, &session_id, json, true).await?;
         return Ok(());
     }
 
@@ -107,7 +109,7 @@ pub async fn run(
         if trimmed.is_empty() {
             anyhow::bail!("--message requires non-empty text");
         }
-        send_chat(&client, &base, &mcp_session_id, trimmed, json).await?;
+        send_chat(&client, &base, &session_id, trimmed, json).await?;
         if !json {
             println!();
         }
@@ -117,10 +119,10 @@ pub async fn run(
     // -- REPL -----------------------------------------------------------------
     // --json is a no-op in REPL mode (text output is always human-readable).
     let _ = json;
-    println!("sapphire-agent call  (session: {actual_session_id})");
+    println!("sapphire-agent call  (session: {display_id})");
     if !is_new {
         println!("[resumed existing session]\n");
-        if let Err(e) = dump_history(&client, &base, &mcp_session_id, false, false).await {
+        if let Err(e) = dump_history(&client, &base, &session_id, false, false).await {
             eprintln!("[warning: failed to load history: {e:#}]");
         }
     }
@@ -150,9 +152,9 @@ pub async fn run(
             }
             "/clear" => {
                 match initialize_session(&client, &base, None, room_profile.as_deref()).await {
-                    Ok((new_mcp_id, new_session_id, _)) => {
-                        mcp_session_id = new_mcp_id;
-                        println!("[new session: {new_session_id}]");
+                    Ok((new_sid, new_display_id, _)) => {
+                        session_id = new_sid;
+                        println!("[new session: {new_display_id}]");
                     }
                     Err(e) => eprintln!("[error starting new session: {e:#}]"),
                 }
@@ -162,7 +164,7 @@ pub async fn run(
             _ => {}
         }
 
-        if let Err(e) = send_chat(&client, &base, &mcp_session_id, trimmed, false).await {
+        if let Err(e) = send_chat(&client, &base, &session_id, trimmed, false).await {
             eprintln!("[error: {e:#}]");
         }
         println!();
@@ -194,16 +196,16 @@ async fn initialize_session(
     });
 
     let resp = client
-        .post(format!("{base}/mcp"))
+        .post(format!("{base}/rpc"))
         .json(&body)
         .send()
         .await
         .context("Failed to connect to server. Is `sapphire-agent serve` running?")?
         .error_for_status()?;
 
-    let mcp_session_id = resp
+    let session_id = resp
         .headers()
-        .get("mcp-session-id")
+        .get("session-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| session_id_req.to_string());
@@ -218,11 +220,11 @@ async fn initialize_session(
     let display_id = result["public_id"]
         .as_str()
         .or_else(|| result["session_id"].as_str())
-        .unwrap_or(&mcp_session_id)
+        .unwrap_or(&session_id)
         .to_string();
     let is_new = result["is_new"].as_bool().unwrap_or(true);
 
-    Ok((mcp_session_id, display_id, is_new))
+    Ok((session_id, display_id, is_new))
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +234,7 @@ async fn initialize_session(
 async fn dump_history(
     client: &reqwest::Client,
     base: &str,
-    mcp_session_id: &str,
+    session_id: &str,
     json_mode: bool,
     standalone: bool,
 ) -> Result<()> {
@@ -244,8 +246,8 @@ async fn dump_history(
     });
 
     let val: Value = client
-        .post(format!("{base}/mcp"))
-        .header("mcp-session-id", mcp_session_id)
+        .post(format!("{base}/rpc"))
+        .header("session-id", session_id)
         .json(&body)
         .send()
         .await?
@@ -316,7 +318,7 @@ async fn dump_history(
 async fn list_sessions(
     client: &reqwest::Client,
     base: &str,
-    mcp_session_id: &str,
+    session_id: &str,
     json_mode: bool,
 ) -> Result<()> {
     let body = json!({
@@ -327,8 +329,8 @@ async fn list_sessions(
     });
 
     let val: Value = client
-        .post(format!("{base}/mcp"))
-        .header("mcp-session-id", mcp_session_id)
+        .post(format!("{base}/rpc"))
+        .header("session-id", session_id)
         .json(&body)
         .send()
         .await?
@@ -370,7 +372,7 @@ async fn list_sessions(
 async fn send_chat(
     client: &reqwest::Client,
     base: &str,
-    mcp_session_id: &str,
+    session_id: &str,
     content: &str,
     json_mode: bool,
 ) -> Result<()> {
@@ -383,8 +385,8 @@ async fn send_chat(
     });
 
     let resp = client
-        .post(format!("{base}/mcp"))
-        .header("mcp-session-id", mcp_session_id)
+        .post(format!("{base}/rpc"))
+        .header("session-id", session_id)
         .header("accept", "text/event-stream")
         .json(&body)
         .send()

@@ -2,8 +2,8 @@
 //!
 //! Exposes STT / TTS provider abstractions and a registry that builds
 //! concrete instances from `[stt_provider.*]` / `[tts_provider.*]` config
-//! blocks. The MCP `voice/pipeline_run` method (in [`crate::serve`])
-//! wires these into a per-request flow:
+//! blocks. The `voice/pipeline_run` JSON-RPC method on `/rpc` (in
+//! [`crate::serve`]) wires these into a per-request flow:
 //!
 //! ```text
 //! base64 PCM ─► SttProvider::transcribe ─► transcript text
