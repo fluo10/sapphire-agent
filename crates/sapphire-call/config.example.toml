@@ -35,8 +35,28 @@ room_profile = "home_voice"
 
 [behavior]
 # Confirmation beeps and follow-up listening window. Defaults shown.
-# beep_on_wake          = true   # rising tone right after the wake word fires
-# beep_on_capture_end   = true   # falling tone when the VAD ships an utterance to STT
+# beep_on_wake          = true   # rising tone — fires on wake word AND when the mic
+#                                  re-opens after the AI's TTS reply (the listen-start
+#                                  cue is the same event in both cases)
+# beep_on_capture_end   = true   # falling tone — fires when the VAD ships an utterance
+#                                  to STT AND when the follow-up window times out
+#                                  without speech (listen-end cue in both cases)
 # follow_up_listen_seconds = 5   # keep the mic open this long after the AI finishes
 #                                  speaking, so the user can reply without re-waking.
 #                                  Set to 0 to require a wake word for every turn.
+
+[sensitivity]
+# Mic gain + wake/VAD thresholds. Everything is optional; built-in
+# defaults (shown commented out) preserve the original hard-coded
+# behaviour. Tune when a speakerphone is too quiet for STT or the
+# wake / VAD models misfire on your room acoustics.
+#
+# Hardware/OS-mixer gain (PulseAudio, pavucontrol, etc.) is the
+# better adjustment when available — cpal exposes no hardware-gain
+# API so this is a software fallback for headless / locked-down hosts.
+# mic_gain           = 1.0   # linear multiplier on raw mic samples (clamped to ±i16)
+# wake_threshold     = 0.5   # openWakeWord confidence; lower = more sensitive
+# wake_cooldown_ms   = 2000  # suppress re-fires for this long after a wake
+# vad_threshold      = 0.5   # Silero speech-probability threshold
+# vad_min_silence_ms = 250   # silence required before VAD closes a segment
+# vad_min_speech_ms  = 250   # minimum speech before a segment is considered valid

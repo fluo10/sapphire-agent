@@ -46,11 +46,11 @@ const MEL_FRAMES_PER_CHUNK: usize = 8;
 /// Wake word classifier window: last 16 embeddings.
 const EMBED_WINDOW: usize = 16;
 const EMBED_DIM: usize = 96;
-/// Default confidence threshold above which wake fires.
-const DEFAULT_THRESHOLD: f32 = 0.5;
-/// Cool-down after a successful wake so a single sustained utterance
-/// doesn't fire repeatedly. 25 chunks ≈ 2 s.
-const COOLDOWN_CHUNKS: usize = 25;
+/// Each OWW pipeline step advances on 80 ms boundaries (CHUNK_SAMPLES
+/// at 16 kHz), so an `N`-ms cool-down requested in config maps to
+/// `ceil(N / 80)` chunks. Exposed so the satellite can translate
+/// `wake_cooldown_ms` once at startup.
+pub const CHUNK_MS: u32 = 80;
 
 pub struct OpenWakeWordDetector {
     mel_session: Session,
@@ -62,6 +62,9 @@ pub struct OpenWakeWordDetector {
     embed_buf: VecDeque<[f32; EMBED_DIM]>,
     label: String,
     threshold: f32,
+    /// Chunks to suppress further wake fires for after one succeeds —
+    /// derived from `wake_cooldown_ms` in the satellite config.
+    cooldown_chunks: usize,
     cooldown_left: usize,
     /// Resolved tensor names per session — Session::inputs()[0].name.
     mel_input_name: String,
@@ -86,6 +89,8 @@ impl OpenWakeWordDetector {
         embed_path: &Path,
         wake_model_path: &Path,
         label: String,
+        threshold: f32,
+        cooldown_chunks: usize,
     ) -> Result<Self> {
         let mel_session = build_session(mel_path)?;
         let embed_session = build_session(embed_path)?;
@@ -104,7 +109,8 @@ impl OpenWakeWordDetector {
             mel_buf: VecDeque::with_capacity(MEL_WINDOW_FRAMES + MEL_FRAMES_PER_CHUNK),
             embed_buf: VecDeque::with_capacity(EMBED_WINDOW + 1),
             label,
-            threshold: DEFAULT_THRESHOLD,
+            threshold,
+            cooldown_chunks,
             cooldown_left: 0,
             mel_input_name,
             embed_input_name,
@@ -236,7 +242,7 @@ impl OpenWakeWordDetector {
             return Ok(None);
         }
         if confidence >= self.threshold {
-            self.cooldown_left = COOLDOWN_CHUNKS;
+            self.cooldown_left = self.cooldown_chunks;
             return Ok(Some(self.label.clone()));
         }
         Ok(None)
@@ -308,6 +314,18 @@ fn push_embedding(buf: &mut VecDeque<[f32; EMBED_DIM]>, flat: &[f32]) -> Result<
     Ok(())
 }
 
+/// Convert a millisecond cool-down (from satellite config) into the
+/// chunk count the detector actually counts down by. Rounds up so a
+/// user-specified non-zero ms never silently degrades to zero, and
+/// matches the historical `DEFAULT_COOLDOWN_CHUNKS = 25` for the
+/// default 2000 ms.
+pub fn cooldown_chunks_from_ms(ms: u32) -> usize {
+    if ms == 0 {
+        return 0;
+    }
+    ms.div_ceil(CHUNK_MS) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +336,24 @@ mod tests {
         assert_eq!(CHUNK_SAMPLES, (PIPELINE_SAMPLE_RATE as usize / 1000) * 80);
         assert_eq!(MEL_WINDOW_FRAMES * MEL_BINS, 76 * 32);
         assert_eq!(EMBED_WINDOW * EMBED_DIM, 16 * 96);
+    }
+
+    #[test]
+    fn ms_to_chunks_matches_historical_default() {
+        // 2000 ms / 80 ms = 25 chunks — preserves the old hard-coded
+        // value (used to be `const COOLDOWN_CHUNKS: usize = 25`) when
+        // the user accepts the documented default.
+        assert_eq!(cooldown_chunks_from_ms(2000), 25);
+    }
+
+    #[test]
+    fn ms_to_chunks_rounds_up() {
+        // A non-zero request never silently degrades to 0.
+        assert_eq!(cooldown_chunks_from_ms(1), 1);
+        assert_eq!(cooldown_chunks_from_ms(79), 1);
+        assert_eq!(cooldown_chunks_from_ms(80), 1);
+        assert_eq!(cooldown_chunks_from_ms(81), 2);
+        // Explicit 0 disables cool-down entirely.
+        assert_eq!(cooldown_chunks_from_ms(0), 0);
     }
 }

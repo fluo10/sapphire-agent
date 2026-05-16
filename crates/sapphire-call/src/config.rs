@@ -38,6 +38,11 @@ pub struct CallConfig {
     /// issue #83 without explicit opt-in.
     #[serde(default)]
     pub behavior: BehaviorConfig,
+    /// Microphone gain + wake/VAD sensitivity. All optional with
+    /// defaults that match the built-in hard-coded values, so existing
+    /// configs keep behaving exactly as before. See issue #87.
+    #[serde(default)]
+    pub sensitivity: SensitivityConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -105,12 +110,18 @@ impl DeviceConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BehaviorConfig {
-    /// Play a short rising beep right after the wake word fires so the
-    /// user knows the satellite is now capturing their command.
+    /// Play a short rising beep whenever the satellite starts listening
+    /// for a command — both the obvious case (wake word fires) and the
+    /// silent case (mic re-opens after the AI's TTS reply finishes,
+    /// either into the follow-up window in wake-word mode or back to
+    /// continuous capture in VAD-only mode). Same role each time: "I'm
+    /// now listening to you".
     #[serde(default = "default_true")]
     pub beep_on_wake: bool,
     /// Play a short falling beep when the VAD detects the end of an
     /// utterance and ships it to STT. Confirms "I heard you, processing".
+    /// Also fires when the post-reply follow-up window elapses without
+    /// the user speaking — same role: "the satellite stopped listening".
     #[serde(default = "default_true")]
     pub beep_on_capture_end: bool,
     /// After the assistant's TTS reply finishes playing, keep the mic
@@ -138,6 +149,79 @@ fn default_true() -> bool {
 
 fn default_follow_up_seconds() -> u32 {
     5
+}
+
+/// Microphone gain + wake/VAD sensitivity knobs. See issue #87.
+///
+/// All fields are optional with built-in defaults that mirror the
+/// constants previously hard-coded into the satellite — so the
+/// historical behaviour is preserved when this block is omitted.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SensitivityConfig {
+    /// Linear multiplier applied to mic samples in the cpal input
+    /// callback before they are quantised to i16. `1.0` is unity gain
+    /// (no change). Anything above unity is clamped to ±full-scale to
+    /// avoid wrap-around; this is a software replacement for users
+    /// whose OS mixer / hardware can't bring a quiet speakerphone
+    /// loud enough for STT.
+    #[serde(default = "default_mic_gain")]
+    pub mic_gain: f32,
+    /// openWakeWord confidence threshold above which a wake fires.
+    /// Range `0.0..=1.0`; lower = more sensitive (and more false
+    /// positives), higher = stricter. Default mirrors openWakeWord's
+    /// own default.
+    #[serde(default = "default_wake_threshold")]
+    pub wake_threshold: f32,
+    /// Cool-down window after a successful wake fire, in milliseconds.
+    /// A single sustained utterance otherwise re-triggers the wake
+    /// model on consecutive 80 ms chunks. Default ≈ 2 s.
+    #[serde(default = "default_wake_cooldown_ms")]
+    pub wake_cooldown_ms: u32,
+    /// Silero VAD speech probability threshold. Higher = needs more
+    /// confident speech to start/extend a segment.
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
+    /// Silero VAD: how long a silence must last (ms) before the
+    /// current speech segment is closed and shipped to STT.
+    #[serde(default = "default_vad_min_silence_ms")]
+    pub vad_min_silence_ms: u32,
+    /// Silero VAD: minimum speech duration (ms) before a segment is
+    /// considered valid. Filters out clicks / single-frame noise.
+    #[serde(default = "default_vad_min_speech_ms")]
+    pub vad_min_speech_ms: u32,
+}
+
+impl Default for SensitivityConfig {
+    fn default() -> Self {
+        Self {
+            mic_gain: default_mic_gain(),
+            wake_threshold: default_wake_threshold(),
+            wake_cooldown_ms: default_wake_cooldown_ms(),
+            vad_threshold: default_vad_threshold(),
+            vad_min_silence_ms: default_vad_min_silence_ms(),
+            vad_min_speech_ms: default_vad_min_speech_ms(),
+        }
+    }
+}
+
+fn default_mic_gain() -> f32 {
+    1.0
+}
+fn default_wake_threshold() -> f32 {
+    0.5
+}
+fn default_wake_cooldown_ms() -> u32 {
+    2000
+}
+fn default_vad_threshold() -> f32 {
+    0.5
+}
+fn default_vad_min_silence_ms() -> u32 {
+    250
+}
+fn default_vad_min_speech_ms() -> u32 {
+    250
 }
 
 impl CallConfig {
@@ -199,6 +283,14 @@ description = "Speakerphone in the living room; STT may produce typos"
 beep_on_wake = false
 beep_on_capture_end = true
 follow_up_listen_seconds = 8
+
+[sensitivity]
+mic_gain           = 1.8
+wake_threshold     = 0.65
+wake_cooldown_ms   = 1500
+vad_threshold      = 0.4
+vad_min_silence_ms = 350
+vad_min_speech_ms  = 200
 "#;
         let cfg: CallConfig = toml::from_str(raw).unwrap();
         assert_eq!(cfg.server.room_profile.as_deref(), Some("home_voice"));
@@ -212,6 +304,12 @@ follow_up_listen_seconds = 8
         assert!(!cfg.behavior.beep_on_wake);
         assert!(cfg.behavior.beep_on_capture_end);
         assert_eq!(cfg.behavior.follow_up_listen_seconds, 8);
+        assert!((cfg.sensitivity.mic_gain - 1.8).abs() < f32::EPSILON);
+        assert!((cfg.sensitivity.wake_threshold - 0.65).abs() < f32::EPSILON);
+        assert_eq!(cfg.sensitivity.wake_cooldown_ms, 1500);
+        assert!((cfg.sensitivity.vad_threshold - 0.4).abs() < f32::EPSILON);
+        assert_eq!(cfg.sensitivity.vad_min_silence_ms, 350);
+        assert_eq!(cfg.sensitivity.vad_min_speech_ms, 200);
     }
 
     #[test]
@@ -220,6 +318,30 @@ follow_up_listen_seconds = 8
         assert!(cfg.behavior.beep_on_wake);
         assert!(cfg.behavior.beep_on_capture_end);
         assert_eq!(cfg.behavior.follow_up_listen_seconds, 5);
+    }
+
+    #[test]
+    fn sensitivity_defaults_when_block_omitted() {
+        let cfg: CallConfig = toml::from_str("").unwrap();
+        assert!((cfg.sensitivity.mic_gain - 1.0).abs() < f32::EPSILON);
+        assert!((cfg.sensitivity.wake_threshold - 0.5).abs() < f32::EPSILON);
+        assert_eq!(cfg.sensitivity.wake_cooldown_ms, 2000);
+        assert!((cfg.sensitivity.vad_threshold - 0.5).abs() < f32::EPSILON);
+        assert_eq!(cfg.sensitivity.vad_min_silence_ms, 250);
+        assert_eq!(cfg.sensitivity.vad_min_speech_ms, 250);
+    }
+
+    #[test]
+    fn sensitivity_partial_block_uses_per_field_defaults() {
+        // Only override mic_gain; every other field should fall back.
+        let raw = r#"
+[sensitivity]
+mic_gain = 2.5
+"#;
+        let cfg: CallConfig = toml::from_str(raw).unwrap();
+        assert!((cfg.sensitivity.mic_gain - 2.5).abs() < f32::EPSILON);
+        assert!((cfg.sensitivity.wake_threshold - 0.5).abs() < f32::EPSILON);
+        assert_eq!(cfg.sensitivity.wake_cooldown_ms, 2000);
     }
 
     #[test]
