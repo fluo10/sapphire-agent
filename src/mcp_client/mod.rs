@@ -287,6 +287,7 @@ impl McpClient {
     }
 
     /// Shut down the transport.
+    #[allow(dead_code)]
     pub async fn shutdown(&self) -> Result<()> {
         let transport = self.transport.read().await.clone();
         transport.shutdown().await

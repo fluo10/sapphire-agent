@@ -125,10 +125,10 @@ impl McpTransport for HttpTransport {
             .context("Failed to send request to MCP server")?;
 
         // Capture session id from response header.
-        if let Some(sid) = resp.headers().get("mcp-session-id") {
-            if let Ok(s) = sid.to_str() {
-                *self.session_id.lock().await = Some(s.to_string());
-            }
+        if let Some(sid) = resp.headers().get("mcp-session-id")
+            && let Ok(s) = sid.to_str()
+        {
+            *self.session_id.lock().await = Some(s.to_string());
         }
 
         let content_type = resp

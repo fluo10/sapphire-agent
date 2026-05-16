@@ -145,10 +145,10 @@ impl CallConfig {
     /// short-circuit when the file doesn't exist — missing-config is
     /// the default state and shouldn't surface as an error.
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
-        let cfg: CallConfig = toml::from_str(&raw)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let cfg: CallConfig =
+            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
         Ok(cfg)
     }
 

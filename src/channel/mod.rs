@@ -23,6 +23,7 @@ pub struct Attachment {
 }
 
 /// A message received from a channel.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {
     /// Platform-specific message ID.
@@ -83,6 +84,7 @@ pub struct RoomInfo {
 
 /// Core channel trait.
 #[async_trait]
+#[allow(dead_code)]
 pub trait Channel: Send + Sync {
     fn name(&self) -> &str;
 
@@ -137,6 +139,7 @@ impl Channels {
 
     /// True when no channels are registered (e.g. standby mode or
     /// API-only deployment).
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()
     }
@@ -198,15 +201,13 @@ impl Channels {
     /// the same outgoing `tx`. Each forwarded message updates the
     /// routing map so the originating channel is locked in for any
     /// subsequent outgoing reply.
-    pub async fn listen_all(
-        self: Arc<Self>,
-        tx: mpsc::Sender<IncomingMessage>,
-    ) -> Result<()> {
+    pub async fn listen_all(self: Arc<Self>, tx: mpsc::Sender<IncomingMessage>) -> Result<()> {
         if self.list.is_empty() {
             return Err(anyhow!("listen_all called with no channels registered"));
         }
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        for (name, ch) in self.list.iter().cloned().collect::<Vec<_>>() {
+        for entry in &self.list {
+            let (name, ch) = (entry.0.clone(), Arc::clone(&entry.1));
             let outer_tx = tx.clone();
             let me = Arc::clone(&self);
             let (inner_tx, mut inner_rx) = mpsc::channel::<IncomingMessage>(64);
@@ -260,4 +261,3 @@ pub fn seed_routing_from_config(config: &crate::config::Config) -> HashMap<Strin
     }
     seed
 }
-

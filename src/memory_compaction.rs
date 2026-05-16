@@ -26,21 +26,20 @@ Output ONLY the new contents of MEMORY.md, with no extra commentary, no code fen
 /// if the file doesn't exist or is effectively empty. Errors are logged
 /// but never returned.
 pub async fn compact_memory(provider: &dyn Provider, workspace_dir: &Path, namespace: &str) {
-    let path = workspace_dir.join("memory").join(namespace).join("MEMORY.md");
+    let path = workspace_dir
+        .join("memory")
+        .join(namespace)
+        .join("MEMORY.md");
     let original = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(_) => {
-            info!(
-                "memory_compaction: no MEMORY.md found in namespace '{namespace}', skipping"
-            );
+            info!("memory_compaction: no MEMORY.md found in namespace '{namespace}', skipping");
             return;
         }
     };
 
     if original.trim().is_empty() {
-        info!(
-            "memory_compaction: MEMORY.md in namespace '{namespace}' is empty, skipping"
-        );
+        info!("memory_compaction: MEMORY.md in namespace '{namespace}' is empty, skipping");
         return;
     }
 
@@ -58,9 +57,7 @@ pub async fn compact_memory(provider: &dyn Provider, workspace_dir: &Path, names
     let new_content = match response.text {
         Some(t) if !t.trim().is_empty() => t,
         _ => {
-            warn!(
-                "memory_compaction: empty response for '{namespace}', leaving file unchanged"
-            );
+            warn!("memory_compaction: empty response for '{namespace}', leaving file unchanged");
             return;
         }
     };

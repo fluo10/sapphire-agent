@@ -154,9 +154,7 @@ fn parse_task(name: String, raw: &str) -> Option<HeartbeatTask> {
     Some(HeartbeatTask {
         name,
         meta,
-        body: body
-            .trim_start_matches(|c: char| c == '\n' || c == '\r')
-            .to_string(),
+        body: body.trim_start_matches(['\n', '\r']).to_string(),
     })
 }
 

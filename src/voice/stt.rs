@@ -20,6 +20,7 @@ pub trait SttProvider: Send + Sync {
     /// pins this at [`super::PIPELINE_SAMPLE_RATE`] (16 kHz); providers
     /// that need a different rate should resample internally rather
     /// than imposing a different rate on the pipeline.
+    #[allow(dead_code)]
     fn sample_rate(&self) -> u32;
 
     /// Transcribe a single utterance. `pcm` is mono s16le at the

@@ -5,14 +5,12 @@
 //! provider is always present under the name [`ANTHROPIC_PROVIDER_NAME`];
 //! additional providers come from `[providers.<name>]` config entries.
 
-use crate::config::{
-    ANTHROPIC_PROVIDER_NAME, BACKGROUND_PROFILE_NAME, Config, ProviderConfig,
-};
+use crate::config::{ANTHROPIC_PROVIDER_NAME, BACKGROUND_PROFILE_NAME, Config, ProviderConfig};
 use crate::provider::Provider;
 use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::fallback::FallbackProvider;
 use crate::provider::openai_compatible::OpenAICompatibleProvider;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -31,7 +29,10 @@ impl ProviderRegistry {
     pub fn from_config(config: &Config) -> Result<Self> {
         let errors = config.validate_profiles();
         if !errors.is_empty() {
-            anyhow::bail!("invalid profile configuration:\n  - {}", errors.join("\n  - "));
+            anyhow::bail!(
+                "invalid profile configuration:\n  - {}",
+                errors.join("\n  - ")
+            );
         }
 
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
@@ -193,7 +194,8 @@ api_key = "test"
 provider = "ghost"
 "#,
         );
-        let err = ProviderRegistry::from_config(&cfg).err()
+        let err = ProviderRegistry::from_config(&cfg)
+            .err()
             .expect("expected an error");
         assert!(format!("{err:#}").contains("ghost"));
     }
@@ -211,7 +213,8 @@ base_url = "http://x/v1"
 model = "y"
 "#,
         );
-        let err = ProviderRegistry::from_config(&cfg).err()
+        let err = ProviderRegistry::from_config(&cfg)
+            .err()
             .expect("expected an error");
         assert!(format!("{err:#}").contains("reserved"));
     }

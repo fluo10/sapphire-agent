@@ -111,10 +111,8 @@ impl Heartbeat {
         tick.tick().await; // skip immediate fire — startup catchup already ran in main
         loop {
             tick.tick().await;
-            let today_local = crate::session::local_date_for_timestamp(
-                Local::now(),
-                self.day_boundary_hour,
-            );
+            let today_local =
+                crate::session::local_date_for_timestamp(Local::now(), self.day_boundary_hour);
             let mut total: usize = 0;
             for ns in self.config.all_memory_namespaces() {
                 let provider = self.provider_for_namespace(&ns);
@@ -317,29 +315,27 @@ impl Heartbeat {
             let enabled: Vec<_> = tasks.into_iter().filter(|t| t.meta.enabled).collect();
 
             let now = Local::now();
-            let (next_at, due_tasks): (
-                chrono::DateTime<Local>,
-                Vec<DueTask>,
-            ) = match next_due(&enabled, now) {
-                None => {
-                    // No tasks (or none with valid schedules); poll the
-                    // directory periodically in case files are added.
-                    tokio::time::sleep(StdDuration::from_secs(60)).await;
-                    continue;
-                }
-                Some((at, due)) => {
-                    let extracted = due
-                        .into_iter()
-                        .map(|t| DueTask {
-                            name: t.name.clone(),
-                            body: t.body.clone(),
-                            room_id: t.meta.room_id.clone(),
-                            voice: t.meta.voice.clone(),
-                        })
-                        .collect();
-                    (at, extracted)
-                }
-            };
+            let (next_at, due_tasks): (chrono::DateTime<Local>, Vec<DueTask>) =
+                match next_due(&enabled, now) {
+                    None => {
+                        // No tasks (or none with valid schedules); poll the
+                        // directory periodically in case files are added.
+                        tokio::time::sleep(StdDuration::from_secs(60)).await;
+                        continue;
+                    }
+                    Some((at, due)) => {
+                        let extracted = due
+                            .into_iter()
+                            .map(|t| DueTask {
+                                name: t.name.clone(),
+                                body: t.body.clone(),
+                                room_id: t.meta.room_id.clone(),
+                                voice: t.meta.voice.clone(),
+                            })
+                            .collect();
+                        (at, extracted)
+                    }
+                };
 
             let wait = (next_at - now)
                 .to_std()
@@ -410,7 +406,9 @@ impl Heartbeat {
                     );
                 }
                 Err(crate::serve::VoicePushError::Other(msg)) => {
-                    warn!("Heartbeat cron: voice push failed for {name}: {msg}; falling back to chat");
+                    warn!(
+                        "Heartbeat cron: voice push failed for {name}: {msg}; falling back to chat"
+                    );
                 }
             }
         }

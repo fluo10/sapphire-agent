@@ -20,8 +20,8 @@ use uuid::Uuid;
 pub fn ensure_device_id() -> Result<String> {
     let path = path()?;
     if path.exists() {
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let id = raw.trim().to_string();
         if !id.is_empty() {
             return Ok(id);
@@ -34,8 +34,7 @@ pub fn ensure_device_id() -> Result<String> {
     }
     let id = Uuid::now_v7().to_string();
     let tmp = path.with_extension("partial");
-    std::fs::write(&tmp, &id)
-        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, &id).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
     Ok(id)

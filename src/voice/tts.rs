@@ -18,6 +18,7 @@ pub trait TtsProvider: Send + Sync {
     /// [`super::PIPELINE_SAMPLE_RATE`] — providers that synthesize at
     /// a different rate should resample internally rather than
     /// imposing a different rate on the pipeline.
+    #[allow(dead_code)]
     fn sample_rate(&self) -> u32;
 
     /// Synthesize `text` and push PCM (mono s16le) frames into `pcm_tx`

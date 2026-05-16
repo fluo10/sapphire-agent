@@ -126,12 +126,8 @@ enum ApiContent {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ApiPart {
-    Text {
-        text: String,
-    },
-    ImageUrl {
-        image_url: ApiImageUrl,
-    },
+    Text { text: String },
+    ImageUrl { image_url: ApiImageUrl },
 }
 
 #[derive(Debug, Serialize)]
@@ -437,16 +433,16 @@ impl Provider for OpenAICompatibleProvider {
                         if let Some(deltas) = choice.delta.tool_calls {
                             for d in deltas {
                                 let entry = tool_acc.entry(d.index).or_default();
-                                if let Some(id) = d.id {
-                                    if !id.is_empty() {
-                                        entry.id = id;
-                                    }
+                                if let Some(id) = d.id
+                                    && !id.is_empty()
+                                {
+                                    entry.id = id;
                                 }
                                 if let Some(f) = d.function {
-                                    if let Some(n) = f.name {
-                                        if !n.is_empty() {
-                                            entry.name = n;
-                                        }
+                                    if let Some(n) = f.name
+                                        && !n.is_empty()
+                                    {
+                                        entry.name = n;
                                     }
                                     if let Some(a) = f.arguments {
                                         entry.arguments.push_str(&a);
@@ -556,8 +552,8 @@ mod tests {
         assert_eq!(calls[0]["id"], "call_1");
         assert_eq!(calls[0]["function"]["name"], "get_weather");
         // arguments is a JSON-encoded string per OpenAI spec.
-        let args: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap())
-            .unwrap();
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args, json!({"city": "Tokyo"}));
     }
 
@@ -610,5 +606,4 @@ mod tests {
         assert!(json.get("content").is_none() || json["content"].is_null());
         assert!(json["tool_calls"].is_array());
     }
-
 }

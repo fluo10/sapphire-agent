@@ -151,8 +151,17 @@ async fn main() -> Result<()> {
         // The in-tree `sapphire-agent call` CLI has no per-device config
         // file, so no DeviceMetadata is forwarded; standalone callers
         // (sapphire-call) plumb their own `[device]` block through.
-        return call::run(server, session, list, message, history, json, room_profile, None)
-            .await;
+        return call::run(
+            server,
+            session,
+            list,
+            message,
+            history,
+            json,
+            room_profile,
+            None,
+        )
+        .await;
     }
 
     let config_path = cli.config.unwrap_or_else(Config::default_path);
@@ -259,7 +268,9 @@ async fn main() -> Result<()> {
             // with-channels code path replaces this with a richer loop
             // below that also rebuilds today_digests on the same tick
             // (so we don't pay periodic_sync twice per interval).
-            if config.standby_mode && let Some(dur) = ws_sync_interval {
+            if config.standby_mode
+                && let Some(dur) = ws_sync_interval
+            {
                 tracing::info!("Periodic workspace sync enabled: every {}s", dur.as_secs());
                 let ws = Arc::clone(&ws_state);
                 tokio::spawn(async move {
@@ -375,10 +386,7 @@ async fn main() -> Result<()> {
                     channel_list,
                     channel::seed_routing_from_config(&config),
                 ));
-                tracing::info!(
-                    "Channels active: {}",
-                    channels.names().join(", ")
-                );
+                tracing::info!("Channels active: {}", channels.names().join(", "));
 
                 // ── Catch-up: iterate every configured memory namespace ────
                 // Each namespace's background tasks run on its own provider
@@ -466,10 +474,7 @@ async fn main() -> Result<()> {
                 // "today's notes" become visible without waiting for the
                 // next day-boundary daily-log generation.
                 if let Some(dur) = ws_sync_interval {
-                    tracing::info!(
-                        "Periodic workspace sync enabled: every {}s",
-                        dur.as_secs()
-                    );
+                    tracing::info!("Periodic workspace sync enabled: every {}s", dur.as_secs());
                     let ws = Arc::clone(&ws_state);
                     let cfg_for_loop = config.clone();
                     let workspace_for_loop = Arc::clone(&workspace);
@@ -580,10 +585,10 @@ async fn main() -> Result<()> {
 
             // Wait for the agent task's graceful shutdown to finish so its
             // summarize_on_shutdown LLM call isn't aborted by runtime drop.
-            if let Some(handle) = agent_handle {
-                if let Err(e) = handle.await {
-                    tracing::warn!("Agent task did not finish cleanly: {e}");
-                }
+            if let Some(handle) = agent_handle
+                && let Err(e) = handle.await
+            {
+                tracing::warn!("Agent task did not finish cleanly: {e}");
             }
         }
         Command::Call { .. } => unreachable!(),
@@ -608,10 +613,7 @@ async fn rebuild_today_digests(
     api_store: &Arc<SessionStore>,
     agent: &Arc<Agent>,
 ) {
-    let today = session::local_date_for_timestamp(
-        chrono::Local::now(),
-        config.day_boundary_hour,
-    );
+    let today = session::local_date_for_timestamp(chrono::Local::now(), config.day_boundary_hour);
     let namespaces = config.all_memory_namespaces();
     let cfg = config.clone();
     let map = build_all_today_digests(
@@ -639,9 +641,7 @@ async fn rebuild_today_digests(
 /// files exist. Refuses to run when a target path is already occupied
 /// (extremely unlikely with ULID/UUID file names but handled for
 /// safety).
-fn migrate_sessions_to_namespaced_layout(
-    sessions_base: &std::path::Path,
-) -> anyhow::Result<()> {
+fn migrate_sessions_to_namespaced_layout(sessions_base: &std::path::Path) -> anyhow::Result<()> {
     use std::io::{BufRead, BufReader};
 
     for kind in ["channel", "api"] {
@@ -698,9 +698,8 @@ fn migrate_sessions_to_namespaced_layout(
                     dst.display(),
                 );
             }
-            std::fs::rename(&path, &dst).with_context(|| {
-                format!("rename {} -> {}", path.display(), dst.display())
-            })?;
+            std::fs::rename(&path, &dst)
+                .with_context(|| format!("rename {} -> {}", path.display(), dst.display()))?;
             moved += 1;
         }
         // Remove the now-empty flat directory; non-fatal if it still has
@@ -740,8 +739,7 @@ fn migrate_per_channel_sessions(sessions_base: &std::path::Path) -> anyhow::Resu
         return Ok(());
     }
 
-    std::fs::create_dir_all(&target)
-        .with_context(|| format!("create {}", target.display()))?;
+    std::fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
 
     for src in sources {
         let entries = match std::fs::read_dir(&src) {
@@ -769,9 +767,8 @@ fn migrate_per_channel_sessions(sessions_base: &std::path::Path) -> anyhow::Resu
                     dst.display(),
                 );
             }
-            std::fs::rename(&path, &dst).with_context(|| {
-                format!("rename {} -> {}", path.display(), dst.display())
-            })?;
+            std::fs::rename(&path, &dst)
+                .with_context(|| format!("rename {} -> {}", path.display(), dst.display()))?;
             moved += 1;
         }
         // Remove the now-empty legacy directory; non-fatal if it has
@@ -835,9 +832,8 @@ fn migrate_pre_namespace_layout(workspace_dir: &std::path::Path) -> anyhow::Resu
     for kind in &pre_dirs {
         let src = memory_root.join(kind);
         let dst = default_root.join(kind);
-        std::fs::rename(&src, &dst).with_context(|| {
-            format!("rename {} -> {}", src.display(), dst.display())
-        })?;
+        std::fs::rename(&src, &dst)
+            .with_context(|| format!("rename {} -> {}", src.display(), dst.display()))?;
         tracing::info!(
             "Migrated memory subdir: {} -> {}",
             src.display(),
@@ -849,11 +845,7 @@ fn migrate_pre_namespace_layout(workspace_dir: &std::path::Path) -> anyhow::Resu
         let dst = default_root.join("MEMORY.md");
         std::fs::rename(&src, &dst)
             .with_context(|| format!("rename {} -> {}", src.display(), dst.display()))?;
-        tracing::info!(
-            "Migrated MEMORY.md: {} -> {}",
-            src.display(),
-            dst.display()
-        );
+        tracing::info!("Migrated MEMORY.md: {} -> {}", src.display(), dst.display());
     }
 
     Ok(())
@@ -978,8 +970,14 @@ mod tests {
             let path = base.join("channel").join(format!("{stem}.jsonl"));
             assert!(path.exists(), "missing: {}", path.display());
         }
-        assert!(!base.join("matrix").exists(), "matrix dir should be removed");
-        assert!(!base.join("discord").exists(), "discord dir should be removed");
+        assert!(
+            !base.join("matrix").exists(),
+            "matrix dir should be removed"
+        );
+        assert!(
+            !base.join("discord").exists(),
+            "discord dir should be removed"
+        );
     }
 
     #[test]

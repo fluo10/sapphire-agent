@@ -80,8 +80,7 @@ impl TtsProvider for MockTts {
         // Generate a sine wave at `frequency_hz` lasting `duration_ms`.
         // Chunked at ~20ms (320 samples @ 16kHz) to exercise the
         // streaming code path.
-        let total_samples =
-            (PIPELINE_SAMPLE_RATE as u64 * self.duration_ms as u64 / 1000) as usize;
+        let total_samples = (PIPELINE_SAMPLE_RATE as u64 * self.duration_ms as u64 / 1000) as usize;
         let chunk_size = PIPELINE_SAMPLE_RATE as usize / 50; // 20ms
         let two_pi = std::f64::consts::TAU;
         let freq = self.frequency_hz as f64;

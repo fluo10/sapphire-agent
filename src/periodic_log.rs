@@ -68,12 +68,7 @@ pub fn log_rel_path(namespace: &str, kind: LogKind, stem: &str) -> PathBuf {
 }
 
 /// Absolute path to the log file under `workspace_dir`.
-pub fn log_abs_path(
-    workspace_dir: &Path,
-    namespace: &str,
-    kind: LogKind,
-    stem: &str,
-) -> PathBuf {
+pub fn log_abs_path(workspace_dir: &Path, namespace: &str, kind: LogKind, stem: &str) -> PathBuf {
     workspace_dir.join(log_rel_path(namespace, kind, stem))
 }
 
@@ -249,6 +244,7 @@ where
 ///
 /// Writes a YAML frontmatter `digest:` array (top-10 importance-ordered
 /// bullets) alongside the Markdown summary body.
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_daily_log<F>(
     session_store: &SessionStore,
     provider: &dyn Provider,
@@ -492,6 +488,7 @@ pub fn read_digest_top_n(
 ///
 /// `input_body` is the concatenated source material (transcript, daily
 /// bodies, etc.) passed as the user message.
+#[allow(clippy::too_many_arguments)]
 async fn write_log_with_digest(
     provider: &dyn Provider,
     ws_state: &Arc<Mutex<WorkspaceState>>,
@@ -988,7 +985,13 @@ pub fn pending_iso_weeks(
     weeks
         .into_iter()
         .filter(|(y, w)| {
-            !log_abs_path(workspace_dir, namespace, LogKind::Weekly, &weekly_stem(*y, *w)).exists()
+            !log_abs_path(
+                workspace_dir,
+                namespace,
+                LogKind::Weekly,
+                &weekly_stem(*y, *w),
+            )
+            .exists()
         })
         .collect()
 }
@@ -996,11 +999,7 @@ pub fn pending_iso_weeks(
 /// Returns calendar (year, month) pairs that have at least one daily log on
 /// disk but no monthly log file yet, excluding `today`'s own month. Sorted
 /// ascending.
-pub fn pending_months(
-    workspace_dir: &Path,
-    namespace: &str,
-    today: NaiveDate,
-) -> Vec<(i32, u32)> {
+pub fn pending_months(workspace_dir: &Path, namespace: &str, today: NaiveDate) -> Vec<(i32, u32)> {
     use std::collections::BTreeSet;
     let current_key = (today.year(), today.month());
     let mut months: BTreeSet<(i32, u32)> = BTreeSet::new();
@@ -1014,8 +1013,13 @@ pub fn pending_months(
     months
         .into_iter()
         .filter(|(y, m)| {
-            !log_abs_path(workspace_dir, namespace, LogKind::Monthly, &monthly_stem(*y, *m))
-                .exists()
+            !log_abs_path(
+                workspace_dir,
+                namespace,
+                LogKind::Monthly,
+                &monthly_stem(*y, *m),
+            )
+            .exists()
         })
         .collect()
 }
@@ -1293,7 +1297,10 @@ mod tests {
         assert_eq!(rel, PathBuf::from("memory/default/monthly/2026-04.md"));
         // Non-default namespace.
         let abs = log_abs_path(Path::new("/ws"), "user_nsfw", LogKind::Daily, "2026-05-05");
-        assert_eq!(abs, PathBuf::from("/ws/memory/user_nsfw/daily/2026-05-05.md"));
+        assert_eq!(
+            abs,
+            PathBuf::from("/ws/memory/user_nsfw/daily/2026-05-05.md")
+        );
     }
 
     #[test]
@@ -1550,9 +1557,11 @@ mod tests {
         let td = make_tempdir();
         let root = td.path();
         for d in [
-            "2026-02-01", "2026-02-15", // Feb
-            "2026-03-05",               // Mar
-            "2026-04-02", "2026-04-16", // Apr (current)
+            "2026-02-01",
+            "2026-02-15", // Feb
+            "2026-03-05", // Mar
+            "2026-04-02",
+            "2026-04-16", // Apr (current)
         ] {
             write_stub(
                 &root.join("memory/default/daily").join(format!("{d}.md")),
@@ -1575,7 +1584,9 @@ mod tests {
         let root = td.path();
         for stem in ["2024-06", "2024-12", "2025-01", "2026-03"] {
             write_stub(
-                &root.join("memory/default/monthly").join(format!("{stem}.md")),
+                &root
+                    .join("memory/default/monthly")
+                    .join(format!("{stem}.md")),
                 "# body\n",
             );
         }

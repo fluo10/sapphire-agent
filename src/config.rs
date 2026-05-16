@@ -934,10 +934,9 @@ impl Config {
     ///
     /// Returns `None` if the profile is not defined. Caller is expected to
     /// fall back to the built-in anthropic provider in that case.
+    #[allow(dead_code)]
     pub fn provider_for_profile(&self, profile_name: &str) -> Option<&str> {
-        self.profiles
-            .get(profile_name)
-            .map(|p| p.provider.as_str())
+        self.profiles.get(profile_name).map(|p| p.provider.as_str())
     }
 
     /// Validate that every profile points to a known provider, and that
@@ -955,12 +954,12 @@ impl Config {
                     prof.provider
                 ));
             }
-            if let Some(fb) = &prof.fallback_provider {
-                if !known_provider(fb) {
-                    errors.push(format!(
-                        "profile '{pname}' references unknown fallback_provider '{fb}'"
-                    ));
-                }
+            if let Some(fb) = &prof.fallback_provider
+                && !known_provider(fb)
+            {
+                errors.push(format!(
+                    "profile '{pname}' references unknown fallback_provider '{fb}'"
+                ));
             }
         }
         // Room profile references and uniqueness of room_ids across profiles.
@@ -973,12 +972,12 @@ impl Config {
                     rp.profile
                 ));
             }
-            if let Some(ns) = &rp.memory_namespace {
-                if !self.namespace_is_defined(ns) {
-                    errors.push(format!(
-                        "room_profile '{rp_name}' references unknown memory_namespace '{ns}'"
-                    ));
-                }
+            if let Some(ns) = &rp.memory_namespace
+                && !self.namespace_is_defined(ns)
+            {
+                errors.push(format!(
+                    "room_profile '{rp_name}' references unknown memory_namespace '{ns}'"
+                ));
             }
             for room in &rp.rooms {
                 if let Some(prev) = seen_rooms.get(room) {
@@ -1014,12 +1013,12 @@ impl Config {
                     ));
                 }
             }
-            if let Some(prof) = &ns_cfg.background_profile {
-                if !self.profiles.contains_key(prof) {
-                    errors.push(format!(
-                        "memory_namespace '{ns_name}' references unknown background_profile '{prof}'"
-                    ));
-                }
+            if let Some(prof) = &ns_cfg.background_profile
+                && !self.profiles.contains_key(prof)
+            {
+                errors.push(format!(
+                    "memory_namespace '{ns_name}' references unknown background_profile '{prof}'"
+                ));
             }
         }
         for ns_name in self.memory_namespaces.keys() {
@@ -1032,12 +1031,12 @@ impl Config {
         }
         // Voice pipeline references.
         for (rp_name, rp) in &self.room_profiles {
-            if let Some(vp) = &rp.voice_pipeline {
-                if !self.voice_pipelines.contains_key(vp) {
-                    errors.push(format!(
-                        "room_profile '{rp_name}' references unknown voice_pipeline '{vp}'"
-                    ));
-                }
+            if let Some(vp) = &rp.voice_pipeline
+                && !self.voice_pipelines.contains_key(vp)
+            {
+                errors.push(format!(
+                    "room_profile '{rp_name}' references unknown voice_pipeline '{vp}'"
+                ));
             }
         }
         // Global [voice].wake_word_model must point at a real file so
@@ -1094,7 +1093,7 @@ impl Config {
                 .unwrap_or_default();
             for parent in parents {
                 if on_stack.contains(&parent) {
-                    let mut cycle: Vec<String> = stack.iter().cloned().collect();
+                    let mut cycle: Vec<String> = stack.to_vec();
                     cycle.push(parent);
                     return Some(cycle);
                 }
@@ -1521,7 +1520,11 @@ include = ["user"]
         );
         assert_eq!(
             cfg.resolve_namespace_chain("user_nsfw"),
-            vec!["user_nsfw".to_string(), "user".to_string(), "default".to_string()]
+            vec![
+                "user_nsfw".to_string(),
+                "user".to_string(),
+                "default".to_string()
+            ]
         );
         assert_eq!(
             cfg.resolve_namespace_chain("user"),
@@ -1806,7 +1809,10 @@ model  = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
         match stt {
             SttProviderConfig::SherpaOnnx(s) => {
                 assert!(matches!(s.kind, SherpaSttKind::SenseVoice));
-                assert_eq!(s.model.as_deref(), Some("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"));
+                assert_eq!(
+                    s.model.as_deref(),
+                    Some("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
+                );
                 assert_eq!(s.num_threads, 2);
                 assert_eq!(s.provider, "cpu");
                 assert!(s.language.is_none());
@@ -1830,10 +1836,7 @@ speaker_id  = 3
 speed       = 1.2
 "#,
         );
-        let tts = cfg
-            .tts_providers
-            .get("vits_ja")
-            .expect("provider parses");
+        let tts = cfg.tts_providers.get("vits_ja").expect("provider parses");
         match tts {
             TtsProviderConfig::SherpaOnnx(s) => {
                 assert!(matches!(s.kind, SherpaTtsKind::Vits));
@@ -1916,7 +1919,9 @@ wake_word_model = "/nonexistent/saphina.onnx"
         );
         let errors = cfg.validate_profiles();
         assert!(
-            errors.iter().any(|e| e.contains("/nonexistent/saphina.onnx")),
+            errors
+                .iter()
+                .any(|e| e.contains("/nonexistent/saphina.onnx")),
             "got: {errors:?}"
         );
     }

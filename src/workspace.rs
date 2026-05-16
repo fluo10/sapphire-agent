@@ -314,7 +314,10 @@ impl Workspace {
                 }
             }
             if !subsections.is_empty() {
-                parts.push(format!("# Past Years' Digests\n\n{}", subsections.join("\n\n")));
+                parts.push(format!(
+                    "# Past Years' Digests\n\n{}",
+                    subsections.join("\n\n")
+                ));
             }
         }
     }
@@ -341,11 +344,11 @@ impl Workspace {
             Some(mtime) => {
                 {
                     let cache = self.cache.lock().await;
-                    if let Some(entry) = cache.get(&path) {
-                        if entry.mtime == mtime {
-                            debug!("Workspace cache hit: {filename}");
-                            return Some(entry.content.clone());
-                        }
+                    if let Some(entry) = cache.get(&path)
+                        && entry.mtime == mtime
+                    {
+                        debug!("Workspace cache hit: {filename}");
+                        return Some(entry.content.clone());
                     }
                 }
 

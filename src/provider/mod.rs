@@ -178,6 +178,7 @@ pub struct ChatResponse {
 }
 
 impl ChatResponse {
+    #[allow(dead_code)]
     pub fn text_only(text: String) -> Self {
         Self {
             text: Some(text),
@@ -190,6 +191,7 @@ impl ChatResponse {
         !self.tool_calls.is_empty()
     }
 
+    #[allow(dead_code)]
     pub fn text_or_empty(&self) -> &str {
         self.text.as_deref().unwrap_or("")
     }

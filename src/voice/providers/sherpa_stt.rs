@@ -58,23 +58,14 @@ impl SherpaOnnxStt {
     }
 }
 
-fn build_recognizer(
-    dir: &Path,
-    cfg: &SherpaSttConfig,
-) -> anyhow::Result<OfflineRecognizer> {
+fn build_recognizer(dir: &Path, cfg: &SherpaSttConfig) -> anyhow::Result<OfflineRecognizer> {
     let mut rec_cfg = OfflineRecognizerConfig::default();
     rec_cfg.model_config.num_threads = cfg.num_threads;
     rec_cfg.model_config.provider = Some(cfg.provider.clone());
 
     match cfg.kind {
         SherpaSttKind::SenseVoice => {
-            let model = pick_file(
-                dir,
-                &[
-                    "model.int8.onnx",
-                    "model.onnx",
-                ],
-            )?;
+            let model = pick_file(dir, &["model.int8.onnx", "model.onnx"])?;
             let tokens = pick_file(dir, &["tokens.txt"])?;
             rec_cfg.model_config.sense_voice = OfflineSenseVoiceModelConfig {
                 model: Some(path_string(&model)),
@@ -165,5 +156,5 @@ impl SttProvider for SherpaOnnxStt {
 }
 
 // Re-export the cache_dir helper for test diagnostics elsewhere.
-#[allow(dead_code)]
+#[allow(unused_imports)]
 pub(crate) use sherpa_download::cache_dir;
