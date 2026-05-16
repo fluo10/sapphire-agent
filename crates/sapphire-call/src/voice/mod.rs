@@ -18,8 +18,8 @@ mod oww;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -88,6 +88,178 @@ pub struct VoiceOptions {
 const BEEP_DURATION_MS: u32 = 150;
 const BEEP_WAKE_HZ: f32 = 880.0;
 const BEEP_CAPTURE_END_HZ: f32 = 660.0;
+
+// ── cpal stream supervisor tuning ──────────────────────────────────────
+//
+// cpal hands per-stream errors to `err_fn`; a misbehaving ALSA backend
+// can flood that hook (the user-observed case: `alsa::poll()` returned
+// POLLERR repeatedly, with no recovery API exposed by cpal). Two
+// defences, applied symmetrically to *both* the input and output
+// streams (we don't know the root cause of the original input flood,
+// so it's prudent to assume the output side is equally exposed):
+//   1. Rate-limit stderr writes so the terminal stays responsive — a
+//      flooded stderr was preventing Ctrl-C from being delivered.
+//   2. Track errors in a sliding window: once the window crosses a
+//      threshold, ask the supervisor thread to drop the Stream and
+//      build a fresh one.
+//
+// The numbers are chosen to tolerate occasional xruns (which can
+// surface as a single POLLERR) while reacting quickly to a sustained
+// failure.
+
+/// Errors observed in `STREAM_ERROR_WINDOW` before the supervisor is
+/// told to rebuild the stream.
+const STREAM_ERROR_THRESHOLD: u32 = 10;
+/// How fresh an error must be to count toward `STREAM_ERROR_THRESHOLD`.
+/// Older errors are forgiven — a long-running session shouldn't restart
+/// a stream just because three xruns piled up over an hour.
+const STREAM_ERROR_WINDOW: Duration = Duration::from_secs(5);
+/// Throttle for the per-error stderr line. cpal can call `err_fn`
+/// hundreds of times per second when ALSA is stuck.
+const STREAM_ERROR_PRINT_INTERVAL: Duration = Duration::from_secs(1);
+/// Initial back-off between a `Stream` drop and the next build
+/// attempt. Doubles per failure, capped.
+const STREAM_REBUILD_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
+const STREAM_REBUILD_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Give up the satellite after this many *consecutive* rebuild
+/// failures (the underlying audio device is probably physically gone
+/// — e.g. USB unplugged — and no amount of retrying will help). The
+/// counter resets every time we successfully (re)acquire the stream,
+/// so a long uptime with one error-recovery event doesn't accumulate.
+const STREAM_REBUILD_MAX_FAILURES: u32 = 5;
+
+/// Shared state between cpal's `err_fn` and the supervisor std::thread
+/// that owns the [`cpal::Stream`]. Lives behind `Arc` because
+/// (a) cpal's error callback requires `Send + 'static`, and
+/// (b) `cpal::Stream` is `!Send` on most backends, forcing the
+/// supervisor to live on its own dedicated OS thread.
+///
+/// One instance per stream — input and output each get their own so
+/// errors on one side don't accidentally rebuild the other.
+struct StreamSupervisor {
+    /// Sliding-window error tracker + last-print timestamp for the
+    /// stderr rate-limit. err_fn updates this on every callback.
+    error_window: Mutex<ErrorWindow>,
+    /// Set to true by err_fn when the threshold is crossed, or by the
+    /// Ctrl-C handler on shutdown. The supervisor `wait`s on `cvar`
+    /// until either this flips or shutdown is observed.
+    needs_restart: Mutex<bool>,
+    cvar: Condvar,
+}
+
+#[derive(Default)]
+struct ErrorWindow {
+    /// When the first error in the current window was observed.
+    /// Cleared by the supervisor after a successful (re)build, and
+    /// rolled forward by err_fn when the window has elapsed.
+    first_at: Option<Instant>,
+    /// Errors counted toward `STREAM_ERROR_THRESHOLD` since `first_at`.
+    count: u32,
+    /// Last time we actually wrote an error line to stderr.
+    last_print_at: Option<Instant>,
+}
+
+impl StreamSupervisor {
+    fn new() -> Self {
+        Self {
+            error_window: Mutex::new(ErrorWindow::default()),
+            needs_restart: Mutex::new(false),
+            cvar: Condvar::new(),
+        }
+    }
+
+    /// Wake the supervisor from its `wait_timeout` — used by err_fn
+    /// when crossing the error threshold, and by the Ctrl-C handler
+    /// to short-circuit the shutdown path.
+    fn notify(&self) {
+        self.cvar.notify_one();
+    }
+}
+
+/// Result of feeding one error into the error window. Returned to
+/// err_fn (which lives on cpal's worker thread) so the I/O side-effects
+/// — printing to stderr and flipping the restart flag — happen *outside*
+/// the lock.
+struct ErrorDecision {
+    /// Print this error line to stderr.
+    print: bool,
+    /// Total errors in the current window after this one.
+    count: u32,
+    /// We just crossed `STREAM_ERROR_THRESHOLD` — ask the supervisor
+    /// to rebuild the stream.
+    request_restart: bool,
+}
+
+/// Pure error-window update — exercised by unit tests so the
+/// rate-limit + restart-threshold logic can be verified without
+/// spinning up cpal. Returns what err_fn should do next; the caller
+/// owns the side-effects.
+fn record_stream_error(window: &mut ErrorWindow, now: Instant) -> ErrorDecision {
+    // Roll the window forward if the previous window has fully
+    // elapsed — that way three errors per minute don't add up to a
+    // false-positive restart over the course of an hour.
+    if let Some(first) = window.first_at
+        && now.duration_since(first) > STREAM_ERROR_WINDOW
+    {
+        window.first_at = None;
+        window.count = 0;
+    }
+    if window.first_at.is_none() {
+        window.first_at = Some(now);
+    }
+    window.count += 1;
+
+    let print = match window.last_print_at {
+        Some(last) if now.duration_since(last) < STREAM_ERROR_PRINT_INTERVAL => false,
+        _ => {
+            window.last_print_at = Some(now);
+            true
+        }
+    };
+
+    // Fire the restart request exactly once per window: when we cross
+    // the threshold. The supervisor will reset first_at/count after
+    // the rebuild, so subsequent errors start a fresh window.
+    let request_restart = window.count == STREAM_ERROR_THRESHOLD;
+
+    ErrorDecision {
+        print,
+        count: window.count,
+        request_restart,
+    }
+}
+
+/// Common err_fn body: rate-limit stderr, count errors, and flip the
+/// supervisor's restart flag when the window crosses the threshold.
+/// Used by both `open_input_stream` and `open_output_stream` so the
+/// behaviour is identical on either side; only the `label` differs.
+fn handle_stream_error(
+    supervisor: &Arc<StreamSupervisor>,
+    label: &'static str,
+    e: cpal::StreamError,
+) {
+    let now = Instant::now();
+    let decision = {
+        let mut w = supervisor
+            .error_window
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        record_stream_error(&mut w, now)
+    };
+    if decision.print {
+        eprintln!("[{label}: {e}] (#{} in window)", decision.count);
+    }
+    if decision.request_restart {
+        let mut needs = supervisor
+            .needs_restart
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !*needs {
+            *needs = true;
+            supervisor.notify();
+        }
+    }
+}
 
 /// Entry point for `sapphire-call voice`.
 pub async fn run(
@@ -191,35 +363,115 @@ pub async fn run(
     };
 
     // ── Audio I/O ────────────────────────────────────────────────────────
+    //
+    // Both the input and output sides are wrapped in supervisor
+    // std::threads that own their `cpal::Stream` for its lifetime and
+    // rebuild it on err_fn-triggered restart requests. `cpal::Stream`
+    // is `!Send` on most backends so we can't park it across an
+    // `.await`; the dedicated OS thread sidesteps that.
+    //
+    // Each supervisor is independent (its own `StreamSupervisor` state
+    // + cvar) — errors on the mic don't cause a speaker rebuild and
+    // vice versa. If either supervisor exhausts its rebuild budget it
+    // sets `shutdown` and exits, which propagates to the rest of the
+    // satellite. See [`supervise_stream`] for the rebuild / give-up
+    // policy.
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<i16>>();
     let mic_enabled = Arc::new(AtomicBool::new(true));
-    let (input_stream, input_rate, input_channels) = open_input_stream(
-        options.input_device.as_deref(),
-        audio_tx,
-        Arc::clone(&mic_enabled),
-        options.sensitivity.mic_gain,
-    )?;
-    input_stream.play()?;
-
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let input_supervisor = Arc::new(StreamSupervisor::new());
+    let output_supervisor = Arc::new(StreamSupervisor::new());
     let playback_queue: Arc<std::sync::Mutex<VecDeque<i16>>> =
         Arc::new(std::sync::Mutex::new(VecDeque::new()));
-    let (output_stream, output_rate, _output_channels) = open_output_stream(
-        options.output_device.as_deref(),
-        Arc::clone(&playback_queue),
-    )?;
-    output_stream.play()?;
+
+    let (input_ready_tx, input_ready_rx) = tokio::sync::oneshot::channel::<Result<(u32, u16)>>();
+    let input_handle = std::thread::Builder::new()
+        .name("sapphire-call input-supervisor".into())
+        .spawn({
+            let name = options.input_device.clone();
+            let enabled = Arc::clone(&mic_enabled);
+            let shutdown = Arc::clone(&shutdown);
+            let supervisor = Arc::clone(&input_supervisor);
+            let mic_gain = options.sensitivity.mic_gain;
+            move || {
+                if let Some(ref n) = name {
+                    eprintln!("input device: {n}");
+                }
+                let supervisor_for_build = Arc::clone(&supervisor);
+                let build = move || -> Result<(cpal::Stream, u32, u16)> {
+                    let (stream, rate, channels) = open_input_stream(
+                        name.as_deref(),
+                        audio_tx.clone(),
+                        Arc::clone(&enabled),
+                        mic_gain,
+                        Arc::clone(&supervisor_for_build),
+                    )?;
+                    stream.play().context("input stream play")?;
+                    Ok((stream, rate, channels))
+                };
+                supervise_stream("input stream", build, shutdown, supervisor, input_ready_tx);
+            }
+        })
+        .context("failed to spawn input-stream supervisor thread")?;
+
+    let (output_ready_tx, output_ready_rx) = tokio::sync::oneshot::channel::<Result<(u32, u16)>>();
+    let output_handle = std::thread::Builder::new()
+        .name("sapphire-call output-supervisor".into())
+        .spawn({
+            let name = options.output_device.clone();
+            let queue = Arc::clone(&playback_queue);
+            let shutdown = Arc::clone(&shutdown);
+            let supervisor = Arc::clone(&output_supervisor);
+            move || {
+                if let Some(ref n) = name {
+                    eprintln!("output device: {n}");
+                }
+                let supervisor_for_build = Arc::clone(&supervisor);
+                let build = move || -> Result<(cpal::Stream, u32, u16)> {
+                    let (stream, rate, channels) = open_output_stream(
+                        name.as_deref(),
+                        Arc::clone(&queue),
+                        Arc::clone(&supervisor_for_build),
+                    )?;
+                    stream.play().context("output stream play")?;
+                    Ok((stream, rate, channels))
+                };
+                supervise_stream(
+                    "output stream",
+                    build,
+                    shutdown,
+                    supervisor,
+                    output_ready_tx,
+                );
+            }
+        })
+        .context("failed to spawn output-stream supervisor thread")?;
+
+    let (input_rate, input_channels) = input_ready_rx
+        .await
+        .map_err(|e| anyhow!("input supervisor dropped before initial build: {e}"))??;
+    let (output_rate, _output_channels) = output_ready_rx
+        .await
+        .map_err(|e| anyhow!("output supervisor dropped before initial build: {e}"))??;
 
     eprintln!("input: {input_rate} Hz × {input_channels}ch  output: {output_rate} Hz",);
     eprintln!("Listening. Ctrl-C to quit.");
 
     // ── Ctrl-C handler ──────────────────────────────────────────────────
-    let shutdown = Arc::new(AtomicBool::new(false));
     {
         let shutdown = Arc::clone(&shutdown);
+        let in_sup = Arc::clone(&input_supervisor);
+        let out_sup = Arc::clone(&output_supervisor);
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
                 eprintln!("\nShutting down...");
                 shutdown.store(true, Ordering::SeqCst);
+                // Wake both supervisors so they drop their cpal
+                // Streams promptly. The input supervisor dropping its
+                // audio_tx clone is also what closes the channel and
+                // pops listen_loop out of its audio_rx.recv() await.
+                in_sup.notify();
+                out_sup.notify();
             }
         });
     }
@@ -252,7 +504,7 @@ pub async fn run(
         room_profile,
         language: options.language,
         device: options.device,
-        shutdown,
+        shutdown: Arc::clone(&shutdown),
         vad,
         wake: wake_detector,
         awaiting_wake,
@@ -263,6 +515,22 @@ pub async fn run(
     })
     .await;
     subscribe_handle.abort();
+
+    // Make sure both supervisors see shutdown before we try to join
+    // them. listen_loop may have exited cleanly (audio_rx closed
+    // because the input supervisor gave up) or returned an error —
+    // in either case we want both supervisor threads to terminate so
+    // their OS threads don't outlive the process.
+    shutdown.store(true, Ordering::SeqCst);
+    input_supervisor.notify();
+    output_supervisor.notify();
+    if let Err(e) = input_handle.join() {
+        eprintln!("[input supervisor thread panicked: {e:?}]");
+    }
+    if let Err(e) = output_handle.join() {
+        eprintln!("[output supervisor thread panicked: {e:?}]");
+    }
+
     listen_result?;
 
     Ok(())
@@ -836,12 +1104,10 @@ fn open_input_stream(
     tx: mpsc::UnboundedSender<Vec<i16>>,
     enabled: Arc<AtomicBool>,
     mic_gain: f32,
+    supervisor: Arc<StreamSupervisor>,
 ) -> Result<(cpal::Stream, u32, u16)> {
     let host = cpal::default_host();
     let device = pick_device(&host, name, DeviceKind::Input)?;
-    if let Some(n) = name {
-        eprintln!("input device: {n}");
-    }
     let supported = device
         .default_input_config()
         .context("failed to query input config")?;
@@ -850,7 +1116,14 @@ fn open_input_stream(
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.clone().into();
 
-    let err_fn = |e| eprintln!("[input stream error: {e}]");
+    // err_fn lives on cpal's worker thread. Funnel its events through
+    // [`handle_stream_error`] so stderr only prints once per
+    // STREAM_ERROR_PRINT_INTERVAL and the supervisor learns when to
+    // rebuild. The closure must be Send + 'static — capture by Arc.
+    let err_fn = {
+        let supervisor = Arc::clone(&supervisor);
+        move |e| handle_stream_error(&supervisor, "input stream error", e)
+    };
 
     // Whether we need to multiply at all. Comparing against 1.0 exactly
     // is fine — the config layer hands us f32::from(1.0) when the user
@@ -930,6 +1203,168 @@ fn open_input_stream(
     Ok((stream, rate, channels))
 }
 
+/// Supervisor thread entry point: owns the [`cpal::Stream`] for its
+/// lifetime, rebuilds it on err_fn-triggered restart requests, and
+/// signals shutdown if rebuilding repeatedly fails (the device has
+/// most likely been physically removed).
+///
+/// Runs on a dedicated `std::thread` rather than a tokio task because
+/// `cpal::Stream` is `!Send` on most backends — we can't park it
+/// across an `.await`.
+///
+/// Generic over the build closure so the same loop handles both
+/// directions: the input flavour captures the audio mpsc sender, the
+/// output flavour captures the playback queue Arc. When the supervisor
+/// returns, the closure drops with it — that's how the input side
+/// closes its mpsc channel (signalling `listen_loop` to exit).
+///
+/// `label` is the prefix used for stderr lines ("input stream", "output
+/// stream"). `initial_ready` carries the first build's `(rate,
+/// channels)` (or its error) back to `run()` so async startup can
+/// finish.
+fn supervise_stream<F>(
+    label: &'static str,
+    build: F,
+    shutdown: Arc<AtomicBool>,
+    supervisor: Arc<StreamSupervisor>,
+    initial_ready: tokio::sync::oneshot::Sender<Result<(u32, u16)>>,
+) where
+    F: Fn() -> Result<(cpal::Stream, u32, u16)>,
+{
+    let mut first_build = true;
+    let mut initial_ready = Some(initial_ready);
+    let mut rebuild_backoff = STREAM_REBUILD_BACKOFF_INITIAL;
+    let mut consecutive_failures: u32 = 0;
+
+    'supervise: loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        let (stream, rate, channels) = match build() {
+            Ok(triple) => triple,
+            Err(e) => {
+                if let Some(tx) = initial_ready.take() {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+                consecutive_failures += 1;
+                eprintln!(
+                    "[{label} rebuild failed: {e:#}; attempt {consecutive_failures}/{STREAM_REBUILD_MAX_FAILURES}, retrying in {rebuild_backoff:?}]"
+                );
+                if consecutive_failures >= STREAM_REBUILD_MAX_FAILURES {
+                    eprintln!(
+                        "[{label} gave up after {STREAM_REBUILD_MAX_FAILURES} consecutive rebuild failures; shutting down satellite]"
+                    );
+                    shutdown.store(true, Ordering::SeqCst);
+                    break 'supervise;
+                }
+                if shutdown_sleep(&shutdown, &supervisor, rebuild_backoff) {
+                    break 'supervise;
+                }
+                rebuild_backoff = (rebuild_backoff * 2).min(STREAM_REBUILD_BACKOFF_MAX);
+                continue;
+            }
+        };
+
+        // A fresh stream is live — reset error/restart bookkeeping so
+        // the next window starts clean.
+        {
+            let mut w = supervisor
+                .error_window
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *w = ErrorWindow::default();
+        }
+        {
+            let mut needs = supervisor
+                .needs_restart
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *needs = false;
+        }
+        consecutive_failures = 0;
+        rebuild_backoff = STREAM_REBUILD_BACKOFF_INITIAL;
+
+        if first_build {
+            first_build = false;
+            if let Some(tx) = initial_ready.take() {
+                let _ = tx.send(Ok((rate, channels)));
+            }
+        } else {
+            eprintln!("[{label} rebuilt: {rate} Hz × {channels}ch]");
+        }
+
+        // Park until the stream needs to come down. Either err_fn
+        // crossed the threshold (`needs_restart` flips true) or the
+        // satellite is shutting down. `wait_timeout` is belt-and-
+        // braces: notifications can be lost across thread boundaries
+        // in theory, so wake periodically to re-check shutdown.
+        let mut needs = supervisor
+            .needs_restart
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let exit_reason = loop {
+            if shutdown.load(Ordering::SeqCst) {
+                break SupervisorWake::Shutdown;
+            }
+            if *needs {
+                break SupervisorWake::Restart;
+            }
+            let (g, _) = supervisor
+                .cvar
+                .wait_timeout(needs, Duration::from_secs(5))
+                .unwrap_or_else(|p| p.into_inner());
+            needs = g;
+        };
+        drop(needs);
+
+        // Drop the stream before sleeping — the ALSA / CoreAudio layer
+        // needs the handle released before a fresh open will succeed.
+        drop(stream);
+
+        match exit_reason {
+            SupervisorWake::Shutdown => break,
+            SupervisorWake::Restart => {
+                eprintln!("[{label} restart requested; dropping and rebuilding...]");
+                if shutdown_sleep(&shutdown, &supervisor, STREAM_REBUILD_BACKOFF_INITIAL) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+enum SupervisorWake {
+    Restart,
+    Shutdown,
+}
+
+/// Sleep up to `dur`, returning `true` if shutdown was observed
+/// (caller should exit) and `false` otherwise. Polls every 200 ms so a
+/// late Ctrl-C doesn't have to wait out the full back-off.
+fn shutdown_sleep(
+    shutdown: &Arc<AtomicBool>,
+    supervisor: &Arc<StreamSupervisor>,
+    dur: Duration,
+) -> bool {
+    let deadline = Instant::now() + dur;
+    while Instant::now() < deadline {
+        if shutdown.load(Ordering::SeqCst) {
+            return true;
+        }
+        // Also wake on the cvar in case Ctrl-C nudges us during the
+        // back-off — saves up to 200 ms on the shutdown path.
+        let lock = supervisor
+            .needs_restart
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait_for = remaining.min(Duration::from_millis(200));
+        let _ = supervisor.cvar.wait_timeout(lock, wait_for);
+    }
+    shutdown.load(Ordering::SeqCst)
+}
+
 /// Multiply an i16 sample by `gain` in f32 space and clamp back into
 /// the i16 range. Used by the mic_gain path for I16 / U16 capture so a
 /// boost above unity can't wrap around.
@@ -941,12 +1376,10 @@ fn apply_gain_i16(sample: i16, gain: f32) -> i16 {
 fn open_output_stream(
     name: Option<&str>,
     queue: Arc<std::sync::Mutex<VecDeque<i16>>>,
+    supervisor: Arc<StreamSupervisor>,
 ) -> Result<(cpal::Stream, u32, u16)> {
     let host = cpal::default_host();
     let device = pick_device(&host, name, DeviceKind::Output)?;
-    if let Some(n) = name {
-        eprintln!("output device: {n}");
-    }
     let supported = device
         .default_output_config()
         .context("failed to query output config")?;
@@ -955,7 +1388,12 @@ fn open_output_stream(
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.clone().into();
 
-    let err_fn = |e| eprintln!("[output stream error: {e}]");
+    // Same rate-limit / restart-request plumbing as the input side —
+    // see [`handle_stream_error`].
+    let err_fn = {
+        let supervisor = Arc::clone(&supervisor);
+        move |e| handle_stream_error(&supervisor, "output stream error", e)
+    };
 
     let stream = match format {
         SampleFormat::F32 => {
@@ -1283,5 +1721,82 @@ mod tests {
         // 0.5× on full-scale should land at half-scale (rounded toward
         // zero by the as-cast).
         assert_eq!(apply_gain_i16(20_000, 0.5), 10_000);
+    }
+
+    // ── StreamSupervisor error-window logic ─────────────────────────────
+    //
+    // `record_stream_error` is pure: it only touches the window passed
+    // in. Test it directly so we can exercise the threshold / sliding-
+    // window / rate-limit branches without instantiating cpal or
+    // spawning threads. Same code path is used by both the input and
+    // output supervisors — covered once.
+
+    #[test]
+    fn record_stream_error_counts_up_to_threshold() {
+        let mut w = ErrorWindow::default();
+        let t0 = Instant::now();
+        for i in 1..STREAM_ERROR_THRESHOLD {
+            let d = record_stream_error(&mut w, t0 + Duration::from_millis(i as u64 * 10));
+            assert_eq!(d.count, i);
+            assert!(!d.request_restart, "shouldn't fire before threshold");
+        }
+        // The N-th error fires the restart request exactly once.
+        let d = record_stream_error(
+            &mut w,
+            t0 + Duration::from_millis(STREAM_ERROR_THRESHOLD as u64 * 10),
+        );
+        assert_eq!(d.count, STREAM_ERROR_THRESHOLD);
+        assert!(d.request_restart);
+
+        // Errors *past* the threshold keep counting but don't re-fire
+        // the restart request — the supervisor handles each window
+        // once.
+        let d = record_stream_error(
+            &mut w,
+            t0 + Duration::from_millis((STREAM_ERROR_THRESHOLD as u64 + 1) * 10),
+        );
+        assert_eq!(d.count, STREAM_ERROR_THRESHOLD + 1);
+        assert!(!d.request_restart);
+    }
+
+    #[test]
+    fn record_stream_error_rolls_window_after_quiet_period() {
+        // A long-running session that's seen 3 xruns over an hour
+        // shouldn't restart the stream on the next xrun. After the
+        // window elapses, the counter resets.
+        let mut w = ErrorWindow::default();
+        let t0 = Instant::now();
+        record_stream_error(&mut w, t0);
+        record_stream_error(&mut w, t0 + Duration::from_millis(100));
+        // Long quiet period: well past STREAM_ERROR_WINDOW.
+        let later = t0 + STREAM_ERROR_WINDOW + Duration::from_secs(60);
+        let d = record_stream_error(&mut w, later);
+        assert_eq!(d.count, 1, "window should have rolled and reset to 1");
+        assert!(!d.request_restart);
+    }
+
+    #[test]
+    fn record_stream_error_rate_limits_prints() {
+        // First call prints; immediately following calls are
+        // suppressed until STREAM_ERROR_PRINT_INTERVAL elapses.
+        let mut w = ErrorWindow::default();
+        let t0 = Instant::now();
+        assert!(record_stream_error(&mut w, t0).print);
+        assert!(
+            !record_stream_error(&mut w, t0 + Duration::from_millis(50)).print,
+            "50 ms later should be suppressed"
+        );
+        assert!(
+            !record_stream_error(&mut w, t0 + Duration::from_millis(500)).print,
+            "500 ms later should still be suppressed"
+        );
+        assert!(
+            record_stream_error(
+                &mut w,
+                t0 + STREAM_ERROR_PRINT_INTERVAL + Duration::from_millis(1)
+            )
+            .print,
+            "past the interval should print again"
+        );
     }
 }
