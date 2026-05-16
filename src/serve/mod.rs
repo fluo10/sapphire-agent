@@ -629,7 +629,12 @@ async fn handle_voice_config(
             Ok(bytes) => {
                 let mut hasher = Sha256::new();
                 hasher.update(&bytes);
-                let sha = format!("{:x}", hasher.finalize());
+                let hash = hasher.finalize();
+                use std::fmt::Write;
+                let mut sha = String::with_capacity(64);
+                for b in hash.iter() {
+                    let _ = write!(&mut sha, "{b:02x}");
+                }
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 let filename = std::path::Path::new(&expanded)
                     .file_name()
