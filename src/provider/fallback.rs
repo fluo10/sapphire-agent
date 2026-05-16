@@ -29,14 +29,14 @@ impl FallbackProvider {
 
 /// Heuristic check for a refusal response.
 ///
-/// Order of signals:
-/// 1. Provider-reported `stop_reason` of `"refusal"` (Anthropic) or
-///    `"content_filter"` (OpenAI-compatible). These are the strongest
-///    signals and match no legitimate response.
-/// 2. Short text-only response (no tool calls, capped length) whose
-///    leading sentence matches an apology pattern. The leading-pattern
-///    + length + no-tools combination keeps false positives down on
-///    legitimate "I can't find that file" style answers.
+/// First, a provider-reported `stop_reason` of `"refusal"` (Anthropic)
+/// or `"content_filter"` (OpenAI-compatible) is the strongest signal
+/// and matches no legitimate response.
+///
+/// Otherwise, fall back to a short text-only response (no tool calls,
+/// capped length) whose leading sentence matches an apology pattern.
+/// The leading-pattern + length + no-tools combination keeps false
+/// positives down on legitimate "I can't find that file" style answers.
 pub fn is_refusal(resp: &ChatResponse) -> bool {
     if matches!(
         resp.stop_reason.as_deref(),
@@ -213,8 +213,8 @@ mod tests {
 
     #[test]
     fn long_response_is_not_a_refusal_even_if_apology_appears() {
-        let mut text = "I'm unable to immediately answer, but here's a detailed walkthrough: "
-            .to_string();
+        let mut text =
+            "I'm unable to immediately answer, but here's a detailed walkthrough: ".to_string();
         text.push_str(&"x".repeat(800));
         let resp = ChatResponse {
             text: Some(text),

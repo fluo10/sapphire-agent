@@ -28,9 +28,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sapphire_agent_api::{
     VoiceEvent, VoicePushEvent, voice::PIPELINE_SAMPLE_RATE, voice_pipeline_run, voice_subscribe,
 };
-use sherpa_onnx::{
-    SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
-};
+use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 use tokio::sync::mpsc;
 
 /// Command sent from the `voice/subscribe` consumer task into the
@@ -115,9 +113,7 @@ pub async fn run(
              or pass --room-profile <name>"
         )
     })?;
-    eprintln!(
-        "sapphire-call voice (device: {device_id}, room_profile: {room_profile})",
-    );
+    eprintln!("sapphire-call voice (device: {device_id}, room_profile: {room_profile})",);
 
     // ── Wake-word config: fetch the inline ONNX from the server ─────────
     let server_wake = sapphire_agent_api::voice_config(&client, &base)
@@ -198,9 +194,7 @@ pub async fn run(
     )?;
     output_stream.play()?;
 
-    eprintln!(
-        "input: {input_rate} Hz × {input_channels}ch  output: {output_rate} Hz",
-    );
+    eprintln!("input: {input_rate} Hz × {input_channels}ch  output: {output_rate} Hz",);
     eprintln!("Listening. Ctrl-C to quit.");
 
     // ── Ctrl-C handler ──────────────────────────────────────────────────
@@ -367,27 +361,27 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
         // audio to the openWakeWord detector only — VAD doesn't see
         // the stream until the wake fires.
         if ctx.awaiting_wake {
-            if let Some(ref mut wake) = ctx.wake {
-                if let Some(keyword) = wake.feed(&pcm16k)? {
-                    eprintln!("[wake: {keyword}] now listening for command...");
-                    ctx.awaiting_wake = false;
-                    // Clear any audio left over from before the wake so
-                    // the VAD starts on the post-wake utterance.
-                    ctx.vad.reset();
-                    window_buf.clear();
-                    if ctx.behavior.beep_on_wake {
-                        // Mute, play the rising tone, drain anything
-                        // already in flight, then re-open. A residual
-                        // input frame queued before the mute would
-                        // otherwise be re-processed as part of the
-                        // command itself.
-                        ctx.mic_enabled.store(false, Ordering::SeqCst);
-                        while ctx.audio_rx.try_recv().is_ok() {}
-                        enqueue_beep(&ctx.playback_queue, BEEP_WAKE_HZ, ctx.output_rate);
-                        wait_for_playback_drain(&ctx.playback_queue).await;
-                        while ctx.audio_rx.try_recv().is_ok() {}
-                        ctx.mic_enabled.store(true, Ordering::SeqCst);
-                    }
+            if let Some(ref mut wake) = ctx.wake
+                && let Some(keyword) = wake.feed(&pcm16k)?
+            {
+                eprintln!("[wake: {keyword}] now listening for command...");
+                ctx.awaiting_wake = false;
+                // Clear any audio left over from before the wake so
+                // the VAD starts on the post-wake utterance.
+                ctx.vad.reset();
+                window_buf.clear();
+                if ctx.behavior.beep_on_wake {
+                    // Mute, play the rising tone, drain anything
+                    // already in flight, then re-open. A residual
+                    // input frame queued before the mute would
+                    // otherwise be re-processed as part of the
+                    // command itself.
+                    ctx.mic_enabled.store(false, Ordering::SeqCst);
+                    while ctx.audio_rx.try_recv().is_ok() {}
+                    enqueue_beep(&ctx.playback_queue, BEEP_WAKE_HZ, ctx.output_rate);
+                    wait_for_playback_drain(&ctx.playback_queue).await;
+                    while ctx.audio_rx.try_recv().is_ok() {}
+                    ctx.mic_enabled.store(true, Ordering::SeqCst);
                 }
             }
             continue;
@@ -465,8 +459,7 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
                 }
                 (Some(_), secs) => {
                     ctx.awaiting_wake = false;
-                    ctx.follow_up_until =
-                        Some(Instant::now() + Duration::from_secs(secs as u64));
+                    ctx.follow_up_until = Some(Instant::now() + Duration::from_secs(secs as u64));
                     eprintln!("Listening for follow-up... ({secs}s)");
                 }
                 (None, _) => {
@@ -490,11 +483,7 @@ enum ListenEvent {
 /// the mic and starts buffering pushed PCM in the playback queue;
 /// `PushDone` waits for the queue to drain and arms the follow-up
 /// listening window so the user can reply without re-waking.
-async fn handle_push_command(
-    ctx: &mut ListenCtx,
-    cmd: ListenCommand,
-    window_buf: &mut Vec<f32>,
-) {
+async fn handle_push_command(ctx: &mut ListenCtx, cmd: ListenCommand, window_buf: &mut Vec<f32>) {
     match cmd {
         ListenCommand::PushAudio(pcm) => {
             if !ctx.push_active {
@@ -532,8 +521,7 @@ async fn handle_push_command(
                 }
                 (Some(_), secs) => {
                     ctx.awaiting_wake = false;
-                    ctx.follow_up_until =
-                        Some(Instant::now() + Duration::from_secs(secs as u64));
+                    ctx.follow_up_until = Some(Instant::now() + Duration::from_secs(secs as u64));
                     eprintln!("Push complete. Listening for follow-up... ({secs}s)");
                 }
                 (None, _) => {
@@ -560,13 +548,7 @@ async fn subscribe_loop(
     let mut backoff_secs: u64 = 1;
     while !shutdown.load(Ordering::SeqCst) {
         let (push_tx, mut push_rx) = mpsc::channel::<VoicePushEvent>(32);
-        let conn = voice_subscribe(
-            &client,
-            &base,
-            &device_id,
-            &room_profile,
-            push_tx,
-        );
+        let conn = voice_subscribe(&client, &base, &device_id, &room_profile, push_tx);
         // Forward push events as ListenCommands while the subscribe
         // call runs to completion in parallel.
         let forwarder = {
@@ -577,7 +559,9 @@ async fn subscribe_loop(
                         VoicePushEvent::PushStart { task } => {
                             eprintln!(
                                 "[push start{}]",
-                                task.as_deref().map(|t| format!(": {t}")).unwrap_or_default()
+                                task.as_deref()
+                                    .map(|t| format!(": {t}"))
+                                    .unwrap_or_default()
                             );
                         }
                         VoicePushEvent::AssistantText { text } => {
@@ -690,11 +674,7 @@ enum DeviceKind {
 /// underlying PCM during enumeration, which can fail transiently), so
 /// enumerating twice — once to match, once to report — can produce
 /// a list in the error that the matcher never actually saw.
-fn pick_device(
-    host: &cpal::Host,
-    name: Option<&str>,
-    kind: DeviceKind,
-) -> Result<cpal::Device> {
+fn pick_device(host: &cpal::Host, name: Option<&str>, kind: DeviceKind) -> Result<cpal::Device> {
     if let Some(want) = name {
         let candidates: Vec<cpal::Device> = match kind {
             DeviceKind::Input => host.input_devices()?.collect(),
@@ -735,12 +715,8 @@ fn pick_device(
 /// `--output-device`.
 fn list_devices() -> Result<()> {
     let host = cpal::default_host();
-    let default_in = host
-        .default_input_device()
-        .and_then(|d| d.name().ok());
-    let default_out = host
-        .default_output_device()
-        .and_then(|d| d.name().ok());
+    let default_in = host.default_input_device().and_then(|d| d.name().ok());
+    let default_out = host.default_output_device().and_then(|d| d.name().ok());
 
     println!("cpal host: {}", host.id().name());
     println!();
@@ -855,8 +831,7 @@ fn open_input_stream(
                     if !enabled.load(Ordering::SeqCst) {
                         return;
                     }
-                    let pcm: Vec<i16> =
-                        data.iter().map(|s| (*s as i32 - 32768) as i16).collect();
+                    let pcm: Vec<i16> = data.iter().map(|s| (*s as i32 - 32768) as i16).collect();
                     let _ = tx.send(pcm);
                 },
                 err_fn,
@@ -1081,11 +1056,7 @@ fn generate_beep(freq_hz: f32, duration_ms: u32) -> Vec<i16> {
 /// Generate a beep at the pipeline rate and append it to the playback
 /// queue, resampling to the output rate so the cpal callback can
 /// consume it without a per-sample rate convert.
-fn enqueue_beep(
-    queue: &Arc<std::sync::Mutex<VecDeque<i16>>>,
-    freq_hz: f32,
-    output_rate: u32,
-) {
+fn enqueue_beep(queue: &Arc<std::sync::Mutex<VecDeque<i16>>>, freq_hz: f32, output_rate: u32) {
     let pcm = generate_beep(freq_hz, BEEP_DURATION_MS);
     let upsampled = resample_to(&pcm, PIPELINE_SAMPLE_RATE, output_rate);
     if let Ok(mut q) = queue.lock() {

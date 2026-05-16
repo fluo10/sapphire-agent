@@ -71,8 +71,7 @@ pub async fn handle_agent_card(State(state): State<Arc<ServeState>>) -> impl Int
         .clone()
         .unwrap_or_else(|| "sapphire-agent".to_string());
     let description = cfg.agent_description.clone().unwrap_or_else(|| {
-        "Personal partner AI agent with persistent character, memory, and tools."
-            .to_string()
+        "Personal partner AI agent with persistent character, memory, and tools.".to_string()
     });
     let url = cfg.public_url.clone().unwrap_or_default();
 
@@ -145,11 +144,7 @@ pub async fn handle_a2a_post(
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     // 0. Feature gate
-    let enabled = state
-        .config
-        .a2a
-        .as_ref()
-        .is_some_and(|c| c.enabled);
+    let enabled = state.config.a2a.as_ref().is_some_and(|c| c.enabled);
     if !enabled {
         return (StatusCode::NOT_FOUND, "A2A disabled").into_response();
     }
@@ -295,7 +290,10 @@ async fn handle_send_message(
     let (state_enum, reply_text) = match outcome.text {
         Some(t) if !t.is_empty() => (TaskState::Completed, t),
         Some(_) => (TaskState::Failed, "(empty response)".to_string()),
-        None => (TaskState::Failed, "agent failed to generate a reply".to_string()),
+        None => (
+            TaskState::Failed,
+            "agent failed to generate a reply".to_string(),
+        ),
     };
 
     let reply_message = Message {
@@ -349,7 +347,9 @@ async fn handle_send_message(
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(axum::http::header::AUTHORIZATION)?;
     let s = value.to_str().ok()?;
-    let token = s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer "))?;
+    let token = s
+        .strip_prefix("Bearer ")
+        .or_else(|| s.strip_prefix("bearer "))?;
     let trimmed = token.trim();
     if trimmed.is_empty() {
         None

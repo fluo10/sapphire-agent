@@ -35,6 +35,7 @@ pub fn cache_dir() -> PathBuf {
 /// Categories on the sherpa-onnx releases page. Each ASR/TTS/KWS/VAD
 /// bundle is published under exactly one of these tags.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum BundleCategory {
     Asr,
     Tts,
@@ -73,9 +74,7 @@ pub fn ensure_bundle(
         anyhow::anyhow!("either `model_dir` or `model` (bundle name) must be set")
     })?;
     if name.contains('/') || name.contains('~') || name.starts_with('.') {
-        anyhow::bail!(
-            "`model` looks like a path ('{name}'); use `model_dir` for explicit paths"
-        );
+        anyhow::bail!("`model` looks like a path ('{name}'); use `model_dir` for explicit paths");
     }
     let dest = cache_dir().join(name);
     if dest.exists() {
@@ -85,11 +84,7 @@ pub fn ensure_bundle(
     Ok(dest)
 }
 
-fn download_and_extract(
-    bundle: &str,
-    category: BundleCategory,
-    dest: &Path,
-) -> anyhow::Result<()> {
+fn download_and_extract(bundle: &str, category: BundleCategory, dest: &Path) -> anyhow::Result<()> {
     let url = format!(
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/{}/{}.tar.bz2",
         category.tag(),

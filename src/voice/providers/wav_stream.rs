@@ -18,14 +18,10 @@ use crate::voice::PIPELINE_SAMPLE_RATE;
 /// Errors only on WAV parse / sample-read failure. A `pcm_tx`
 /// receiver drop is treated as caller cancellation and short-circuits
 /// without returning an error.
-pub async fn stream_wav(
-    bytes: Vec<u8>,
-    pcm_tx: mpsc::Sender<Vec<i16>>,
-) -> anyhow::Result<()> {
-    let (samples, sample_rate, channels) =
-        tokio::task::spawn_blocking(move || decode_wav(&bytes))
-            .await
-            .map_err(|e| anyhow::anyhow!("WAV decode task panicked: {e}"))??;
+pub async fn stream_wav(bytes: Vec<u8>, pcm_tx: mpsc::Sender<Vec<i16>>) -> anyhow::Result<()> {
+    let (samples, sample_rate, channels) = tokio::task::spawn_blocking(move || decode_wav(&bytes))
+        .await
+        .map_err(|e| anyhow::anyhow!("WAV decode task panicked: {e}"))??;
 
     let mono = if channels == 1 {
         samples

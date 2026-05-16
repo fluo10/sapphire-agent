@@ -28,14 +28,14 @@ pub fn estimate_tokens(text: &str) -> usize {
     }
     // Rough estimate: ASCII ~4 chars/token, non-ASCII ~1.5 chars/token
     let ascii_tokens = ascii_chars / 4;
-    let non_ascii_tokens = (non_ascii_chars * 2 + 2) / 3; // ceil(n * 2/3)
+    let non_ascii_tokens = (non_ascii_chars * 2).div_ceil(3); // ceil(n * 2/3)
     ascii_tokens + non_ascii_tokens
 }
 
 /// Estimate the total token usage for a system prompt + message history.
 pub fn estimate_total_tokens(system: Option<&str>, messages: &[ChatMessage]) -> usize {
-    let system_tokens = system.map(|s| estimate_tokens(s)).unwrap_or(0);
-    let message_tokens: usize = messages.iter().map(|m| estimate_message_tokens(m)).sum();
+    let system_tokens = system.map(estimate_tokens).unwrap_or(0);
+    let message_tokens: usize = messages.iter().map(estimate_message_tokens).sum();
     // Add a small overhead for message framing (~4 tokens per message)
     system_tokens + message_tokens + messages.len() * 4
 }

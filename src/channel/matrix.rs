@@ -180,13 +180,11 @@ async fn download_matrix_image(client: &Client, image: &ImageMessageEventContent
             } else {
                 match sniff_image_mime(&bytes) {
                     Some(t) => {
-                        if declared.is_some() {
+                        if let Some(d) = declared {
                             warn!(
                                 "Matrix image '{}' declared MIME '{}' is unsupported; \
                                  detected '{}' from bytes",
-                                image.body,
-                                declared.unwrap(),
-                                t
+                                image.body, d, t
                             );
                         }
                         t.to_string()

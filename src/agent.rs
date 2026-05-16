@@ -254,9 +254,9 @@ impl Agent {
                     // Also publish an intra-day digest line so the
                     // cross-session today_digest picks up what this
                     // session covered before we went down.
-                    if let Err(e) = self
-                        .session_store
-                        .append_intraday_digest(&session_id, &summary, None)
+                    if let Err(e) =
+                        self.session_store
+                            .append_intraday_digest(&session_id, &summary, None)
                     {
                         warn!("Failed to persist shutdown intra-day digest for {session_id}: {e}");
                     }
@@ -660,14 +660,14 @@ impl Agent {
 
         {
             let snapshots = self.snapshots.lock().await;
-            if let Some(snap) = snapshots.get(key) {
-                if snap.date == today {
-                    return if snap.system_prompt.is_empty() {
-                        None
-                    } else {
-                        Some(snap.system_prompt.clone())
-                    };
-                }
+            if let Some(snap) = snapshots.get(key)
+                && snap.date == today
+            {
+                return if snap.system_prompt.is_empty() {
+                    None
+                } else {
+                    Some(snap.system_prompt.clone())
+                };
             }
         }
 
@@ -820,7 +820,7 @@ impl Agent {
                 &*provider,
                 system_with_context.as_deref(),
                 &messages,
-                &compression_config,
+                compression_config,
             )
             .await
             {
@@ -900,21 +900,21 @@ impl Agent {
                     // tokio::spawn does not propagate task_local, so we
                     // re-bind it inside each spawned future.
                     let tools = Arc::clone(self.tools.as_ref().unwrap());
-                    let ns = self.config.namespace_for_room(&incoming.room_id).to_string();
+                    let ns = self
+                        .config
+                        .namespace_for_room(&incoming.room_id)
+                        .to_string();
                     let mut handles = Vec::with_capacity(tool_calls.len());
                     for call in tool_calls {
                         let tools = Arc::clone(&tools);
                         let ns = ns.clone();
                         handles.push(tokio::spawn(
-                            crate::tools::workspace_tools::scope_memory_namespace(
-                                ns,
-                                async move {
-                                    info!("Executing tool: {} (id={})", call.name, call.id);
-                                    let result = tools.execute(&call).await;
-                                    info!("Tool {} result: {}", call.name, result);
-                                    (call.id, result)
-                                },
-                            ),
+                            crate::tools::workspace_tools::scope_memory_namespace(ns, async move {
+                                info!("Executing tool: {} (id={})", call.name, call.id);
+                                let result = tools.execute(&call).await;
+                                info!("Tool {} result: {}", call.name, result);
+                                (call.id, result)
+                            }),
                         ));
                     }
 

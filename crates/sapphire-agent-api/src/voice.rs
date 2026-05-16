@@ -58,10 +58,7 @@ pub struct WakeWordModel {
 /// No session token needed — wake-word config is the same for every
 /// satellite regardless of room_profile, so this is a stateless
 /// GET-like call.
-pub async fn voice_config(
-    client: &reqwest::Client,
-    base: &str,
-) -> Result<WakeWordConfig> {
+pub async fn voice_config(client: &reqwest::Client, base: &str) -> Result<WakeWordConfig> {
     let base = base.trim_end_matches('/');
     let body = json!({
         "jsonrpc": "2.0",
@@ -185,6 +182,7 @@ pub enum VoicePushEvent {
 /// server derives a deterministic session id from this pair so the
 /// satellite can resume the same conversation across restarts /
 /// network blips without juggling explicit session tokens.
+#[allow(clippy::too_many_arguments)]
 pub async fn voice_pipeline_run(
     client: &reqwest::Client,
     base: &str,
@@ -319,9 +317,13 @@ async fn dispatch_push_event(val: &Value, tx: &mpsc::Sender<VoicePushEvent>) -> 
                     "push_start" => Some(VoicePushEvent::PushStart {
                         task: params["task"].as_str().map(String::from),
                     }),
-                    "assistant_text" => params["text"]
-                        .as_str()
-                        .map(|s| VoicePushEvent::AssistantText { text: s.to_string() }),
+                    "assistant_text" => {
+                        params["text"]
+                            .as_str()
+                            .map(|s| VoicePushEvent::AssistantText {
+                                text: s.to_string(),
+                            })
+                    }
                     "audio_chunk" => params["data"].as_str().and_then(decode_push_audio_chunk),
                     "push_done" => Some(VoicePushEvent::PushDone),
                     "error" => Some(VoicePushEvent::Error {

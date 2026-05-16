@@ -47,12 +47,8 @@ impl OpenAiTts {
         let auth_header = match api_key_env {
             Some(var) => match std::env::var(var) {
                 Ok(k) if !k.is_empty() => Some(format!("Bearer {k}")),
-                Ok(_) => anyhow::bail!(
-                    "tts_provider '{name}': env var '{var}' is set but empty"
-                ),
-                Err(_) => anyhow::bail!(
-                    "tts_provider '{name}': env var '{var}' is not set"
-                ),
+                Ok(_) => anyhow::bail!("tts_provider '{name}': env var '{var}' is set but empty"),
+                Err(_) => anyhow::bail!("tts_provider '{name}': env var '{var}' is not set"),
             },
             None => None,
         };

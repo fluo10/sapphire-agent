@@ -50,9 +50,8 @@ const MAX_TOOL_ROUNDS: usize = 10;
 /// which room_profile it's bound to when it subscribes, and we keep
 /// that around as the reverse index so heartbeat tasks don't have to
 /// duplicate the value.
-pub type VoiceSubscribers = tokio::sync::Mutex<
-    HashMap<String, (String, mpsc::Sender<crate::voice::VoicePushItem>)>,
->;
+pub type VoiceSubscribers =
+    tokio::sync::Mutex<HashMap<String, (String, mpsc::Sender<crate::voice::VoicePushItem>)>>;
 
 pub struct ServeState {
     pub(crate) config: Config,
@@ -190,11 +189,7 @@ fn error_event(id: &Value, code: i32, message: &str) -> Event {
 // Router entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run(
-    addr: String,
-    state: Arc<ServeState>,
-) -> anyhow::Result<()> {
-
+pub async fn run(addr: String, state: Arc<ServeState>) -> anyhow::Result<()> {
     // Routes are intentionally separated so future protocol endpoints
     // (`/mcp` for the MCP server in #79/#80) can be mounted alongside
     // `/rpc` without colliding with the control API methods (`chat`,
@@ -255,9 +250,10 @@ async fn summarize_all_sessions(state: &Arc<ServeState>) {
                 {
                     warn!("Failed to persist shutdown summary for {session_id}: {e}");
                 }
-                if let Err(e) = state
-                    .api_session_store
-                    .append_intraday_digest(&session_id, &summary, None)
+                if let Err(e) =
+                    state
+                        .api_session_store
+                        .append_intraday_digest(&session_id, &summary, None)
                 {
                     warn!("Failed to persist shutdown intra-day digest for {session_id}: {e}");
                 }
@@ -290,9 +286,7 @@ async fn rpc_post(
         "list_sessions" => handle_list_sessions(state, req_id).await,
         "get_session" => handle_get_session(state, req_id, session_id).await,
         "voice/config" => handle_voice_config(state, req_id, req.params).await,
-        "voice/pipeline_run" => {
-            handle_voice_pipeline_run(state, req_id, req.params).await
-        }
+        "voice/pipeline_run" => handle_voice_pipeline_run(state, req_id, req.params).await,
         "voice/subscribe" => handle_voice_subscribe(state, req_id, req.params).await,
         _ => {
             let body = error_response(req_id, -32601, "Method not found");
@@ -330,12 +324,11 @@ async fn handle_initialize(
         .as_ref()
         .and_then(|p| p["room_profile"].as_str())
         .map(|s| s.to_string());
-    if let Some(name) = &requested_room_profile {
-        if state.config.room_profile(name).is_none() {
-            let body =
-                error_response(req_id, -32602, &format!("Unknown room_profile '{name}'"));
-            return body.into_response();
-        }
+    if let Some(name) = &requested_room_profile
+        && state.config.room_profile(name).is_none()
+    {
+        let body = error_response(req_id, -32602, &format!("Unknown room_profile '{name}'"));
+        return body.into_response();
     }
 
     // Resolve to an internal UUID session_id.
@@ -651,9 +644,7 @@ async fn handle_voice_config(
                 });
             }
             Err(e) => {
-                error!(
-                    "voice/config: failed to read openWakeWord model '{expanded}': {e}"
-                );
+                error!("voice/config: failed to read openWakeWord model '{expanded}': {e}");
                 let body = error_response(
                     req_id,
                     -32603,
@@ -737,7 +728,10 @@ async fn handle_voice_pipeline_run(
     // pipeline_run so satellites can update their description without a
     // separate handshake. Treated as room metadata for the session.
     if let Some(device) = params.get("device") {
-        let device_name = device.get("name").and_then(|v| v.as_str()).map(str::to_string);
+        let device_name = device
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         let device_description = device
             .get("description")
             .and_then(|v| v.as_str())
@@ -812,9 +806,7 @@ async fn handle_voice_subscribe(
         let mut subs = state.voice_subscribers.lock().await;
         subs.insert(device_id.clone(), (room_profile.clone(), push_tx));
     }
-    info!(
-        "voice/subscribe: registered (device={device_id}, room_profile={room_profile})"
-    );
+    info!("voice/subscribe: registered (device={device_id}, room_profile={room_profile})");
 
     let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(32);
     let cleanup_state = Arc::clone(&state);
@@ -830,12 +822,9 @@ async fn handle_voice_subscribe(
             .get(&cleanup_device)
             .map(|(_, tx)| tx.is_closed())
             .unwrap_or(false)
+            && let Some((rp, _)) = subs.remove(&cleanup_device)
         {
-            if let Some((rp, _)) = subs.remove(&cleanup_device) {
-                info!(
-                    "voice/subscribe: unregistered (device={cleanup_device}, room_profile={rp})"
-                );
-            }
+            info!("voice/subscribe: unregistered (device={cleanup_device}, room_profile={rp})");
         }
     });
 
@@ -874,10 +863,9 @@ async fn translate_voice_pushes(
                     json!({"kind": "audio_chunk", "data": b64}),
                 )
             }
-            crate::voice::VoicePushItem::Done => notification_event(
-                "notifications/voice_push",
-                json!({"kind": "push_done"}),
-            ),
+            crate::voice::VoicePushItem::Done => {
+                notification_event("notifications/voice_push", json!({"kind": "push_done"}))
+            }
             crate::voice::VoicePushItem::Error(message) => notification_event(
                 "notifications/voice_push",
                 json!({"kind": "error", "message": message}),
@@ -958,10 +946,7 @@ async fn run_voice_turn(
             send(error_event(
                 &req_id,
                 -32603,
-                &format!(
-                    "stt_provider '{}' not instantiated",
-                    pipeline.stt_provider
-                ),
+                &format!("stt_provider '{}' not instantiated", pipeline.stt_provider),
             ))
             .await;
             return;
@@ -1104,10 +1089,7 @@ async fn run_voice_turn_from_text_sse(
             send(error_event(
                 &req_id,
                 -32603,
-                &format!(
-                    "tts_provider '{}' not instantiated",
-                    pipeline.tts_provider
-                ),
+                &format!("tts_provider '{}' not instantiated", pipeline.tts_provider),
             ))
             .await;
             return;
@@ -1163,10 +1145,7 @@ async fn run_voice_turn_from_text_sse(
         tokio::spawn(async move { tts.synthesize_stream(&reply_for_tts, pcm_tx).await });
     let mut chunks_emitted = 0usize;
     while let Some(chunk) = pcm_rx.recv().await {
-        let bytes: Vec<u8> = chunk
-            .iter()
-            .flat_map(|s| s.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         send(notification_event(
             "notifications/progress",
@@ -1242,10 +1221,10 @@ async fn run_voice_turn_from_text_sse(
         let reply = reply_text.clone();
         tokio::spawn(async move {
             let p = state2.provider_for_session(&sid).await;
-            if let Some(title) = generate_session_title(&*p, &user_text, &reply).await {
-                if let Err(e) = state2.api_session_store.set_title(&sid, &title) {
-                    warn!("Failed to store session title: {e}");
-                }
+            if let Some(title) = generate_session_title(&*p, &user_text, &reply).await
+                && let Err(e) = state2.api_session_store.set_title(&sid, &title)
+            {
+                warn!("Failed to store session title: {e}");
             }
         });
     }
@@ -1332,9 +1311,7 @@ pub(crate) async fn push_voice_text_to_subscriber(
     // LLM turn (no SSE response channel — discard tool_start/tool_end
     // notifications by draining the sink in a background task).
     let (sink_tx, mut sink_rx) = mpsc::channel::<Result<Event, Infallible>>(32);
-    let drain_handle = tokio::spawn(async move {
-        while sink_rx.recv().await.is_some() {}
-    });
+    let drain_handle = tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
     let outcome = run_llm_turn(
         Arc::clone(&state),
         session_id.clone(),
@@ -1356,7 +1333,9 @@ pub(crate) async fn push_voice_text_to_subscriber(
         }
     };
     let _ = push_tx
-        .send(crate::voice::VoicePushItem::AssistantText(reply_text.clone()))
+        .send(crate::voice::VoicePushItem::AssistantText(
+            reply_text.clone(),
+        ))
         .await;
 
     // TTS: stream chunks to the subscriber as soon as they're synthesised.
@@ -1379,10 +1358,7 @@ pub(crate) async fn push_voice_text_to_subscriber(
     }
     match synth_handle.await {
         Ok(Ok(())) if chunks_emitted == 0 => {
-            let msg = format!(
-                "TTS provider '{}' produced no audio",
-                pipeline.tts_provider
-            );
+            let msg = format!("TTS provider '{}' produced no audio", pipeline.tts_provider);
             warn!("{msg}");
             let _ = push_tx
                 .send(crate::voice::VoicePushItem::Error(msg.clone()))
@@ -1539,14 +1515,7 @@ async fn run_llm_turn(
         }
 
         // Check if context compression is needed
-        match maybe_compress(
-            &*provider,
-            system.as_deref(),
-            &history,
-            &compression_config,
-        )
-        .await
-        {
+        match maybe_compress(&*provider, system.as_deref(), &history, compression_config).await {
             Ok(Some(result)) => {
                 history = result.compressed;
                 if let Err(e) = state
@@ -1688,20 +1657,20 @@ async fn run_turn(
     }
 
     // Generate and store session title after the first successful turn.
-    if outcome.was_first_turn {
-        if let Some(text) = outcome.text {
-            let state2 = Arc::clone(&state);
-            let sid = session_id.clone();
-            let user_msg = user_message.clone();
-            tokio::spawn(async move {
-                let p = state2.provider_for_session(&sid).await;
-                if let Some(title) = generate_session_title(&*p, &user_msg, &text).await {
-                    if let Err(e) = state2.api_session_store.set_title(&sid, &title) {
-                        warn!("Failed to store session title: {e}");
-                    }
-                }
-            });
-        }
+    if outcome.was_first_turn
+        && let Some(text) = outcome.text
+    {
+        let state2 = Arc::clone(&state);
+        let sid = session_id.clone();
+        let user_msg = user_message.clone();
+        tokio::spawn(async move {
+            let p = state2.provider_for_session(&sid).await;
+            if let Some(title) = generate_session_title(&*p, &user_msg, &text).await
+                && let Err(e) = state2.api_session_store.set_title(&sid, &title)
+            {
+                warn!("Failed to store session title: {e}");
+            }
+        });
     }
 }
 

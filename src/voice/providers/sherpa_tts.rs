@@ -42,8 +42,8 @@ impl SherpaOnnxTts {
             cfg.model.as_deref(),
             BundleCategory::Tts,
         )?;
-        let tts = build_tts(&dir, &cfg)
-            .map_err(|e| anyhow::anyhow!("tts_provider '{name}': {e:#}"))?;
+        let tts =
+            build_tts(&dir, &cfg).map_err(|e| anyhow::anyhow!("tts_provider '{name}': {e:#}"))?;
         let native_rate = tts.sample_rate() as u32;
         Ok(Self {
             name,
@@ -85,10 +85,9 @@ fn build_tts(dir: &Path, cfg: &SherpaTtsConfig) -> anyhow::Result<OfflineTts> {
             // Matcha bundles ship the acoustic model under a name like
             // `model-steps-3.onnx`; the vocoder (often `vocos-*.onnx`)
             // sits alongside or in the cache root.
-            let acoustic = find_by_substring(dir, "model-steps")
-                .or_else(|_| pick_onnx(dir))?;
-            let vocoder = find_by_substring(dir, "vocos")
-                .or_else(|_| find_by_substring(dir, "vocoder"))?;
+            let acoustic = find_by_substring(dir, "model-steps").or_else(|_| pick_onnx(dir))?;
+            let vocoder =
+                find_by_substring(dir, "vocos").or_else(|_| find_by_substring(dir, "vocoder"))?;
             let tokens = pick_file(dir, &["tokens.txt"])?;
             let lexicon = optional(dir, "lexicon.txt");
             let dict_dir = optional_dir(dir, "dict");

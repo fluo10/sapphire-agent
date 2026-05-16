@@ -155,6 +155,7 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
+    #[allow(dead_code)]
     pub fn new(base_dir: PathBuf, kind: &'static str) -> Self {
         Self {
             base_dir,
@@ -244,6 +245,7 @@ impl SessionStore {
     }
 
     /// Notify sapphire-workspace that a session file was deleted.
+    #[allow(dead_code)]
     fn notify_deleted(&self, abs_path: &Path) {
         let Some(state) = &self.ws_state else { return };
         let guard = match state.lock() {
@@ -265,6 +267,7 @@ impl SessionStore {
     }
 
     /// Delete a session file (used when an empty session is discarded).
+    #[allow(dead_code)]
     pub fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
         if let Some(path) = self.resolve_path(session_id) {
             if path.exists() {
@@ -429,6 +432,7 @@ impl SessionStore {
     /// - `fallback_messages`: raw `ChatMessage` list for active sessions that
     ///   have NO summary yet — Agent bootstrap uses these to synthesize a
     ///   summary on startup (e.g. after a crash that skipped graceful shutdown)
+    #[allow(clippy::type_complexity)]
     pub fn load_all(
         &self,
     ) -> (
@@ -584,10 +588,10 @@ impl SessionStore {
     /// Returns the internal UUID `session_id` if found.
     pub fn find_by_public_id(&self, public_id: &str) -> Option<String> {
         for path in collect_session_files(&self.base_dir, self.kind) {
-            if let Some((meta, _, _, _)) = load_session_file(&path) {
-                if meta.public_id.as_deref() == Some(public_id) {
-                    return Some(meta.session_id);
-                }
+            if let Some((meta, _, _, _)) = load_session_file(&path)
+                && meta.public_id.as_deref() == Some(public_id)
+            {
+                return Some(meta.session_id);
             }
         }
         None
@@ -654,11 +658,7 @@ impl SessionStore {
     /// Like `all_session_dates`, but only counts sessions whose `meta`
     /// satisfies `predicate`. Used so per-namespace daily-log catch-up
     /// only enumerates dates that have at least one in-namespace session.
-    pub fn all_session_dates_filtered<F>(
-        &self,
-        boundary_hour: u8,
-        predicate: F,
-    ) -> Vec<NaiveDate>
+    pub fn all_session_dates_filtered<F>(&self, boundary_hour: u8, predicate: F) -> Vec<NaiveDate>
     where
         F: Fn(&SessionMeta) -> bool,
     {
@@ -684,6 +684,7 @@ impl SessionStore {
 
     /// Return all local dates for which at least one session message exists.
     /// Used by daily_log to find dates that need a log generated.
+    #[allow(dead_code)]
     pub fn all_session_dates(&self, boundary_hour: u8) -> Vec<NaiveDate> {
         let mut dates = std::collections::HashSet::new();
 
@@ -798,7 +799,7 @@ fn load_session_file(
     let mut is_closed = false;
     let mut latest_summary: Option<SummaryLine> = None;
 
-    for raw in lines.flatten() {
+    for raw in lines.map_while(Result::ok) {
         let raw = raw.trim().to_string();
         if raw.is_empty() {
             continue;
@@ -853,7 +854,7 @@ fn load_meta_and_latest_intraday_digest(
     let meta = meta_line.meta;
 
     let mut latest: Option<IntradayDigestLine> = None;
-    for raw in lines.flatten() {
+    for raw in lines.map_while(Result::ok) {
         let raw = raw.trim();
         if raw.is_empty() {
             continue;
@@ -862,10 +863,10 @@ fn load_meta_and_latest_intraday_digest(
             Ok(v) => v,
             Err(_) => continue,
         };
-        if value.get("digest_at").is_some() {
-            if let Ok(d) = serde_json::from_value::<IntradayDigestLine>(value) {
-                latest = Some(d);
-            }
+        if value.get("digest_at").is_some()
+            && let Ok(d) = serde_json::from_value::<IntradayDigestLine>(value)
+        {
+            latest = Some(d);
         }
     }
     Some((meta, latest))

@@ -10,11 +10,11 @@
 mod mock;
 mod openai_tts;
 #[cfg(feature = "voice-sherpa")]
+pub(crate) mod sherpa_download;
+#[cfg(feature = "voice-sherpa")]
 mod sherpa_stt;
 #[cfg(feature = "voice-sherpa")]
 mod sherpa_tts;
-#[cfg(feature = "voice-sherpa")]
-pub(crate) mod sherpa_download;
 mod wav_stream;
 
 pub(super) use mock::{MockStt, MockTts};

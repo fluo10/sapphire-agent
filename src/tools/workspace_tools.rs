@@ -113,9 +113,7 @@ fn parse_memory_file(raw: &str) -> (MemoryMeta, String) {
     match crate::frontmatter::split(raw) {
         Some((fm, body)) => {
             let meta: MemoryMeta = serde_yaml::from_str(fm).unwrap_or_default();
-            let body = body
-                .trim_start_matches(|c: char| c == '\n' || c == '\r')
-                .to_string();
+            let body = body.trim_start_matches(['\n', '\r']).to_string();
             (meta, body)
         }
         None => (MemoryMeta::default(), raw.to_string()),
@@ -125,7 +123,7 @@ fn parse_memory_file(raw: &str) -> (MemoryMeta, String) {
 /// Serialize `(meta, body)` back into a Markdown file with YAML frontmatter.
 fn serialize_memory_file(meta: &MemoryMeta, body: &str) -> Result<String> {
     let fm = serde_yaml::to_string(meta).context("failed to serialize memory frontmatter")?;
-    let body_trimmed = body.trim_start_matches(|c: char| c == '\n' || c == '\r');
+    let body_trimmed = body.trim_start_matches(['\n', '\r']);
     Ok(format!("---\n{fm}---\n\n{body_trimmed}"))
 }
 
@@ -321,7 +319,7 @@ impl Tool for MemoryAppendTool {
             if meta.created_at.is_none() {
                 meta.created_at = Some(now);
             }
-            let trimmed = old_body.trim_end_matches(|c: char| c == '\n' || c == '\r');
+            let trimmed = old_body.trim_end_matches(['\n', '\r']);
             let new_body = if trimmed.is_empty() {
                 content.to_string()
             } else {
@@ -500,23 +498,23 @@ impl Tool for WorkspaceSearchTool {
 
         let state = lock(&self.state);
 
-        if mode == "semantic" {
-            if let Some(embedder) = state.embedder() {
-                let vq = VectorQuery::new(query, embedder).limit(limit);
-                let results = state
-                    .retrieve_db()
-                    .search_similar(&vq)
-                    .context("Vector similarity search failed")?;
+        if mode == "semantic"
+            && let Some(embedder) = state.embedder()
+        {
+            let vq = VectorQuery::new(query, embedder).limit(limit);
+            let results = state
+                .retrieve_db()
+                .search_similar(&vq)
+                .context("Vector similarity search failed")?;
 
-                if results.is_empty() {
-                    return Ok("No results found.".to_string());
-                }
-                let lines: Vec<String> = results
-                    .iter()
-                    .map(|r| format!("- {} [score: {:.4}]", r.path, r.score))
-                    .collect();
-                return Ok(format!("[semantic]\n{}", lines.join("\n")));
+            if results.is_empty() {
+                return Ok("No results found.".to_string());
             }
+            let lines: Vec<String> = results
+                .iter()
+                .map(|r| format!("- {} [score: {:.4}]", r.path, r.score))
+                .collect();
+            return Ok(format!("[semantic]\n{}", lines.join("\n")));
         }
 
         // FTS (default or fallback)

@@ -253,13 +253,13 @@ fn chat_message_to_api(msg: &ChatMessage) -> ApiMessage {
     };
 
     // If there's exactly one Text part and no other parts, use the wire shorthand.
-    if msg.parts.len() == 1 {
-        if let ContentPart::Text(text) = &msg.parts[0] {
-            return ApiMessage {
-                role: role.to_string(),
-                content: ApiContent::Text(text.clone()),
-            };
-        }
+    if msg.parts.len() == 1
+        && let ContentPart::Text(text) = &msg.parts[0]
+    {
+        return ApiMessage {
+            role: role.to_string(),
+            content: ApiContent::Text(text.clone()),
+        };
     }
 
     let parts: Vec<ApiPart> = msg

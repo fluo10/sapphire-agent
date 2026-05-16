@@ -108,6 +108,7 @@ fn next_id() -> u64 {
 ///
 /// This is the shared entry point used by both `sapphire-agent call` and
 /// the standalone `sapphire-call` binary.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     server: String,
     session: Option<String>,
