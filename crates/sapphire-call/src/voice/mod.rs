@@ -702,7 +702,7 @@ fn pick_device(
         };
         let mut seen: Vec<String> = Vec::with_capacity(candidates.len());
         for d in candidates {
-            match d.name() {
+            match d.description().map(|desc| desc.name().to_string()) {
                 Ok(n) if n == want => return Ok(d),
                 Ok(n) => seen.push(n),
                 Err(_) => {}
@@ -737,10 +737,10 @@ fn list_devices() -> Result<()> {
     let host = cpal::default_host();
     let default_in = host
         .default_input_device()
-        .and_then(|d| d.name().ok());
+        .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
     let default_out = host
         .default_output_device()
-        .and_then(|d| d.name().ok());
+        .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
 
     println!("cpal host: {}", host.id().name());
     println!();
@@ -760,7 +760,10 @@ fn print_devices<I: Iterator<Item = cpal::Device>>(
     let mut any = false;
     for d in devices {
         any = true;
-        let name = d.name().unwrap_or_else(|_| "<unnamed>".to_string());
+        let name = d
+            .description()
+            .map(|desc| desc.name().to_string())
+            .unwrap_or_else(|_| "<unnamed>".to_string());
         let marker = if Some(name.as_str()) == default_name {
             "*"
         } else {
@@ -774,7 +777,7 @@ fn print_devices<I: Iterator<Item = cpal::Device>>(
         match cfg {
             Some(c) => println!(
                 "  {marker} {name}\n      {} Hz × {}ch ({:?})",
-                c.sample_rate().0,
+                c.sample_rate(),
                 c.channels(),
                 c.sample_format(),
             ),
@@ -804,7 +807,7 @@ fn open_input_stream(
     let supported = device
         .default_input_config()
         .context("failed to query input config")?;
-    let rate = supported.sample_rate().0;
+    let rate = supported.sample_rate();
     let channels = supported.channels();
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.clone().into();
@@ -880,7 +883,7 @@ fn open_output_stream(
     let supported = device
         .default_output_config()
         .context("failed to query output config")?;
-    let rate = supported.sample_rate().0;
+    let rate = supported.sample_rate();
     let channels = supported.channels();
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.clone().into();
