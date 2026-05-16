@@ -77,6 +77,9 @@ pub struct VoiceOptions {
     /// Listen-state UX: confirmation beeps + post-reply follow-up
     /// listening window. See [`crate::config::BehaviorConfig`].
     pub behavior: crate::config::BehaviorConfig,
+    /// Mic gain + wake/VAD sensitivity knobs (issue #87). Defaults
+    /// preserve the historical hard-coded values.
+    pub sensitivity: crate::config::SensitivityConfig,
 }
 
 /// Frequency / duration of the confirmation beeps. Picked to be
@@ -137,7 +140,8 @@ pub async fn run(
     eprintln!("VAD model: {}", vad_model_path.display());
     let vad = tokio::task::spawn_blocking({
         let path = vad_model_path.clone();
-        move || build_vad(&path)
+        let sens = options.sensitivity.clone();
+        move || build_vad(&path, &sens)
     })
     .await
     .map_err(|e| anyhow!("VAD build task panicked: {e}"))??;
@@ -158,6 +162,9 @@ pub async fn run(
                 .and_then(|s| s.to_str())
                 .map(|s| s.split('-').next().unwrap_or(s).to_string())
                 .unwrap_or_else(|| "wake".to_string());
+            let wake_threshold = options.sensitivity.wake_threshold;
+            let wake_cooldown_chunks =
+                oww::cooldown_chunks_from_ms(options.sensitivity.wake_cooldown_ms);
             let detector = tokio::task::spawn_blocking({
                 let label = label.clone();
                 move || {
@@ -165,7 +172,14 @@ pub async fn run(
                         .context("failed to fetch openWakeWord frontend models")?;
                     let wake_path = download::cache_inline_oww(&bytes, &sha256)
                         .context("failed to cache openWakeWord classifier")?;
-                    oww::OpenWakeWordDetector::create(&mel, &embed, &wake_path, label)
+                    oww::OpenWakeWordDetector::create(
+                        &mel,
+                        &embed,
+                        &wake_path,
+                        label,
+                        wake_threshold,
+                        wake_cooldown_chunks,
+                    )
                 }
             })
             .await
@@ -183,6 +197,7 @@ pub async fn run(
         options.input_device.as_deref(),
         audio_tx,
         Arc::clone(&mic_enabled),
+        options.sensitivity.mic_gain,
     )?;
     input_stream.play()?;
 
@@ -305,7 +320,7 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
             Some(deadline) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    expire_follow_up(&mut ctx, &mut window_buf);
+                    expire_follow_up(&mut ctx, &mut window_buf).await;
                     continue;
                 }
                 let remaining = deadline - now;
@@ -319,7 +334,7 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
                         Ok(Some(buf)) => ListenEvent::Audio(buf),
                         Ok(None) => break,
                         Err(_) => {
-                            expire_follow_up(&mut ctx, &mut window_buf);
+                            expire_follow_up(&mut ctx, &mut window_buf).await;
                             continue;
                         }
                     },
@@ -451,20 +466,36 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
             // In wake-word mode, optionally stay in a short follow-up
             // window so the user can reply without re-waking; otherwise
             // (or in VAD-only mode) keep the existing behaviour.
-            match (ctx.wake.as_mut(), ctx.behavior.follow_up_listen_seconds) {
+            //
+            // `into_listen` = true means the mic is about to re-open
+            // for command capture (VAD-only mode, or wake-mode with a
+            // follow-up window). In that case we play `beep_on_wake`
+            // before unmuting so the user knows the turn handed back
+            // to them. When we're going back to wake-wait
+            // (secs == 0), the next listen-start beep will fire on
+            // the actual wake event itself — don't double up.
+            let into_listen = match (ctx.wake.as_mut(), ctx.behavior.follow_up_listen_seconds) {
                 (Some(wake), 0) => {
                     wake.reset();
                     ctx.awaiting_wake = true;
                     eprintln!("Waiting for wake word.");
+                    false
                 }
                 (Some(_), secs) => {
                     ctx.awaiting_wake = false;
                     ctx.follow_up_until = Some(Instant::now() + Duration::from_secs(secs as u64));
                     eprintln!("Listening for follow-up... ({secs}s)");
+                    true
                 }
                 (None, _) => {
                     eprintln!("Listening.");
+                    true
                 }
+            };
+            if into_listen && ctx.behavior.beep_on_wake {
+                enqueue_beep(&ctx.playback_queue, BEEP_WAKE_HZ, ctx.output_rate);
+                wait_for_playback_drain(&ctx.playback_queue).await;
+                while ctx.audio_rx.try_recv().is_ok() {}
             }
             ctx.mic_enabled.store(true, Ordering::SeqCst);
         }
@@ -512,21 +543,29 @@ async fn handle_push_command(ctx: &mut ListenCtx, cmd: ListenCommand, window_buf
             // Same follow-up arming as the regular reply path: in
             // wake-word mode, give the user a window to reply
             // without re-waking; otherwise just keep listening.
-            match (ctx.wake.as_mut(), ctx.behavior.follow_up_listen_seconds) {
+            let into_listen = match (ctx.wake.as_mut(), ctx.behavior.follow_up_listen_seconds) {
                 (Some(wake), 0) => {
                     wake.reset();
                     ctx.awaiting_wake = true;
                     ctx.follow_up_until = None;
                     eprintln!("Push complete. Waiting for wake word.");
+                    false
                 }
                 (Some(_), secs) => {
                     ctx.awaiting_wake = false;
                     ctx.follow_up_until = Some(Instant::now() + Duration::from_secs(secs as u64));
                     eprintln!("Push complete. Listening for follow-up... ({secs}s)");
+                    true
                 }
                 (None, _) => {
                     eprintln!("Push complete. Listening.");
+                    true
                 }
+            };
+            if into_listen && ctx.behavior.beep_on_wake {
+                enqueue_beep(&ctx.playback_queue, BEEP_WAKE_HZ, ctx.output_rate);
+                wait_for_playback_drain(&ctx.playback_queue).await;
+                while ctx.audio_rx.try_recv().is_ok() {}
             }
             ctx.mic_enabled.store(true, Ordering::SeqCst);
         }
@@ -607,7 +646,12 @@ async fn subscribe_loop(
 /// Time-out hook for the follow-up window: silence elapsed without a
 /// new utterance, so reset transcription state and return to
 /// wake-listening. Caller `continue`s after this.
-fn expire_follow_up(ctx: &mut ListenCtx, window_buf: &mut Vec<f32>) {
+///
+/// Fires `beep_on_capture_end` (falling tone) before we leave the
+/// listening state — listen-end is conceptually the same event as the
+/// "I shipped your utterance to STT" beep: the satellite has stopped
+/// taking audio for this turn.
+async fn expire_follow_up(ctx: &mut ListenCtx, window_buf: &mut Vec<f32>) {
     ctx.follow_up_until = None;
     ctx.vad.reset();
     window_buf.clear();
@@ -615,6 +659,16 @@ fn expire_follow_up(ctx: &mut ListenCtx, window_buf: &mut Vec<f32>) {
         wake.reset();
         ctx.awaiting_wake = true;
         eprintln!("Follow-up window elapsed. Waiting for wake word.");
+        if ctx.behavior.beep_on_capture_end {
+            // Mute mic for the duration of the beep so we don't
+            // re-capture the falling tone as a new utterance.
+            ctx.mic_enabled.store(false, Ordering::SeqCst);
+            while ctx.audio_rx.try_recv().is_ok() {}
+            enqueue_beep(&ctx.playback_queue, BEEP_CAPTURE_END_HZ, ctx.output_rate);
+            wait_for_playback_drain(&ctx.playback_queue).await;
+            while ctx.audio_rx.try_recv().is_ok() {}
+            ctx.mic_enabled.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -636,12 +690,15 @@ fn ensure_silero_model() -> Result<PathBuf> {
     download::ensure_single_file(SILERO_VAD_URL, &dest)
 }
 
-fn build_vad(model_path: &std::path::Path) -> Result<VoiceActivityDetector> {
+fn build_vad(
+    model_path: &std::path::Path,
+    sensitivity: &crate::config::SensitivityConfig,
+) -> Result<VoiceActivityDetector> {
     let silero = SileroVadModelConfig {
         model: Some(model_path.to_string_lossy().into_owned()),
-        threshold: 0.5,
-        min_silence_duration: 0.25,
-        min_speech_duration: 0.25,
+        threshold: sensitivity.vad_threshold,
+        min_silence_duration: sensitivity.vad_min_silence_ms as f32 / 1000.0,
+        min_speech_duration: sensitivity.vad_min_speech_ms as f32 / 1000.0,
         window_size: VAD_WINDOW_SAMPLES as i32,
         max_speech_duration: VAD_MAX_SPEECH_SECONDS,
     };
@@ -778,6 +835,7 @@ fn open_input_stream(
     name: Option<&str>,
     tx: mpsc::UnboundedSender<Vec<i16>>,
     enabled: Arc<AtomicBool>,
+    mic_gain: f32,
 ) -> Result<(cpal::Stream, u32, u16)> {
     let host = cpal::default_host();
     let device = pick_device(&host, name, DeviceKind::Input)?;
@@ -794,6 +852,10 @@ fn open_input_stream(
 
     let err_fn = |e| eprintln!("[input stream error: {e}]");
 
+    // Whether we need to multiply at all. Comparing against 1.0 exactly
+    // is fine — the config layer hands us f32::from(1.0) when the user
+    // omits the field, and any explicit override will differ.
+    let gain = mic_gain;
     let stream = match format {
         SampleFormat::F32 => {
             let tx = tx.clone();
@@ -806,7 +868,10 @@ fn open_input_stream(
                     }
                     let pcm: Vec<i16> = data
                         .iter()
-                        .map(|f| (f.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                        .map(|f| {
+                            let v = if gain == 1.0 { *f } else { *f * gain };
+                            (v.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+                        })
                         .collect();
                     let _ = tx.send(pcm);
                 },
@@ -823,7 +888,12 @@ fn open_input_stream(
                     if !enabled.load(Ordering::SeqCst) {
                         return;
                     }
-                    let _ = tx.send(data.to_vec());
+                    let pcm: Vec<i16> = if gain == 1.0 {
+                        data.to_vec()
+                    } else {
+                        data.iter().map(|s| apply_gain_i16(*s, gain)).collect()
+                    };
+                    let _ = tx.send(pcm);
                 },
                 err_fn,
                 None,
@@ -838,7 +908,17 @@ fn open_input_stream(
                     if !enabled.load(Ordering::SeqCst) {
                         return;
                     }
-                    let pcm: Vec<i16> = data.iter().map(|s| (*s as i32 - 32768) as i16).collect();
+                    let pcm: Vec<i16> = data
+                        .iter()
+                        .map(|s| {
+                            let centered = (*s as i32 - 32768) as i16;
+                            if gain == 1.0 {
+                                centered
+                            } else {
+                                apply_gain_i16(centered, gain)
+                            }
+                        })
+                        .collect();
                     let _ = tx.send(pcm);
                 },
                 err_fn,
@@ -848,6 +928,14 @@ fn open_input_stream(
         other => anyhow::bail!("unsupported input sample format: {other:?}"),
     };
     Ok((stream, rate, channels))
+}
+
+/// Multiply an i16 sample by `gain` in f32 space and clamp back into
+/// the i16 range. Used by the mic_gain path for I16 / U16 capture so a
+/// boost above unity can't wrap around.
+fn apply_gain_i16(sample: i16, gain: f32) -> i16 {
+    let scaled = sample as f32 * gain;
+    scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
 fn open_output_stream(
@@ -1170,5 +1258,30 @@ mod tests {
         let len = q.lock().unwrap().len();
         // Equal sample rates → no resample → exact pipeline-rate length.
         assert_eq!(len, generate_beep(660.0, BEEP_DURATION_MS).len());
+    }
+
+    #[test]
+    fn apply_gain_i16_unity_is_identity() {
+        // Spot-check the helper directly so the input-stream callback
+        // logic is exercised without spinning up cpal.
+        for s in [-32768i16, -1, 0, 1, 32767] {
+            assert_eq!(apply_gain_i16(s, 1.0), s);
+        }
+    }
+
+    #[test]
+    fn apply_gain_i16_boost_clamps_to_full_scale() {
+        // 2× boost on a near-peak sample must clamp at i16::MAX,
+        // not wrap. This is what protects against wrap-around when
+        // the operator dials gain above what the source can support.
+        assert_eq!(apply_gain_i16(20_000, 2.0), i16::MAX);
+        assert_eq!(apply_gain_i16(-20_000, 2.0), i16::MIN);
+    }
+
+    #[test]
+    fn apply_gain_i16_attenuation() {
+        // 0.5× on full-scale should land at half-scale (rounded toward
+        // zero by the as-cast).
+        assert_eq!(apply_gain_i16(20_000, 0.5), 10_000);
     }
 }
