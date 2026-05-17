@@ -12,10 +12,12 @@
 //! it. A token leak therefore exposes one profile, not all.
 //!
 //! Out of scope (v1): `SendStreamingMessage` (SSE), `GetTask`,
-//! `CancelTask`, `SubscribeToTask`, push notifications, `FilePart`
-//! (vision). Wire-format types come from `a2a-lf`; the JSON-RPC
-//! dispatch is hand-rolled here to share `ServeState` with the
-//! existing `/rpc` endpoint.
+//! `CancelTask`, `SubscribeToTask`, push notifications, `FilePart` `url`
+//! (privacy/security: requires explicit operator opt-in), `DataPart`.
+//! `FilePart` inline (`raw` base64) for `image/*` is supported and routes
+//! through the existing multimodal provider path. Wire-format types come
+//! from `a2a-lf`; the JSON-RPC dispatch is hand-rolled here to share
+//! `ServeState` with the existing `/rpc` endpoint.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -28,12 +30,13 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{Json, response::sse::Event};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tracing::warn;
 
 use super::ServeState;
+use crate::provider::ChatMessage;
 
 /// Method name for the only A2A method we implement. The A2A v1 spec
 /// uses PascalCase JSON-RPC method names (`SendMessage`, `GetTask`,
@@ -91,7 +94,7 @@ pub async fn handle_agent_card(State(state): State<Arc<ServeState>>) -> impl Int
             "pushNotifications": false,
             "extendedAgentCard": false,
         },
-        "defaultInputModes": ["text/plain"],
+        "defaultInputModes": ["text/plain", "image/jpeg", "image/png", "image/gif", "image/webp"],
         "defaultOutputModes": ["text/plain"],
         "skills": [
             {
@@ -99,9 +102,10 @@ pub async fn handle_agent_card(State(state): State<Arc<ServeState>>) -> impl Int
                 "name": "Chat with the agent",
                 "description":
                     "Hold a multi-turn conversation; the agent remembers context across calls \
-                     within the same contextId and applies its server-side persona / memory.",
-                "tags": ["chat", "conversation"],
-                "inputModes": ["text/plain"],
+                     within the same contextId and applies its server-side persona / memory. \
+                     Inline images (FilePart raw) are accepted for vision-capable backends.",
+                "tags": ["chat", "conversation", "vision"],
+                "inputModes": ["text/plain", "image/jpeg", "image/png", "image/gif", "image/webp"],
                 "outputModes": ["text/plain"]
             }
         ],
@@ -227,17 +231,28 @@ async fn handle_send_message(
         }
     };
 
-    // Extract plain-text content from message parts. v1 of this handler
-    // ignores non-text parts (FilePart vision, DataPart structured input);
-    // a future change will route those into the multimodal provider path.
-    let user_text = collect_text(&request.message.parts);
-    if user_text.trim().is_empty() {
+    // Extract text + inline image parts. `FilePart` with `url` is rejected
+    // (server-side URL fetch is a privacy/security choice that should
+    // require explicit operator opt-in); `DataPart` is rejected in v1
+    // until we have a structured-tool routing story.
+    let (user_text, images) = match collect_text_and_images(&request.message.parts) {
+        Ok(v) => v,
+        Err(e) => {
+            return jsonrpc_error_response(req_id, codes::INVALID_PARAMS, &e);
+        }
+    };
+    if user_text.trim().is_empty() && images.is_empty() {
         return jsonrpc_error_response(
             req_id,
             codes::INVALID_PARAMS,
-            "message must contain at least one non-empty text part",
+            "message must contain at least one non-empty text part or an inline image",
         );
     }
+    let user_msg = if images.is_empty() {
+        ChatMessage::user(&user_text)
+    } else {
+        ChatMessage::user_with_images(&user_text, images)
+    };
 
     // contextId: client-supplied (resume) or server-generated (new). The
     // params-level field wins over message-level if both are present —
@@ -278,7 +293,7 @@ async fn handle_send_message(
     let outcome = super::run_llm_turn(
         Arc::clone(&state),
         session_id.clone(),
-        user_text,
+        user_msg,
         req_id.clone(),
         tx,
     )
@@ -296,10 +311,16 @@ async fn handle_send_message(
         ),
     };
 
+    // Mint the new task id once and reference it from both the Task and
+    // the inner reply Message. Per A2A v1.0, `Message.taskId` identifies
+    // the task this message belongs to — without it, clients that key
+    // off `result.status.message.taskId` see `None` and may treat the
+    // reply as orphaned.
+    let task_id = new_task_id();
     let reply_message = Message {
         message_id: a2a::new_message_id(),
         context_id: Some(context_id.clone()),
-        task_id: None,
+        task_id: Some(task_id.clone()),
         role: Role::Agent,
         parts: vec![Part::text(reply_text)],
         metadata: None,
@@ -308,7 +329,7 @@ async fn handle_send_message(
     };
 
     let task = Task {
-        id: new_task_id(),
+        id: task_id,
         context_id,
         status: TaskStatus {
             state: state_enum,
@@ -358,22 +379,54 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     }
 }
 
-fn collect_text(parts: &[Part]) -> String {
-    let mut out = String::new();
+/// Extract text and inline images from `parts`. Returns
+/// `(joined_text, Vec<(media_type, base64)>)` on success.
+///
+/// Rejects (with a caller-facing error string for JSON-RPC -32602):
+/// - `PartContent::Url`: server-side URL fetch is a privacy/security
+///   surface that needs explicit operator opt-in.
+/// - `PartContent::Data`: structured-input routing is out of scope for v1.
+/// - `PartContent::Raw` with a non-`image/*` `mediaType`: only the
+///   multimodal provider path (image) is wired through today.
+/// - `PartContent::Raw` without any `mediaType`: ambiguous; the spec
+///   makes it optional but we need it to dispatch.
+fn collect_text_and_images(parts: &[Part]) -> Result<(String, Vec<(String, String)>), String> {
+    let mut text = String::new();
+    let mut images: Vec<(String, String)> = Vec::new();
     for p in parts {
-        if let PartContent::Text(s) = &p.content {
-            if !out.is_empty() {
-                out.push('\n');
+        match &p.content {
+            PartContent::Text(s) => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(s);
             }
-            out.push_str(s);
-        } else {
-            // Non-text part observed but unsupported; flag in logs so
-            // operators noticing missing context in replies have a
-            // pointer rather than having to deserialize the request.
-            warn!("a2a: ignoring non-text Part (vision/data unsupported in v1)");
+            PartContent::Raw(bytes) => {
+                let Some(media_type) = p.media_type.as_deref() else {
+                    return Err(
+                        "FilePart with raw content requires a mediaType (e.g. image/jpeg)"
+                            .to_string(),
+                    );
+                };
+                if !media_type.starts_with("image/") {
+                    return Err(format!(
+                        "unsupported mediaType '{media_type}' for inline FilePart \
+                         (v1 only routes image/* to the multimodal provider)"
+                    ));
+                }
+                images.push((media_type.to_string(), BASE64_STANDARD.encode(bytes)));
+            }
+            PartContent::Url(_) => {
+                return Err("FilePart with url is not supported (server-side URL fetch \
+                     requires explicit operator opt-in)"
+                    .to_string());
+            }
+            PartContent::Data(_) => {
+                return Err("DataPart is not supported in A2A v1 of this agent".to_string());
+            }
         }
     }
-    out
+    Ok((text, images))
 }
 
 fn jsonrpc_error_response(id: Value, code: i32, message: &str) -> axum::response::Response {
@@ -383,4 +436,62 @@ fn jsonrpc_error_response(id: Value, code: i32, message: &str) -> axum::response
         "error": { "code": code, "message": message },
     });
     (StatusCode::OK, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn collect_text_only() {
+        let parts = vec![Part::text("hello"), Part::text("world")];
+        let (text, images) = collect_text_and_images(&parts).unwrap();
+        assert_eq!(text, "hello\nworld");
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn collect_text_plus_inline_image() {
+        let img_bytes = b"\xff\xd8\xff\xe0fake-jpeg".to_vec();
+        let parts = vec![
+            Part::text("look at this"),
+            Part::raw(img_bytes.clone()).with_media_type("image/jpeg"),
+        ];
+        let (text, images) = collect_text_and_images(&parts).unwrap();
+        assert_eq!(text, "look at this");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].0, "image/jpeg");
+        // Round-trip: the encoded blob must decode back to the original bytes.
+        let decoded = BASE64_STANDARD.decode(&images[0].1).unwrap();
+        assert_eq!(decoded, img_bytes);
+    }
+
+    #[test]
+    fn raw_part_without_media_type_is_rejected() {
+        let parts = vec![Part::raw(vec![1, 2, 3])];
+        let err = collect_text_and_images(&parts).unwrap_err();
+        assert!(err.contains("mediaType"), "got: {err}");
+    }
+
+    #[test]
+    fn raw_part_with_non_image_media_type_is_rejected() {
+        let parts = vec![Part::raw(vec![1, 2, 3]).with_media_type("application/pdf")];
+        let err = collect_text_and_images(&parts).unwrap_err();
+        assert!(err.contains("application/pdf"), "got: {err}");
+    }
+
+    #[test]
+    fn url_part_is_rejected() {
+        let parts = vec![Part::url("https://example.com/foo.jpg").with_media_type("image/jpeg")];
+        let err = collect_text_and_images(&parts).unwrap_err();
+        assert!(err.contains("url"), "got: {err}");
+    }
+
+    #[test]
+    fn data_part_is_rejected() {
+        let parts = vec![Part::data(json!({"k": "v"}))];
+        let err = collect_text_and_images(&parts).unwrap_err();
+        assert!(err.to_lowercase().contains("datapart"), "got: {err}");
+    }
 }

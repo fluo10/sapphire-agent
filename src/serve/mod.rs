@@ -72,8 +72,7 @@ pub struct ServeState {
     /// persisted to its own file: each session file's first-line meta
     /// IS the source of truth, so a restart rebuilds the index by
     /// scanning `sessions/<ns>/mcp/*.jsonl` meta lines.
-    pub(crate) mcp_project_index:
-        tokio::sync::Mutex<HashMap<(String, String), String>>,
+    pub(crate) mcp_project_index: tokio::sync::Mutex<HashMap<(String, String), String>>,
     /// In-memory conversation history, keyed by session_id.
     /// Lazy-loaded from JSONL on first access.
     pub(crate) sessions: tokio::sync::Mutex<HashMap<String, Vec<ChatMessage>>>,
@@ -1192,7 +1191,7 @@ async fn run_voice_turn_from_text_sse(
     let outcome = run_llm_turn(
         Arc::clone(&state),
         session_id.clone(),
-        user_text.clone(),
+        ChatMessage::user(&user_text),
         req_id.clone(),
         tx.clone(),
     )
@@ -1402,7 +1401,7 @@ pub(crate) async fn push_voice_text_to_subscriber(
     let outcome = run_llm_turn(
         Arc::clone(&state),
         session_id.clone(),
-        user_text.clone(),
+        ChatMessage::user(&user_text),
         Value::Null,
         sink_tx,
     )
@@ -1501,7 +1500,7 @@ struct LlmTurnOutcome {
 async fn run_llm_turn(
     state: Arc<ServeState>,
     session_id: String,
-    user_message: String,
+    user_msg: ChatMessage,
     req_id: Value,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) -> LlmTurnOutcome {
@@ -1574,8 +1573,9 @@ async fn run_llm_turn(
         if sp.is_empty() { None } else { Some(sp) }
     };
 
-    // 4. Append user message
-    let user_msg = ChatMessage::user(&user_message);
+    // 4. Append user message. Image scrubbing for storage is handled inside
+    //    `SessionStore::append` so the in-memory history keeps full image
+    //    bytes for the provider call while JSONL gets a hash marker.
     history.push(user_msg.clone());
     if let Err(e) = state.api_session_store.append(&session_id, &user_msg) {
         warn!("Failed to persist user message: {e}");
@@ -1727,7 +1727,7 @@ async fn run_turn(
     let outcome = run_llm_turn(
         Arc::clone(&state),
         session_id.clone(),
-        user_message.clone(),
+        ChatMessage::user(&user_message),
         req_id.clone(),
         tx.clone(),
     )
