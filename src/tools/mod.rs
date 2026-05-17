@@ -1,4 +1,5 @@
 pub mod builtin_tools;
+pub mod timer_tools;
 pub mod workspace_tools;
 
 use crate::config::McpServerConfig;
@@ -135,12 +136,18 @@ impl ToolSet {
 /// `tavily_api_key`: if provided, the `web_search` tool is included.
 /// `mcp_servers`: external MCP servers whose tools are registered with the
 /// naming convention `mcp__<name>__<tool_name>`.
+/// `timer_manager` + `timer_presets`: drive the `timer_*` tools. Manager
+/// is shared with `main` so the agent/serve fire dispatchers can be
+/// wired in after construction.
 pub async fn default_tool_set(
     state: Arc<Mutex<sapphire_workspace::WorkspaceState>>,
     tavily_api_key: Option<String>,
     mcp_servers: &[McpServerConfig],
+    timer_manager: Arc<crate::timer::TimerManager>,
+    timer_presets: Vec<crate::config::TimerPreset>,
 ) -> Arc<ToolSet> {
     use builtin_tools::*;
+    use timer_tools::*;
     use workspace_tools::*;
 
     let workspace_root = state
@@ -166,6 +173,13 @@ pub async fn default_tool_set(
         Box::new(DirWalkTool::new(Arc::clone(&state))),
         Box::new(ShellTool::new(workspace_root.clone())),
         Box::new(WeatherTool::new()),
+        Box::new(TimerSetTool::new(Arc::clone(&timer_manager))),
+        Box::new(TimerPresetTool::new(
+            Arc::clone(&timer_manager),
+            timer_presets,
+        )),
+        Box::new(TimerCancelTool::new(Arc::clone(&timer_manager))),
+        Box::new(TimerStatusTool::new(Arc::clone(&timer_manager))),
     ];
 
     if let Some(key) = tavily_api_key {

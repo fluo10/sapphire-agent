@@ -142,6 +142,12 @@ pub struct Config {
     /// satellite regardless of which room_profile they connect to.
     #[serde(default)]
     pub voice: VoiceConfig,
+    /// Timer / Pomodoro presets. Single-slot in-memory timers fired from
+    /// the `timer_*` tools — Pomodoro cycles drop into [[timer.preset]]
+    /// blocks so the user can say "ポモドーロ開始" instead of redeclaring
+    /// "25分集中 + 5分休憩を3回" every time.
+    #[serde(default)]
+    pub timer: TimerConfig,
 }
 
 fn default_true() -> bool {
@@ -797,6 +803,41 @@ fn default_preserve_recent() -> usize {
 // ---------------------------------------------------------------------------
 // Digest config
 // ---------------------------------------------------------------------------
+
+/// Timer presets (Pomodoro etc.). Each preset names a sequence of
+/// `[label, minutes]` steps and a repeat count. Single-shot timers
+/// don't need a preset — they take `minutes` + `message` directly via
+/// the `timer_set` tool.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TimerConfig {
+    /// Named presets referenced by the `timer_preset` tool.
+    #[serde(default, rename = "preset")]
+    pub presets: Vec<TimerPreset>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TimerPreset {
+    /// Unique preset name (matched case-insensitively against the
+    /// `name` argument of `timer_preset`).
+    pub name: String,
+    /// How many times to repeat the `steps` sequence. Default 1.
+    #[serde(default = "default_timer_cycles")]
+    pub cycles: u32,
+    /// Ordered steps fired once per cycle.
+    pub steps: Vec<TimerStep>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TimerStep {
+    /// Short label surfaced in the fire prompt (e.g. "Focus", "Break").
+    pub label: String,
+    /// Step duration in minutes. Fractional minutes are allowed.
+    pub minutes: f64,
+}
+
+fn default_timer_cycles() -> u32 {
+    1
+}
 
 /// Frontmatter-digest injection & generation config.
 ///

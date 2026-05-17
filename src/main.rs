@@ -13,6 +13,7 @@ mod periodic_log;
 mod provider;
 mod serve;
 mod session;
+mod timer;
 mod tools;
 mod voice;
 mod workspace;
@@ -290,11 +291,19 @@ async fn main() -> Result<()> {
                 });
             }
 
+            // ── Timer manager (single-slot, in-memory) ──────────────────────
+            // Built before the tool set so the timer_* tools can hold an
+            // `Arc<TimerManager>`. The agent / serve_state refs are
+            // installed below once those are constructed (Weak both ways).
+            let timer_manager = timer::TimerManager::new();
+
             // ── Tools ───────────────────────────────────────────────────────
             let tool_set = tools::default_tool_set(
                 Arc::clone(&ws_state),
                 config.tools.tavily_api_key.clone(),
                 &config.tools.mcp_servers,
+                Arc::clone(&timer_manager),
+                config.timer.presets.clone(),
             )
             .await;
 
@@ -395,6 +404,9 @@ async fn main() -> Result<()> {
                 voice_providers,
                 image_cache.clone(),
             ));
+            // Wire serve_state into the timer manager so voice-origin
+            // timers can push fire messages back to their satellite.
+            timer_manager.set_serve_state(Arc::downgrade(&serve_state));
 
             if config.standby_mode {
                 tracing::info!(
@@ -517,6 +529,9 @@ async fn main() -> Result<()> {
                     image_cache.clone(),
                 ));
                 agent.bootstrap().await;
+                // Wire the agent into the timer manager so chat-origin
+                // timers fire through `Agent::trigger`.
+                timer_manager.set_agent(Arc::downgrade(&agent));
 
                 // ── Periodic workspace sync + today-digest rebuild ──────
                 // Same cadence drives both: when `periodic_sync` pulls

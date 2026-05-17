@@ -852,8 +852,18 @@ async fn handle_voice_pipeline_run(
 
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
+    let device_id_for_timer = device_id.clone();
     tokio::spawn(async move {
-        run_voice_turn(state, session_id, audio_b64, language, req_id, tx).await;
+        run_voice_turn(
+            state,
+            session_id,
+            audio_b64,
+            language,
+            req_id,
+            tx,
+            Some(device_id_for_timer),
+        )
+        .await;
     });
 
     let stream = ReceiverStream::new(rx);
@@ -1007,6 +1017,7 @@ async fn run_voice_turn(
     language: Option<String>,
     req_id: Value,
     tx: mpsc::Sender<Result<Event, Infallible>>,
+    device_id: Option<String>,
 ) {
     use base64::Engine;
 
@@ -1113,7 +1124,7 @@ async fn run_voice_turn(
     .await;
 
     // Hand off to the from-text path for everything past STT.
-    run_voice_turn_from_text_sse(state, session_id, transcript, req_id, tx).await;
+    run_voice_turn_from_text_sse(state, session_id, transcript, req_id, tx, device_id).await;
 }
 
 /// Voice pipeline failure when looking up the per-session config.
@@ -1151,6 +1162,7 @@ async fn run_voice_turn_from_text_sse(
     user_text: String,
     req_id: Value,
     tx: mpsc::Sender<Result<Event, Infallible>>,
+    device_id: Option<String>,
 ) {
     use base64::Engine;
 
@@ -1208,6 +1220,9 @@ async fn run_voice_turn_from_text_sse(
         ChatMessage::user(&user_text),
         req_id.clone(),
         tx.clone(),
+        device_id
+            .clone()
+            .map(|d| crate::timer::TimerOrigin::Voice { device_id: d }),
     )
     .await;
     send(notification_event(
@@ -1418,6 +1433,9 @@ pub(crate) async fn push_voice_text_to_subscriber(
         ChatMessage::user(&user_text),
         Value::Null,
         sink_tx,
+        Some(crate::timer::TimerOrigin::Voice {
+            device_id: device_id.clone(),
+        }),
     )
     .await;
     drain_handle.abort();
@@ -1517,6 +1535,7 @@ async fn run_llm_turn(
     user_msg: ChatMessage,
     req_id: Value,
     tx: mpsc::Sender<Result<Event, Infallible>>,
+    timer_origin: Option<crate::timer::TimerOrigin>,
 ) -> LlmTurnOutcome {
     let send = |evt: Event| {
         let tx = tx.clone();
@@ -1687,17 +1706,28 @@ async fn run_llm_turn(
                 // memory tool writes under `memory/<namespace>/...`.
                 let tools = Arc::clone(&state.tools);
                 let ns = namespace.clone();
+                let timer_origin = timer_origin.clone();
                 let results: Vec<(String, String)> =
                     futures_util::future::join_all(tool_calls.iter().map(|c| {
                         let tools = Arc::clone(&tools);
                         let c = c.clone();
                         let ns = ns.clone();
-                        crate::tools::workspace_tools::scope_memory_namespace(ns, async move {
-                            info!("Executing tool: {} (id={})", c.name, c.id);
-                            let result = tools.execute(&c).await;
-                            info!("Tool {} done", c.name);
-                            (c.id, result)
-                        })
+                        let origin = timer_origin.clone();
+                        async move {
+                            let fut = crate::tools::workspace_tools::scope_memory_namespace(
+                                ns,
+                                async move {
+                                    info!("Executing tool: {} (id={})", c.name, c.id);
+                                    let result = tools.execute(&c).await;
+                                    info!("Tool {} done", c.name);
+                                    (c.id, result)
+                                },
+                            );
+                            match origin {
+                                Some(o) => crate::timer::scope_timer_origin(o, fut).await,
+                                None => fut.await,
+                            }
+                        }
                     }))
                     .await;
 
@@ -1757,6 +1787,7 @@ async fn run_turn(
         ChatMessage::user(&user_message),
         req_id.clone(),
         tx.clone(),
+        None,
     )
     .await;
 
