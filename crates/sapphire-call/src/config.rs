@@ -124,13 +124,20 @@ pub struct BehaviorConfig {
     /// the user speaking — same role: "the satellite stopped listening".
     #[serde(default = "default_true")]
     pub beep_on_capture_end: bool,
-    /// After the assistant's TTS reply finishes playing, keep the mic
-    /// open for this many seconds without requiring the wake word —
-    /// captures conversational follow-ups. Set to `0` to disable
-    /// (every turn requires re-waking). Only takes effect in
-    /// wake-word mode; VAD-only mode is always continuously listening.
-    #[serde(default = "default_follow_up_seconds")]
-    pub follow_up_listen_seconds: u32,
+    /// Silence-cancellation timeout (seconds) for any state where the
+    /// satellite is waiting for the user to speak: after the wake word
+    /// fires *and* after the AI's TTS reply finishes (the follow-up
+    /// window). If the user doesn't start speaking within this many
+    /// seconds the satellite drops back to wake-listening. An
+    /// in-progress utterance is never cut off — VAD's speech-detected
+    /// state extends the deadline so a long reply still ships to STT.
+    ///
+    /// Set to `0` to disable the timeout entirely (legacy behaviour:
+    /// the mic stays open until VAD ships an utterance, regardless of
+    /// how long the user takes). Only takes effect in wake-word mode;
+    /// VAD-only mode is always continuously listening.
+    #[serde(default = "default_listen_timeout_seconds")]
+    pub listen_timeout_seconds: u32,
 }
 
 impl Default for BehaviorConfig {
@@ -138,7 +145,7 @@ impl Default for BehaviorConfig {
         Self {
             beep_on_wake: default_true(),
             beep_on_capture_end: default_true(),
-            follow_up_listen_seconds: default_follow_up_seconds(),
+            listen_timeout_seconds: default_listen_timeout_seconds(),
         }
     }
 }
@@ -147,8 +154,8 @@ fn default_true() -> bool {
     true
 }
 
-fn default_follow_up_seconds() -> u32 {
-    5
+fn default_listen_timeout_seconds() -> u32 {
+    8
 }
 
 /// Microphone gain + wake/VAD sensitivity knobs. See issue #87.
@@ -282,7 +289,7 @@ description = "Speakerphone in the living room; STT may produce typos"
 [behavior]
 beep_on_wake = false
 beep_on_capture_end = true
-follow_up_listen_seconds = 8
+listen_timeout_seconds = 8
 
 [sensitivity]
 mic_gain           = 1.8
@@ -303,7 +310,7 @@ vad_min_speech_ms  = 200
         assert!(cfg.device.description.is_some());
         assert!(!cfg.behavior.beep_on_wake);
         assert!(cfg.behavior.beep_on_capture_end);
-        assert_eq!(cfg.behavior.follow_up_listen_seconds, 8);
+        assert_eq!(cfg.behavior.listen_timeout_seconds, 8);
         assert!((cfg.sensitivity.mic_gain - 1.8).abs() < f32::EPSILON);
         assert!((cfg.sensitivity.wake_threshold - 0.65).abs() < f32::EPSILON);
         assert_eq!(cfg.sensitivity.wake_cooldown_ms, 1500);
@@ -317,7 +324,7 @@ vad_min_speech_ms  = 200
         let cfg: CallConfig = toml::from_str("").unwrap();
         assert!(cfg.behavior.beep_on_wake);
         assert!(cfg.behavior.beep_on_capture_end);
-        assert_eq!(cfg.behavior.follow_up_listen_seconds, 5);
+        assert_eq!(cfg.behavior.listen_timeout_seconds, 8);
     }
 
     #[test]
