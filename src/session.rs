@@ -53,6 +53,13 @@ pub struct SessionMeta {
     /// field; consumers fall back to room-id derivation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    /// External-AI logical project key for MCP-driven sessions
+    /// (`write_report` / `recall_memory`). Stable across hosts and
+    /// sources for the same project — the MCP layer reverse-looks-up
+    /// `(namespace, project) -> session_id` from this field. Absent on
+    /// chat/API/voice sessions.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project: Option<String>,
     /// Short auto-generated title, populated from a later `session_title` line.
     #[serde(skip)]
     pub title: Option<String>,
@@ -64,6 +71,29 @@ pub struct StoredMessage {
     pub timestamp: DateTime<Utc>,
     pub role: Role,
     pub parts: Vec<ContentPart>,
+    /// Provenance for messages written through MCP `write_report`.
+    /// Absent on normal chat messages and on assistant-side replies.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub report_meta: Option<ReportMeta>,
+}
+
+/// Per-report provenance and structured fields. `source` distinguishes
+/// external AI clients (e.g. "claude-code"); `hostname` records the
+/// machine that originated the report, since a single project may
+/// legitimately be touched from multiple hosts. `summary`, `body`,
+/// and `files` mirror the `write_report` arguments so `recall_memory`
+/// can return structured data without re-parsing the rendered text
+/// that lives in the message's `parts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportMeta {
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<String>>,
 }
 
 impl StoredMessage {
@@ -72,6 +102,7 @@ impl StoredMessage {
             timestamp: Utc::now(),
             role: msg.role.clone(),
             parts: msg.parts.clone(),
+            report_meta: None,
         }
     }
 
@@ -301,6 +332,7 @@ impl SessionStore {
             created_at: Utc::now(),
             public_id: None,
             namespace: Some(namespace.to_string()),
+            project: None,
             title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta })?;
@@ -523,6 +555,87 @@ impl SessionStore {
         )
     }
 
+    /// Load a session preserving wall-clock timestamps and
+    /// `report_meta` provenance, alongside the latest `SummaryLine`
+    /// if one has been written. Used by `recall_memory`: the summary
+    /// becomes `project_summary` (older content compacted) and the
+    /// messages provide the recent verbatim reports. Plain
+    /// `load_session` is unsuitable because the `ChatMessage`
+    /// conversion drops both fields.
+    pub fn load_session_full(
+        &self,
+        session_id: &str,
+    ) -> Option<(Vec<StoredMessage>, Option<SummaryLine>)> {
+        let path = self.resolve_path(session_id)?;
+        let (_, messages, _, summary) = load_session_file(&path)?;
+        Some((messages, summary))
+    }
+
+    /// Create a new MCP-driven session for a logical `project`. Unlike
+    /// `create_session` there's no `ConversationKey` — MCP sessions
+    /// don't map to a chat room, so `room_id` is left empty and the
+    /// `project` field on `SessionMeta` serves as the reverse lookup
+    /// key. Files land under `<base_dir>/<namespace>/mcp/<ULID>.jsonl`
+    /// when this store is constructed with `kind = "mcp"`.
+    pub fn create_mcp_session(
+        &self,
+        namespace: &str,
+        project: &str,
+    ) -> anyhow::Result<String> {
+        let session_id = Uuid::now_v7().to_string();
+        let path = self.path_for_new(&session_id, namespace);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let meta = SessionMeta {
+            session_id: session_id.clone(),
+            room_id: String::new(),
+            thread_id: None,
+            channel: "mcp".to_string(),
+            created_at: Utc::now(),
+            public_id: None,
+            namespace: Some(namespace.to_string()),
+            project: Some(project.to_string()),
+            title: None,
+        };
+        let line = serde_json::to_string(&MetaLine { meta })?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(file, "{line}")?;
+        drop(file);
+        self.notify_updated(&path);
+        Ok(session_id)
+    }
+
+    /// Append a user-role report message tagged with MCP provenance.
+    /// `rendered_text` is what lives in the message's `parts` (used
+    /// as LLM context for the ねぎらい reply and any future feature
+    /// that reads sessions as conversation); `meta` carries the
+    /// structured form `recall_memory` returns to clients. The
+    /// assistant's reply is written through the regular `append`
+    /// path so the session reads back as a normal conversation.
+    pub fn append_report(
+        &self,
+        session_id: &str,
+        rendered_text: &str,
+        meta: ReportMeta,
+    ) -> anyhow::Result<()> {
+        let stored = StoredMessage {
+            timestamp: Utc::now(),
+            role: Role::User,
+            parts: vec![ContentPart::Text(rendered_text.to_string())],
+            report_meta: Some(meta),
+        };
+        let line = serde_json::to_string(&stored)?;
+        let path = self
+            .resolve_path(session_id)
+            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(file, "{line}")?;
+        drop(file);
+        self.notify_updated(&path);
+        Ok(())
+    }
+
     /// Ensure a session file exists for the given caller-supplied ID.
     /// Unlike `create_session`, this uses the provided ID rather than generating a new UUID.
     ///
@@ -559,6 +672,7 @@ impl SessionStore {
             created_at: Utc::now(),
             public_id: public_id.clone(),
             namespace: Some(namespace.to_string()),
+            project: None,
             title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta })?;

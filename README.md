@@ -14,6 +14,7 @@ A personal AI assistant agent that lives in a [`sapphire-workspace`](https://cra
 - **Built-in tools**: `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `web_search`, `weather`, `shell`, plus workspace memory / search / sync tools.
 - **Sessions**: human-readable [`grain-id`](https://crates.io/crates/grain-id) aliases, auto-generated titles, history dump on resume.
 - **Background**: heartbeat cron tasks, periodic memory compaction, periodic workspace sync, daily logs.
+- **External AI integration**: `/mcp` endpoint publishes `write_report` and `recall_memory` tools so Claude Code (and other MCP clients) can share project context with the agent — see [docs/mcp-integration.md](docs/mcp-integration.md).
 - **Commands**:
   - `call` — interactive REPL (reedline)
   - `serve` — JSON-RPC over HTTP control API (`/rpc`)

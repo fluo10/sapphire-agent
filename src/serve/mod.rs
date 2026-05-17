@@ -10,6 +10,7 @@
 //! #79) and is intentionally not served here.
 
 pub mod a2a;
+pub mod mcp;
 
 use crate::channel::RoomInfo;
 use crate::config::Config;
@@ -59,6 +60,20 @@ pub struct ServeState {
     pub(crate) workspace: Arc<Workspace>,
     pub(crate) tools: Arc<ToolSet>,
     pub(crate) api_session_store: Arc<SessionStore>,
+    /// MCP session store (kind = `"mcp"`). Holds long-lived
+    /// per-project sessions written through `/mcp`'s `write_report`
+    /// tool — kept physically separate from `api_session_store` so the
+    /// project index scan and any future MCP-specific retention only
+    /// see MCP traffic.
+    pub(crate) mcp_session_store: Arc<SessionStore>,
+    /// Reverse index `(namespace, project) → session_id` for the MCP
+    /// session store. Seeded at startup from `SessionMeta.project` and
+    /// maintained on `create_mcp_session`. The mapping isn't
+    /// persisted to its own file: each session file's first-line meta
+    /// IS the source of truth, so a restart rebuilds the index by
+    /// scanning `sessions/<ns>/mcp/*.jsonl` meta lines.
+    pub(crate) mcp_project_index:
+        tokio::sync::Mutex<HashMap<(String, String), String>>,
     /// In-memory conversation history, keyed by session_id.
     /// Lazy-loaded from JSONL on first access.
     pub(crate) sessions: tokio::sync::Mutex<HashMap<String, Vec<ChatMessage>>>,
@@ -101,14 +116,34 @@ impl ServeState {
         workspace: Arc<Workspace>,
         tools: Arc<ToolSet>,
         api_session_store: Arc<SessionStore>,
+        mcp_session_store: Arc<SessionStore>,
         voice: Option<Arc<VoiceProviders>>,
     ) -> Self {
+        // Scan once on startup: each MCP session's first-line meta
+        // carries `namespace` + `project`, so this reproduces the
+        // logical mapping without a side-channel index file. The same
+        // map is updated in-place when `write_report` creates a new
+        // project session.
+        let mut mcp_index: HashMap<(String, String), String> = HashMap::new();
+        for meta in mcp_session_store.list_sessions() {
+            let (Some(ns), Some(proj)) = (meta.namespace.clone(), meta.project.clone()) else {
+                continue;
+            };
+            // `list_sessions` is sorted by `created_at`, so overwriting
+            // here keeps the most recent session per (ns, project) —
+            // matters only if a project ever ended up with multiple
+            // session files (manual surgery, future reset semantics).
+            mcp_index.insert((ns, proj), meta.session_id);
+        }
+
         Self {
             config,
             registry,
             workspace,
             tools,
             api_session_store,
+            mcp_session_store,
+            mcp_project_index: tokio::sync::Mutex::new(mcp_index),
             sessions: tokio::sync::Mutex::new(HashMap::new()),
             pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
             session_room_profiles: tokio::sync::Mutex::new(HashMap::new()),
@@ -116,6 +151,52 @@ impl ServeState {
             voice,
             voice_subscribers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Look up the MCP session id for `(namespace, project)`. Returns
+    /// `None` if the project has never received a report.
+    pub(crate) async fn mcp_session_for_project(
+        &self,
+        namespace: &str,
+        project: &str,
+    ) -> Option<String> {
+        self.mcp_project_index
+            .lock()
+            .await
+            .get(&(namespace.to_string(), project.to_string()))
+            .cloned()
+    }
+
+    /// Look up (or create) the MCP session for `(namespace, project)`.
+    /// First call for a project creates the underlying session file
+    /// and registers it in the index; subsequent calls hit the index.
+    /// Concurrent calls for the same new project are serialized
+    /// through the index mutex so only one session file is created.
+    pub(crate) async fn mcp_session_for_project_or_create(
+        &self,
+        namespace: &str,
+        project: &str,
+    ) -> anyhow::Result<String> {
+        let key = (namespace.to_string(), project.to_string());
+        {
+            let idx = self.mcp_project_index.lock().await;
+            if let Some(id) = idx.get(&key) {
+                return Ok(id.clone());
+            }
+        }
+        // Hold the lock across creation so two simultaneous
+        // first-time writers for the same project don't each spawn
+        // a session file. Double-check inside the lock in case
+        // another task won the race between our two acquisitions.
+        let mut idx = self.mcp_project_index.lock().await;
+        if let Some(id) = idx.get(&key) {
+            return Ok(id.clone());
+        }
+        let session_id = self
+            .mcp_session_store
+            .create_mcp_session(namespace, project)?;
+        idx.insert(key, session_id.clone());
+        Ok(session_id)
     }
 
     /// Provider that should serve the given session. Resolves the
@@ -200,6 +281,7 @@ pub async fn run(addr: String, state: Arc<ServeState>) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/rpc", post(rpc_post).get(rpc_get))
         .route("/a2a", post(a2a::handle_a2a_post))
+        .route("/mcp", post(mcp::handle_mcp_post))
         .route(
             "/.well-known/agent-card.json",
             axum::routing::get(a2a::handle_agent_card),
