@@ -163,18 +163,30 @@ system_prompt = "You are a helpful personal assistant."
 # session_policy   = "compact"
 # rooms            = ["!nsfw:example.com"]
 #
-# A2A (Agent2Agent Protocol) clients reach a room_profile through
-# bearer tokens declared here. Each token must be unique across all
-# room profiles — startup fails if two profiles share one — and an
+# A2A (Agent2Agent Protocol) and MCP clients reach a room_profile
+# through bearer tokens declared here. Each token must be unique across
+# all room profiles — startup fails if two profiles share one — and an
 # incoming `Authorization: Bearer <token>` resolves implicitly to the
-# owning profile, so A2A clients never name room_profile themselves.
-# Leave `api_keys = []` (or omit) to deny A2A access to a profile.
+# owning profile, so external clients never name room_profile
+# themselves. Leave `api_keys = []` (or omit) to deny external access
+# to a profile.
 #
 # [room_profile.sapphire_world]
 # profile          = "default"
 # memory_namespace = "sapphire_world"
 # rooms            = []                       # A2A-only; no chat rooms map here
 # api_keys         = ["sa-a2a-<long random>"] # one token per allowed client
+#
+# A typical MCP setup for an external coding assistant (Claude Code
+# and similar) sharing the user's default memory namespace. The
+# profile pin is what the ねぎらい reply for `write_report` uses; pick
+# whichever model you want responding to project reports.
+#
+# [room_profile.claude_code]
+# profile          = "default"
+# memory_namespace = "default"                # share the everyday namespace
+# rooms            = []                       # MCP-only; no chat rooms map here
+# api_keys         = ["sa-mcp-<long random>"]
 #
 # Caveat: workspace retrieve (FTS / vector search) currently spans every
 # namespace because sapphire-workspace 0.10.x has no path_prefix filter.
@@ -195,6 +207,31 @@ system_prompt = "You are a helpful personal assistant."
 # public_url        = "https://agent.example.com/a2a"
 # agent_name        = "Sapphire"
 # agent_description = "Personal partner AI with persistent character and memory."
+
+# ─────────────────────────────────────────────────────────────────────
+# MCP (Model Context Protocol) server
+# ─────────────────────────────────────────────────────────────────────
+# Mounts `/mcp` (JSON-RPC) on the same HTTP server as `/rpc`. Always
+# enabled — there's no `[mcp]` block — but gated entirely by
+# `[room_profile.<n>].api_keys`: without a configured token, every
+# request returns 401. See the `[room_profile.claude_code]` example
+# above for the typical wiring.
+#
+# Two tools are exposed:
+#
+#   - `write_report` — external AI clients (Claude Code, etc.) report
+#     a unit of work back. Stored per-project under
+#     `sessions/<namespace>/mcp/<ULID>.jsonl`; the response is a
+#     ねぎらい (acknowledgement) generated through the room_profile's
+#     `profile`.
+#   - `recall_memory` — fetch a project's compact summary + recent
+#     reports at session start, so the external AI can pick up where
+#     the user left off (possibly across hosts).
+#
+# Trust boundary is asymmetric: writes flow into the namespace's
+# daily-digest pipeline normally, but `recall_memory` is scoped
+# strictly to the named project's session — namespace-wide memory
+# never leaks back to the external AI.
 
 # ─────────────────────────────────────────────────────────────────────
 # Voice pipeline (optional)

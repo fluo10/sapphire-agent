@@ -317,6 +317,17 @@ async fn main() -> Result<()> {
                 Arc::clone(&ws_state),
             ));
 
+            // ── MCP session store (sessions/<namespace>/mcp/) ──────────────
+            // External AI clients (Claude Code, etc.) reach this through
+            // the `/mcp` `write_report` / `recall_memory` tools. Kept in
+            // its own `kind` directory so the project-name reverse index
+            // and any future MCP-specific retention only scan MCP files.
+            let mcp_session_store = Arc::new(SessionStore::with_workspace(
+                sessions_base.clone(),
+                "mcp",
+                Arc::clone(&ws_state),
+            ));
+
             // ── Voice providers + ServeState (built early) ──────────────────
             // ServeState owns the voice_subscribers registry that heartbeat
             // pushes through, so it has to exist before heartbeat is spawned.
@@ -343,6 +354,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&workspace),
                 Arc::clone(&tool_set),
                 Arc::clone(&api_session_store),
+                Arc::clone(&mcp_session_store),
                 voice_providers,
             ));
 
