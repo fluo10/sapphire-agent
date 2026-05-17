@@ -17,9 +17,11 @@
 //! of this line means the session is no longer active.
 
 use crate::provider::{ChatMessage, ContentPart, Role};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 use sapphire_workspace::WorkspaceState;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -345,7 +347,9 @@ impl SessionStore {
 
     /// Append a `ChatMessage` (with current timestamp) to an existing session.
     pub fn append(&self, session_id: &str, msg: &ChatMessage) -> anyhow::Result<()> {
-        let stored = StoredMessage::from_chat(msg);
+        let scrubbed = scrub_images_for_storage(msg);
+        let to_store = scrubbed.as_ref().unwrap_or(msg);
+        let stored = StoredMessage::from_chat(to_store);
         let line = serde_json::to_string(&stored)?;
         let path = self
             .resolve_path(session_id)
@@ -577,11 +581,7 @@ impl SessionStore {
     /// `project` field on `SessionMeta` serves as the reverse lookup
     /// key. Files land under `<base_dir>/<namespace>/mcp/<ULID>.jsonl`
     /// when this store is constructed with `kind = "mcp"`.
-    pub fn create_mcp_session(
-        &self,
-        namespace: &str,
-        project: &str,
-    ) -> anyhow::Result<String> {
+    pub fn create_mcp_session(&self, namespace: &str, project: &str) -> anyhow::Result<String> {
         let session_id = Uuid::now_v7().to_string();
         let path = self.path_for_new(&session_id, namespace);
         if let Some(parent) = path.parent() {
@@ -819,6 +819,66 @@ impl SessionStore {
 }
 
 // ---------------------------------------------------------------------------
+// Image scrubbing for persistence
+// ---------------------------------------------------------------------------
+
+/// Replace every `ContentPart::Image` in `msg` with a text marker that
+/// preserves the MIME type and a SHA-256 of the raw bytes, returning the
+/// rewritten message. Returns `None` when `msg` has no image parts (so
+/// callers can skip the allocation).
+///
+/// Format: `[image: <media_type> sha256=<hex>]` — the hash gives future
+/// out-of-band caches a stable key (planned follow-up: ImageRef +
+/// workspace-external cache) without dragging multi-MB base64 blobs into
+/// JSONL session files or the in-memory history on reload.
+///
+/// An undecodable `data_base64` is recorded as `sha256=invalid-base64`
+/// rather than failing the append — a corrupt image shouldn't lose the
+/// surrounding turn from persistence.
+pub(crate) fn scrub_images_for_storage(msg: &ChatMessage) -> Option<ChatMessage> {
+    if !msg
+        .parts
+        .iter()
+        .any(|p| matches!(p, ContentPart::Image { .. }))
+    {
+        return None;
+    }
+    let parts = msg
+        .parts
+        .iter()
+        .map(|p| match p {
+            ContentPart::Image {
+                media_type,
+                data_base64,
+            } => {
+                let hash = match BASE64_STANDARD.decode(data_base64) {
+                    Ok(bytes) => sha256_hex(&bytes),
+                    Err(_) => "invalid-base64".to_string(),
+                };
+                ContentPart::Text(format!("[image: {media_type} sha256={hash}]"))
+            }
+            other => other.clone(),
+        })
+        .collect();
+    Some(ChatMessage {
+        role: msg.role.clone(),
+        parts,
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let digest = h.finalize();
+    let mut s = String::with_capacity(64);
+    for b in digest.iter() {
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
 // Namespace-scoped filesystem walking
 // ---------------------------------------------------------------------------
 
@@ -984,4 +1044,62 @@ fn load_meta_and_latest_intraday_digest(
         }
     }
     Some((meta, latest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrub_returns_none_when_no_images() {
+        let msg = ChatMessage::user("plain text");
+        assert!(scrub_images_for_storage(&msg).is_none());
+    }
+
+    #[test]
+    fn scrub_replaces_image_with_hash_marker() {
+        let bytes = b"\xff\xd8\xff\xe0fake-jpeg".to_vec();
+        let b64 = BASE64_STANDARD.encode(&bytes);
+        let msg =
+            ChatMessage::user_with_images("look", std::iter::once(("image/jpeg".to_string(), b64)));
+        let scrubbed = scrub_images_for_storage(&msg).expect("scrub should rewrite");
+
+        // No Image parts remain on the persisted shape.
+        assert!(
+            !scrubbed
+                .parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::Image { .. })),
+            "scrubbed message still contains Image part"
+        );
+
+        // The marker is text and carries the expected hash.
+        let expected = sha256_hex(&bytes);
+        let has_marker = scrubbed
+            .parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::Text(s) if s.contains(&expected) && s.contains("image/jpeg")));
+        assert!(
+            has_marker,
+            "missing hash marker; parts={:?}",
+            scrubbed.parts
+        );
+    }
+
+    #[test]
+    fn scrub_invalid_base64_records_marker_without_panic() {
+        let msg = ChatMessage {
+            role: Role::User,
+            parts: vec![ContentPart::Image {
+                media_type: "image/png".to_string(),
+                data_base64: "@@@not-base64@@@".to_string(),
+            }],
+        };
+        let scrubbed = scrub_images_for_storage(&msg).expect("scrub should rewrite");
+        let has_marker = scrubbed
+            .parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::Text(s) if s.contains("invalid-base64")));
+        assert!(has_marker, "expected invalid-base64 marker");
+    }
 }

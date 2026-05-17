@@ -954,7 +954,7 @@ mod tests {
         write_stub(&root.join("memory/daily/2026-04-15.md"), "old");
         write_stub(&root.join("memory/default/daily/2026-04-16.md"), "new");
 
-        let err = migrate_pre_namespace_layout(root).err().expect("error");
+        let err = migrate_pre_namespace_layout(root).expect_err("error");
         assert!(format!("{err:#}").contains("Reconcile manually"));
         // Files untouched.
         assert!(root.join("memory/daily/2026-04-15.md").exists());
@@ -1008,7 +1008,7 @@ mod tests {
         let base = td.path();
         write_stub(&base.join("matrix/01H1.jsonl"), "matrix");
         write_stub(&base.join("channel/01H1.jsonl"), "pre-existing");
-        let err = migrate_per_channel_sessions(base).err().expect("error");
+        let err = migrate_per_channel_sessions(base).expect_err("error");
         assert!(
             format!("{err:#}").contains("already exists"),
             "got: {err:#}"

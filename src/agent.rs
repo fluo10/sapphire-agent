@@ -505,10 +505,9 @@ impl Agent {
     /// and we never reload raw history across restarts, so persisting them
     /// would only bloat the JSONL. Context survives via compaction summaries.
     ///
-    /// Messages with `Image` parts are persisted with the raw image data
-    /// stripped (replaced with a `[image: <media_type>]` text marker) so the
-    /// JSONL stays small while daily logs / summaries can still see that an
-    /// image was sent.
+    /// Image scrubbing (raw base64 → `[image: <media_type> sha256=...]` text
+    /// marker) happens centrally inside [`SessionStore::append`] so every
+    /// persist path (agent, A2A, MCP) inherits the same on-disk shape.
     fn persist(&self, session_id: &str, msg: &ChatMessage) {
         if session_id.is_empty() {
             return;
@@ -522,9 +521,7 @@ impl Agent {
         if has_tool_parts {
             return;
         }
-        let scrubbed = strip_image_data(msg);
-        let to_write = scrubbed.as_ref().unwrap_or(msg);
-        if let Err(e) = self.session_store.append(session_id, to_write) {
+        if let Err(e) = self.session_store.append(session_id, msg) {
             warn!("Failed to persist message: {e}");
         }
     }
@@ -992,32 +989,6 @@ fn build_user_message(text: &str, attachments: &[Attachment]) -> ChatMessage {
         .iter()
         .map(|a| (a.media_type.clone(), STANDARD.encode(&a.data)));
     ChatMessage::user_with_images(text, images)
-}
-
-/// Return a copy of `msg` with every `Image` part replaced by a small text
-/// marker, or `None` if the message has no `Image` parts (avoids cloning).
-fn strip_image_data(msg: &ChatMessage) -> Option<ChatMessage> {
-    if !msg
-        .parts
-        .iter()
-        .any(|p| matches!(p, ContentPart::Image { .. }))
-    {
-        return None;
-    }
-    let parts = msg
-        .parts
-        .iter()
-        .map(|p| match p {
-            ContentPart::Image { media_type, .. } => {
-                ContentPart::Text(format!("[image: {media_type}]"))
-            }
-            other => other.clone(),
-        })
-        .collect();
-    Some(ChatMessage {
-        role: msg.role.clone(),
-        parts,
-    })
 }
 
 /// Read the created_at date of a session file and convert to the local day.
