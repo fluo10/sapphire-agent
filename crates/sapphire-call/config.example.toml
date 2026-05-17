@@ -34,16 +34,23 @@ room_profile = "home_voice"
 # description = "Speakerphone in the living room; STT may produce typos due to ambient noise"
 
 [behavior]
-# Confirmation beeps and follow-up listening window. Defaults shown.
+# Confirmation beeps and listen-window timeout. Defaults shown.
 # beep_on_wake          = true   # rising tone — fires on wake word AND when the mic
 #                                  re-opens after the AI's TTS reply (the listen-start
 #                                  cue is the same event in both cases)
 # beep_on_capture_end   = true   # falling tone — fires when the VAD ships an utterance
-#                                  to STT AND when the follow-up window times out
-#                                  without speech (listen-end cue in both cases)
-# follow_up_listen_seconds = 5   # keep the mic open this long after the AI finishes
-#                                  speaking, so the user can reply without re-waking.
-#                                  Set to 0 to require a wake word for every turn.
+#                                  to STT. A distinct double-beep at a lower pitch
+#                                  fires when a listen window times out without speech,
+#                                  so the user can tell success from cancellation.
+# listen_timeout_seconds = 8     # silence-cancel timeout used in both wake-word states:
+#                                  after a wake match (drop back to wake-listening if
+#                                  the user doesn't speak) and after the AI's TTS reply
+#                                  (the follow-up window). An in-progress utterance is
+#                                  never cut off — VAD's speech-detected state extends
+#                                  the deadline so long replies still ship to STT.
+#                                  Set to 0 for no timeout (legacy: mic stays open
+#                                  until VAD ships). Wake-word mode only; VAD-only
+#                                  mode is always continuously listening.
 
 [sensitivity]
 # Mic gain + wake/VAD thresholds. Everything is optional; built-in

@@ -88,6 +88,19 @@ pub struct VoiceOptions {
 const BEEP_DURATION_MS: u32 = 150;
 const BEEP_WAKE_HZ: f32 = 880.0;
 const BEEP_CAPTURE_END_HZ: f32 = 660.0;
+/// Silence-cancellation cue: a double-beep at a lower pitch, audibly
+/// distinct from the single falling tone used for capture success so
+/// the user can tell whether their utterance shipped or the listen
+/// window timed out without speech.
+const BEEP_TIMEOUT_HZ: f32 = 440.0;
+const BEEP_TIMEOUT_DURATION_MS: u32 = 80;
+const BEEP_TIMEOUT_GAP_MS: u32 = 60;
+/// Grace window pushed onto the deadline when it elapses while VAD
+/// reports an in-progress speech segment. Long enough that VAD's
+/// min_silence_duration always lands inside it, so a long reply that
+/// crosses the configured follow-up window still ships to STT instead
+/// of being silently dropped.
+const SPEECH_IN_PROGRESS_GRACE_SECS: u64 = 5;
 
 // ── cpal stream supervisor tuning ──────────────────────────────────────
 //
@@ -588,6 +601,17 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
             Some(deadline) => {
                 let now = Instant::now();
                 if now >= deadline {
+                    // Don't kill an in-progress utterance. VAD is
+                    // between the speech-start and silence-close
+                    // transitions — extend the deadline so the
+                    // segment has time to close (min_silence_duration)
+                    // and ship to STT normally.
+                    if ctx.vad.detected() {
+                        ctx.follow_up_until = Some(
+                            now + Duration::from_secs(SPEECH_IN_PROGRESS_GRACE_SECS),
+                        );
+                        continue;
+                    }
                     expire_follow_up(&mut ctx, &mut window_buf).await;
                     continue;
                 }
@@ -602,6 +626,16 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
                         Ok(Some(buf)) => ListenEvent::Audio(buf),
                         Ok(None) => break,
                         Err(_) => {
+                            // Same speech-in-progress guard as the
+                            // top-of-loop check: don't expire while a
+                            // segment is mid-flight.
+                            if ctx.vad.detected() {
+                                ctx.follow_up_until = Some(
+                                    Instant::now()
+                                        + Duration::from_secs(SPEECH_IN_PROGRESS_GRACE_SECS),
+                                );
+                                continue;
+                            }
                             expire_follow_up(&mut ctx, &mut window_buf).await;
                             continue;
                         }
@@ -665,6 +699,17 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
                     wait_for_playback_drain(&ctx.playback_queue).await;
                     while ctx.audio_rx.try_recv().is_ok() {}
                     ctx.mic_enabled.store(true, Ordering::SeqCst);
+                }
+                // Silence-cancellation: drop back to wake-waiting if
+                // the user doesn't actually start speaking. Without
+                // this, a stray wake match would hold the mic open
+                // indefinitely. Set after the beep/drain so the
+                // timer starts when the mic is truly live.
+                if ctx.behavior.listen_timeout_seconds > 0 {
+                    ctx.follow_up_until = Some(
+                        Instant::now()
+                            + Duration::from_secs(ctx.behavior.listen_timeout_seconds as u64),
+                    );
                 }
             }
             continue;
@@ -731,31 +776,23 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
             while ctx.audio_rx.try_recv().is_ok() {}
             ctx.vad.reset();
             window_buf.clear();
-            // In wake-word mode, optionally stay in a short follow-up
-            // window so the user can reply without re-waking; otherwise
-            // (or in VAD-only mode) keep the existing behaviour.
-            //
-            // `into_listen` = true means the mic is about to re-open
-            // for command capture (VAD-only mode, or wake-mode with a
-            // follow-up window). In that case we play `beep_on_wake`
-            // before unmuting so the user knows the turn handed back
-            // to them. When we're going back to wake-wait
-            // (secs == 0), the next listen-start beep will fire on
-            // the actual wake event itself — don't double up.
-            let into_listen = match (ctx.wake.as_mut(), ctx.behavior.follow_up_listen_seconds) {
-                (Some(wake), 0) => {
-                    wake.reset();
-                    ctx.awaiting_wake = true;
-                    eprintln!("Waiting for wake word.");
-                    false
-                }
-                (Some(_), secs) => {
+            // After a successful turn, the mic re-opens for the next
+            // user utterance. In wake-word mode it's a follow-up
+            // window with the same silence-cancel timeout as the
+            // post-wake state; in VAD-only mode the mic is just
+            // perpetually listening.
+            let into_listen = match ctx.wake.as_mut() {
+                Some(_) => {
                     ctx.awaiting_wake = false;
-                    ctx.follow_up_until = Some(Instant::now() + Duration::from_secs(secs as u64));
-                    eprintln!("Listening for follow-up... ({secs}s)");
+                    let secs = ctx.behavior.listen_timeout_seconds;
+                    if secs > 0 {
+                        eprintln!("Listening for follow-up... ({secs}s)");
+                    } else {
+                        eprintln!("Listening for follow-up.");
+                    }
                     true
                 }
-                (None, _) => {
+                None => {
                     eprintln!("Listening.");
                     true
                 }
@@ -764,6 +801,17 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
                 enqueue_beep(&ctx.playback_queue, BEEP_WAKE_HZ, ctx.output_rate);
                 wait_for_playback_drain(&ctx.playback_queue).await;
                 while ctx.audio_rx.try_recv().is_ok() {}
+            }
+            // Start the silence-cancel deadline once the mic is
+            // actually live — otherwise the ~300 ms of beep + drain
+            // eats into the configured window. `listen_timeout_seconds
+            // == 0` opts out of the deadline entirely (legacy
+            // indefinite-listen behaviour).
+            if into_listen && ctx.wake.is_some() && ctx.behavior.listen_timeout_seconds > 0 {
+                ctx.follow_up_until = Some(
+                    Instant::now()
+                        + Duration::from_secs(ctx.behavior.listen_timeout_seconds as u64),
+                );
             }
             ctx.mic_enabled.store(true, Ordering::SeqCst);
         }
@@ -811,21 +859,18 @@ async fn handle_push_command(ctx: &mut ListenCtx, cmd: ListenCommand, window_buf
             // Same follow-up arming as the regular reply path: in
             // wake-word mode, give the user a window to reply
             // without re-waking; otherwise just keep listening.
-            let into_listen = match (ctx.wake.as_mut(), ctx.behavior.follow_up_listen_seconds) {
-                (Some(wake), 0) => {
-                    wake.reset();
-                    ctx.awaiting_wake = true;
-                    ctx.follow_up_until = None;
-                    eprintln!("Push complete. Waiting for wake word.");
-                    false
-                }
-                (Some(_), secs) => {
+            let into_listen = match ctx.wake.as_mut() {
+                Some(_) => {
                     ctx.awaiting_wake = false;
-                    ctx.follow_up_until = Some(Instant::now() + Duration::from_secs(secs as u64));
-                    eprintln!("Push complete. Listening for follow-up... ({secs}s)");
+                    let secs = ctx.behavior.listen_timeout_seconds;
+                    if secs > 0 {
+                        eprintln!("Push complete. Listening for follow-up... ({secs}s)");
+                    } else {
+                        eprintln!("Push complete. Listening for follow-up.");
+                    }
                     true
                 }
-                (None, _) => {
+                None => {
                     eprintln!("Push complete. Listening.");
                     true
                 }
@@ -834,6 +879,14 @@ async fn handle_push_command(ctx: &mut ListenCtx, cmd: ListenCommand, window_buf
                 enqueue_beep(&ctx.playback_queue, BEEP_WAKE_HZ, ctx.output_rate);
                 wait_for_playback_drain(&ctx.playback_queue).await;
                 while ctx.audio_rx.try_recv().is_ok() {}
+            }
+            // Start the silence-cancel deadline only after the beep
+            // finishes, mirroring the regular reply path.
+            if into_listen && ctx.wake.is_some() && ctx.behavior.listen_timeout_seconds > 0 {
+                ctx.follow_up_until = Some(
+                    Instant::now()
+                        + Duration::from_secs(ctx.behavior.listen_timeout_seconds as u64),
+                );
             }
             ctx.mic_enabled.store(true, Ordering::SeqCst);
         }
@@ -911,14 +964,14 @@ async fn subscribe_loop(
     }
 }
 
-/// Time-out hook for the follow-up window: silence elapsed without a
+/// Time-out hook for the listen window: silence elapsed without a
 /// new utterance, so reset transcription state and return to
 /// wake-listening. Caller `continue`s after this.
 ///
-/// Fires `beep_on_capture_end` (falling tone) before we leave the
-/// listening state — listen-end is conceptually the same event as the
-/// "I shipped your utterance to STT" beep: the satellite has stopped
-/// taking audio for this turn.
+/// Fires the dedicated silence-cancel cue (a double-beep at a lower
+/// pitch) rather than the capture-end tone so the user can tell
+/// whether their utterance shipped to STT or the satellite timed out
+/// without hearing them.
 async fn expire_follow_up(ctx: &mut ListenCtx, window_buf: &mut Vec<f32>) {
     ctx.follow_up_until = None;
     ctx.vad.reset();
@@ -926,13 +979,13 @@ async fn expire_follow_up(ctx: &mut ListenCtx, window_buf: &mut Vec<f32>) {
     if let Some(ref mut wake) = ctx.wake {
         wake.reset();
         ctx.awaiting_wake = true;
-        eprintln!("Follow-up window elapsed. Waiting for wake word.");
+        eprintln!("Listen window elapsed without speech. Waiting for wake word.");
         if ctx.behavior.beep_on_capture_end {
             // Mute mic for the duration of the beep so we don't
-            // re-capture the falling tone as a new utterance.
+            // re-capture the tone as a new utterance.
             ctx.mic_enabled.store(false, Ordering::SeqCst);
             while ctx.audio_rx.try_recv().is_ok() {}
-            enqueue_beep(&ctx.playback_queue, BEEP_CAPTURE_END_HZ, ctx.output_rate);
+            enqueue_timeout_beep(&ctx.playback_queue, ctx.output_rate);
             wait_for_playback_drain(&ctx.playback_queue).await;
             while ctx.audio_rx.try_recv().is_ok() {}
             ctx.mic_enabled.store(true, Ordering::SeqCst);
@@ -1597,6 +1650,29 @@ fn enqueue_beep(queue: &Arc<std::sync::Mutex<VecDeque<i16>>>, freq_hz: f32, outp
     }
 }
 
+/// Synthesise the silence-cancel cue: two short beeps at a lower
+/// pitch separated by a small gap. The rhythm + pitch differ from the
+/// single capture-end tone so the user can distinguish "you got cut
+/// off / not heard" from "I shipped your utterance".
+fn generate_timeout_beep() -> Vec<i16> {
+    let beep = generate_beep(BEEP_TIMEOUT_HZ, BEEP_TIMEOUT_DURATION_MS);
+    let gap_samples =
+        (PIPELINE_SAMPLE_RATE as f32 * BEEP_TIMEOUT_GAP_MS as f32 / 1000.0) as usize;
+    let mut out = Vec::with_capacity(beep.len() * 2 + gap_samples);
+    out.extend_from_slice(&beep);
+    out.extend(std::iter::repeat_n(0i16, gap_samples));
+    out.extend_from_slice(&beep);
+    out
+}
+
+fn enqueue_timeout_beep(queue: &Arc<std::sync::Mutex<VecDeque<i16>>>, output_rate: u32) {
+    let pcm = generate_timeout_beep();
+    let upsampled = resample_to(&pcm, PIPELINE_SAMPLE_RATE, output_rate);
+    if let Ok(mut q) = queue.lock() {
+        q.extend(upsampled);
+    }
+}
+
 // ── Format helpers ──────────────────────────────────────────────────────
 
 fn to_mono(samples: &[i16], channels: u16) -> Vec<i16> {
@@ -1696,6 +1772,35 @@ mod tests {
         let len = q.lock().unwrap().len();
         // Equal sample rates → no resample → exact pipeline-rate length.
         assert_eq!(len, generate_beep(660.0, BEEP_DURATION_MS).len());
+    }
+
+    #[test]
+    fn timeout_beep_is_two_short_beeps_with_a_gap() {
+        // Distinct shape from the single capture-end beep: two short
+        // beeps separated by a silence gap. The total length must
+        // match 2 × beep + gap, and the gap region must be silent.
+        let pcm = generate_timeout_beep();
+        let beep_samples = (PIPELINE_SAMPLE_RATE as usize) * BEEP_TIMEOUT_DURATION_MS as usize
+            / 1000;
+        let gap_samples =
+            (PIPELINE_SAMPLE_RATE as f32 * BEEP_TIMEOUT_GAP_MS as f32 / 1000.0) as usize;
+        assert_eq!(pcm.len(), beep_samples * 2 + gap_samples);
+        // Gap is exactly zero — synthesised from `repeat_n(0i16, ..)`.
+        let gap_start = beep_samples;
+        let gap_end = beep_samples + gap_samples;
+        for s in &pcm[gap_start..gap_end] {
+            assert_eq!(*s, 0);
+        }
+    }
+
+    #[test]
+    fn timeout_beep_differs_from_capture_end_beep() {
+        // Audible distinguishability is the whole point — guard
+        // against someone "simplifying" the timeout cue back to a
+        // single tone.
+        let timeout = generate_timeout_beep();
+        let capture_end = generate_beep(BEEP_CAPTURE_END_HZ, BEEP_DURATION_MS);
+        assert_ne!(timeout.len(), capture_end.len());
     }
 
     #[test]
