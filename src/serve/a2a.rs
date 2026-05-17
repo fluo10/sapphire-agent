@@ -296,6 +296,7 @@ async fn handle_send_message(
         user_msg,
         req_id.clone(),
         tx,
+        None,
     )
     .await;
     drop(drain); // sender dropped at end of run_llm_turn, drain returns

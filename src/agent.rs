@@ -911,17 +911,24 @@ impl Agent {
                         .config
                         .namespace_for_room(&incoming.room_id)
                         .to_string();
+                    let room_id_for_timer = incoming.room_id.clone();
                     let mut handles = Vec::with_capacity(tool_calls.len());
                     for call in tool_calls {
                         let tools = Arc::clone(&tools);
                         let ns = ns.clone();
+                        let origin = crate::timer::TimerOrigin::Chat {
+                            room_id: room_id_for_timer.clone(),
+                        };
                         handles.push(tokio::spawn(
-                            crate::tools::workspace_tools::scope_memory_namespace(ns, async move {
-                                info!("Executing tool: {} (id={})", call.name, call.id);
-                                let result = tools.execute(&call).await;
-                                info!("Tool {} result: {}", call.name, result);
-                                (call.id, result)
-                            }),
+                            crate::tools::workspace_tools::scope_memory_namespace(
+                                ns,
+                                crate::timer::scope_timer_origin(origin, async move {
+                                    info!("Executing tool: {} (id={})", call.name, call.id);
+                                    let result = tools.execute(&call).await;
+                                    info!("Tool {} result: {}", call.name, result);
+                                    (call.id, result)
+                                }),
+                            ),
                         ));
                     }
 

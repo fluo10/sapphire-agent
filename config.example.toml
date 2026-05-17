@@ -303,3 +303,32 @@ system_prompt = "You are a helpful personal assistant."
 # # satellite fetches the bytes via voice/config and caches by SHA-256.
 # [voice]
 # wake_word_model = "/srv/sapphire/wake-models/saphina-v1.onnx"
+
+# ── Timer / Pomodoro presets ────────────────────────────────────────
+# Single-shot timers ("5分後に教えて") don't need configuration — the
+# `timer_set` tool takes minutes + label directly. Presets are for
+# multi-step routines like Pomodoro so the user can say "ポモドーロ開始"
+# instead of redictating "25分集中 + 5分休憩を3回" every time.
+#
+# Only ONE timer (single-shot or preset) can be active per process;
+# starting a new one cancels the previous. Timers are in-memory and
+# reset on restart. When a timer fires the agent is re-invoked to send
+# a notification on the same channel it was set from — voice → voice,
+# chat → chat, no cross-fallback.
+
+[[timer.preset]]
+name   = "pomodoro"
+cycles = 4
+steps  = [
+  { label = "Focus", minutes = 25 },
+  { label = "Break", minutes = 5 },
+]
+
+# Example: a long-form variant for deep work.
+# [[timer.preset]]
+# name   = "deep_work"
+# cycles = 2
+# steps  = [
+#   { label = "Focus",      minutes = 50 },
+#   { label = "Break",      minutes = 10 },
+# ]
