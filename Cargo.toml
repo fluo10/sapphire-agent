@@ -176,5 +176,10 @@ hound = "3.5"
 # own JSON-RPC dispatch on the existing axum app in src/serve.
 a2a = { package = "a2a-lf", version = "0.3" }
 
+# OS-standard cache / data / config directory resolution. Used by the
+# image cache to default to `$XDG_CACHE_HOME/sapphire-agent/images/`
+# (or the platform equivalent) when no explicit dir is configured.
+dirs = "6"
+
 [dev-dependencies]
 tempfile = "3"

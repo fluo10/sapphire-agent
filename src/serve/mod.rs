@@ -98,6 +98,12 @@ pub struct ServeState {
     /// `[tts_provider.*]` blocks are configured — in that case the
     /// `voice/pipeline_run` method returns a method-not-available error.
     pub(crate) voice: Option<Arc<VoiceProviders>>,
+    /// Workspace-external image cache. `None` when the operator set
+    /// `[image_cache] enabled = false`, when cache directory resolution
+    /// failed at startup, or when `dirs::cache_dir()` returned `None`
+    /// (rare). Absent → no in-memory scrub; on-disk persistence still
+    /// gets the hash-marker fallback from `SessionStore::append`.
+    pub(crate) image_cache: Option<Arc<crate::image_cache::ImageCache>>,
     /// Active satellites, keyed by `(device_id, room_profile)`. Inserted
     /// by `voice/subscribe`, removed by the per-subscription writer task
     /// when its SSE channel closes (i.e. satellite disconnects).
@@ -109,6 +115,7 @@ impl ServeState {
     /// the in-process channel handlers (Discord voice in particular).
     /// Shared across both so they read from the same session store /
     /// in-memory conversation map.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         registry: Arc<ProviderRegistry>,
@@ -117,6 +124,7 @@ impl ServeState {
         api_session_store: Arc<SessionStore>,
         mcp_session_store: Arc<SessionStore>,
         voice: Option<Arc<VoiceProviders>>,
+        image_cache: Option<Arc<crate::image_cache::ImageCache>>,
     ) -> Self {
         // Scan once on startup: each MCP session's first-line meta
         // carries `namespace` + `project`, so this reproduces the
@@ -149,6 +157,7 @@ impl ServeState {
             session_room_metadata: tokio::sync::Mutex::new(HashMap::new()),
             voice,
             voice_subscribers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            image_cache,
         }
     }
 
@@ -662,6 +671,11 @@ async fn handle_get_session(
                     ContentPart::Image { media_type, .. } => {
                         // Image bytes are not exposed via the API listing; surface a marker only.
                         json!({ "type": "image", "media_type": media_type })
+                    }
+                    ContentPart::ImageRef { media_type, sha256 } => {
+                        // Same shape as Image, with the cache key surfaced so
+                        // a caller can later fetch the bytes out of band.
+                        json!({ "type": "image", "media_type": media_type, "sha256": sha256 })
                     }
                     ContentPart::ToolUse { id, name, input } => {
                         json!({ "type": "tool_use", "id": id, "name": name, "input": input })
@@ -1618,8 +1632,15 @@ async fn run_llm_turn(
             }
         }
 
+        // Hydrate `ImageRef` parts from the image cache into full
+        // `Image` parts for the provider call. `Image` parts (just
+        // arrived this turn) and Text/Tool parts pass through. Cache
+        // misses degrade to text markers carrying the hash so the
+        // model still has a stable reference to the image.
+        let history_for_provider =
+            crate::image_cache::hydrate_history(&history, state.image_cache.as_deref());
         let response = provider
-            .chat(system.as_deref(), &history, Some(&tool_specs))
+            .chat(system.as_deref(), &history_for_provider, Some(&tool_specs))
             .await;
 
         match response {
@@ -1696,6 +1717,12 @@ async fn run_llm_turn(
             }
         }
     };
+
+    // Scrub `Image` parts in the just-completed history into compact
+    // `ImageRef` references backed by the workspace-external image
+    // cache. After this, long-lived in-memory storage is hash-only;
+    // the next turn re-hydrates from cache for the provider call.
+    crate::image_cache::scrub_history_inplace(&mut history, state.image_cache.as_deref());
 
     // Update in-memory sessions map
     state

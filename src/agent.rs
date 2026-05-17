@@ -1,6 +1,7 @@
 use crate::channel::{Attachment, Channels, OutgoingMessage};
 use crate::config::{Config, SessionPolicy};
 use crate::context_compression::{generate_summary, maybe_compress};
+use crate::image_cache::{ImageCache, hydrate_history, scrub_history_inplace};
 use crate::provider::registry::ProviderRegistry;
 use crate::provider::{ChatMessage, ContentPart, Provider, Role, ToolCall};
 use crate::session::{ConversationKey, SessionStore, local_date_for_timestamp};
@@ -44,6 +45,9 @@ pub struct Agent {
     workspace: Arc<Workspace>,
     tools: Option<Arc<ToolSet>>,
     session_store: Arc<SessionStore>,
+    /// Workspace-external image cache. `None` disables in-memory image
+    /// scrubbing entirely (PR1 hash-marker on disk still applies).
+    image_cache: Option<Arc<ImageCache>>,
     /// In-memory conversation history, keyed by (room_id, thread_id).
     /// Starts empty on process startup; raw history from disk is never reloaded
     /// (see `restart_summaries` for how prior context is carried across restarts).
@@ -86,6 +90,7 @@ impl Agent {
         workspace: Arc<Workspace>,
         tools: Option<Arc<ToolSet>>,
         session_store: Arc<SessionStore>,
+        image_cache: Option<Arc<ImageCache>>,
     ) -> Self {
         let (active_sessions, summaries, fallback) = session_store.load_all();
         info!(
@@ -101,6 +106,7 @@ impl Agent {
             workspace,
             tools,
             session_store,
+            image_cache,
             history: Mutex::new(HashMap::new()),
             active_sessions: Mutex::new(active_sessions),
             snapshots: Mutex::new(HashMap::new()),
@@ -840,10 +846,14 @@ impl Agent {
                 }
             };
 
+            // Hydrate `ImageRef` parts back to `Image` so the provider
+            // sees the actual bytes. Cache misses degrade to a text
+            // marker that preserves the hash for context references.
+            let messages_for_provider = hydrate_history(&messages, self.image_cache.as_deref());
             let response = provider
                 .chat(
                     system_with_context.as_deref(),
-                    &messages,
+                    &messages_for_provider,
                     tool_specs.as_deref(),
                 )
                 .await;
@@ -934,6 +944,19 @@ impl Agent {
                 }
             }
         };
+
+        // Scrub `Image` parts in the just-completed history into compact
+        // `ImageRef` references backed by the workspace-external image
+        // cache. Long-lived in-memory storage stays hash-only between
+        // turns; subsequent turns re-hydrate from cache for provider
+        // calls. No-op when the image cache is disabled (PR1 marker
+        // still applies on the persistence side).
+        {
+            let mut hist = self.history.lock().await;
+            if let Some(entry) = hist.get_mut(&key) {
+                scrub_history_inplace(entry, self.image_cache.as_deref());
+            }
+        }
 
         let _ = self.channels.stop_typing(&incoming.room_id).await;
 

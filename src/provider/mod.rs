@@ -44,9 +44,22 @@ pub enum Role {
 pub enum ContentPart {
     Text(String),
     /// Inline image, base64-encoded. `media_type` is the MIME type (e.g. `image/png`).
+    /// Carries the actual bytes; appears in in-flight `ChatMessage`s sent to a
+    /// provider. Persisted forms swap this for [`ContentPart::ImageRef`] (when
+    /// the image cache is enabled) to keep JSONL and long-lived in-memory
+    /// history small.
     Image {
         media_type: String,
         data_base64: String,
+    },
+    /// Reference to an image stored in the workspace-external image cache.
+    /// Persisted to JSONL as the canonical compact image representation
+    /// and held in long-lived in-memory history. Re-hydrated to
+    /// [`ContentPart::Image`] just before each provider call when the
+    /// cache still has the bytes; a cache miss degrades to a text marker.
+    ImageRef {
+        media_type: String,
+        sha256: String,
     },
     ToolUse {
         id: String,

@@ -6,6 +6,7 @@ mod context_compression;
 mod frontmatter;
 mod heartbeat;
 mod heartbeat_config;
+mod image_cache;
 mod mcp_client;
 mod memory_compaction;
 mod periodic_log;
@@ -348,6 +349,42 @@ async fn main() -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("voice provider init panicked: {e}"))??;
                 Some(Arc::new(providers))
             };
+            // ── Image cache (workspace-external) ──────────────────────────
+            // Resolves once at startup. A missing platform cache dir
+            // (rare; effectively only headless edge cases) or a config
+            // explicitly disabling the cache yields `None`, which makes
+            // the scrub / hydrate helpers no-op and persistence falls
+            // back to the SHA-256 text marker in SessionStore::append.
+            let image_cache: Option<Arc<image_cache::ImageCache>> = if config.image_cache.enabled {
+                let resolved = config
+                    .image_cache
+                    .dir
+                    .clone()
+                    .or_else(image_cache::ImageCache::default_dir);
+                match resolved {
+                    Some(dir) => match image_cache::ImageCache::open(dir.clone()) {
+                        Ok(cache) => {
+                            tracing::info!("Image cache opened at {dir:?}");
+                            Some(cache)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Image cache open failed ({e:?}); falling back to text-marker only"
+                            );
+                            None
+                        }
+                    },
+                    None => {
+                        tracing::warn!(
+                            "No platform cache dir resolvable; image cache disabled (set [image_cache] dir = \"...\" to override)"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let serve_state = Arc::new(serve::ServeState::new(
                 config.clone(),
                 Arc::clone(&registry),
@@ -356,6 +393,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&api_session_store),
                 Arc::clone(&mcp_session_store),
                 voice_providers,
+                image_cache.clone(),
             ));
 
             if config.standby_mode {
@@ -476,6 +514,7 @@ async fn main() -> Result<()> {
                     Arc::clone(&workspace),
                     Some(Arc::clone(&tool_set)),
                     Arc::clone(&channel_session_store),
+                    image_cache.clone(),
                 ));
                 agent.bootstrap().await;
 

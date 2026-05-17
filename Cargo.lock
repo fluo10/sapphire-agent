@@ -7609,6 +7609,7 @@ dependencies = [
  "clap",
  "cron",
  "directories",
+ "dirs 6.0.0",
  "futures-util",
  "grain-id",
  "hostname",

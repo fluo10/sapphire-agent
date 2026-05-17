@@ -230,6 +230,13 @@ fn convert_user_message(msg: &ChatMessage) -> Vec<ApiMessage> {
                     url: format!("data:{media_type};base64,{data_base64}"),
                 },
             }),
+            // ImageRef reaches this provider only when the image cache
+            // missed at re-hydration time. Surface it as a text marker
+            // so the model still has the hash for context-window
+            // references like "the picture above".
+            ContentPart::ImageRef { media_type, sha256 } => text_parts.push(ApiPart::Text {
+                text: format!("[image: {media_type} sha256={sha256} (cache miss)]"),
+            }),
             ContentPart::ToolResult {
                 tool_use_id,
                 content,
@@ -289,7 +296,9 @@ fn convert_assistant_message(msg: &ChatMessage) -> ApiMessage {
                 });
             }
             // Assistant should not carry images or tool results.
-            ContentPart::Image { .. } | ContentPart::ToolResult { .. } => {}
+            ContentPart::Image { .. }
+            | ContentPart::ImageRef { .. }
+            | ContentPart::ToolResult { .. } => {}
         }
     }
 
