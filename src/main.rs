@@ -1,5 +1,4 @@
 mod agent;
-mod call;
 mod channel;
 mod config;
 mod context_compression;
@@ -82,50 +81,18 @@ struct Cli {
     #[arg(short, long, value_name = "FILE")]
     config: Option<PathBuf>,
 
+    /// Override bind address (e.g. 127.0.0.1:9000)
+    #[arg(long, value_name = "ADDR")]
+    bind: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the agent — Matrix/Discord channels + HTTP API server (default)
-    Serve {
-        /// Override bind address (e.g. 127.0.0.1:9000)
-        #[arg(long, value_name = "ADDR")]
-        bind: Option<String>,
-    },
     /// Validate the config file and exit
     Verify,
-    /// Interactive session with a running serve server
-    Call {
-        /// Server base URL
-        #[arg(long, default_value = "http://localhost:9000")]
-        server: String,
-        /// Grain-id of an existing session to resume (e.g. a3b7k9p)
-        #[arg(long)]
-        session: Option<String>,
-        /// List available API sessions and exit
-        #[arg(long)]
-        list: bool,
-        /// Send a single message and exit instead of entering the REPL.
-        /// Useful as a CJK-safe fallback or for IDE/editor integration.
-        #[arg(short, long, value_name = "TEXT")]
-        message: Option<String>,
-        /// Dump the session history and exit (no message sent, no REPL).
-        /// Intended for IDE integrations restoring a session.
-        #[arg(long)]
-        history: bool,
-        /// Emit machine-readable JSON output. Applies to --list, --history,
-        /// and --message; ignored in REPL mode.
-        #[arg(long)]
-        json: bool,
-        /// Bearer token sent as `Authorization: Bearer <token>` on every
-        /// `/rpc` request. Must match an `api_keys` entry on a server-side
-        /// `[room_profile.<name>]`; the room_profile resolved from the
-        /// token is the session's binding (mirrors MCP and A2A auth).
-        #[arg(long, env = "SAPPHIRE_AGENT_TOKEN")]
-        token: Option<String>,
-    },
 }
 
 #[tokio::main]
@@ -140,35 +107,12 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // `call` needs no config file — handle before loading config
-    if let Some(Command::Call {
-        server,
-        session,
-        list,
-        message,
-        history,
-        json,
-        token,
-    }) = cli.command
-    {
-        let token = token.ok_or_else(|| {
-            anyhow::anyhow!(
-                "missing bearer token — pass --token <TOKEN> or export SAPPHIRE_AGENT_TOKEN; the \
-                 agent looks the token up under `[room_profile.<n>].api_keys` to pin the session"
-            )
-        })?;
-        // The in-tree `sapphire-agent call` CLI has no per-device config
-        // file, so no DeviceMetadata is forwarded; standalone callers
-        // (sapphire-call) plumb their own `[device]` block through.
-        return call::run(server, session, list, message, history, json, token, None).await;
-    }
-
     let config_path = cli.config.unwrap_or_else(Config::default_path);
     let config = Config::load(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
-    match cli.command.unwrap_or(Command::Serve { bind: None }) {
-        Command::Verify => {
+    match cli.command {
+        Some(Command::Verify) => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
             println!("Config OK");
             if let Some(m) = &config.matrix {
@@ -213,7 +157,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Serve { bind } => {
+        None => {
+            let bind = cli.bind;
             let workspace_dir = config.resolved_workspace_dir(&config_path);
 
             // ── Migrate pre-namespace memory layout (one-time) ─────────────
@@ -654,7 +599,6 @@ async fn main() -> Result<()> {
                 tracing::warn!("Agent task did not finish cleanly: {e}");
             }
         }
-        Command::Call { .. } => unreachable!(),
     }
 
     Ok(())
