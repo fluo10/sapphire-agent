@@ -48,6 +48,11 @@ fn estimate_message_tokens(msg: &ChatMessage) -> usize {
             ContentPart::Text(t) => estimate_tokens(t),
             // Anthropic charges per ~750x750 image tile; rough flat approximation.
             ContentPart::Image { .. } => 1600,
+            // ImageRef is the compact form held in long-lived history.
+            // If hydration succeeds at provider-call time, the bytes
+            // count as ~Image; until then it's a hash marker. Estimate
+            // as Image so we don't under-budget when the cache is hot.
+            ContentPart::ImageRef { .. } => 1600,
             ContentPart::ToolUse { name, input, .. } => {
                 estimate_tokens(name) + estimate_tokens(&input.to_string())
             }
@@ -196,6 +201,11 @@ pub async fn generate_summary(
                 }
                 ContentPart::Image { media_type, .. } => {
                     transcript.push_str(&format!("{role_label}: [image: {media_type}]\n\n"));
+                }
+                ContentPart::ImageRef { media_type, sha256 } => {
+                    transcript.push_str(&format!(
+                        "{role_label}: [image: {media_type} sha256={sha256}]\n\n"
+                    ));
                 }
                 ContentPart::ToolUse { name, .. } => {
                     transcript.push_str(&format!("{role_label}: [Called tool: {name}]\n\n"));

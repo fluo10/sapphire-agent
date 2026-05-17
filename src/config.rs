@@ -30,6 +30,14 @@ pub struct Config {
     /// the `/a2a` and `/.well-known/agent-card.json` routes off.
     #[serde(default)]
     pub a2a: Option<A2aConfig>,
+    /// Workspace-external image cache. Holds raw bytes for vision
+    /// inputs by SHA-256 so in-memory `ChatMessage` history and JSONL
+    /// session files only carry compact references. When unset, the
+    /// cache uses `dirs::cache_dir() / "sapphire-agent" / "images"`.
+    /// Set `enabled = false` to fall back to the PR1 text-marker shape
+    /// (no re-display of past images, but no cache directory either).
+    #[serde(default)]
+    pub image_cache: ImageCacheConfig,
     /// Directory containing AGENT.md and MEMORY.md.
     /// Defaults to the config file's parent directory.
     pub workspace_dir: Option<String>,
@@ -228,6 +236,37 @@ pub struct A2aConfig {
     /// a generic personal-assistant description.
     #[serde(default)]
     pub agent_description: Option<String>,
+}
+
+/// Image cache settings. See [`Config::image_cache`] for an overview
+/// of how this interacts with persistence and provider calls.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImageCacheConfig {
+    /// When false, no cache directory is opened and the image scrubbing
+    /// path becomes a no-op. JSONL still gets the SHA-256 text marker
+    /// from `SessionStore::append`; in-memory history keeps full base64
+    /// (same shape as before PR2).
+    #[serde(default = "default_image_cache_enabled")]
+    pub enabled: bool,
+    /// Override the default cache directory. `None` resolves to
+    /// `dirs::cache_dir() / "sapphire-agent" / "images"` at startup.
+    /// Path may be relative; resolved against the process cwd at open
+    /// time (typical configs use absolute paths).
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+}
+
+impl Default for ImageCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: None,
+        }
+    }
+}
+
+fn default_image_cache_enabled() -> bool {
+    true
 }
 
 /// Voice-mode global settings — everything that's the same for every

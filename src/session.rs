@@ -1102,4 +1102,21 @@ mod tests {
             .any(|p| matches!(p, ContentPart::Text(s) if s.contains("invalid-base64")));
         assert!(has_marker, "expected invalid-base64 marker");
     }
+
+    #[test]
+    fn scrub_passes_imageref_through_unchanged() {
+        let msg = ChatMessage {
+            role: Role::User,
+            parts: vec![ContentPart::ImageRef {
+                media_type: "image/jpeg".to_string(),
+                sha256: "abc123".to_string(),
+            }],
+        };
+        // ImageRef carries no raw bytes — nothing to scrub, so the
+        // helper returns None and append serializes the variant as-is.
+        assert!(
+            scrub_images_for_storage(&msg).is_none(),
+            "scrub should leave ImageRef-only messages untouched"
+        );
+    }
 }

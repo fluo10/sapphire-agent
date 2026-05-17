@@ -276,6 +276,13 @@ fn chat_message_to_api(msg: &ChatMessage) -> ApiMessage {
                     data: data_base64.clone(),
                 },
             },
+            // ImageRef reaches this provider only when the image cache
+            // missed at re-hydration time. Surface it as a text marker
+            // so the model still has the hash for context-window
+            // references like "the picture above".
+            ContentPart::ImageRef { media_type, sha256 } => ApiPart::Text {
+                text: format!("[image: {media_type} sha256={sha256} (cache miss)]"),
+            },
             ContentPart::ToolUse { id, name, input } => ApiPart::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
