@@ -7,28 +7,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-17
+
 ### Added
 
+- **Voice pipeline + `sapphire-call` satellite** — local STT/TTS via
+  the official `sherpa-onnx` crate (statically linked, no system
+  install), Silero VAD, and a three-stage openWakeWord ONNX detector.
+  `sapphire-call voice` runs as a satellite: capture mic → wake →
+  VAD → ship PCM to the agent's `voice/pipeline_run` JSON-RPC method →
+  receive synthesized speech back via SSE. Always-on listening with
+  silence-cancel timeout (`listen_timeout_seconds`), distinct
+  wake/capture/timeout beeps, supervisor threads that survive ALSA
+  POLLERR, `--list-devices` discovery, persistent TOML config, and
+  heartbeat→satellite push so the agent can speak unprompted. Wake
+  word is served from the agent so all satellites for a given
+  `room_profile` share the same phrase, and voice routes by
+  `(device_id, room_profile)` rather than session pinning. Multiple
+  TTS providers are supported (Style-Bert-VITS2 / Gradio / OpenAI
+  audio/speech). Optional `voice-sherpa` feature for the local
+  inference path. (Issues #82, #83, #87, #88, #94, #95, #103, #105,
+  #106 and related.)
+- **OpenAI-compatible chat provider + per-room routing** — new
+  `[providers]` / `[profiles]` / `[room_profile]` schema lets you mix
+  Anthropic and OpenAI-compatible (local LLM, OpenRouter, …) backends
+  and bind each Matrix/Discord room to a profile. Background and
+  refusal-fallback chains layer on top so heartbeat / catch-up tasks
+  can use a different model than the user-facing room. Per-session
+  profile selection is exposed on the JSON-RPC `initialize` call.
+  (#68)
+- **Memory namespaces** — workspaces can now host multiple memory
+  namespaces, each with its own digest cadence and optional
+  `background_profile`. Writes, reads, and catch-up are threaded
+  through the namespace; room → profile → namespace pairing is
+  declared in `[room_profile.<n>]`. (#70)
 - **A2A (Agent2Agent Protocol) server** — minimal v1 implementation
-  exposing `POST /a2a` (JSON-RPC 2.0, `SendMessage` only) and
-  `GET /.well-known/agent-card.json` on the existing HTTP server. Off
-  by default; enable via `[a2a].enabled = true`. Auth is per-room
-  profile: `[room_profile.<n>].api_keys` declares bearer tokens, and an
+  exposing `POST /a2a` (JSON-RPC 2.0, `SendMessage`) and
+  `GET /.well-known/agent-card.json`. Off by default; enable via
+  `[a2a].enabled = true`. Auth is per-room profile:
+  `[room_profile.<n>].api_keys` declares bearer tokens, and an
   incoming `Authorization: Bearer <token>` reverse-looks-up the owning
   profile so clients (e.g. sapphire-world) never name `room_profile`
-  themselves. Streaming, `tasks/*`, push notifications, and vision
-  parts are deferred. (#78; partial #73 in the form of the `api_keys`
-  field.)
+  themselves. `FilePart` is routed to the multimodal provider for
+  image / vision input, with an external image cache so satellites can
+  reference content by hash instead of re-uploading bytes.
+  Streaming, `tasks/*`, and push notifications are deferred. (#78, #93,
+  #108)
+- **MCP server for external AI clients** — `POST /mcp` now publishes
+  the `recall_memory` and `write_report` tools so Claude Code (and
+  other MCP clients) can share project context with the agent. See
+  [docs/mcp-integration.md](docs/mcp-integration.md). (#79)
+- **Concurrent Matrix + Discord channels** — both channels now run in
+  the same process and can be enabled simultaneously. (#76)
+- **Timer + Pomodoro tools** — single-slot in-memory timer with
+  `timer_set` / `timer_preset` / `timer_cancel` / `timer_status`,
+  including Pomodoro presets. The expiry fires a notification back into
+  the active conversation. (#110)
+- **Intra-day cross-session memory digest** — sessions opened later
+  the same day inherit a compressed digest of prior same-day sessions
+  for the same room, along with explicit room metadata in the system
+  prompt. (#85)
+- **Periodic log catch-up + draft merge** — heartbeat now back-fills
+  missing weekly / monthly / yearly logs after downtime and merges
+  pre-written drafts instead of overwriting them. (#67)
+- **`ANTHROPIC_API_KEY` env fallback** — `[anthropic].api_key` falls
+  back to the standard environment variable when omitted from
+  `config.toml`.
+
+### Changed
+
+- **`sapphire-workspace` 0.10.1 → 0.11.0** — picks up upstream
+  improvements; `cpal` 0.16 → 0.17, `bzip2` 0.5 → 0.6, `sha2` 0.10 →
+  0.11, plus various Dependabot patch bumps (sherpa-onnx, tokio,
+  grain-id, matrix-sdk, openssl, …).
 
 ### Breaking
 
+- **`sapphire-agent` subcommands collapsed** — the `call` and `serve`
+  subcommands are gone. `sapphire-agent` with no arguments now starts
+  the channel listeners + JSON-RPC HTTP control API directly. `verify`
+  and `summarize` remain. Anyone scripting `sapphire-agent serve` must
+  drop the subcommand. (#113)
 - **Control API endpoint renamed `/mcp` → `/rpc`** — the existing
   JSON-RPC control surface (`initialize`, `chat`, `get_session`,
   `list_sessions`, `voice/*`) is sapphire-agent's own control API, not
   an MCP server, so it moves to a neutral path. The session header is
   likewise renamed `Mcp-Session-Id` → `Session-Id`. `sapphire-call` is
-  updated in lockstep. `/mcp` is now unbound and reserved for a real
-  MCP server (#79, #80); `/a2a` is now implemented (see "Added" above).
+  updated in lockstep. `/mcp` is now bound to the real MCP server
+  described in "Added" above. (#79, #80, #84)
+- **`sapphire-call` config: `room_profile` knob replaced by bearer
+  token** — the satellite no longer names a `room_profile` itself.
+  Instead, the bearer token in `[server].token` must appear in some
+  `[room_profile.<n>].api_keys` on the agent, and the matching profile
+  is selected server-side (same mechanism as MCP and A2A). (#111)
+- **Per-room config moved into `[room_profile]`** — room → profile →
+  namespace pairing is now declared in `[room_profile.<n>]` instead of
+  being scattered across `[matrix.rooms]` / `[discord.channels]`. Old
+  layouts must be migrated. (#70)
+
+### Fixed
+
+- **ALSA POLLERR survival** — input and output `cpal::Stream`s now run
+  under supervisor threads that restart on ALSA error, so the satellite
+  survives transient USB / device hiccups instead of falling silent.
+  (#104)
+- **Follow-up listen window after TTS reply** — the mic re-opens
+  reliably after the AI speaks, with a separate wake-then-command
+  timeout and a distinct double-beep on cancellation so the user can
+  tell success from silence. (#106)
+- **Gradio TTS reliability** — corrected `audio_field` SSE shape,
+  surfaced upstream errors instead of swallowing them, and included
+  `enable_watermark` in the Irodori-TTS payload.
 
 ## [0.5.0] - 2026-04-22
 
@@ -291,6 +380,7 @@ an HTTP/MCP server mode.
   and workspace-aware writes.
 - **Logging** — `tracing` with env-filter and ANSI output.
 
+[0.6.0]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.6.0
 [0.5.0]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.5.0
 [0.4.1]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.4.1
 [0.4.0]: https://github.com/fluo10/sapphire-agent/releases/tag/v0.4.0
