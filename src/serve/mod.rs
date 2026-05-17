@@ -358,6 +358,12 @@ async fn summarize_all_sessions(state: &Arc<ServeState>) {
 // POST /rpc  — dispatch JSON-RPC methods
 // ---------------------------------------------------------------------------
 
+/// JSON-RPC error code returned when the Authorization header is present
+/// but the bearer token is not registered under any
+/// `[room_profile.<n>].api_keys`. Mirrors `codes::AUTH_REQUIRED` used by
+/// `/a2a` and `/mcp` so the three protocol surfaces stay symmetrical.
+const RPC_AUTH_REQUIRED: i32 = -32001;
+
 async fn rpc_post(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
@@ -370,18 +376,60 @@ async fn rpc_post(
 
     let req_id = req.id.clone().unwrap_or(Value::Null);
 
+    // Bearer auth → room_profile reverse lookup. The token IS the
+    // profile selector; clients no longer pass `room_profile` in
+    // params. Missing/empty bearer → 401 at the HTTP layer (matches
+    // /a2a); unknown token → JSON-RPC AUTH_REQUIRED.
+    let bearer = match extract_bearer(&headers) {
+        Some(b) => b,
+        None => {
+            return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
+        }
+    };
+    let profile_name = match state.config.resolve_a2a_token(&bearer) {
+        Some(name) => name.to_string(),
+        None => {
+            let body = error_response(req_id, RPC_AUTH_REQUIRED, "unknown or revoked bearer token");
+            return body.into_response();
+        }
+    };
+
     match req.method.as_str() {
-        "initialize" => handle_initialize(state, req_id, req.params, session_id).await,
+        "initialize" => {
+            handle_initialize(state, req_id, req.params, session_id, profile_name).await
+        }
         "chat" => handle_chat(state, req_id, req.params, session_id).await,
         "list_sessions" => handle_list_sessions(state, req_id).await,
         "get_session" => handle_get_session(state, req_id, session_id).await,
         "voice/config" => handle_voice_config(state, req_id, req.params).await,
-        "voice/pipeline_run" => handle_voice_pipeline_run(state, req_id, req.params).await,
-        "voice/subscribe" => handle_voice_subscribe(state, req_id, req.params).await,
+        "voice/pipeline_run" => {
+            handle_voice_pipeline_run(state, req_id, req.params, profile_name).await
+        }
+        "voice/subscribe" => {
+            handle_voice_subscribe(state, req_id, req.params, profile_name).await
+        }
         _ => {
             let body = error_response(req_id, -32601, "Method not found");
             body.into_response()
         }
+    }
+}
+
+/// Extract a `Bearer <token>` from the `Authorization` header, trimming
+/// whitespace. Empty / malformed → `None`. Shared shape with
+/// `serve::a2a::extract_bearer` — same Authorization parsing rules so
+/// the three protocol endpoints stay symmetrical.
+fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(axum::http::header::AUTHORIZATION)?;
+    let s = value.to_str().ok()?;
+    let token = s
+        .strip_prefix("Bearer ")
+        .or_else(|| s.strip_prefix("bearer "))?;
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -405,21 +453,12 @@ async fn handle_initialize(
     req_id: Value,
     params: Option<Value>,
     existing_header_session: Option<String>,
+    profile_name: String,
 ) -> axum::response::Response {
-    // Optional `params.room_profile` — must reference a defined
-    // `[room_profile.<n>]` entry. Rejected eagerly so misspellings
-    // surface at session start rather than as a silent fallback to
-    // the background provider.
-    let requested_room_profile: Option<String> = params
-        .as_ref()
-        .and_then(|p| p["room_profile"].as_str())
-        .map(|s| s.to_string());
-    if let Some(name) = &requested_room_profile
-        && state.config.room_profile(name).is_none()
-    {
-        let body = error_response(req_id, -32602, &format!("Unknown room_profile '{name}'"));
-        return body.into_response();
-    }
+    // `room_profile` is no longer accepted as a JSON-RPC param — the
+    // bearer token resolved in `rpc_post` is the sole profile selector
+    // (mirrors A2A / MCP). `resolve_a2a_token` only returns names that
+    // exist in the config, so no extra validation is needed here.
 
     // Resolve to an internal UUID session_id.
     // - Session-Id header: already a UUID (internal), use directly.
@@ -491,13 +530,11 @@ async fn handle_initialize(
             .and_then(|m| m.public_id)
     };
 
-    if let Some(name) = requested_room_profile {
-        state
-            .session_room_profiles
-            .lock()
-            .await
-            .insert(session_id.clone(), name);
-    }
+    state
+        .session_room_profiles
+        .lock()
+        .await
+        .insert(session_id.clone(), profile_name.clone());
 
     // Optional `params.device = { name, description }` from sapphire-call /
     // other voice clients. We treat `name` as the device handle (e.g.
@@ -767,6 +804,7 @@ async fn handle_voice_pipeline_run(
     state: Arc<ServeState>,
     req_id: Value,
     params: Option<Value>,
+    room_profile: String,
 ) -> axum::response::Response {
     if state.voice.is_none() {
         let body = error_response(
@@ -792,24 +830,8 @@ async fn handle_voice_pipeline_run(
             return body.into_response();
         }
     };
-    let room_profile = match params["room_profile"].as_str() {
-        Some(s) => s.to_string(),
-        None => {
-            let body = error_response(req_id, -32602, "Missing params.room_profile");
-            return body.into_response();
-        }
-    };
-    // Validate room_profile up front so typos surface as a clean
-    // JSON-RPC error rather than as a silent fallback to the
-    // background provider.
-    if state.config.room_profile(&room_profile).is_none() {
-        let body = error_response(
-            req_id,
-            -32602,
-            &format!("Unknown room_profile '{room_profile}'"),
-        );
-        return body.into_response();
-    }
+    // `room_profile` comes from the bearer token resolved in
+    // `rpc_post`; clients no longer pass it as a param.
     let language = params["language"].as_str().map(|s| s.to_string());
 
     // Derive a deterministic session id from (device_id, room_profile)
@@ -880,6 +902,7 @@ async fn handle_voice_subscribe(
     state: Arc<ServeState>,
     req_id: Value,
     params: Option<Value>,
+    room_profile: String,
 ) -> axum::response::Response {
     let params = params.unwrap_or(Value::Null);
     let device_id = match params["device_id"].as_str() {
@@ -889,21 +912,8 @@ async fn handle_voice_subscribe(
             return body.into_response();
         }
     };
-    let room_profile = match params["room_profile"].as_str() {
-        Some(s) => s.to_string(),
-        None => {
-            let body = error_response(req_id, -32602, "Missing params.room_profile");
-            return body.into_response();
-        }
-    };
-    if state.config.room_profile(&room_profile).is_none() {
-        let body = error_response(
-            req_id,
-            -32602,
-            &format!("Unknown room_profile '{room_profile}'"),
-        );
-        return body.into_response();
-    }
+    // `room_profile` comes from the bearer token resolved in
+    // `rpc_post`; clients no longer pass it as a param.
 
     // Replace any prior subscription for this device (typical case:
     // the same satellite reconnects after a brief network blip). The

@@ -27,12 +27,14 @@ struct Cli {
     #[arg(long, global = true)]
     session: Option<String>,
 
-    /// Room profile name to bind to a newly created session. Must match a
-    /// `[room_profile.<name>]` entry on the server side. Ignored when
-    /// resuming an existing session via --session. Overrides
-    /// `[server].room_profile` in the config file.
-    #[arg(long, global = true)]
-    room_profile: Option<String>,
+    /// Bearer token sent as `Authorization: Bearer <token>` on every
+    /// `/rpc` request. Must match an `api_keys` entry on a server-side
+    /// `[room_profile.<name>]`; the room_profile resolved from this
+    /// token is the session's binding (mirrors how MCP and A2A
+    /// authenticate). Overrides `[server].token` in the config file
+    /// and the `SAPPHIRE_AGENT_TOKEN` environment variable.
+    #[arg(long, global = true, env = "SAPPHIRE_AGENT_TOKEN")]
+    token: Option<String>,
 
     /// Path to a TOML config file. Defaults to
     /// `~/.config/sapphire-call/config.toml` when present; missing is
@@ -121,7 +123,17 @@ async fn main() -> Result<()> {
         .or(file_cfg.server.url)
         .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
     let session = cli.session.clone().or(file_cfg.server.session);
-    let room_profile = cli.room_profile.clone().or(file_cfg.server.room_profile);
+    let token = cli
+        .token
+        .clone()
+        .or(file_cfg.server.token)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing bearer token — set [server].token in the config, pass --token <TOKEN>, \
+                 or export SAPPHIRE_AGENT_TOKEN; the agent uses it to look up your room_profile \
+                 (api_keys on [room_profile.<n>])"
+            )
+        })?;
     let device = file_cfg.device.to_api();
 
     if let Some(Command::Voice {
@@ -134,7 +146,7 @@ async fn main() -> Result<()> {
         return voice::run(
             server,
             session,
-            room_profile,
+            token,
             voice::VoiceOptions {
                 language: language.or(file_cfg.language.stt),
                 list_devices,
@@ -155,7 +167,7 @@ async fn main() -> Result<()> {
         cli.message,
         cli.history,
         cli.json,
-        room_profile,
+        token,
         device,
     )
     .await

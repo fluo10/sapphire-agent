@@ -119,11 +119,12 @@ enum Command {
         /// and --message; ignored in REPL mode.
         #[arg(long)]
         json: bool,
-        /// Room profile name to bind to a newly created session. Must match a
-        /// `[room_profile.<name>]` entry on the server side. Ignored when
-        /// resuming an existing session via --session.
-        #[arg(long)]
-        room_profile: Option<String>,
+        /// Bearer token sent as `Authorization: Bearer <token>` on every
+        /// `/rpc` request. Must match an `api_keys` entry on a server-side
+        /// `[room_profile.<name>]`; the room_profile resolved from the
+        /// token is the session's binding (mirrors MCP and A2A auth).
+        #[arg(long, env = "SAPPHIRE_AGENT_TOKEN")]
+        token: Option<String>,
     },
 }
 
@@ -147,23 +148,19 @@ async fn main() -> Result<()> {
         message,
         history,
         json,
-        room_profile,
+        token,
     }) = cli.command
     {
+        let token = token.ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing bearer token — pass --token <TOKEN> or export SAPPHIRE_AGENT_TOKEN; the \
+                 agent looks the token up under `[room_profile.<n>].api_keys` to pin the session"
+            )
+        })?;
         // The in-tree `sapphire-agent call` CLI has no per-device config
         // file, so no DeviceMetadata is forwarded; standalone callers
         // (sapphire-call) plumb their own `[device]` block through.
-        return call::run(
-            server,
-            session,
-            list,
-            message,
-            history,
-            json,
-            room_profile,
-            None,
-        )
-        .await;
+        return call::run(server, session, list, message, history, json, token, None).await;
     }
 
     let config_path = cli.config.unwrap_or_else(Config::default_path);

@@ -57,14 +57,19 @@ impl DeviceMetadata {
 /// `Session-Id` header), the human-readable display id, and whether
 /// the session is brand-new. Exposed so out-of-tree clients (e.g. the
 /// voice satellite) can reuse the same session-setup flow as the REPL.
+///
+/// `token` is sent as `Authorization: Bearer <token>` and selects the
+/// room_profile server-side (the token must match an `api_keys` entry
+/// on some `[room_profile.<n>]`). The control API requires this on
+/// every `/rpc` call — there is no anonymous mode.
 pub async fn initialize(
     client: &reqwest::Client,
     base: &str,
     session: Option<String>,
-    room_profile: Option<&str>,
+    token: &str,
     device: Option<&DeviceMetadata>,
 ) -> Result<(String, String, bool)> {
-    initialize_session(client, base, session, room_profile, device).await
+    initialize_session(client, base, session, token, device).await
 }
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -107,7 +112,10 @@ fn next_id() -> u64 {
 /// Run the interactive call client.
 ///
 /// This is the shared entry point used by both `sapphire-agent call` and
-/// the standalone `sapphire-call` binary.
+/// the standalone `sapphire-call` binary. `token` is forwarded as
+/// `Authorization: Bearer <token>` on every `/rpc` call — its match
+/// against `[room_profile.<n>].api_keys` server-side is what pins the
+/// session to a profile (no more `--room-profile`).
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     server: String,
@@ -116,7 +124,7 @@ pub async fn run(
     message: Option<String>,
     history: bool,
     json: bool,
-    room_profile: Option<String>,
+    token: String,
     device: Option<DeviceMetadata>,
 ) -> Result<()> {
     let base = server.trim_end_matches('/').to_string();
@@ -125,24 +133,18 @@ pub async fn run(
     // -- --list mode ----------------------------------------------------------
     if list {
         let (session_id, _, _) =
-            initialize_session(&client, &base, session, None, device.as_ref()).await?;
-        list_sessions(&client, &base, &session_id, json).await?;
+            initialize_session(&client, &base, session, &token, device.as_ref()).await?;
+        list_sessions(&client, &base, &token, &session_id, json).await?;
         return Ok(());
     }
 
     // -- Initialize session ---------------------------------------------------
-    let (mut session_id, display_id, is_new) = initialize_session(
-        &client,
-        &base,
-        session,
-        room_profile.as_deref(),
-        device.as_ref(),
-    )
-    .await?;
+    let (mut session_id, display_id, is_new) =
+        initialize_session(&client, &base, session, &token, device.as_ref()).await?;
 
     // -- --history dump-only mode ---------------------------------------------
     if history {
-        dump_history(&client, &base, &session_id, json, true).await?;
+        dump_history(&client, &base, &token, &session_id, json, true).await?;
         return Ok(());
     }
 
@@ -152,7 +154,7 @@ pub async fn run(
         if trimmed.is_empty() {
             anyhow::bail!("--message requires non-empty text");
         }
-        send_chat(&client, &base, &session_id, trimmed, json).await?;
+        send_chat(&client, &base, &token, &session_id, trimmed, json).await?;
         if !json {
             println!();
         }
@@ -165,7 +167,7 @@ pub async fn run(
     println!("sapphire-agent call  (session: {display_id})");
     if !is_new {
         println!("[resumed existing session]\n");
-        if let Err(e) = dump_history(&client, &base, &session_id, false, false).await {
+        if let Err(e) = dump_history(&client, &base, &token, &session_id, false, false).await {
             eprintln!("[warning: failed to load history: {e:#}]");
         }
     }
@@ -194,15 +196,7 @@ pub async fn run(
                 continue;
             }
             "/clear" => {
-                match initialize_session(
-                    &client,
-                    &base,
-                    None,
-                    room_profile.as_deref(),
-                    device.as_ref(),
-                )
-                .await
-                {
+                match initialize_session(&client, &base, None, &token, device.as_ref()).await {
                     Ok((new_sid, new_display_id, _)) => {
                         session_id = new_sid;
                         println!("[new session: {new_display_id}]");
@@ -215,7 +209,7 @@ pub async fn run(
             _ => {}
         }
 
-        if let Err(e) = send_chat(&client, &base, &session_id, trimmed, false).await {
+        if let Err(e) = send_chat(&client, &base, &token, &session_id, trimmed, false).await {
             eprintln!("[error: {e:#}]");
         }
         println!();
@@ -232,14 +226,11 @@ async fn initialize_session(
     client: &reqwest::Client,
     base: &str,
     session: Option<String>,
-    room_profile: Option<&str>,
+    token: &str,
     device: Option<&DeviceMetadata>,
 ) -> Result<(String, String, bool)> {
     let session_id_req = session.as_deref().unwrap_or("new");
     let mut params = json!({ "session_id": session_id_req });
-    if let Some(p) = room_profile {
-        params["room_profile"] = json!(p);
-    }
     if let Some(d) = device.and_then(DeviceMetadata::to_params) {
         params["device"] = d;
     }
@@ -252,6 +243,7 @@ async fn initialize_session(
 
     let resp = client
         .post(format!("{base}/rpc"))
+        .bearer_auth(token)
         .json(&body)
         .send()
         .await
@@ -289,6 +281,7 @@ async fn initialize_session(
 async fn dump_history(
     client: &reqwest::Client,
     base: &str,
+    token: &str,
     session_id: &str,
     json_mode: bool,
     standalone: bool,
@@ -302,6 +295,7 @@ async fn dump_history(
 
     let val: Value = client
         .post(format!("{base}/rpc"))
+        .bearer_auth(token)
         .header("session-id", session_id)
         .json(&body)
         .send()
@@ -373,6 +367,7 @@ async fn dump_history(
 async fn list_sessions(
     client: &reqwest::Client,
     base: &str,
+    token: &str,
     session_id: &str,
     json_mode: bool,
 ) -> Result<()> {
@@ -385,6 +380,7 @@ async fn list_sessions(
 
     let val: Value = client
         .post(format!("{base}/rpc"))
+        .bearer_auth(token)
         .header("session-id", session_id)
         .json(&body)
         .send()
@@ -427,6 +423,7 @@ async fn list_sessions(
 async fn send_chat(
     client: &reqwest::Client,
     base: &str,
+    token: &str,
     session_id: &str,
     content: &str,
     json_mode: bool,
@@ -441,6 +438,7 @@ async fn send_chat(
 
     let resp = client
         .post(format!("{base}/rpc"))
+        .bearer_auth(token)
         .header("session-id", session_id)
         .header("accept", "text/event-stream")
         .json(&body)

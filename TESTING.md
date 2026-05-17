@@ -46,7 +46,7 @@ cargo run --bin sapphire-agent -- \
 Terminal B (satellite, microphone + speaker required):
 
 ```sh
-cargo run --bin sapphire-call -- voice --room-profile voice_test
+cargo run --bin sapphire-call -- voice --token "<voice_test api_key>"
 ```
 
 The first satellite run downloads the Silero VAD ONNX (~2 MB) to
@@ -132,7 +132,7 @@ Terminal B (satellite):
 
 ```sh
 cargo run --release --bin sapphire-call -- voice \
-    --room-profile voice_irodori --language ja
+    --token "<voice_irodori api_key>" --language ja
 ```
 
 First boot auto-downloads Silero VAD (~2 MB) to
@@ -190,7 +190,7 @@ release to `~/.local/share/sapphire-call/voice-models/oww/`):
 
 ```sh
 cargo run --release --bin sapphire-call -- voice \
-    --room-profile voice_irodori
+    --token "<voice_irodori api_key>"
 ```
 
 The display label printed on wake-fire is derived from the ONNX
@@ -234,13 +234,13 @@ override with `--config <path>`). See
 
 ```toml
 [server]
-url          = "https://agent.example.com"
-room_profile = "home_voice"
+url   = "https://agent.example.com"
+token = "sa-call-<long random>"  # must match an api_keys entry on the agent
 ```
 
-CLI flags override config-file values. Wake-word fields are
-deliberately rejected here — server side is the source of truth
-(see §3).
+CLI flags override config-file values; `SAPPHIRE_AGENT_TOKEN` works
+too. Wake-word fields are deliberately rejected here — server side is
+the source of truth (see §3).
 
 ---
 
@@ -265,7 +265,7 @@ them verbatim into the selection flags.
 sapphire-call voice \
     --input-device  "Jabra SPEAK 510 USB"  \
     --output-device "Jabra SPEAK 510 USB"  \
-    --language ja --room-profile voice_irodori
+    --language ja --token "<voice_irodori api_key>"
 ```
 
 The system "default" rarely points at a USB speakerphone — it

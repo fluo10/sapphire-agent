@@ -55,10 +55,14 @@ pub struct WakeWordModel {
 /// Fetch the server's global wake-word configuration. Returns an
 /// empty `WakeWordConfig` when `[voice].wake_word_model` is unset.
 ///
-/// No session token needed — wake-word config is the same for every
-/// satellite regardless of room_profile, so this is a stateless
-/// GET-like call.
-pub async fn voice_config(client: &reqwest::Client, base: &str) -> Result<WakeWordConfig> {
+/// `token` is sent as `Authorization: Bearer <token>` — the `/rpc`
+/// endpoint is uniformly authenticated, so even this stateless lookup
+/// requires the satellite's bearer.
+pub async fn voice_config(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+) -> Result<WakeWordConfig> {
     let base = base.trim_end_matches('/');
     let body = json!({
         "jsonrpc": "2.0",
@@ -68,6 +72,7 @@ pub async fn voice_config(client: &reqwest::Client, base: &str) -> Result<WakeWo
     });
     let val: Value = client
         .post(format!("{base}/rpc"))
+        .bearer_auth(token)
         .json(&body)
         .send()
         .await?
@@ -178,16 +183,17 @@ pub enum VoicePushEvent {
 /// returned future is dropped, but explicit closure helps the
 /// playback consumer exit.
 ///
-/// `device_id` + `room_profile` are the conversation-routing key. The
-/// server derives a deterministic session id from this pair so the
-/// satellite can resume the same conversation across restarts /
-/// network blips without juggling explicit session tokens.
+/// `device_id` + the room_profile resolved from `token` are the
+/// conversation-routing key. The server derives a deterministic
+/// session id from this pair so the satellite can resume the same
+/// conversation across restarts / network blips without juggling
+/// explicit session tokens.
 #[allow(clippy::too_many_arguments)]
 pub async fn voice_pipeline_run(
     client: &reqwest::Client,
     base: &str,
+    token: &str,
     device_id: &str,
-    room_profile: &str,
     pcm: &[i16],
     language: Option<&str>,
     device: Option<&crate::DeviceMetadata>,
@@ -205,7 +211,6 @@ pub async fn voice_pipeline_run(
     let mut params = json!({
         "audio": audio_b64,
         "device_id": device_id,
-        "room_profile": room_profile,
     });
     if let Some(l) = language {
         params["language"] = json!(l);
@@ -222,6 +227,7 @@ pub async fn voice_pipeline_run(
 
     let resp = client
         .post(format!("{base}/rpc"))
+        .bearer_auth(token)
         .header("accept", "text/event-stream")
         .json(&body)
         .send()
@@ -258,14 +264,15 @@ fn parse_sse_data(raw: &str) -> Option<Value> {
 /// returns — the typical flow is "until satellite shuts down."
 ///
 /// Routing is by `(device_id, room_profile)` — the same key
-/// `voice/pipeline_run` uses to derive its session id. A new
-/// subscription supersedes any prior subscription for the same key, so
-/// reconnecting after a network blip just re-binds the channel.
+/// `voice/pipeline_run` uses to derive its session id; `room_profile`
+/// comes from the bearer `token`. A new subscription supersedes any
+/// prior subscription for the same key, so reconnecting after a
+/// network blip just re-binds the channel.
 pub async fn voice_subscribe(
     client: &reqwest::Client,
     base: &str,
+    token: &str,
     device_id: &str,
-    room_profile: &str,
     event_tx: mpsc::Sender<VoicePushEvent>,
 ) -> Result<()> {
     let base = base.trim_end_matches('/');
@@ -275,12 +282,12 @@ pub async fn voice_subscribe(
         "method": "voice/subscribe",
         "params": {
             "device_id": device_id,
-            "room_profile": room_profile,
         },
     });
 
     let resp = client
         .post(format!("{base}/rpc"))
+        .bearer_auth(token)
         .header("accept", "text/event-stream")
         .json(&body)
         .send()

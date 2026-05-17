@@ -7,11 +7,16 @@
 # room_profile — see `[room_profile.<n>].wake_word` on the agent.
 # Every satellite for that room_profile fetches the same phrase via
 # `voice/config` at startup.
+#
+# The room_profile binding is selected server-side by the bearer
+# `token` below: the token must appear in some
+# `[room_profile.<n>].api_keys` on the agent, and that profile becomes
+# the session's binding (same mechanism MCP and A2A use).
 
 [server]
-url          = "https://agent.example.com"
-room_profile = "home_voice"
-# session    = "abc1234"   # 7-char grain id to resume an existing session
+url   = "https://agent.example.com"
+token = "sa-call-REPLACE_ME"   # bearer; must match [room_profile.<n>].api_keys on the agent
+# session = "abc1234"          # 7-char grain id to resume an existing session
 
 [audio]
 # Discover names via `sapphire-call voice --list-devices`. Either or

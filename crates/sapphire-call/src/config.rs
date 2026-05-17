@@ -1,10 +1,16 @@
 //! Persistent satellite configuration.
 //!
 //! All fields are optional and override-able from the CLI; this file
-//! exists so you don't have to type `--server https://… --room-profile …`
+//! exists so you don't have to type `--server https://… --token …`
 //! every time you start `sapphire-call`. Wake-word configuration is
 //! intentionally **not** here — the server is the source of truth for
 //! the AI's name (see `[room_profile.<n>].wake_word` on the server).
+//!
+//! The room_profile is selected server-side by the bearer token — the
+//! token must appear in some `[room_profile.<n>].api_keys` entry on
+//! the agent, and that profile becomes the session's binding. Mirrors
+//! the existing MCP / A2A authentication model so all three protocol
+//! surfaces use the same `api_keys` table.
 //!
 //! Resolution order at startup:
 //!   1. explicit CLI flag
@@ -54,9 +60,11 @@ pub struct ServerConfig {
     /// Resume an existing session by 7-char grain id. Equivalent to
     /// `--session`.
     pub session: Option<String>,
-    /// Pin the session to a server-side `[room_profile.<n>]`.
-    /// Equivalent to `--room-profile`.
-    pub room_profile: Option<String>,
+    /// Bearer token sent as `Authorization: Bearer <token>` on every
+    /// `/rpc` request. Must match an `api_keys` entry on some
+    /// `[room_profile.<n>]` on the agent — that profile becomes the
+    /// session's binding. Equivalent to `--token`.
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -273,7 +281,7 @@ url = "https://agent.example.com"
 [server]
 url = "https://agent.example.com"
 session = "abc1234"
-room_profile = "home_voice"
+token = "sa-call-abc123"
 
 [audio]
 input_device = "Jabra SPEAK 510 USB"
@@ -300,7 +308,7 @@ vad_min_silence_ms = 350
 vad_min_speech_ms  = 200
 "#;
         let cfg: CallConfig = toml::from_str(raw).unwrap();
-        assert_eq!(cfg.server.room_profile.as_deref(), Some("home_voice"));
+        assert_eq!(cfg.server.token.as_deref(), Some("sa-call-abc123"));
         assert_eq!(
             cfg.audio.input_device.as_deref(),
             Some("Jabra SPEAK 510 USB")

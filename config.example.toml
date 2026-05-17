@@ -143,8 +143,11 @@ system_prompt = "You are a helpful personal assistant."
 # if defined, otherwise the built-in defaults (Anthropic provider,
 # `default` namespace, global session_policy).
 #
-# API sessions pin a room profile at `initialize` time via the
-# `room_profile` parameter (sapphire-call: `--room-profile <name>`).
+# API sessions pin a room profile via the bearer token sent in
+# `Authorization: Bearer <token>` on every `/rpc` request — the token
+# must appear in some `[room_profile.<n>].api_keys` below, same
+# mechanism MCP and A2A use (sapphire-call: `[server].token` or
+# `--token <TOKEN>`).
 #
 # [room_profile.everyday]
 # profile          = "default"
@@ -163,13 +166,13 @@ system_prompt = "You are a helpful personal assistant."
 # session_policy   = "compact"
 # rooms            = ["!nsfw:example.com"]
 #
-# A2A (Agent2Agent Protocol) and MCP clients reach a room_profile
-# through bearer tokens declared here. Each token must be unique across
-# all room profiles — startup fails if two profiles share one — and an
-# incoming `Authorization: Bearer <token>` resolves implicitly to the
-# owning profile, so external clients never name room_profile
-# themselves. Leave `api_keys = []` (or omit) to deny external access
-# to a profile.
+# /rpc (sapphire-call), A2A (Agent2Agent Protocol), and MCP clients all
+# reach a room_profile through bearer tokens declared here. Each token
+# must be unique across all room profiles — startup fails if two
+# profiles share one — and an incoming `Authorization: Bearer <token>`
+# resolves implicitly to the owning profile, so external clients never
+# name room_profile themselves. Leave `api_keys = []` (or omit) to
+# deny external access to a profile.
 #
 # [room_profile.sapphire_world]
 # profile          = "default"
