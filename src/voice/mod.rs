@@ -34,8 +34,8 @@ pub const PIPELINE_SAMPLE_RATE: u32 = 16_000;
 
 /// Server-internal push event delivered to a `voice/subscribe` writer
 /// task, which translates to wire-format SSE notifications. Mirrors the
-/// public `sapphire_agent_api::VoicePushEvent` plus enough metadata to
-/// reconstruct the heartbeat task name on the wire.
+/// public `VoicePushEvent` in `sapphire-agent-api` plus enough metadata
+/// to reconstruct the heartbeat task name on the wire.
 #[derive(Debug, Clone)]
 pub enum VoicePushItem {
     /// Begin a new push (e.g. heartbeat fire).

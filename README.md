@@ -16,10 +16,9 @@ A personal AI assistant agent that lives in a [`sapphire-workspace`](https://cra
 - **Background**: heartbeat cron tasks, periodic memory compaction, periodic workspace sync, daily logs.
 - **External AI integration**: `/mcp` endpoint publishes `write_report` and `recall_memory` tools so Claude Code (and other MCP clients) can share project context with the agent — see [docs/mcp-integration.md](docs/mcp-integration.md).
 - **Commands**:
-  - `call` — interactive REPL (reedline)
-  - `serve` — JSON-RPC over HTTP control API (`/rpc`)
-  - `run` — start the channel listeners
-  - `verify` — validate config and report loaded workspace files
+  - `sapphire-agent` — start the channel listeners + JSON-RPC HTTP control API (`/rpc`)
+  - `sapphire-agent verify` — validate config and report loaded workspace files
+  - `sapphire-call` — interactive REPL / voice satellite client (separate crate; see [crates/sapphire-call](crates/sapphire-call/))
 
 ## Install
 
@@ -43,8 +42,8 @@ Then:
 
 ```sh
 sapphire-agent verify   # sanity-check config and workspace
-sapphire-agent run      # start the channel listeners
-sapphire-agent call     # one-off interactive session
+sapphire-agent          # start the channel listeners + HTTP control API
+sapphire-call           # one-off interactive session (separate crate)
 ```
 
 ## License

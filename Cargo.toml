@@ -128,10 +128,7 @@ sapphire-workspace = { version = "0.11.0", default-features = false }
 # Human-readable session IDs for API sessions
 grain-id = { version = "0.14", features = ["serde"] }
 
-# Client library (shared with sapphire-call)
-sapphire-agent-api = { path = "crates/sapphire-agent-api", version = "0.5.0" }
-
-# HTTP server (serve command)
+# HTTP server (control API + Matrix/Discord channels)
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 
 # Stream utilities (axum SSE)
