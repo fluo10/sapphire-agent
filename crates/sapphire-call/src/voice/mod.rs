@@ -278,7 +278,7 @@ fn handle_stream_error(
 pub async fn run(
     server: String,
     _session: Option<String>,
-    room_profile: Option<String>,
+    token: String,
     options: VoiceOptions,
 ) -> Result<()> {
     // `--list-devices` short-circuits before we touch the network /
@@ -291,20 +291,15 @@ pub async fn run(
     let client = reqwest::Client::new();
 
     // Voice conversations are routed by (device_id, room_profile) so
-    // the satellite picks up where it left off across restarts.
+    // the satellite picks up where it left off across restarts. The
+    // room_profile is resolved server-side from the bearer `token`.
     // `session` (legacy chat session id) is ignored in voice mode.
     let device_id = crate::device_id::ensure_device_id()
         .context("failed to load or generate sapphire-call device id")?;
-    let room_profile = room_profile.ok_or_else(|| {
-        anyhow!(
-            "voice mode requires a room_profile — set [server].room_profile in the config \
-             or pass --room-profile <name>"
-        )
-    })?;
-    eprintln!("sapphire-call voice (device: {device_id}, room_profile: {room_profile})",);
+    eprintln!("sapphire-call voice (device: {device_id})");
 
     // ── Wake-word config: fetch the inline ONNX from the server ─────────
-    let server_wake = sapphire_agent_api::voice_config(&client, &base)
+    let server_wake = sapphire_agent_api::voice_config(&client, &base, &token)
         .await
         .unwrap_or_else(|e| {
             eprintln!(
@@ -497,8 +492,8 @@ pub async fn run(
     let subscribe_handle = tokio::spawn(subscribe_loop(
         client.clone(),
         base.clone(),
+        token.clone(),
         device_id.clone(),
-        room_profile.clone(),
         cmd_tx,
         Arc::clone(&shutdown),
     ));
@@ -513,8 +508,8 @@ pub async fn run(
         output_rate,
         client,
         base,
+        token,
         device_id,
-        room_profile,
         language: options.language,
         device: options.device,
         shutdown: Arc::clone(&shutdown),
@@ -558,8 +553,8 @@ struct ListenCtx {
     output_rate: u32,
     client: reqwest::Client,
     base: String,
+    token: String,
     device_id: String,
-    room_profile: String,
     language: Option<String>,
     device: Option<sapphire_agent_api::DeviceMetadata>,
     shutdown: Arc<AtomicBool>,
@@ -760,8 +755,8 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
             if let Err(e) = process_utterance(
                 &ctx.client,
                 &ctx.base,
+                &ctx.token,
                 &ctx.device_id,
-                &ctx.room_profile,
                 &utterance,
                 ctx.language.as_deref(),
                 ctx.device.as_ref(),
@@ -900,15 +895,15 @@ async fn handle_push_command(ctx: &mut ListenCtx, cmd: ListenCommand, window_buf
 async fn subscribe_loop(
     client: reqwest::Client,
     base: String,
+    token: String,
     device_id: String,
-    room_profile: String,
     cmd_tx: mpsc::UnboundedSender<ListenCommand>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff_secs: u64 = 1;
     while !shutdown.load(Ordering::SeqCst) {
         let (push_tx, mut push_rx) = mpsc::channel::<VoicePushEvent>(32);
-        let conn = voice_subscribe(&client, &base, &device_id, &room_profile, push_tx);
+        let conn = voice_subscribe(&client, &base, &token, &device_id, push_tx);
         // Forward push events as ListenCommands while the subscribe
         // call runs to completion in parallel.
         let forwarder = {
@@ -1537,8 +1532,8 @@ fn open_output_stream(
 async fn process_utterance(
     client: &reqwest::Client,
     base: &str,
+    token: &str,
     device_id: &str,
-    room_profile: &str,
     pcm_16khz: &[i16],
     language: Option<&str>,
     device_meta: Option<&sapphire_agent_api::DeviceMetadata>,
@@ -1554,8 +1549,8 @@ async fn process_utterance(
     let server_call = tokio::spawn({
         let client = client.clone();
         let base = base.to_string();
+        let token = token.to_string();
         let device = device_id.to_string();
-        let room = room_profile.to_string();
         let pcm = pcm_16khz.to_vec();
         let lang = language.map(String::from);
         let device_meta = device_meta.cloned();
@@ -1563,8 +1558,8 @@ async fn process_utterance(
             voice_pipeline_run(
                 &client,
                 &base,
+                &token,
                 &device,
-                &room,
                 &pcm,
                 lang.as_deref(),
                 device_meta.as_ref(),
