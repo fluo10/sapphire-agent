@@ -66,11 +66,16 @@ impl TimerSetTool {
             manager,
             spec: ToolSpec {
                 name: "timer_set".into(),
-                description: "Set a single-shot in-memory timer. When it fires, the agent is \
-                    re-invoked to deliver a short notification on the same channel (chat or voice) \
-                    where this tool was called. The process supports ONE active timer at a time — \
-                    calling this with another timer already active cancels the previous one. Use \
-                    'timer_preset' for Pomodoro-style multi-step routines."
+                description: "Set a single-shot in-memory timer. The timer lives ONLY in the \
+                    agent process — the user has no visual indicator, no notification, no way to \
+                    see it. When you set, replace, or cancel a timer you MUST tell the user in \
+                    your text reply (label + when it will fire), otherwise they have no idea \
+                    anything happened. When the timer fires, the agent is re-invoked with a \
+                    heartbeat — again, ALWAYS reply with a short text message to actually deliver \
+                    the notification (tool-only replies are silent to the user). The process \
+                    supports ONE active timer at a time; calling this with another timer already \
+                    active cancels the previous one. Use 'timer_preset' for Pomodoro-style \
+                    multi-step routines."
                     .into(),
                 input_schema: json!({
                     "type": "object",
@@ -138,8 +143,13 @@ impl TimerPresetTool {
         let names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
         let description = format!(
             "Start a configured timer preset (Pomodoro-style work/break cycles). The preset's \
-             ordered steps fire one by one and the cycle repeats `cycles` times. Cancels any \
-             active timer. Configured presets: {names:?}. Use 'timer_set' for simple one-shot timers."
+             ordered steps fire one by one AUTOMATICALLY — once started, do NOT call timer_set or \
+             timer_preset again to advance steps; the next step is already scheduled. Cancels any \
+             active timer. The preset lives ONLY in the agent process — the user has no visible \
+             indicator. Always confirm in your text reply (which preset, how many cycles, when \
+             the first step fires); and when each step fires you'll be re-invoked via heartbeat, \
+             so ALWAYS reply with a short text message to actually notify the user. Configured \
+             presets: {names:?}. Use 'timer_set' for simple one-shot timers."
         );
         Self {
             manager,
@@ -214,8 +224,9 @@ impl TimerCancelTool {
             manager,
             spec: ToolSpec {
                 name: "timer_cancel".into(),
-                description: "Cancel the active timer (single-shot or preset). No-op if no timer \
-                    is running."
+                description: "Cancel the active timer (single-shot or preset). No-op if no \
+                    timer is running. The user can't see the timer state, so confirm the \
+                    cancellation in your text reply."
                     .into(),
                 input_schema: json!({
                     "type": "object",
@@ -256,7 +267,8 @@ impl TimerStatusTool {
             spec: ToolSpec {
                 name: "timer_status".into(),
                 description: "Report the currently active timer (label, kind, time remaining), \
-                    or that none is set."
+                    or that none is set. The tool result is for your eyes only — relay it to the \
+                    user in your text reply, since they have no other way to see timer state."
                     .into(),
                 input_schema: json!({
                     "type": "object",

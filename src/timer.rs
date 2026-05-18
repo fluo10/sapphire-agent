@@ -140,8 +140,7 @@ impl TimerManager {
                 label = label_for_fire,
                 minutes = minutes,
             );
-            me.dispatch_fire(&label_for_fire, &prompt, &origin_for_fire)
-                .await;
+            me.dispatch_fire(&label_for_fire, &prompt, &origin_for_fire);
             // Clear our own slot if we're still the active timer.
             let mut slot = me.inner.lock().await;
             if let Some(active) = slot.as_ref()
@@ -272,7 +271,7 @@ impl TimerManager {
                     )
                 } else {
                     format!(
-                        "[Timer: {preset_name}] Step {cur}/{total} of cycle {cycle}/{cycles}: '{label}' ({minutes:.1} min) ended. Next: '{next}'. Tell the user to switch. Keep it short.",
+                        "[Timer: {preset_name}] Step {cur}/{total} of cycle {cycle}/{cycles}: '{label}' ({minutes:.1} min) ended. Next step '{next}' is already auto-scheduled by the preset — do NOT call timer_set / timer_preset. Just tell the user to switch. Keep it short.",
                         preset_name = preset.name,
                         cur = i + 1,
                         total = total_steps,
@@ -283,7 +282,7 @@ impl TimerManager {
                         next = next_label.as_deref().unwrap_or(""),
                     )
                 };
-                self.dispatch_fire(&step.label, &prompt, &origin).await;
+                self.dispatch_fire(&step.label, &prompt, &origin);
             }
         }
         // Clear slot at the end if still ours.
@@ -297,13 +296,27 @@ impl TimerManager {
 
     /// Send the fire message to the right channel. Logs and drops on
     /// failure — no fallback to the other channel.
-    async fn dispatch_fire(&self, task_name: &str, prompt: &str, origin: &TimerOrigin) {
+    ///
+    /// The dispatch is detached via `tokio::spawn` so the trigger does not
+    /// run inside the calling timer task. If we awaited it here, an AI
+    /// `timer_set`/`timer_preset` invocation during the trigger would call
+    /// `replace_active` → `prev.handle.abort()` on the very task we're
+    /// running inside, killing the AI's tool-call loop mid-flight (the
+    /// `tool_use` then has no matching `tool_result` and the next turn
+    /// fails with Anthropic 400 `tool_use ids were found without
+    /// tool_result blocks immediately after`).
+    fn dispatch_fire(&self, task_name: &str, prompt: &str, origin: &TimerOrigin) {
         match origin {
             TimerOrigin::Chat { room_id } => match self.agent.get().and_then(Weak::upgrade) {
                 Some(agent) => {
-                    if let Err(e) = agent.trigger(task_name, prompt, room_id).await {
-                        warn!("Timer fire (chat) failed for {task_name} -> {room_id}: {e:#}");
-                    }
+                    let task_name = task_name.to_string();
+                    let prompt = prompt.to_string();
+                    let room_id = room_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = agent.trigger(&task_name, &prompt, &room_id).await {
+                            warn!("Timer fire (chat) failed for {task_name} -> {room_id}: {e:#}");
+                        }
+                    });
                 }
                 None => warn!(
                     "Timer fire (chat) skipped for {task_name}: agent not wired into TimerManager"
@@ -315,29 +328,36 @@ impl TimerManager {
                 .and_then(Weak::upgrade)
             {
                 Some(state) => {
-                    match crate::serve::push_voice_text_to_subscriber(
-                        state,
-                        device_id.clone(),
-                        Some(task_name.to_string()),
-                        prompt.to_string(),
-                    )
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(e) => {
-                            let reason = match e {
-                                crate::serve::VoicePushError::Offline => "offline".to_string(),
-                                crate::serve::VoicePushError::NoVoice => "no voice providers".to_string(),
-                                crate::serve::VoicePushError::NotConfigured => {
-                                    "voice_pipeline not configured for room_profile".to_string()
-                                }
-                                crate::serve::VoicePushError::Other(msg) => msg,
-                            };
-                            warn!(
-                                "Timer fire (voice) failed for {task_name} -> device={device_id}: {reason}"
-                            );
+                    let task_name = task_name.to_string();
+                    let prompt = prompt.to_string();
+                    let device_id = device_id.clone();
+                    tokio::spawn(async move {
+                        match crate::serve::push_voice_text_to_subscriber(
+                            state,
+                            device_id.clone(),
+                            Some(task_name.clone()),
+                            prompt,
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(e) => {
+                                let reason = match e {
+                                    crate::serve::VoicePushError::Offline => "offline".to_string(),
+                                    crate::serve::VoicePushError::NoVoice => {
+                                        "no voice providers".to_string()
+                                    }
+                                    crate::serve::VoicePushError::NotConfigured => {
+                                        "voice_pipeline not configured for room_profile".to_string()
+                                    }
+                                    crate::serve::VoicePushError::Other(msg) => msg,
+                                };
+                                warn!(
+                                    "Timer fire (voice) failed for {task_name} -> device={device_id}: {reason}"
+                                );
+                            }
                         }
-                    }
+                    });
                 }
                 None => warn!(
                     "Timer fire (voice) skipped for {task_name}: serve_state not wired into TimerManager"
