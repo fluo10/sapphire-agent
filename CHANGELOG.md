@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-05-18
+
+### Fixed
+
+- **Timer fire heartbeat now reliably delivers a notification.** When a
+  preset step (or single timer) fired, the timer task awaited
+  `agent.trigger` inline; an AI `timer_set` call during that reply
+  caused `replace_active` → `abort` on the very task driving the
+  heartbeat, dropping the chat loop mid tool-round so the matching
+  `tool_result` never landed in history. The next turn then hit
+  Anthropic `400: tool_use ids were found without tool_result blocks
+  immediately after` and the notification never reached the channel.
+  `TimerManager::dispatch_fire` is now sync-spawning detached so the
+  trigger runs outside the timer task. (#116)
+- **Preset auto-chain prompt** — the intermediate-step heartbeat now
+  states the next step is already scheduled and forbids
+  `timer_set` / `timer_preset` re-invocation, to keep the AI from
+  racing the state machine. (#116)
+- **`timer_*` tool descriptions** — all four tools now make explicit
+  that the timer state is agent-private and the AI must always notify
+  the user via text on set / cancel / fire; tool-only replies are
+  silent to the user. (#116)
+- **`Agent::persist`** strips `ToolUse` / `ToolResult` parts in place
+  instead of dropping the whole message, so the assistant text that
+  accompanies a tool call is preserved in the session log. (#116)
+- **Release workflow** installs `libasound2-dev` on Linux so
+  `sapphire-call`'s `cpal` dependency builds cleanly during the
+  workspace publish step. (#115)
+
 ## [0.6.0] - 2026-05-17
 
 ### Added
