@@ -506,10 +506,15 @@ impl Agent {
 
     /// Persist `msg` to the session store. No-op if session creation failed.
     ///
-    /// Messages containing `ToolUse` or `ToolResult` parts are intentionally
-    /// skipped: tool payloads can be arbitrarily large (file contents, etc.)
-    /// and we never reload raw history across restarts, so persisting them
-    /// would only bloat the JSONL. Context survives via compaction summaries.
+    /// `ToolUse` / `ToolResult` parts are stripped before write: tool
+    /// payloads can be arbitrarily large (file contents, etc.) and raw
+    /// history is never reloaded across restarts, so persisting them
+    /// would only bloat the JSONL — context survives via compaction
+    /// summaries. The assistant's *text* alongside a tool call is kept,
+    /// however, since that's what the user actually saw and removing it
+    /// makes the session log a misleading record of the conversation.
+    /// A message that becomes empty after stripping is dropped entirely
+    /// (e.g. pure tool-result turns).
     ///
     /// Image scrubbing (raw base64 → `[image: <media_type> sha256=...]` text
     /// marker) happens centrally inside [`SessionStore::append`] so every
@@ -518,16 +523,29 @@ impl Agent {
         if session_id.is_empty() {
             return;
         }
-        let has_tool_parts = msg.parts.iter().any(|p| {
-            matches!(
-                p,
-                ContentPart::ToolUse { .. } | ContentPart::ToolResult { .. }
-            )
+        let kept: Vec<ContentPart> = msg
+            .parts
+            .iter()
+            .filter(|p| {
+                !matches!(
+                    p,
+                    ContentPart::ToolUse { .. } | ContentPart::ToolResult { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        let has_content = kept.iter().any(|p| match p {
+            ContentPart::Text(t) => !t.is_empty(),
+            _ => true,
         });
-        if has_tool_parts {
+        if !has_content {
             return;
         }
-        if let Err(e) = self.session_store.append(session_id, msg) {
+        let filtered = ChatMessage {
+            role: msg.role.clone(),
+            parts: kept,
+        };
+        if let Err(e) = self.session_store.append(session_id, &filtered) {
             warn!("Failed to persist message: {e}");
         }
     }
