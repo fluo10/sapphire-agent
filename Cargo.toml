@@ -22,7 +22,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fluo10/sapphire-agent"
