@@ -117,23 +117,6 @@ impl MatrixChannel {
     }
 }
 
-/// Detect the MIME type of an image from its magic bytes.
-/// Returns `None` if the format is not one of the four types supported by
-/// the Anthropic API (jpeg, png, gif, webp).
-fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        Some("image/jpeg")
-    } else if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
-        Some("image/png")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
-}
-
 /// Result of attempting to download a Matrix image attachment.
 enum ImageDownload {
     /// Successfully downloaded and format is supported.
@@ -166,36 +149,33 @@ async fn download_matrix_image(client: &Client, image: &ImageMessageEventContent
 
     match client.media().get_media_content(&request, true).await {
         Ok(bytes) if bytes.len() <= MAX_ATTACHMENT_BYTES => {
-            // Determine MIME type: trust the event metadata only if it names one
-            // of the four types the Anthropic API accepts. Otherwise fall back to
-            // sniffing the magic bytes — Matrix clients sometimes omit `mimetype`
-            // or send a generic type even for standard formats.
-            const SUPPORTED: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
+            // Always derive the MIME from the actual bytes. Anthropic rejects
+            // requests whose declared `media_type` doesn't match the bytes
+            // (400 invalid_request_error), so the declared MIME is only used
+            // for diagnostic warnings on mismatch.
             let declared = image
                 .info
                 .as_ref()
                 .and_then(|info| info.mimetype.as_deref());
-            let media_type = if declared.is_some_and(|m| SUPPORTED.contains(&m)) {
-                declared.unwrap().to_string()
-            } else {
-                match sniff_image_mime(&bytes) {
-                    Some(t) => {
-                        if let Some(d) = declared {
-                            warn!(
-                                "Matrix image '{}' declared MIME '{}' is unsupported; \
-                                 detected '{}' from bytes",
-                                image.body, d, t
-                            );
-                        }
-                        t.to_string()
-                    }
-                    None => {
+            let media_type = match super::sniff_image_mime(&bytes) {
+                Some(t) => {
+                    if let Some(d) = declared
+                        && d != t
+                    {
                         warn!(
-                            "Matrix image '{}' has unrecognised format (declared: {:?})",
-                            image.body, declared
+                            "Matrix image '{}' declared MIME '{}' differs from \
+                             detected '{}'; using detected",
+                            image.body, d, t
                         );
-                        return ImageDownload::UnsupportedFormat;
                     }
+                    t.to_string()
+                }
+                None => {
+                    warn!(
+                        "Matrix image '{}' has unrecognised format (declared: {:?})",
+                        image.body, declared
+                    );
+                    return ImageDownload::UnsupportedFormat;
                 }
             };
             ImageDownload::Ok(Attachment {

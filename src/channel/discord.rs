@@ -253,14 +253,18 @@ impl Channel for DiscordChannel {
 /// Download every `image/*` attachment on `msg`. Oversized attachments
 /// (>5 MB) and non-image attachments are skipped with a warning so the
 /// conversation continues without them.
+///
+/// After download, the MIME type is derived from the actual bytes rather
+/// than Discord's declared `content_type`. Discord occasionally labels a
+/// transcoded image with a stale MIME (e.g. claims `image/webp` for what
+/// is in fact PNG bytes), which Anthropic's API rejects with a 400.
 async fn download_image_attachments(msg: &Message) -> Vec<Attachment> {
     let mut out = Vec::new();
     for att in &msg.attachments {
         let Some(ct) = att.content_type.as_deref() else {
             continue;
         };
-        const SUPPORTED: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
-        if !SUPPORTED.contains(&ct) {
+        if !super::SUPPORTED_IMAGE_MIME.contains(&ct) {
             warn!(
                 "Discord image '{}' has unsupported MIME type '{}'; skipping",
                 att.filename, ct
@@ -276,10 +280,25 @@ async fn download_image_attachments(msg: &Message) -> Vec<Attachment> {
         }
         match att.download().await {
             Ok(bytes) if bytes.len() <= MAX_ATTACHMENT_BYTES => {
-                out.push(Attachment {
-                    media_type: ct.to_string(),
-                    data: bytes,
-                });
+                match super::sniff_image_mime(&bytes) {
+                    Some(t) => {
+                        if t != ct {
+                            warn!(
+                                "Discord image '{}' declared MIME '{}' differs from \
+                                 detected '{}'; using detected",
+                                att.filename, ct, t
+                            );
+                        }
+                        out.push(Attachment {
+                            media_type: t.to_string(),
+                            data: bytes,
+                        });
+                    }
+                    None => warn!(
+                        "Discord image '{}' has unrecognised format (declared: '{}'); skipping",
+                        att.filename, ct
+                    ),
+                }
             }
             Ok(bytes) => warn!(
                 "Discord image '{}' decoded to {} bytes (>5MB); skipping",
