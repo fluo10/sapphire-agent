@@ -867,7 +867,7 @@ impl Agent {
             // Hydrate `ImageRef` parts back to `Image` so the provider
             // sees the actual bytes. Cache misses degrade to a text
             // marker that preserves the hash for context references.
-            let messages_for_provider = hydrate_history(&messages, self.image_cache.as_deref());
+            let messages_for_provider = hydrate_history(&messages);
             let response = provider
                 .chat(
                     system_with_context.as_deref(),
@@ -942,9 +942,14 @@ impl Agent {
                                 ns,
                                 crate::timer::scope_timer_origin(origin, async move {
                                     info!("Executing tool: {} (id={})", call.name, call.id);
-                                    let result = tools.execute(&call).await;
-                                    info!("Tool {} result: {}", call.name, result);
-                                    (call.id, result)
+                                    let output = tools.execute(&call).await;
+                                    info!(
+                                        "Tool {} result ({} image(s) attached): {}",
+                                        call.name,
+                                        output.images.len(),
+                                        output.text
+                                    );
+                                    (call.id, output)
                                 }),
                             ),
                         ));
@@ -958,7 +963,16 @@ impl Agent {
                         }
                     }
 
-                    let msg = ChatMessage::tool_results(results);
+                    // Split each ToolOutput into the text body (becomes a
+                    // tool_result block) and any images (sibling Image
+                    // blocks on the same user message).
+                    let mut text_results = Vec::with_capacity(results.len());
+                    let mut images = Vec::new();
+                    for (id, output) in results {
+                        text_results.push((id, output.text));
+                        images.extend(output.images);
+                    }
+                    let msg = ChatMessage::tool_results_with_images(text_results, images);
                     self.history
                         .lock()
                         .await
@@ -1013,7 +1027,11 @@ impl Agent {
                             input,
                         })
                         .await;
-                    agent.prefetch_cache.lock().await.insert(key_clone, result);
+                    agent
+                        .prefetch_cache
+                        .lock()
+                        .await
+                        .insert(key_clone, result.text);
                 });
             }
         }

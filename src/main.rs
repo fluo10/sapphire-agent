@@ -336,6 +336,15 @@ async fn main() -> Result<()> {
                 None
             };
 
+            // Register `recall_image` once the image cache is resolved.
+            // Without a cache there's nothing to recall, so skip the
+            // tool entirely — the model never sees it advertised.
+            if let Some(cache) = image_cache.clone() {
+                tool_set
+                    .register_tool(Box::new(tools::builtin_tools::RecallImageTool::new(cache)))
+                    .await;
+            }
+
             let serve_state = Arc::new(serve::ServeState::new(
                 config.clone(),
                 Arc::clone(&registry),

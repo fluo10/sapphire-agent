@@ -529,10 +529,13 @@ mod tests {
 
     #[test]
     fn tool_results_split_into_separate_tool_messages() {
-        let msg = ChatMessage::tool_results(vec![
-            ("call_a".to_string(), "result_a".to_string()),
-            ("call_b".to_string(), "result_b".to_string()),
-        ]);
+        let msg = ChatMessage::tool_results_with_images(
+            vec![
+                ("call_a".to_string(), "result_a".to_string()),
+                ("call_b".to_string(), "result_b".to_string()),
+            ],
+            vec![],
+        );
         let api = chat_message_to_api(&msg);
         assert_eq!(api.len(), 2);
         assert_eq!(api[0].role, "tool");
