@@ -13,6 +13,32 @@ use tracing::{error, warn};
 /// dropped with a warning (the conversation continues without them).
 pub const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 
+/// MIME types of images forwarded to the LLM. Anthropic accepts these four;
+/// anything else is dropped at the channel layer.
+pub(crate) const SUPPORTED_IMAGE_MIME: &[&str] =
+    &["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+/// Detect the MIME type of an image from its magic bytes. Returns `None`
+/// when the bytes don't match one of the four types Anthropic accepts.
+///
+/// Used in preference to the platform-declared content type because
+/// Discord (and some Matrix clients) sometimes label, say, a PNG as
+/// `image/webp`. Anthropic strictly validates that the declared
+/// `media_type` matches the actual bytes and 400s on mismatch.
+pub(crate) fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 /// A binary attachment fetched from a channel (currently images only).
 #[derive(Debug, Clone)]
 pub struct Attachment {
@@ -260,4 +286,48 @@ pub fn seed_routing_from_config(config: &crate::config::Config) -> HashMap<Strin
         }
     }
     seed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sniff_image_mime;
+
+    #[test]
+    fn sniffs_jpeg() {
+        assert_eq!(sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn sniffs_png() {
+        let png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
+        assert_eq!(sniff_image_mime(&png), Some("image/png"));
+    }
+
+    #[test]
+    fn sniffs_gif() {
+        assert_eq!(sniff_image_mime(b"GIF87a..."), Some("image/gif"));
+        assert_eq!(sniff_image_mime(b"GIF89a..."), Some("image/gif"));
+    }
+
+    #[test]
+    fn sniffs_webp() {
+        let mut webp = Vec::new();
+        webp.extend_from_slice(b"RIFF");
+        webp.extend_from_slice(&[0; 4]);
+        webp.extend_from_slice(b"WEBP");
+        webp.extend_from_slice(b"VP8 ");
+        assert_eq!(sniff_image_mime(&webp), Some("image/webp"));
+    }
+
+    #[test]
+    fn returns_none_for_unknown() {
+        assert_eq!(sniff_image_mime(&[0, 0, 0, 0]), None);
+        assert_eq!(sniff_image_mime(b""), None);
+        // RIFF prefix without WEBP marker (e.g. WAV) is not an image.
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&[0; 4]);
+        wav.extend_from_slice(b"WAVE");
+        assert_eq!(sniff_image_mime(&wav), None);
+    }
 }
