@@ -11,14 +11,55 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+/// Output of a tool execution.
+///
+/// Most tools return only text — for those, construct via `String` (impl
+/// `From<String>` below). Tools that also need to deliver image bytes to
+/// a multimodal model (e.g. `recall_image`, fetching a past image from
+/// the cache) populate `images` so the agent runtime can attach them to
+/// the user message carrying the tool_result block.
+#[derive(Debug, Clone, Default)]
+pub struct ToolOutput {
+    /// Text content of the tool result.
+    pub text: String,
+    /// Optional inline image attachments — `(media_type, data_base64)`.
+    /// Attached as `ContentPart::Image` parts on the tool_result user
+    /// message; only providers that understand image input use them.
+    pub images: Vec<(String, String)>,
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for ToolOutput {
+    fn from(text: &str) -> Self {
+        Self::from(text.to_string())
+    }
+}
+
 /// A tool the agent can invoke.
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// The spec advertised to the LLM.
     fn spec(&self) -> &ToolSpec;
 
-    /// Execute the tool with the given JSON input.
+    /// Execute the tool with the given JSON input. Used by all tools
+    /// that return only text — which is most of them.
     async fn execute(&self, input: &serde_json::Value) -> Result<String>;
+
+    /// Execute the tool and return a `ToolOutput` carrying both text
+    /// and any image attachments. The default impl wraps `execute`;
+    /// override when the tool needs to return image bytes (e.g.
+    /// `recall_image`).
+    async fn execute_full(&self, input: &serde_json::Value) -> Result<ToolOutput> {
+        Ok(ToolOutput::from(self.execute(input).await?))
+    }
 }
 
 /// A collection of tools with their specs.
@@ -50,18 +91,21 @@ impl ToolSet {
         self.inner.read().await.specs.clone()
     }
 
-    /// Execute a tool call; returns a human-readable result string.
-    pub async fn execute(&self, call: &ToolCall) -> String {
+    /// Execute a tool call. The returned `ToolOutput` carries the
+    /// text result plus any image attachments the tool produced; the
+    /// caller is responsible for assembling them into a tool_result
+    /// user message.
+    pub async fn execute(&self, call: &ToolCall) -> ToolOutput {
         let inner = self.inner.read().await;
         for tool in &inner.tools {
             if tool.spec().name == call.name {
-                return match tool.execute(&call.input).await {
-                    Ok(result) => result,
-                    Err(e) => format!("Error: {e:#}"),
+                return match tool.execute_full(&call.input).await {
+                    Ok(output) => output,
+                    Err(e) => ToolOutput::from(format!("Error: {e:#}")),
                 };
             }
         }
-        format!("Unknown tool: {}", call.name)
+        ToolOutput::from(format!("Unknown tool: {}", call.name))
     }
 
     /// Check all MCP clients for `tools_changed` flags and refresh their

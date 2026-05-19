@@ -1,7 +1,9 @@
+use crate::image_cache::ImageCache;
 use crate::provider::ToolSpec;
-use crate::tools::{Tool, ToolSet};
+use crate::tools::{Tool, ToolOutput, ToolSet};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sapphire_workspace::WorkspaceState;
 use serde_json::json;
 use std::path::PathBuf;
@@ -1135,5 +1137,161 @@ impl Tool for McpReconnectTool {
         }
 
         tool_set.reconnect_mcp_server(server).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// recall_image
+// ---------------------------------------------------------------------------
+
+/// Re-fetch a past image from the workspace-external image cache and
+/// attach it to the tool_result so the model can look at it again.
+///
+/// Older turns in conversation history appear to the model as text
+/// markers like `[image: image/png sha256=<hex>]` — the raw bytes
+/// aren't re-sent every turn to keep input-token cost down. When the
+/// user asks the model to look at a past image, the model is expected
+/// to call this tool with the marker's sha256 + media_type; the cache
+/// is then queried and the actual bytes get appended to the user
+/// message carrying this tool's result.
+pub struct RecallImageTool {
+    cache: Arc<ImageCache>,
+    spec: ToolSpec,
+}
+
+impl RecallImageTool {
+    pub fn new(cache: Arc<ImageCache>) -> Self {
+        let spec = ToolSpec {
+            name: "recall_image".into(),
+            description: "Re-fetch a past image from the conversation by its sha256 hash. \
+                Use this when the user references an image that now appears in history as a \
+                `[image: <media_type> sha256=<hex>]` text marker (only images attached in the \
+                CURRENT turn are visible inline; older ones are shown as markers to save \
+                tokens). Pass the marker's `sha256` and `media_type` verbatim; the actual \
+                image bytes will be returned as an attachment for you to view."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "sha256": {
+                        "type": "string",
+                        "description": "Hex sha256 of the image to recall (copy from the `[image: ... sha256=<hex>]` marker)."
+                    },
+                    "media_type": {
+                        "type": "string",
+                        "description": "MIME type of the image, e.g. `image/png`, `image/jpeg`, `image/gif`, `image/webp` (copy from the marker)."
+                    }
+                },
+                "required": ["sha256", "media_type"]
+            }),
+        };
+        Self { cache, spec }
+    }
+}
+
+#[async_trait]
+impl Tool for RecallImageTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
+        // Should never be reached: `execute_full` is overridden below.
+        // If something does call this path, surface a clear marker text
+        // rather than a panic — the model can recover.
+        Ok("recall_image returned no image (text-only path).".to_string())
+    }
+
+    async fn execute_full(&self, input: &serde_json::Value) -> Result<ToolOutput> {
+        let sha256 = input
+            .get("sha256")
+            .and_then(|v| v.as_str())
+            .context("Missing required field: sha256")?;
+        let media_type = input
+            .get("media_type")
+            .and_then(|v| v.as_str())
+            .context("Missing required field: media_type")?;
+
+        if !is_hex_sha256(sha256) {
+            anyhow::bail!(
+                "sha256 must be a 64-char lowercase hex string; got {} char(s)",
+                sha256.len()
+            );
+        }
+
+        let bytes = self
+            .cache
+            .get(sha256)
+            .with_context(|| format!("image not in cache (sha256={sha256})"))?;
+
+        let data_base64 = BASE64_STANDARD.encode(&bytes);
+        let byte_len = bytes.len();
+        Ok(ToolOutput {
+            text: format!(
+                "Recalled image (sha256={sha256}, media_type={media_type}, {byte_len} bytes). \
+                 Image attached to this tool result — refer to it directly."
+            ),
+            images: vec![(media_type.to_string(), data_base64)],
+        })
+    }
+}
+
+fn is_hex_sha256(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+#[cfg(test)]
+mod recall_image_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn open_cache() -> (TempDir, Arc<ImageCache>) {
+        let tmp = TempDir::new().unwrap();
+        let cache = ImageCache::open(tmp.path().to_path_buf()).unwrap();
+        (tmp, cache)
+    }
+
+    #[tokio::test]
+    async fn returns_image_on_cache_hit() {
+        let (_tmp, cache) = open_cache();
+        let bytes = b"\xff\xd8\xfffake-jpeg".to_vec();
+        let sha = crate::image_cache::sha256_hex(&bytes);
+        cache.put(&sha, &bytes).unwrap();
+
+        let tool = RecallImageTool::new(cache);
+        let out = tool
+            .execute_full(&json!({"sha256": sha, "media_type": "image/jpeg"}))
+            .await
+            .unwrap();
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].0, "image/jpeg");
+        assert_eq!(
+            BASE64_STANDARD.decode(&out.images[0].1).unwrap(),
+            bytes
+        );
+        assert!(out.text.contains(&sha));
+    }
+
+    #[tokio::test]
+    async fn errors_on_cache_miss() {
+        let (_tmp, cache) = open_cache();
+        let tool = RecallImageTool::new(cache);
+        let sha = "0".repeat(64);
+        let err = tool
+            .execute_full(&json!({"sha256": sha, "media_type": "image/png"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not in cache"));
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_sha() {
+        let (_tmp, cache) = open_cache();
+        let tool = RecallImageTool::new(cache);
+        let err = tool
+            .execute_full(&json!({"sha256": "abc", "media_type": "image/png"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("64-char"));
     }
 }

@@ -136,18 +136,21 @@ pub fn scrub_history_inplace(history: &mut [ChatMessage], cache: Option<&ImageCa
     }
 }
 
-/// Build a hydrated copy of `history`: every `ImageRef` whose bytes
-/// live in `cache` becomes an `Image` again so the provider call sees
-/// the actual pixels. A cache miss is replaced with a `Text` marker
-/// (`[image: <media_type> sha256=<hex> (cache miss)]`) so the model
-/// retains a stable reference to the image even when the bytes are
-/// gone.
+/// Build a provider-ready copy of `history`: `ImageRef` parts are
+/// degraded to a `Text` marker (`[image: <media_type> sha256=<hex>]`)
+/// so that historical images are NOT re-sent to the model every turn.
+/// `Image` parts pass through unchanged — an image that arrived this
+/// turn hasn't been scrubbed to `ImageRef` yet, and is the only thing
+/// that should reach the model.
 ///
-/// `Image` parts pass through unchanged (an image that arrived this
-/// turn hasn't been scrubbed yet but is already inline). When `cache`
-/// is `None`, every `ImageRef` falls back to the text marker — same
-/// degradation path as a cache miss.
-pub fn hydrate_history(history: &[ChatMessage], cache: Option<&ImageCache>) -> Vec<ChatMessage> {
+/// Rationale: re-sending every past image as input bytes every turn
+/// re-bills the entire image-token cost per turn for the whole
+/// session. The cache still retains the raw bytes by sha256, so a
+/// dedicated `recall_image` tool can fetch a specific past image on
+/// demand when the user actually asks about one — but day-to-day
+/// "react to this image" interactions don't pay for the entire
+/// historical gallery.
+pub fn hydrate_history(history: &[ChatMessage]) -> Vec<ChatMessage> {
     history
         .iter()
         .map(|msg| ChatMessage {
@@ -156,17 +159,9 @@ pub fn hydrate_history(history: &[ChatMessage], cache: Option<&ImageCache>) -> V
                 .parts
                 .iter()
                 .map(|p| match p {
-                    ContentPart::ImageRef { media_type, sha256 } => {
-                        match cache.and_then(|c| c.get(sha256)) {
-                            Some(bytes) => ContentPart::Image {
-                                media_type: media_type.clone(),
-                                data_base64: BASE64_STANDARD.encode(&bytes),
-                            },
-                            None => ContentPart::Text(format!(
-                                "[image: {media_type} sha256={sha256} (cache miss)]"
-                            )),
-                        }
-                    }
+                    ContentPart::ImageRef { media_type, sha256 } => ContentPart::Text(
+                        format!("[image: {media_type} sha256={sha256}]"),
+                    ),
                     other => other.clone(),
                 })
                 .collect(),
@@ -260,54 +255,21 @@ mod tests {
     }
 
     #[test]
-    fn hydrate_revives_imageref_when_cache_hit() {
-        let tmp = TempDir::new().unwrap();
-        let cache = ImageCache::open(tmp.path().to_path_buf()).unwrap();
-        let bytes = fake_image();
-        let sha = sha256_hex(&bytes);
-        cache.put(&sha, &bytes).unwrap();
-
+    fn hydrate_degrades_imageref_to_text_marker() {
         let history = vec![ChatMessage {
             role: Role::User,
             parts: vec![ContentPart::ImageRef {
                 media_type: "image/jpeg".to_string(),
-                sha256: sha.clone(),
+                sha256: "abc123".to_string(),
             }],
         }];
-        let hydrated = hydrate_history(&history, Some(&cache));
-        match &hydrated[0].parts[0] {
-            ContentPart::Image {
-                media_type,
-                data_base64,
-            } => {
-                assert_eq!(media_type, "image/jpeg");
-                assert_eq!(BASE64_STANDARD.decode(data_base64).unwrap(), bytes);
-            }
-            other => panic!("expected Image, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn hydrate_degrades_to_text_on_cache_miss() {
-        let tmp = TempDir::new().unwrap();
-        let cache = ImageCache::open(tmp.path().to_path_buf()).unwrap();
-        // Note: cache is empty.
-
-        let history = vec![ChatMessage {
-            role: Role::User,
-            parts: vec![ContentPart::ImageRef {
-                media_type: "image/jpeg".to_string(),
-                sha256: "missing".to_string(),
-            }],
-        }];
-        let hydrated = hydrate_history(&history, Some(&cache));
+        let hydrated = hydrate_history(&history);
         match &hydrated[0].parts[0] {
             ContentPart::Text(s) => {
-                assert!(s.contains("cache miss"));
                 assert!(s.contains("image/jpeg"));
-                assert!(s.contains("sha256=missing"));
+                assert!(s.contains("sha256=abc123"));
             }
-            other => panic!("expected Text marker on miss, got {other:?}"),
+            other => panic!("expected Text marker, got {other:?}"),
         }
     }
 
@@ -319,7 +281,7 @@ mod tests {
             "now",
             std::iter::once(("image/png".to_string(), b64.clone())),
         )];
-        let hydrated = hydrate_history(&history, None);
+        let hydrated = hydrate_history(&history);
         match &hydrated[0].parts[0] {
             ContentPart::Image {
                 media_type,

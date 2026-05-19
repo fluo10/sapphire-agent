@@ -137,15 +137,34 @@ impl ChatMessage {
         }
     }
 
-    /// User message containing tool execution results.
-    pub fn tool_results(results: Vec<(String, String)>) -> Self {
-        let parts = results
+    /// User message containing tool execution results plus optional
+    /// image attachments. Images are appended after all tool_result
+    /// parts; they're carried as siblings to the tool_result blocks on
+    /// the same user message — the wire format both Anthropic and (in
+    /// degraded form) OpenAI-compatible accept.
+    ///
+    /// Used by tools like `recall_image` to deliver image bytes back to
+    /// the model alongside their textual tool_result. Pass an empty
+    /// `images` vec for the common text-only case.
+    pub fn tool_results_with_images(
+        results: Vec<(String, String)>,
+        images: Vec<(String, String)>,
+    ) -> Self {
+        let mut parts: Vec<ContentPart> = results
             .into_iter()
             .map(|(id, content)| ContentPart::ToolResult {
                 tool_use_id: id,
                 content,
             })
             .collect();
+        parts.extend(
+            images
+                .into_iter()
+                .map(|(media_type, data_base64)| ContentPart::Image {
+                    media_type,
+                    data_base64,
+                }),
+        );
         Self {
             role: Role::User,
             parts,

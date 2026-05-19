@@ -1663,11 +1663,11 @@ async fn run_llm_turn(
 
         // Hydrate `ImageRef` parts from the image cache into full
         // `Image` parts for the provider call. `Image` parts (just
-        // arrived this turn) and Text/Tool parts pass through. Cache
-        // misses degrade to text markers carrying the hash so the
-        // model still has a stable reference to the image.
-        let history_for_provider =
-            crate::image_cache::hydrate_history(&history, state.image_cache.as_deref());
+        // arrived this turn) and Text/Tool parts pass through;
+        // `ImageRef` parts are intentionally degraded to text markers
+        // so historical images aren't re-billed every turn (the cache
+        // still retains the bytes for an on-demand recall tool).
+        let history_for_provider = crate::image_cache::hydrate_history(&history);
         let response = provider
             .chat(system.as_deref(), &history_for_provider, Some(&tool_specs))
             .await;
@@ -1717,7 +1717,7 @@ async fn run_llm_turn(
                 let tools = Arc::clone(&state.tools);
                 let ns = namespace.clone();
                 let timer_origin = timer_origin.clone();
-                let results: Vec<(String, String)> =
+                let results: Vec<(String, crate::tools::ToolOutput)> =
                     futures_util::future::join_all(tool_calls.iter().map(|c| {
                         let tools = Arc::clone(&tools);
                         let c = c.clone();
@@ -1728,9 +1728,9 @@ async fn run_llm_turn(
                                 ns,
                                 async move {
                                     info!("Executing tool: {} (id={})", c.name, c.id);
-                                    let result = tools.execute(&c).await;
+                                    let output = tools.execute(&c).await;
                                     info!("Tool {} done", c.name);
-                                    (c.id, result)
+                                    (c.id, output)
                                 },
                             );
                             match origin {
@@ -1750,7 +1750,13 @@ async fn run_llm_turn(
                     .await;
                 }
 
-                let result_msg = ChatMessage::tool_results(results);
+                let mut text_results = Vec::with_capacity(results.len());
+                let mut images = Vec::new();
+                for (id, output) in results {
+                    text_results.push((id, output.text));
+                    images.extend(output.images);
+                }
+                let result_msg = ChatMessage::tool_results_with_images(text_results, images);
                 history.push(result_msg.clone());
                 // Tool_result payloads are not persisted — see the matching
                 // tool_use branch above for rationale.
