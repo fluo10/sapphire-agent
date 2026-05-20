@@ -45,14 +45,15 @@ name = "sapphire-agent"
 path = "src/main.rs"
 
 [features]
-default = ["lancedb-store", "fastembed-embed", "git-sync"]
+default = ["lancedb-store", "fastembed-embed", "git-sync", "voice-sherpa"]
 lancedb-store = ["sapphire-workspace/lancedb-store"]
 fastembed-embed = ["sapphire-workspace/fastembed-embed"]
 git-sync = ["sapphire-workspace/git-sync"]
-# Compile in the local sherpa-onnx STT + TTS providers. Off by default
-# because sherpa-onnx-sys pulls in a large C++ build (sherpa-onnx +
-# ONNX runtime, ~5–10 minutes on a cold cache). Users who only run the
-# Gradio TTS path or who don't need voice at all should skip it.
+# Compile in the local sherpa-onnx STT + TTS providers. Enabled by
+# default, but note that sherpa-onnx-sys pulls in a large C++ build
+# (sherpa-onnx + ONNX runtime, ~5–10 minutes on a cold cache). Users
+# who only run the Gradio TTS path or who don't need voice at all can
+# opt out with `--no-default-features` plus the other defaults.
 voice-sherpa = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2"]
 
 [dependencies]
