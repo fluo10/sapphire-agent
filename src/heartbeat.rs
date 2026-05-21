@@ -68,16 +68,12 @@ pub struct Heartbeat {
 impl Heartbeat {
     /// Resolve which namespace a session belongs to. Matrix/Discord rooms
     /// follow `Config::namespace_for_room`. Device-default sessions
-    /// (channel=`"device-default"`) and RPC cross-device sessions
-    /// (`"rpc"`, or legacy `"api"` until the bundled session migration
-    /// rewrites stored values) persist their resolved namespace in the
-    /// JSONL meta — trust that first, falling back to the default
-    /// namespace for old files that predate the field.
+    /// (channel=`"device-default"`) and cross-device sessions
+    /// (channel=`"rpc"`) persist their resolved namespace in the JSONL
+    /// meta — trust that first, falling back to the default namespace
+    /// for old files that predate the field.
     fn namespace_for_session(&self, meta: &crate::session::SessionMeta) -> String {
-        if meta.channel == "device-default"
-            || meta.channel == "rpc"
-            || meta.channel == "api"
-        {
+        if meta.channel == "device-default" || meta.channel == "rpc" {
             meta.namespace
                 .clone()
                 .unwrap_or_else(|| crate::config::DEFAULT_NAMESPACE_NAME.to_string())
