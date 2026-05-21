@@ -262,10 +262,25 @@ async fn main() -> Result<()> {
                     .context("Failed to build provider registry")?,
             );
 
-            // ── RPC session store (sessions/<namespace>/rpc/) ──────────────
-            let rpc_session_store = Arc::new(SessionStore::with_workspace(
+            // ── Cross-device session store (sessions/<namespace>/rpc/) ─────
+            // Cross-device sessions are the user-selectable, multi-device
+            // conversation threads (resumed via `--resume <grain-id>`).
+            // The on-disk directory is still `rpc/` until the bundled
+            // session migration (#122 PR 3) renames it to `cross-device/`;
+            // the kind constant matches.
+            let cross_device_session_store = Arc::new(SessionStore::with_workspace(
                 sessions_base.clone(),
                 "rpc",
+                Arc::clone(&ws_state),
+            ));
+
+            // ── Device-default session store (sessions/<ns>/device-default/) ─
+            // Lazy-created, daily-rotated per `(device_id, room_profile)` —
+            // the heartbeat target and the implicit session for a satellite
+            // with nothing else selected. See #122.
+            let device_default_session_store = Arc::new(SessionStore::with_workspace(
+                sessions_base.clone(),
+                "device-default",
                 Arc::clone(&ws_state),
             ));
 
@@ -350,7 +365,8 @@ async fn main() -> Result<()> {
                 Arc::clone(&registry),
                 Arc::clone(&workspace),
                 Arc::clone(&tool_set),
-                Arc::clone(&rpc_session_store),
+                Arc::clone(&cross_device_session_store),
+                Arc::clone(&device_default_session_store),
                 Arc::clone(&mcp_session_store),
                 voice_providers,
                 image_cache.clone(),
@@ -500,7 +516,8 @@ async fn main() -> Result<()> {
                     let workspace_for_loop = Arc::clone(&workspace);
                     let workspace_dir_for_loop = workspace_dir.clone();
                     let channel_store_for_loop = Arc::clone(&channel_session_store);
-                    let rpc_store_for_loop = Arc::clone(&rpc_session_store);
+                    let cross_device_store_for_loop = Arc::clone(&cross_device_session_store);
+                    let device_default_store_for_loop = Arc::clone(&device_default_session_store);
                     let agent_for_loop = Arc::clone(&agent);
                     tokio::spawn(async move {
                         let mut tick = tokio::time::interval(dur);
@@ -521,7 +538,8 @@ async fn main() -> Result<()> {
                                 &workspace_for_loop,
                                 &workspace_dir_for_loop,
                                 &channel_store_for_loop,
-                                &rpc_store_for_loop,
+                                &cross_device_store_for_loop,
+                                &device_default_store_for_loop,
                                 &agent_for_loop,
                             )
                             .await;
@@ -536,7 +554,8 @@ async fn main() -> Result<()> {
                         &workspace,
                         &workspace_dir,
                         &channel_session_store,
-                        &rpc_session_store,
+                        &cross_device_session_store,
+                        &device_default_session_store,
                         &agent,
                     )
                     .await;
@@ -629,7 +648,8 @@ async fn rebuild_today_digests(
     workspace: &Arc<Workspace>,
     workspace_dir: &std::path::Path,
     channel_store: &Arc<SessionStore>,
-    rpc_store: &Arc<SessionStore>,
+    cross_device_store: &Arc<SessionStore>,
+    device_default_store: &Arc<SessionStore>,
     agent: &Arc<Agent>,
 ) {
     let today = session::local_date_for_timestamp(chrono::Local::now(), config.day_boundary_hour);
@@ -640,7 +660,8 @@ async fn rebuild_today_digests(
         today,
         config.day_boundary_hour,
         channel_store,
-        Some(rpc_store.as_ref()),
+        Some(cross_device_store.as_ref()),
+        Some(device_default_store.as_ref()),
         |room_id: &str| cfg.namespace_for_room(room_id).to_string(),
     );
     let had_content = !map.is_empty();
