@@ -59,10 +59,19 @@ pub struct ServeState {
     pub(crate) registry: Arc<ProviderRegistry>,
     pub(crate) workspace: Arc<Workspace>,
     pub(crate) tools: Arc<ToolSet>,
-    pub(crate) rpc_session_store: Arc<SessionStore>,
+    /// Cross-device session store (kind = `"rpc"` for now; #122 PR 3
+    /// renames the on-disk dir to `cross-device/`). Holds the
+    /// user-selectable, multi-device sessions resumed via
+    /// `--resume <grain-id>`.
+    pub(crate) cross_device_session_store: Arc<SessionStore>,
+    /// Device-default session store (kind = `"device-default"`). Holds the
+    /// per-`(device_id, room_profile)` always-on session that heartbeat
+    /// pushes target and that a satellite falls into when no other session
+    /// is selected. Lazy-created, daily-rotated. See #122.
+    pub(crate) device_default_session_store: Arc<SessionStore>,
     /// MCP session store (kind = `"mcp"`). Holds long-lived
     /// per-project sessions written through `/mcp`'s `write_report`
-    /// tool — kept physically separate from `rpc_session_store` so the
+    /// tool — kept physically separate from `cross_device_session_store` so the
     /// project index scan and any future MCP-specific retention only
     /// see MCP traffic.
     pub(crate) mcp_session_store: Arc<SessionStore>,
@@ -121,7 +130,8 @@ impl ServeState {
         registry: Arc<ProviderRegistry>,
         workspace: Arc<Workspace>,
         tools: Arc<ToolSet>,
-        rpc_session_store: Arc<SessionStore>,
+        cross_device_session_store: Arc<SessionStore>,
+        device_default_session_store: Arc<SessionStore>,
         mcp_session_store: Arc<SessionStore>,
         voice: Option<Arc<VoiceProviders>>,
         image_cache: Option<Arc<crate::image_cache::ImageCache>>,
@@ -148,7 +158,8 @@ impl ServeState {
             registry,
             workspace,
             tools,
-            rpc_session_store,
+            cross_device_session_store,
+            device_default_session_store,
             mcp_session_store,
             mcp_project_index: tokio::sync::Mutex::new(mcp_index),
             sessions: tokio::sync::Mutex::new(HashMap::new()),
@@ -158,6 +169,24 @@ impl ServeState {
             voice,
             voice_subscribers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             image_cache,
+        }
+    }
+
+    /// Pick the [`SessionStore`] that owns `session_id`. Device-default
+    /// sessions land in `device-default/`; everything else (cross-device
+    /// text sessions, deferred sessions awaiting their first message)
+    /// lives in `cross_device_session_store`'s `rpc/` tree. Falls back
+    /// to the cross-device store so newly-`ensure_session`'d files
+    /// (which haven't hit disk yet) commit to the right place. See #122.
+    pub(crate) fn store_for_session(&self, session_id: &str) -> &Arc<SessionStore> {
+        if self
+            .device_default_session_store
+            .absolute_path_for(session_id)
+            .is_some()
+        {
+            &self.device_default_session_store
+        } else {
+            &self.cross_device_session_store
         }
     }
 
@@ -332,19 +361,13 @@ async fn summarize_all_sessions(state: &Arc<ServeState>) {
     );
     for (session_id, messages) in snapshot {
         let provider = state.provider_for_session(&session_id).await;
+        let store = state.store_for_session(&session_id);
         match generate_summary(&*provider, &messages).await {
             Ok(summary) if !summary.trim().is_empty() => {
-                if let Err(e) = state
-                    .rpc_session_store
-                    .append_summary(&session_id, &summary)
-                {
+                if let Err(e) = store.append_summary(&session_id, &summary) {
                     warn!("Failed to persist shutdown summary for {session_id}: {e}");
                 }
-                if let Err(e) =
-                    state
-                        .rpc_session_store
-                        .append_intraday_digest(&session_id, &summary, None)
-                {
+                if let Err(e) = store.append_intraday_digest(&session_id, &summary, None) {
                     warn!("Failed to persist shutdown intra-day digest for {session_id}: {e}");
                 }
             }
@@ -475,7 +498,7 @@ async fn handle_initialize(
 
         match param_id {
             None => None,
-            Some(ref id) if id.len() == 7 => match state.rpc_session_store.find_by_public_id(id) {
+            Some(ref id) if id.len() == 7 => match state.cross_device_session_store.find_by_public_id(id) {
                 Some(uuid) => Some(uuid),
                 None => {
                     let body = error_response(req_id, -32602, "Session not found");
@@ -495,7 +518,7 @@ async fn handle_initialize(
 
     let (session_id, is_new) = match resolved {
         Some(id) => {
-            let exists = state.rpc_session_store.load_session(&id).is_some();
+            let exists = state.cross_device_session_store.load_session(&id).is_some();
             (id, !exists)
         }
         None => (uuid::Uuid::now_v7().to_string(), true),
@@ -517,13 +540,13 @@ async fn handle_initialize(
         let mut sessions = state.sessions.lock().await;
         sessions.entry(session_id.clone()).or_insert_with(|| {
             state
-                .rpc_session_store
+                .cross_device_session_store
                 .load_session(&session_id)
                 .unwrap_or_default()
         });
         // Look up the public_id from the existing file metadata.
         state
-            .rpc_session_store
+            .cross_device_session_store
             .list_sessions()
             .into_iter()
             .find(|m| m.session_id == session_id)
@@ -645,7 +668,7 @@ async fn handle_chat(
 // ---------------------------------------------------------------------------
 
 async fn handle_list_sessions(state: Arc<ServeState>, req_id: Value) -> axum::response::Response {
-    let metas = state.rpc_session_store.list_sessions();
+    let metas = state.cross_device_session_store.list_sessions();
     let items: Vec<Value> = metas
         .into_iter()
         .map(|m| {
@@ -689,7 +712,7 @@ async fn handle_get_session(
     };
 
     let messages = state
-        .rpc_session_store
+        .store_for_session(&session_id)
         .load_session(&session_id)
         .unwrap_or_default();
 
@@ -834,12 +857,31 @@ async fn handle_voice_pipeline_run(
     // `rpc_post`; clients no longer pass it as a param.
     let language = params["language"].as_str().map(|s| s.to_string());
 
-    // Derive a deterministic session id from (device_id, room_profile)
-    // so the satellite can resume the conversation thread across
-    // restarts / day boundaries without juggling explicit session
-    // tokens. Pin the room_profile so run_llm_turn picks up the
-    // right LLM profile + memory namespace + voice config.
-    let session_id = voice_session_id(&device_id, &room_profile);
+    // Resolve / lazily-create the device-default session for this
+    // `(device_id, room_profile)` pair under that profile's memory
+    // namespace. Daily rotation falls out naturally: a satellite
+    // reconnecting after the day boundary finds yesterday's file as
+    // "not in today's window" and a fresh UUID file is opened. See #122.
+    let namespace = state
+        .config
+        .namespace_for_room_profile(&room_profile)
+        .to_string();
+    let session_id = match state.device_default_session_store.find_or_create_for_device(
+        &device_id,
+        &room_profile,
+        &namespace,
+        state.config.day_boundary_hour,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            let body = error_response(
+                req_id,
+                -32603,
+                &format!("failed to resolve device-default session: {e}"),
+            );
+            return body.into_response();
+        }
+    };
     state
         .session_room_profiles
         .lock()
@@ -997,28 +1039,6 @@ async fn translate_voice_pushes(
     }
 }
 
-/// Deterministic session id derived from `(device_id, room_profile)`.
-/// Always-same input ⇒ always-same id, so a satellite reconnecting
-/// after a crash or day rollover resumes the same conversation file.
-///
-/// Format: `voice-<first 16 hex chars of SHA-256>`. Filesystem-safe,
-/// unique enough for any realistic deployment.
-pub(crate) fn voice_session_id(device_id: &str, room_profile: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"voice:");
-    hasher.update(device_id.as_bytes());
-    hasher.update(b":");
-    hasher.update(room_profile.as_bytes());
-    let hash = hasher.finalize();
-    let mut s = String::with_capacity(22);
-    s.push_str("voice-");
-    for b in &hash[..8] {
-        use std::fmt::Write;
-        let _ = write!(&mut s, "{b:02x}");
-    }
-    s
-}
 
 async fn run_voice_turn(
     state: Arc<ServeState>,
@@ -1347,7 +1367,7 @@ async fn run_voice_turn_from_text_sse(
         tokio::spawn(async move {
             let p = state2.provider_for_session(&sid).await;
             if let Some(title) = generate_session_title(&*p, &user_text, &reply).await
-                && let Err(e) = state2.rpc_session_store.set_title(&sid, &title)
+                && let Err(e) = state2.store_for_session(&sid).set_title(&sid, &title)
             {
                 warn!("Failed to store session title: {e}");
             }
@@ -1403,9 +1423,23 @@ pub(crate) async fn push_voice_text_to_subscriber(
         return Err(VoicePushError::NotConfigured);
     }
 
-    // Pin the room_profile on the synthetic session id so
-    // `resolve_voice_pipeline` and `run_llm_turn` find the right config.
-    let session_id = voice_session_id(&device_id, &room_profile);
+    // Resolve / lazily-create the device-default session for this
+    // `(device_id, room_profile)` pair under that profile's memory
+    // namespace, then pin the room_profile so `resolve_voice_pipeline`
+    // and `run_llm_turn` find the right config. See #122.
+    let namespace = state
+        .config
+        .namespace_for_room_profile(&room_profile)
+        .to_string();
+    let session_id = state
+        .device_default_session_store
+        .find_or_create_for_device(
+            &device_id,
+            &room_profile,
+            &namespace,
+            state.config.day_boundary_hour,
+        )
+        .map_err(|e| VoicePushError::Other(format!("device-default lookup: {e}")))?;
     state
         .session_room_profiles
         .lock()
@@ -1554,17 +1588,16 @@ async fn run_llm_turn(
         }
     };
 
+    // Pick the right store up front so every persistence call in this
+    // turn lands in the same place (device-default vs cross-device).
+    let store = Arc::clone(state.store_for_session(&session_id));
+
     // 1. Load or lazy-hydrate in-memory history
     let mut history: Vec<ChatMessage> = {
         let mut sessions = state.sessions.lock().await;
         sessions
             .entry(session_id.clone())
-            .or_insert_with(|| {
-                state
-                    .rpc_session_store
-                    .load_session(&session_id)
-                    .unwrap_or_default()
-            })
+            .or_insert_with(|| store.load_session(&session_id).unwrap_or_default())
             .clone()
     };
     let was_first_turn = history.is_empty();
@@ -1586,14 +1619,21 @@ async fn run_llm_turn(
 
     // 2b. Ensure JSONL file exists. If this session was deferred at initialize
     //     time, commit it now using the reserved public_id.
+    //
+    // Device-default sessions are always already-on-disk by the time
+    // run_llm_turn runs (find_or_create_for_device writes the meta
+    // line at create time) so `ensure_session` against them is a
+    // no-op. Skip it to avoid synthesising a spurious grain-id
+    // public_id that device-default sessions don't need.
     let key: ConversationKey = (session_id.clone(), None);
-    let pending_pub_id = state.pending_sessions.lock().await.remove(&session_id);
-    if let Err(e) = state
-        .rpc_session_store
-        .ensure_session(&session_id, &key, "rpc", pending_pub_id, &namespace)
-        .map(|_| ())
-    {
-        warn!("Failed to ensure session file: {e}");
+    if Arc::ptr_eq(&store, &state.cross_device_session_store) {
+        let pending_pub_id = state.pending_sessions.lock().await.remove(&session_id);
+        if let Err(e) = store
+            .ensure_session(&session_id, &key, "rpc", pending_pub_id, &namespace)
+            .map(|_| ())
+        {
+            warn!("Failed to ensure session file: {e}");
+        }
     }
 
     // 3a. System prompt (rebuilt fresh per request).
@@ -1620,7 +1660,7 @@ async fn run_llm_turn(
     //    `SessionStore::append` so the in-memory history keeps full image
     //    bytes for the provider call while JSONL gets a hash marker.
     history.push(user_msg.clone());
-    if let Err(e) = state.rpc_session_store.append(&session_id, &user_msg) {
+    if let Err(e) = store.append(&session_id, &user_msg) {
         warn!("Failed to persist user message: {e}");
     }
 
@@ -1648,10 +1688,7 @@ async fn run_llm_turn(
         match maybe_compress(&*provider, system.as_deref(), &history, compression_config).await {
             Ok(Some(result)) => {
                 history = result.compressed;
-                if let Err(e) = state
-                    .rpc_session_store
-                    .append_summary(&session_id, &result.summary)
-                {
+                if let Err(e) = store.append_summary(&session_id, &result.summary) {
                     warn!("Failed to persist compaction summary: {e}");
                 }
             }
@@ -1682,7 +1719,7 @@ async fn run_llm_turn(
                 let text = resp.text.unwrap_or_default();
                 let msg = ChatMessage::assistant(&text);
                 history.push(msg.clone());
-                if let Err(e) = state.rpc_session_store.append(&session_id, &msg) {
+                if let Err(e) = store.append(&session_id, &msg) {
                     warn!("Failed to persist assistant message: {e}");
                 }
                 if !text.is_empty() {
@@ -1827,7 +1864,7 @@ async fn run_turn(
         tokio::spawn(async move {
             let p = state2.provider_for_session(&sid).await;
             if let Some(title) = generate_session_title(&*p, &user_msg, &text).await
-                && let Err(e) = state2.rpc_session_store.set_title(&sid, &title)
+                && let Err(e) = state2.store_for_session(&sid).set_title(&sid, &title)
             {
                 warn!("Failed to store session title: {e}");
             }
