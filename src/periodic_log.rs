@@ -1156,9 +1156,10 @@ pub async fn catchup_pending_yearly_logs(
 // ---------------------------------------------------------------------------
 
 /// Render the bullet block that goes under `# Today's Cross-Session Notes`
-/// for `namespace`. Walks `channel_store` and `api_store` for digests
-/// whose `digest_at` falls inside `today`'s local window, keeping only
-/// the latest per session that maps to `namespace` via `room_to_namespace`.
+/// for `namespace`. Walks `channel_store`, `cross_device_store`, and
+/// `device_default_store` for digests whose `digest_at` falls inside
+/// `today`'s local window, keeping only the latest per session that
+/// maps to `namespace`.
 ///
 /// Returns `None` when no qualifying digest exists, so the caller can
 /// omit the namespace from the cache map and the system prompt block.
@@ -1167,7 +1168,8 @@ pub fn build_today_digest_for_namespace<F>(
     today: NaiveDate,
     boundary_hour: u8,
     channel_store: &SessionStore,
-    api_store: Option<&SessionStore>,
+    cross_device_store: Option<&SessionStore>,
+    device_default_store: Option<&SessionStore>,
     room_to_namespace: F,
 ) -> Option<String>
 where
@@ -1175,8 +1177,11 @@ where
 {
     let mut entries: Vec<(SessionMeta, crate::session::IntradayDigestLine)> = Vec::new();
     entries.extend(channel_store.intraday_digests_for_day(today, boundary_hour));
-    if let Some(api) = api_store {
-        entries.extend(api.intraday_digests_for_day(today, boundary_hour));
+    if let Some(s) = cross_device_store {
+        entries.extend(s.intraday_digests_for_day(today, boundary_hour));
+    }
+    if let Some(s) = device_default_store {
+        entries.extend(s.intraday_digests_for_day(today, boundary_hour));
     }
     if entries.is_empty() {
         return None;
@@ -1187,15 +1192,23 @@ where
         // Dual-accept `"api"` (legacy) and `"rpc"` (post-#112) until the
         // bundled session migration rewrites stored `meta.channel` strings.
         let is_rpc = meta.channel == "rpc" || meta.channel == "api";
+        let is_device_default = meta.channel == "device-default";
         let ns = if is_rpc {
             crate::config::DEFAULT_NAMESPACE_NAME.to_string()
+        } else if is_device_default {
+            // Device-default sessions pin their namespace at create time —
+            // honour it directly so an NSFW-profile satellite's digests
+            // don't leak into the default namespace.
+            meta.namespace
+                .clone()
+                .unwrap_or_else(|| crate::config::DEFAULT_NAMESPACE_NAME.to_string())
         } else {
             room_to_namespace(&meta.room_id)
         };
         if ns != namespace {
             continue;
         }
-        let room_label = if is_rpc {
+        let room_label = if is_rpc || is_device_default {
             meta.title.clone().unwrap_or_else(|| {
                 format!("{}/{}", meta.channel, short_id(&meta.session_id))
             })
@@ -1226,7 +1239,8 @@ pub fn build_all_today_digests<F>(
     today: NaiveDate,
     boundary_hour: u8,
     channel_store: &SessionStore,
-    api_store: Option<&SessionStore>,
+    cross_device_store: Option<&SessionStore>,
+    device_default_store: Option<&SessionStore>,
     room_to_namespace: F,
 ) -> HashMap<String, String>
 where
@@ -1239,7 +1253,8 @@ where
             today,
             boundary_hour,
             channel_store,
-            api_store,
+            cross_device_store,
+            device_default_store,
             room_to_namespace,
         ) {
             out.insert(ns.clone(), text);
