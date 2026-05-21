@@ -187,11 +187,11 @@ pub struct SessionStore {
     /// so retrieve indexing can scope itself by directory and never
     /// accidentally mix NSFW sessions with default-namespace ones.
     pub base_dir: PathBuf,
-    /// Second-level subdirectory: `"channel"` for Matrix/Discord, `"rpc"`
-    /// for HTTP (renamed from `"api"` in #112; readers transparently
-    /// fall through to the legacy `"api"` dir until the bundled session
-    /// migration moves the files). Lets the Agent and ServeState keep
-    /// separate `SessionStore` instances while sharing one base dir.
+    /// Second-level subdirectory: `"channel"` for Matrix/Discord,
+    /// `"cross-device"` for user-selectable RPC sessions,
+    /// `"device-default"` for per-`(device_id, room_profile)` sessions,
+    /// `"mcp"` for MCP project sessions. Lets the Agent and ServeState
+    /// keep separate `SessionStore` instances while sharing one base dir.
     pub kind: &'static str,
     /// Optional sapphire-workspace state. When set, file modifications notify
     /// the workspace so the index/cache and git staging stay in sync.
@@ -658,9 +658,9 @@ impl SessionStore {
     /// Ensure a session file exists for the given caller-supplied ID.
     /// Unlike `create_session`, this uses the provided ID rather than generating a new UUID.
     ///
-    /// For RPC sessions (`channel == "rpc"`, or legacy `"api"`), a grain-id
-    /// `public_id` is generated on creation unless `public_id_override` is
-    /// supplied (used to commit a deferred public_id).
+    /// For RPC sessions (`channel == "rpc"`), a grain-id `public_id` is
+    /// generated on creation unless `public_id_override` is supplied
+    /// (used to commit a deferred public_id).
     /// Returns the `public_id` if present (new or existing).
     pub fn ensure_session(
         &self,
@@ -679,7 +679,7 @@ impl SessionStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let public_id = if channel == "rpc" || channel == "api" {
+        let public_id = if channel == "rpc" {
             Some(public_id_override.unwrap_or_else(|| grain_id::GrainId::random().to_string()))
         } else {
             None
@@ -986,36 +986,24 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Enumerate `<base_dir>/<namespace>/<kind>/*.jsonl` across every namespace
 /// directory. Returns an empty Vec when `base_dir` doesn't exist yet (fresh
 /// install) or has no namespace subdirs. Each returned path is absolute.
-///
-/// Dual-read shim for #112: when `kind == "rpc"`, the legacy `"api"` directory
-/// is also scanned so post-rename builds keep surfacing pre-migration files.
-/// The bundled session-store migration removes the shim once it has moved the
-/// files into the new layout.
 fn collect_session_files(base_dir: &Path, kind: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(base_dir) else {
         return out;
-    };
-    let scan_kinds: &[&str] = if kind == "rpc" {
-        &["rpc", "api"]
-    } else {
-        std::slice::from_ref(&kind)
     };
     for entry in entries.flatten() {
         let ns_dir = entry.path();
         if !ns_dir.is_dir() {
             continue;
         }
-        for k in scan_kinds {
-            let kind_dir = ns_dir.join(k);
-            let Ok(kind_entries) = fs::read_dir(&kind_dir) else {
-                continue;
-            };
-            for k_entry in kind_entries.flatten() {
-                let path = k_entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    out.push(path);
-                }
+        let kind_dir = ns_dir.join(kind);
+        let Ok(kind_entries) = fs::read_dir(&kind_dir) else {
+            continue;
+        };
+        for k_entry in kind_entries.flatten() {
+            let path = k_entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                out.push(path);
             }
         }
     }
@@ -1231,38 +1219,6 @@ mod tests {
             scrub_images_for_storage(&msg).is_none(),
             "scrub should leave ImageRef-only messages untouched"
         );
-    }
-
-    /// Post-#112 dual-read shim: when scanning for `"rpc"` files, the
-    /// legacy `"api"` sub-directory must also be visible so existing
-    /// sessions stay reachable until the bundled migration moves them.
-    #[test]
-    fn collect_session_files_dual_reads_legacy_api_dir() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let ns = tmp.path().join("default");
-        let api_dir = ns.join("api");
-        let rpc_dir = ns.join("rpc");
-        fs::create_dir_all(&api_dir).unwrap();
-        fs::create_dir_all(&rpc_dir).unwrap();
-        let legacy = api_dir.join("old.jsonl");
-        let fresh = rpc_dir.join("new.jsonl");
-        std::fs::write(&legacy, b"").unwrap();
-        std::fs::write(&fresh, b"").unwrap();
-
-        // Stray file that should NOT be picked up (wrong extension).
-        std::fs::write(rpc_dir.join("ignore.txt"), b"").unwrap();
-
-        let mut found = collect_session_files(tmp.path(), "rpc");
-        found.sort();
-        assert_eq!(found, {
-            let mut expected = vec![legacy, fresh];
-            expected.sort();
-            expected
-        });
-
-        // Sanity: scanning a non-rpc kind does NOT pull in the api dir.
-        let channel_only = collect_session_files(tmp.path(), "channel");
-        assert!(channel_only.is_empty(), "channel scan must not see rpc/api dirs");
     }
 
     // ── device-default session routing (#122) ────────────────────────────

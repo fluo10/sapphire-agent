@@ -102,10 +102,9 @@ pub struct RoomInfo {
     /// Free-form description / topic. `None` when the channel side has
     /// nothing to offer (e.g. Matrix DM with no topic).
     pub description: Option<String>,
-    /// Originating channel name: `"matrix"`, `"discord"`, `"rpc"`
-    /// (legacy `"api"` until the bundled session migration rewrites
-    /// stored values), or `"voice"`. Lets the system prompt tell the
-    /// model whether transcripts may contain STT errors etc.
+    /// Originating channel name: `"matrix"`, `"discord"`, `"rpc"`,
+    /// `"device-default"`, or `"voice"`. Lets the system prompt tell
+    /// the model whether transcripts may contain STT errors etc.
     pub kind: String,
 }
 

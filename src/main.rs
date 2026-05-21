@@ -181,6 +181,15 @@ async fn main() -> Result<()> {
             if let Err(e) = migrate_sessions_to_namespaced_layout(&sessions_base_for_migration) {
                 anyhow::bail!("Session namespace migration failed: {e:#}");
             }
+            // ── Split sessions/<ns>/{api,rpc}/ into cross-device + legacy-voice ─
+            // Quarantines pre-redesign voice files (their `voice-<hash>`
+            // names can't be re-hydrated into the new
+            // `(device_id, room_profile)` keying) and moves remaining
+            // sessions into the new `cross-device/` directory, rewriting
+            // stored `meta.channel = "api"` → `"rpc"` along the way.
+            if let Err(e) = migrate_to_device_default_layout(&sessions_base_for_migration) {
+                anyhow::bail!("Device-default session migration failed: {e:#}");
+            }
 
             // ── Bootstrap file loader (AGENTS.md, SOUL.md, MEMORY.md …) ────
             let workspace = Arc::new(Workspace::new(workspace_dir.clone(), config.digest.clone()));
@@ -262,15 +271,14 @@ async fn main() -> Result<()> {
                     .context("Failed to build provider registry")?,
             );
 
-            // ── Cross-device session store (sessions/<namespace>/rpc/) ─────
+            // ── Cross-device session store (sessions/<namespace>/cross-device/) ─
             // Cross-device sessions are the user-selectable, multi-device
             // conversation threads (resumed via `--resume <grain-id>`).
-            // The on-disk directory is still `rpc/` until the bundled
-            // session migration (#122 PR 3) renames it to `cross-device/`;
-            // the kind constant matches.
+            // The bundled session migration moves pre-PR-3 files into
+            // this dir from the legacy `api/` and `rpc/` locations.
             let cross_device_session_store = Arc::new(SessionStore::with_workspace(
                 sessions_base.clone(),
-                "rpc",
+                "cross-device",
                 Arc::clone(&ws_state),
             ));
 
@@ -431,10 +439,7 @@ async fn main() -> Result<()> {
                     let cfg_for_predicate = config.clone();
                     let ns_for_predicate = ns.clone();
                     let predicate = move |meta: &session::SessionMeta| -> bool {
-                        // Dual-accept `"api"` (legacy) and `"rpc"` (post-#112)
-                        // until the bundled session migration rewrites stored
-                        // `meta.channel` strings.
-                        if meta.channel == "api" || meta.channel == "rpc" {
+                        if meta.channel == "rpc" {
                             return ns_for_predicate == config::DEFAULT_NAMESPACE_NAME;
                         }
                         cfg_for_predicate.namespace_for_room(&meta.room_id) == ns_for_predicate
@@ -759,6 +764,161 @@ fn migrate_sessions_to_namespaced_layout(sessions_base: &std::path::Path) -> any
     Ok(())
 }
 
+/// One-shot migration completing #112 + #122: split each
+/// `sessions/<ns>/{api,rpc}/` directory into the new layout.
+///
+/// - Files whose name starts with `voice-` are pre-redesign voice
+///   sessions. Their `(device_id, room_profile)` was hashed into the
+///   filename and is unrecoverable from disk, so we can't slot them
+///   into the new device-default layout. They move to
+///   `sessions/<ns>/legacy-voice/` instead — the daily-log archive
+///   still indexes their content for FTS / semantic search; only the
+///   live continuation is given up.
+/// - Everything else moves to `sessions/<ns>/cross-device/`, with
+///   stored `meta.channel = "api"` rewritten to `"rpc"` in-place.
+/// - The PR 1 dual-read shim and dual-accept fallbacks become
+///   unnecessary after this run.
+///
+/// Idempotent: a workspace that's already migrated has no `api/` or
+/// `rpc/` directory under any namespace and the function exits silently.
+/// Refuses to run when a name collision would clobber an existing
+/// destination (extremely unlikely with UUIDs but handled for safety).
+fn migrate_to_device_default_layout(sessions_base: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let Ok(ns_entries) = std::fs::read_dir(sessions_base) else {
+        return Ok(());
+    };
+
+    let mut moved = 0usize;
+    let mut quarantined = 0usize;
+
+    for ns_entry in ns_entries.flatten() {
+        let ns_dir = ns_entry.path();
+        if !ns_dir.is_dir() {
+            continue;
+        }
+
+        for src_kind in ["api", "rpc"] {
+            let src_dir = ns_dir.join(src_kind);
+            if !src_dir.is_dir() {
+                continue;
+            }
+            let entries = match std::fs::read_dir(&src_dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("Skipping {}: {e}", src_dir.display());
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file()
+                    || path.extension().and_then(|e| e.to_str()) != Some("jsonl")
+                {
+                    continue;
+                }
+                let Some(file_name) = path.file_name() else {
+                    continue;
+                };
+                let is_voice = file_name
+                    .to_str()
+                    .map(|s| s.starts_with("voice-"))
+                    .unwrap_or(false);
+
+                let (dst_dir, needs_meta_rewrite) = if is_voice {
+                    (ns_dir.join("legacy-voice"), false)
+                } else {
+                    // Cross-device files moving from the legacy `api/`
+                    // directory still carry `meta.channel = "api"` in
+                    // their first line — rewrite to `"rpc"` so the
+                    // dual-accept fallbacks can be removed.
+                    (ns_dir.join("cross-device"), src_kind == "api")
+                };
+                std::fs::create_dir_all(&dst_dir)
+                    .with_context(|| format!("create {}", dst_dir.display()))?;
+                let dst = dst_dir.join(file_name);
+                if dst.exists() {
+                    anyhow::bail!(
+                        "Refusing to migrate {}: destination {} already exists. \
+                         Reconcile manually before starting.",
+                        path.display(),
+                        dst.display(),
+                    );
+                }
+
+                if needs_meta_rewrite {
+                    // Stream the source into a temp file at the
+                    // destination dir (so `fs::rename` stays
+                    // intra-filesystem and atomic), rewriting just the
+                    // first line. Then drop the source.
+                    let tmp = dst.with_extension("partial");
+                    let src_file = std::fs::File::open(&path)
+                        .with_context(|| format!("open {}", path.display()))?;
+                    let mut reader = BufReader::new(src_file);
+                    let mut first_line = String::new();
+                    reader
+                        .read_line(&mut first_line)
+                        .with_context(|| format!("read first line of {}", path.display()))?;
+
+                    let rewritten = rewrite_meta_channel(first_line.trim(), "rpc")?;
+                    let mut writer = std::fs::File::create(&tmp)
+                        .with_context(|| format!("create {}", tmp.display()))?;
+                    writeln!(writer, "{rewritten}")
+                        .with_context(|| format!("write {}", tmp.display()))?;
+                    std::io::copy(&mut reader, &mut writer)
+                        .with_context(|| format!("copy body of {}", path.display()))?;
+                    drop(writer);
+                    std::fs::rename(&tmp, &dst).with_context(|| {
+                        format!("rename {} -> {}", tmp.display(), dst.display())
+                    })?;
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("remove {}", path.display()))?;
+                } else {
+                    std::fs::rename(&path, &dst).with_context(|| {
+                        format!("rename {} -> {}", path.display(), dst.display())
+                    })?;
+                }
+
+                if is_voice {
+                    quarantined += 1;
+                } else {
+                    moved += 1;
+                }
+            }
+            // Remove the now-empty source dir; non-fatal if it has
+            // leftovers (e.g. operator dropped unrelated files).
+            let _ = std::fs::remove_dir(&src_dir);
+        }
+    }
+
+    if moved > 0 || quarantined > 0 {
+        tracing::info!(
+            "Session migration: {moved} cross-device session(s), \
+             {quarantined} legacy voice file(s) quarantined under legacy-voice/"
+        );
+    }
+    Ok(())
+}
+
+/// Parse a session-meta JSONL line, set `meta.channel` to `new_channel`,
+/// and re-serialise. Used by `migrate_to_device_default_layout` to
+/// rewrite legacy `"api"` strings to `"rpc"` while preserving all
+/// other meta fields.
+fn rewrite_meta_channel(line: &str, new_channel: &str) -> anyhow::Result<String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(line).with_context(|| format!("parse meta line: {line}"))?;
+    if let Some(meta) = value.get_mut("meta").and_then(|m| m.as_object_mut()) {
+        meta.insert(
+            "channel".to_string(),
+            serde_json::Value::String(new_channel.to_string()),
+        );
+    } else {
+        anyhow::bail!("first JSONL line missing `meta` object: {line}");
+    }
+    Ok(serde_json::to_string(&value)?)
+}
+
 /// One-shot migration from the per-channel session layout
 /// (`sessions/matrix/` + `sessions/discord/`) to the consolidated
 /// `sessions/channel/` directory. The originating channel is still
@@ -1051,6 +1211,151 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(base.join("channel/01H1.jsonl")).unwrap(),
+            "pre-existing"
+        );
+    }
+
+    // ── device-default layout migration (#122 PR 3) ──────────────────────
+
+    /// Render a minimal meta line for the device-default migration tests.
+    /// Only `session_id` and `channel` are exercised by the migration —
+    /// everything else just rides along untouched.
+    fn meta_line(session_id: &str, channel: &str) -> String {
+        format!(
+            r#"{{"meta":{{"session_id":"{session_id}","room_id":"","thread_id":null,"channel":"{channel}","created_at":"2026-05-22T00:00:00Z","namespace":"default"}}}}"#
+        )
+    }
+
+    #[test]
+    fn device_default_migration_no_op_on_fresh_workspace() {
+        let td = tempfile::tempdir().unwrap();
+        migrate_to_device_default_layout(td.path()).expect("clean migration");
+        // No directories should be created on an empty workspace.
+        assert!(!td.path().join("default").exists());
+    }
+
+    /// Cross-device text sessions move into `cross-device/`;
+    /// `voice-<hash>` files go into `legacy-voice/`. Both source dirs
+    /// are removed afterwards.
+    #[test]
+    fn device_default_migration_moves_cross_device_and_quarantines_voice() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path();
+        let ns = base.join("default");
+        write_stub(
+            &ns.join("api").join("uuid-text.jsonl"),
+            &meta_line("uuid-text", "api"),
+        );
+        write_stub(
+            &ns.join("rpc").join("uuid-text-modern.jsonl"),
+            &meta_line("uuid-text-modern", "rpc"),
+        );
+        write_stub(
+            &ns.join("api").join("voice-deadbeef.jsonl"),
+            &meta_line("voice-deadbeef", "api"),
+        );
+        write_stub(
+            &ns.join("rpc").join("voice-feedface.jsonl"),
+            &meta_line("voice-feedface", "rpc"),
+        );
+
+        migrate_to_device_default_layout(base).expect("migration");
+
+        assert!(ns.join("cross-device/uuid-text.jsonl").exists());
+        assert!(ns.join("cross-device/uuid-text-modern.jsonl").exists());
+        assert!(ns.join("legacy-voice/voice-deadbeef.jsonl").exists());
+        assert!(ns.join("legacy-voice/voice-feedface.jsonl").exists());
+        assert!(!ns.join("api").exists(), "api dir should be removed");
+        assert!(!ns.join("rpc").exists(), "rpc dir should be removed");
+    }
+
+    /// Files that arrive from the legacy `api/` dir get their stored
+    /// `meta.channel = "api"` rewritten to `"rpc"`; files from `rpc/`
+    /// keep their meta unchanged. Voice files in `legacy-voice/` are
+    /// preserved verbatim (no rewrite — they're never re-loaded).
+    #[test]
+    fn device_default_migration_rewrites_legacy_meta_channel() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path();
+        let ns = base.join("default");
+        write_stub(
+            &ns.join("api").join("uuid-from-api.jsonl"),
+            &meta_line("uuid-from-api", "api"),
+        );
+        write_stub(
+            &ns.join("rpc").join("uuid-from-rpc.jsonl"),
+            &meta_line("uuid-from-rpc", "rpc"),
+        );
+        write_stub(
+            &ns.join("api").join("voice-cafe.jsonl"),
+            &meta_line("voice-cafe", "api"),
+        );
+
+        migrate_to_device_default_layout(base).expect("migration");
+
+        let api_migrated =
+            std::fs::read_to_string(ns.join("cross-device/uuid-from-api.jsonl")).unwrap();
+        assert!(
+            api_migrated.contains(r#""channel":"rpc""#),
+            "legacy `api` meta must be rewritten to `rpc`: {api_migrated}"
+        );
+        assert!(
+            !api_migrated.contains(r#""channel":"api""#),
+            "legacy `api` meta should no longer appear: {api_migrated}"
+        );
+
+        let rpc_migrated =
+            std::fs::read_to_string(ns.join("cross-device/uuid-from-rpc.jsonl")).unwrap();
+        assert!(
+            rpc_migrated.contains(r#""channel":"rpc""#),
+            "post-PR1 `rpc` meta stays as-is: {rpc_migrated}"
+        );
+
+        let voice_quarantined =
+            std::fs::read_to_string(ns.join("legacy-voice/voice-cafe.jsonl")).unwrap();
+        assert!(
+            voice_quarantined.contains(r#""channel":"api""#),
+            "voice meta is preserved verbatim (no rewrite): {voice_quarantined}"
+        );
+    }
+
+    #[test]
+    fn device_default_migration_is_idempotent() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path();
+        let ns = base.join("default");
+        write_stub(
+            &ns.join("api").join("uuid-text.jsonl"),
+            &meta_line("uuid-text", "api"),
+        );
+        migrate_to_device_default_layout(base).expect("first");
+        migrate_to_device_default_layout(base).expect("second is a no-op");
+        assert!(ns.join("cross-device/uuid-text.jsonl").exists());
+    }
+
+    #[test]
+    fn device_default_migration_refuses_on_collision() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path();
+        let ns = base.join("default");
+        write_stub(
+            &ns.join("api").join("uuid-text.jsonl"),
+            &meta_line("uuid-text", "api"),
+        );
+        write_stub(
+            &ns.join("cross-device").join("uuid-text.jsonl"),
+            "pre-existing",
+        );
+
+        let err = migrate_to_device_default_layout(base).expect_err("collision");
+        assert!(
+            format!("{err:#}").contains("already exists"),
+            "got: {err:#}"
+        );
+        // Source untouched.
+        assert!(ns.join("api/uuid-text.jsonl").exists());
+        assert_eq!(
+            std::fs::read_to_string(ns.join("cross-device/uuid-text.jsonl")).unwrap(),
             "pre-existing"
         );
     }

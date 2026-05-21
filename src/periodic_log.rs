@@ -1189,9 +1189,7 @@ where
 
     let mut lines: Vec<String> = Vec::new();
     for (meta, digest) in entries {
-        // Dual-accept `"api"` (legacy) and `"rpc"` (post-#112) until the
-        // bundled session migration rewrites stored `meta.channel` strings.
-        let is_rpc = meta.channel == "rpc" || meta.channel == "api";
+        let is_rpc = meta.channel == "rpc";
         let is_device_default = meta.channel == "device-default";
         let ns = if is_rpc {
             crate::config::DEFAULT_NAMESPACE_NAME.to_string()

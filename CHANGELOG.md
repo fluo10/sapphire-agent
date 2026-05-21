@@ -33,8 +33,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ServeState::rpc_session_store` → `cross_device_session_store`** —
   user-selectable, multi-device sessions resumed via `--resume
   <grain-id>` are now logically separated from device-default sessions.
-  The on-disk directory remains `sessions/<ns>/rpc/` for now; the
-  bundled session migration (PR 3) renames it to `cross-device/`. (#122)
+  On-disk directory moves to `sessions/<ns>/cross-device/`; the bundled
+  session migration relocates pre-existing files. (#122)
+
+### Migration
+
+- **One-shot session-store migration** runs on first startup of this
+  version, completing both #112 and #122:
+  - `sessions/<ns>/api/<uuid>.jsonl` and `sessions/<ns>/rpc/<uuid>.jsonl`
+    cross-device files move to `sessions/<ns>/cross-device/<uuid>.jsonl`.
+    Stored `meta.channel = "api"` is rewritten to `"rpc"` along the way.
+  - Pre-redesign voice files (`voice-<hash>.jsonl`) are quarantined to
+    `sessions/<ns>/legacy-voice/`. Their `(device_id, room_profile)`
+    routing key was hashed into the filename and is unrecoverable; the
+    daily-log archive still indexes their content so nothing is lost
+    for FTS / semantic search, only the live conversation continuation.
+  - The PR-1 dual-read shim and dual-accept `"api"`/`"rpc"` fallbacks
+    are removed after this migration runs.
+  - Idempotent and safe to interrupt. No backup is taken — the
+    workspace is expected to be under git.
 
 ## [0.6.1] - 2026-05-18
 
