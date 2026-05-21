@@ -29,7 +29,7 @@ use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::TensorRef;
 
 #[cfg(test)]
-use sapphire_agent_api::voice::PIPELINE_SAMPLE_RATE;
+use sapphire_agent_rpc::voice::PIPELINE_SAMPLE_RATE;
 
 /// 80 ms at 16 kHz. The OWW pipeline only advances state on this
 /// boundary; sub-chunk audio is buffered until the next multiple.

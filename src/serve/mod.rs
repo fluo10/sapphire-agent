@@ -59,10 +59,10 @@ pub struct ServeState {
     pub(crate) registry: Arc<ProviderRegistry>,
     pub(crate) workspace: Arc<Workspace>,
     pub(crate) tools: Arc<ToolSet>,
-    pub(crate) api_session_store: Arc<SessionStore>,
+    pub(crate) rpc_session_store: Arc<SessionStore>,
     /// MCP session store (kind = `"mcp"`). Holds long-lived
     /// per-project sessions written through `/mcp`'s `write_report`
-    /// tool — kept physically separate from `api_session_store` so the
+    /// tool — kept physically separate from `rpc_session_store` so the
     /// project index scan and any future MCP-specific retention only
     /// see MCP traffic.
     pub(crate) mcp_session_store: Arc<SessionStore>,
@@ -111,7 +111,7 @@ pub struct ServeState {
 }
 
 impl ServeState {
-    /// Construct a runtime ready for both the HTTP API server and
+    /// Construct a runtime ready for both the HTTP RPC server and
     /// the in-process channel handlers (Discord voice in particular).
     /// Shared across both so they read from the same session store /
     /// in-memory conversation map.
@@ -121,7 +121,7 @@ impl ServeState {
         registry: Arc<ProviderRegistry>,
         workspace: Arc<Workspace>,
         tools: Arc<ToolSet>,
-        api_session_store: Arc<SessionStore>,
+        rpc_session_store: Arc<SessionStore>,
         mcp_session_store: Arc<SessionStore>,
         voice: Option<Arc<VoiceProviders>>,
         image_cache: Option<Arc<crate::image_cache::ImageCache>>,
@@ -148,7 +148,7 @@ impl ServeState {
             registry,
             workspace,
             tools,
-            api_session_store,
+            rpc_session_store,
             mcp_session_store,
             mcp_project_index: tokio::sync::Mutex::new(mcp_index),
             sessions: tokio::sync::Mutex::new(HashMap::new()),
@@ -281,7 +281,7 @@ fn error_event(id: &Value, code: i32, message: &str) -> Event {
 pub async fn run(addr: String, state: Arc<ServeState>) -> anyhow::Result<()> {
     // Routes are intentionally separated so future protocol endpoints
     // (`/mcp` for the MCP server in #79/#80) can be mounted alongside
-    // `/rpc` without colliding with the control API methods (`chat`,
+    // `/rpc` without colliding with the methods (`chat`,
     // `initialize`, `voice/*`, …) that live here. The A2A protocol
     // endpoints below are mounted unconditionally — the handler refuses
     // requests when `[a2a].enabled = false` so we don't pay a route
@@ -327,7 +327,7 @@ async fn summarize_all_sessions(state: &Arc<ServeState>) {
         return;
     }
     info!(
-        "Graceful shutdown: summarizing {} API session(s)",
+        "Graceful shutdown: summarizing {} RPC session(s)",
         snapshot.len()
     );
     for (session_id, messages) in snapshot {
@@ -335,14 +335,14 @@ async fn summarize_all_sessions(state: &Arc<ServeState>) {
         match generate_summary(&*provider, &messages).await {
             Ok(summary) if !summary.trim().is_empty() => {
                 if let Err(e) = state
-                    .api_session_store
+                    .rpc_session_store
                     .append_summary(&session_id, &summary)
                 {
                     warn!("Failed to persist shutdown summary for {session_id}: {e}");
                 }
                 if let Err(e) =
                     state
-                        .api_session_store
+                        .rpc_session_store
                         .append_intraday_digest(&session_id, &summary, None)
                 {
                     warn!("Failed to persist shutdown intra-day digest for {session_id}: {e}");
@@ -475,7 +475,7 @@ async fn handle_initialize(
 
         match param_id {
             None => None,
-            Some(ref id) if id.len() == 7 => match state.api_session_store.find_by_public_id(id) {
+            Some(ref id) if id.len() == 7 => match state.rpc_session_store.find_by_public_id(id) {
                 Some(uuid) => Some(uuid),
                 None => {
                     let body = error_response(req_id, -32602, "Session not found");
@@ -495,7 +495,7 @@ async fn handle_initialize(
 
     let (session_id, is_new) = match resolved {
         Some(id) => {
-            let exists = state.api_session_store.load_session(&id).is_some();
+            let exists = state.rpc_session_store.load_session(&id).is_some();
             (id, !exists)
         }
         None => (uuid::Uuid::now_v7().to_string(), true),
@@ -517,13 +517,13 @@ async fn handle_initialize(
         let mut sessions = state.sessions.lock().await;
         sessions.entry(session_id.clone()).or_insert_with(|| {
             state
-                .api_session_store
+                .rpc_session_store
                 .load_session(&session_id)
                 .unwrap_or_default()
         });
         // Look up the public_id from the existing file metadata.
         state
-            .api_session_store
+            .rpc_session_store
             .list_sessions()
             .into_iter()
             .find(|m| m.session_id == session_id)
@@ -645,7 +645,7 @@ async fn handle_chat(
 // ---------------------------------------------------------------------------
 
 async fn handle_list_sessions(state: Arc<ServeState>, req_id: Value) -> axum::response::Response {
-    let metas = state.api_session_store.list_sessions();
+    let metas = state.rpc_session_store.list_sessions();
     let items: Vec<Value> = metas
         .into_iter()
         .map(|m| {
@@ -689,7 +689,7 @@ async fn handle_get_session(
     };
 
     let messages = state
-        .api_session_store
+        .rpc_session_store
         .load_session(&session_id)
         .unwrap_or_default();
 
@@ -706,7 +706,7 @@ async fn handle_get_session(
                 .map(|p| match p {
                     ContentPart::Text(t) => json!({ "type": "text", "text": t }),
                     ContentPart::Image { media_type, .. } => {
-                        // Image bytes are not exposed via the API listing; surface a marker only.
+                        // Image bytes are not exposed via the RPC listing; surface a marker only.
                         json!({ "type": "image", "media_type": media_type })
                     }
                     ContentPart::ImageRef { media_type, sha256 } => {
@@ -1347,7 +1347,7 @@ async fn run_voice_turn_from_text_sse(
         tokio::spawn(async move {
             let p = state2.provider_for_session(&sid).await;
             if let Some(title) = generate_session_title(&*p, &user_text, &reply).await
-                && let Err(e) = state2.api_session_store.set_title(&sid, &title)
+                && let Err(e) = state2.rpc_session_store.set_title(&sid, &title)
             {
                 warn!("Failed to store session title: {e}");
             }
@@ -1561,7 +1561,7 @@ async fn run_llm_turn(
             .entry(session_id.clone())
             .or_insert_with(|| {
                 state
-                    .api_session_store
+                    .rpc_session_store
                     .load_session(&session_id)
                     .unwrap_or_default()
             })
@@ -1589,8 +1589,8 @@ async fn run_llm_turn(
     let key: ConversationKey = (session_id.clone(), None);
     let pending_pub_id = state.pending_sessions.lock().await.remove(&session_id);
     if let Err(e) = state
-        .api_session_store
-        .ensure_session(&session_id, &key, "api", pending_pub_id, &namespace)
+        .rpc_session_store
+        .ensure_session(&session_id, &key, "rpc", pending_pub_id, &namespace)
         .map(|_| ())
     {
         warn!("Failed to ensure session file: {e}");
@@ -1620,7 +1620,7 @@ async fn run_llm_turn(
     //    `SessionStore::append` so the in-memory history keeps full image
     //    bytes for the provider call while JSONL gets a hash marker.
     history.push(user_msg.clone());
-    if let Err(e) = state.api_session_store.append(&session_id, &user_msg) {
+    if let Err(e) = state.rpc_session_store.append(&session_id, &user_msg) {
         warn!("Failed to persist user message: {e}");
     }
 
@@ -1649,7 +1649,7 @@ async fn run_llm_turn(
             Ok(Some(result)) => {
                 history = result.compressed;
                 if let Err(e) = state
-                    .api_session_store
+                    .rpc_session_store
                     .append_summary(&session_id, &result.summary)
                 {
                     warn!("Failed to persist compaction summary: {e}");
@@ -1682,7 +1682,7 @@ async fn run_llm_turn(
                 let text = resp.text.unwrap_or_default();
                 let msg = ChatMessage::assistant(&text);
                 history.push(msg.clone());
-                if let Err(e) = state.api_session_store.append(&session_id, &msg) {
+                if let Err(e) = state.rpc_session_store.append(&session_id, &msg) {
                     warn!("Failed to persist assistant message: {e}");
                 }
                 if !text.is_empty() {
@@ -1827,7 +1827,7 @@ async fn run_turn(
         tokio::spawn(async move {
             let p = state2.provider_for_session(&sid).await;
             if let Some(title) = generate_session_title(&*p, &user_msg, &text).await
-                && let Err(e) = state2.api_session_store.set_title(&sid, &title)
+                && let Err(e) = state2.rpc_session_store.set_title(&sid, &title)
             {
                 warn!("Failed to store session title: {e}");
             }

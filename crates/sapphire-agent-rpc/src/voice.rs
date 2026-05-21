@@ -25,7 +25,7 @@ fn next_id() -> u64 {
 
 /// Pipeline sample rate. Must match the server-side constant in
 /// `sapphire-agent::voice::PIPELINE_SAMPLE_RATE`. Duplicated here so
-/// the API crate doesn't depend on the agent binary.
+/// the RPC crate doesn't depend on the agent binary.
 pub const PIPELINE_SAMPLE_RATE: u32 = 16_000;
 
 /// Wake-word configuration fetched from the server's `voice/config`

@@ -1184,7 +1184,10 @@ where
 
     let mut lines: Vec<String> = Vec::new();
     for (meta, digest) in entries {
-        let ns = if meta.channel == "api" {
+        // Dual-accept `"api"` (legacy) and `"rpc"` (post-#112) until the
+        // bundled session migration rewrites stored `meta.channel` strings.
+        let is_rpc = meta.channel == "rpc" || meta.channel == "api";
+        let ns = if is_rpc {
             crate::config::DEFAULT_NAMESPACE_NAME.to_string()
         } else {
             room_to_namespace(&meta.room_id)
@@ -1192,10 +1195,10 @@ where
         if ns != namespace {
             continue;
         }
-        let room_label = if meta.channel == "api" {
-            meta.title
-                .clone()
-                .unwrap_or_else(|| format!("api/{}", short_id(&meta.session_id)))
+        let room_label = if is_rpc {
+            meta.title.clone().unwrap_or_else(|| {
+                format!("{}/{}", meta.channel, short_id(&meta.session_id))
+            })
         } else {
             format!("{}/{}", meta.channel, short_id(&meta.room_id))
         };

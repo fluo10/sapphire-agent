@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`sapphire-agent-api` crate renamed to `sapphire-agent-rpc`** to match
+  the `/rpc` endpoint it talks to. The session-kind directory it persists
+  to also moves: `sessions/<ns>/api/` → `sessions/<ns>/rpc/`. Until the
+  bundled session migration runs (separate PR), readers transparently
+  fall through to the legacy `api/` directory so existing files remain
+  visible. The `api_keys` config field on `[room_profile.<n>]` is
+  deliberately unchanged — it gates `/rpc`, `/mcp`, and `/a2a` together
+  and the broad "api" name still fits. (#112)
+
 ## [0.6.1] - 2026-05-18
 
 ### Fixed

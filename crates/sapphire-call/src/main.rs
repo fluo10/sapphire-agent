@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    sapphire_agent_api::run(
+    sapphire_agent_rpc::run(
         server,
         session,
         cli.list,

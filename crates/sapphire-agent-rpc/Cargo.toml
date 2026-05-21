@@ -1,8 +1,8 @@
 [package]
-name = "sapphire-agent-api"
+name = "sapphire-agent-rpc"
 version.workspace = true
 edition.workspace = true
-description = "Client library and shared types for sapphire-agent"
+description = "Client library and shared types for sapphire-agent's RPC surface"
 license.workspace = true
 repository.workspace = true
 

@@ -1,6 +1,6 @@
 //! Client library for `sapphire-agent`.
 //!
-//! Provides an HTTP client for the sapphire-agent control API
+//! Provides an HTTP client for the sapphire-agent RPC surface
 //! (`/rpc`, JSON-RPC 2.0) and an interactive REPL that can be embedded
 //! in any binary (`sapphire-agent call` or the standalone
 //! `sapphire-call`).
@@ -60,7 +60,7 @@ impl DeviceMetadata {
 ///
 /// `token` is sent as `Authorization: Bearer <token>` and selects the
 /// room_profile server-side (the token must match an `api_keys` entry
-/// on some `[room_profile.<n>]`). The control API requires this on
+/// on some `[room_profile.<n>]`). The RPC surface requires this on
 /// every `/rpc` call — there is no anonymous mode.
 pub async fn initialize(
     client: &reqwest::Client,

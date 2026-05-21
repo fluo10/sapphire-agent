@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use sapphire_agent_api::{
+use sapphire_agent_rpc::{
     VoiceEvent, VoicePushEvent, voice::PIPELINE_SAMPLE_RATE, voice_pipeline_run, voice_subscribe,
 };
 use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
@@ -73,7 +73,7 @@ pub struct VoiceOptions {
     pub output_device: Option<String>,
     /// Optional device identity sent in every `voice/pipeline_run` so the
     /// agent can render "voice channel with <name>" in the system prompt.
-    pub device: Option<sapphire_agent_api::DeviceMetadata>,
+    pub device: Option<sapphire_agent_rpc::DeviceMetadata>,
     /// Listen-state UX: confirmation beeps + post-reply follow-up
     /// listening window. See [`crate::config::BehaviorConfig`].
     pub behavior: crate::config::BehaviorConfig,
@@ -299,13 +299,13 @@ pub async fn run(
     eprintln!("sapphire-call voice (device: {device_id})");
 
     // ── Wake-word config: fetch the inline ONNX from the server ─────────
-    let server_wake = sapphire_agent_api::voice_config(&client, &base, &token)
+    let server_wake = sapphire_agent_rpc::voice_config(&client, &base, &token)
         .await
         .unwrap_or_else(|e| {
             eprintln!(
                 "warning: voice/config fetch failed ({e:#}); proceeding without wake-word gating"
             );
-            sapphire_agent_api::WakeWordConfig::default()
+            sapphire_agent_rpc::WakeWordConfig::default()
         });
 
     // ── VAD model ────────────────────────────────────────────────────────
@@ -329,7 +329,7 @@ pub async fn run(
     // ── Optional wake-word detector ─────────────────────────────────────
     let wake_detector: Option<oww::OpenWakeWordDetector> = match server_wake.model {
         Some(model) => {
-            let sapphire_agent_api::WakeWordModel {
+            let sapphire_agent_rpc::WakeWordModel {
                 filename,
                 sha256,
                 bytes,
@@ -556,7 +556,7 @@ struct ListenCtx {
     token: String,
     device_id: String,
     language: Option<String>,
-    device: Option<sapphire_agent_api::DeviceMetadata>,
+    device: Option<sapphire_agent_rpc::DeviceMetadata>,
     shutdown: Arc<AtomicBool>,
     vad: VoiceActivityDetector,
     /// `Some` enables wake-word mode; the satellite gates VAD behind
@@ -1536,7 +1536,7 @@ async fn process_utterance(
     device_id: &str,
     pcm_16khz: &[i16],
     language: Option<&str>,
-    device_meta: Option<&sapphire_agent_api::DeviceMetadata>,
+    device_meta: Option<&sapphire_agent_rpc::DeviceMetadata>,
     playback_queue: Arc<std::sync::Mutex<VecDeque<i16>>>,
     output_rate: u32,
 ) -> Result<()> {

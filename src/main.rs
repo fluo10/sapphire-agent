@@ -262,10 +262,10 @@ async fn main() -> Result<()> {
                     .context("Failed to build provider registry")?,
             );
 
-            // ── API session store (sessions/<namespace>/api/) ──────────────
-            let api_session_store = Arc::new(SessionStore::with_workspace(
+            // ── RPC session store (sessions/<namespace>/rpc/) ──────────────
+            let rpc_session_store = Arc::new(SessionStore::with_workspace(
                 sessions_base.clone(),
-                "api",
+                "rpc",
                 Arc::clone(&ws_state),
             ));
 
@@ -350,7 +350,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&registry),
                 Arc::clone(&workspace),
                 Arc::clone(&tool_set),
-                Arc::clone(&api_session_store),
+                Arc::clone(&rpc_session_store),
                 Arc::clone(&mcp_session_store),
                 voice_providers,
                 image_cache.clone(),
@@ -415,7 +415,10 @@ async fn main() -> Result<()> {
                     let cfg_for_predicate = config.clone();
                     let ns_for_predicate = ns.clone();
                     let predicate = move |meta: &session::SessionMeta| -> bool {
-                        if meta.channel == "api" {
+                        // Dual-accept `"api"` (legacy) and `"rpc"` (post-#112)
+                        // until the bundled session migration rewrites stored
+                        // `meta.channel` strings.
+                        if meta.channel == "api" || meta.channel == "rpc" {
                             return ns_for_predicate == config::DEFAULT_NAMESPACE_NAME;
                         }
                         cfg_for_predicate.namespace_for_room(&meta.room_id) == ns_for_predicate
@@ -497,7 +500,7 @@ async fn main() -> Result<()> {
                     let workspace_for_loop = Arc::clone(&workspace);
                     let workspace_dir_for_loop = workspace_dir.clone();
                     let channel_store_for_loop = Arc::clone(&channel_session_store);
-                    let api_store_for_loop = Arc::clone(&api_session_store);
+                    let rpc_store_for_loop = Arc::clone(&rpc_session_store);
                     let agent_for_loop = Arc::clone(&agent);
                     tokio::spawn(async move {
                         let mut tick = tokio::time::interval(dur);
@@ -518,7 +521,7 @@ async fn main() -> Result<()> {
                                 &workspace_for_loop,
                                 &workspace_dir_for_loop,
                                 &channel_store_for_loop,
-                                &api_store_for_loop,
+                                &rpc_store_for_loop,
                                 &agent_for_loop,
                             )
                             .await;
@@ -533,7 +536,7 @@ async fn main() -> Result<()> {
                         &workspace,
                         &workspace_dir,
                         &channel_session_store,
-                        &api_session_store,
+                        &rpc_session_store,
                         &agent,
                     )
                     .await;
@@ -626,7 +629,7 @@ async fn rebuild_today_digests(
     workspace: &Arc<Workspace>,
     workspace_dir: &std::path::Path,
     channel_store: &Arc<SessionStore>,
-    api_store: &Arc<SessionStore>,
+    rpc_store: &Arc<SessionStore>,
     agent: &Arc<Agent>,
 ) {
     let today = session::local_date_for_timestamp(chrono::Local::now(), config.day_boundary_hour);
@@ -637,7 +640,7 @@ async fn rebuild_today_digests(
         today,
         config.day_boundary_hour,
         channel_store,
-        Some(api_store.as_ref()),
+        Some(rpc_store.as_ref()),
         |room_id: &str| cfg.namespace_for_room(room_id).to_string(),
     );
     let had_content = !map.is_empty();
@@ -660,7 +663,10 @@ async fn rebuild_today_digests(
 fn migrate_sessions_to_namespaced_layout(sessions_base: &std::path::Path) -> anyhow::Result<()> {
     use std::io::{BufRead, BufReader};
 
-    for kind in ["channel", "api"] {
+    // Pre-namespace migration covers both the legacy `"api"` kind dir and
+    // the post-#112 `"rpc"` dir; either may exist in a long-lived workspace
+    // that skipped a release.
+    for kind in ["channel", "api", "rpc"] {
         let kind_dir = sessions_base.join(kind);
         if !kind_dir.is_dir() {
             continue;
