@@ -103,11 +103,11 @@ pub struct DeviceConfig {
 impl DeviceConfig {
     /// Convert into the API crate's wire-format struct. Empty when no
     /// field is set so we don't send a meaningless `device: {}` block.
-    pub fn to_api(&self) -> Option<sapphire_agent_api::DeviceMetadata> {
+    pub fn to_api(&self) -> Option<sapphire_agent_rpc::DeviceMetadata> {
         if self.name.is_none() && self.description.is_none() {
             return None;
         }
-        Some(sapphire_agent_api::DeviceMetadata {
+        Some(sapphire_agent_rpc::DeviceMetadata {
             name: self.name.clone(),
             description: self.description.clone(),
         })

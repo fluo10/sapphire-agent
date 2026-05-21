@@ -7636,7 +7636,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sapphire-agent-api"
+name = "sapphire-agent-rpc"
 version = "0.6.1"
 dependencies = [
  "anyhow",
@@ -7660,7 +7660,7 @@ dependencies = [
  "ndarray 0.17.2",
  "ort",
  "reqwest",
- "sapphire-agent-api",
+ "sapphire-agent-rpc",
  "serde",
  "sha2 0.11.0",
  "shellexpand",

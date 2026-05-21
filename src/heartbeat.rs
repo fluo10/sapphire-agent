@@ -67,12 +67,13 @@ pub struct Heartbeat {
 
 impl Heartbeat {
     /// Resolve which namespace a session belongs to. Matrix/Discord rooms
-    /// follow `Config::namespace_for_room`. API sessions (channel="api")
-    /// fall back to the default namespace because their per-session
-    /// profile pinning is in-memory only and not persisted in the JSONL
-    /// metadata.
+    /// follow `Config::namespace_for_room`. RPC sessions (`channel="rpc"`,
+    /// or legacy `"api"` until the bundled session migration rewrites
+    /// stored values) fall back to the default namespace because their
+    /// per-session profile pinning is in-memory only and not persisted
+    /// in the JSONL metadata.
     fn namespace_for_session(&self, meta: &crate::session::SessionMeta) -> String {
-        if meta.channel == "api" {
+        if meta.channel == "rpc" || meta.channel == "api" {
             crate::config::DEFAULT_NAMESPACE_NAME.to_string()
         } else {
             self.config.namespace_for_room(&meta.room_id).to_string()
