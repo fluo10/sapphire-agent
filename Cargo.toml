@@ -4,6 +4,7 @@ members = [
     "crates/sapphire-agent-rpc",
     "crates/sapphire-call-core",
     "crates/sapphire-call-cli",
+    "crates/sapphire-call-desktop",
 ]
 
 [workspace.dependencies]

@@ -1,0 +1,67 @@
+[package]
+name = "sapphire-call-desktop"
+version.workspace = true
+edition.workspace = true
+description = "Desktop GUI client for sapphire-agent (bevy + egui)"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "sapphire-call-desktop"
+path = "src/main.rs"
+
+[dependencies]
+sapphire-agent-rpc = { path = "../sapphire-agent-rpc", version = "0.6.1" }
+sapphire-call-core = { path = "../sapphire-call-core", version = "0.6.1" }
+
+# Game engine — needed up front for the eventual 3D character work
+# (desktop-mate-style avatar). For the chat-only first cut we use only
+# the windowing + render essentials, but pinning bevy now keeps us from
+# rewriting the runtime later. Default features are deliberately
+# avoided: bevy ships ~70 of them, including audio and asset loaders we
+# don't need yet, and pulling them all in slows the cold build by minutes.
+bevy = { version = "0.18", default-features = false, features = [
+    "bevy_winit",
+    "bevy_window",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_sprite",
+    # bevy_egui 0.39 enables its `picking` feature by default and emits
+    # a warning at startup if bevy's matching `bevy_picking` isn't on;
+    # without it, the picking plugin isn't installed and bevy_egui's
+    # input + render path doesn't wire up correctly (window paints
+    # black, no UI visible).
+    "bevy_picking",
+    "default_font",
+    "x11",
+    "wayland",
+    "multi_threaded",
+] }
+
+# Immediate-mode UI inside the bevy app — drives every panel until /
+# unless we eventually replace specific panels with native bevy_ui.
+bevy_egui = "0.39"
+
+# Async RPC needs its own runtime because bevy's scheduler is sync.
+# Multi-threaded so streaming chat + audio playback don't block the
+# UI tokio task on the same thread.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+# Shared HTTP client.
+reqwest = { workspace = true }
+
+# Error handling
+anyhow.workspace = true
+
+# Logging
+tracing = "0.1"
+tracing-subscriber.workspace = true
+
+# Desktop-specific config (extends the shared core ServerConfig with
+# TTS opt-in + window-state knobs).
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+directories = "6"
