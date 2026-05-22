@@ -16,7 +16,7 @@
 //! AI retrieval. `closed_at` acts as an append-only archive marker; presence
 //! of this line means the session is no longer active.
 
-use crate::provider::{ChatMessage, ContentPart, Role};
+use crate::provider::{ChatMessage, ContentPart, Role, UserInputKind};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 use sapphire_workspace::WorkspaceState;
@@ -86,6 +86,17 @@ pub struct StoredMessage {
     pub timestamp: DateTime<Utc>,
     pub role: Role,
     pub parts: Vec<ContentPart>,
+    /// Input modality for user-role messages. `None` for legacy
+    /// pre-existing JSONL (read via `serde(default)`), for assistant
+    /// replies, and for synthetic user lines that don't have a
+    /// meaningful modality (e.g. heartbeat-injected pushes).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub input_kind: Option<UserInputKind>,
+    /// Authenticated user id, when the inbound transport has mapped
+    /// the message to a known identity. Always `None` today;
+    /// reserved for API-key / channel-ID → user_id mapping work.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub user_id: Option<String>,
     /// Provenance for messages written through MCP `write_report`.
     /// Absent on normal chat messages and on assistant-side replies.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -117,6 +128,8 @@ impl StoredMessage {
             timestamp: Utc::now(),
             role: msg.role.clone(),
             parts: msg.parts.clone(),
+            input_kind: msg.input_kind.clone(),
+            user_id: msg.user_id.clone(),
             report_meta: None,
         }
     }
@@ -125,6 +138,8 @@ impl StoredMessage {
         ChatMessage {
             role: self.role,
             parts: self.parts,
+            input_kind: self.input_kind,
+            user_id: self.user_id,
         }
     }
 }
@@ -642,6 +657,8 @@ impl SessionStore {
             timestamp: Utc::now(),
             role: Role::User,
             parts: vec![ContentPart::Text(rendered_text.to_string())],
+            input_kind: None,
+            user_id: None,
             report_meta: Some(meta),
         };
         let line = serde_json::to_string(&stored)?;
@@ -964,6 +981,8 @@ pub(crate) fn scrub_images_for_storage(msg: &ChatMessage) -> Option<ChatMessage>
     Some(ChatMessage {
         role: msg.role.clone(),
         parts,
+        input_kind: msg.input_kind.clone(),
+        user_id: msg.user_id.clone(),
     })
 }
 
@@ -1195,6 +1214,8 @@ mod tests {
                 media_type: "image/png".to_string(),
                 data_base64: "@@@not-base64@@@".to_string(),
             }],
+            input_kind: Some(UserInputKind::Text),
+            user_id: None,
         };
         let scrubbed = scrub_images_for_storage(&msg).expect("scrub should rewrite");
         let has_marker = scrubbed
@@ -1212,6 +1233,8 @@ mod tests {
                 media_type: "image/jpeg".to_string(),
                 sha256: "abc123".to_string(),
             }],
+            input_kind: Some(UserInputKind::Text),
+            user_id: None,
         };
         // ImageRef carries no raw bytes — nothing to scrub, so the
         // helper returns None and append serializes the variant as-is.
@@ -1219,6 +1242,97 @@ mod tests {
             scrub_images_for_storage(&msg).is_none(),
             "scrub should leave ImageRef-only messages untouched"
         );
+    }
+
+    // ── input_kind / user_id round-trip and backward compat ─────────────
+
+    #[test]
+    fn stored_message_without_input_kind_or_user_id_deserializes_as_none() {
+        // Legacy JSONL written before these fields existed must still
+        // load: no `input_kind`, no `user_id`.
+        let legacy =
+            r#"{"timestamp":"2026-04-08T11:30:22.372570890Z","role":"user","parts":[{"Text":"hello"}]}"#;
+        let msg: StoredMessage = serde_json::from_str(legacy).expect("legacy JSONL parses");
+        assert!(msg.input_kind.is_none());
+        assert!(msg.user_id.is_none());
+    }
+
+    #[test]
+    fn stored_message_omits_none_fields_on_serialize() {
+        let msg = StoredMessage {
+            timestamp: Utc::now(),
+            role: Role::Assistant,
+            parts: vec![ContentPart::Text("hi".to_string())],
+            input_kind: None,
+            user_id: None,
+            report_meta: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            !json.contains("input_kind"),
+            "None input_kind must be omitted, got: {json}"
+        );
+        assert!(
+            !json.contains("user_id"),
+            "None user_id must be omitted, got: {json}"
+        );
+        assert!(
+            !json.contains("report_meta"),
+            "None report_meta must be omitted, got: {json}"
+        );
+    }
+
+    #[test]
+    fn stored_message_text_input_kind_round_trip() {
+        let original = StoredMessage {
+            timestamp: Utc::now(),
+            role: Role::User,
+            parts: vec![ContentPart::Text("hi".to_string())],
+            input_kind: Some(UserInputKind::Text),
+            user_id: Some("owner".to_string()),
+            report_meta: None,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains(r#""input_kind":{"kind":"text"}"#));
+        assert!(json.contains(r#""user_id":"owner""#));
+        let parsed: StoredMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.input_kind, Some(UserInputKind::Text));
+        assert_eq!(parsed.user_id.as_deref(), Some("owner"));
+    }
+
+    #[test]
+    fn stored_message_voice_input_kind_round_trip() {
+        let original = StoredMessage {
+            timestamp: Utc::now(),
+            role: Role::User,
+            parts: vec![ContentPart::Text("hello there".to_string())],
+            input_kind: Some(UserInputKind::Voice),
+            user_id: None,
+            report_meta: None,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(
+            json.contains(r#""input_kind":{"kind":"voice"}"#),
+            "missing voice tag: {json}"
+        );
+        let parsed: StoredMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.input_kind, Some(UserInputKind::Voice));
+    }
+
+    #[test]
+    fn from_chat_and_into_chat_preserve_input_kind_and_user_id() {
+        let chat = ChatMessage {
+            role: Role::User,
+            parts: vec![ContentPart::Text("hi".to_string())],
+            input_kind: Some(UserInputKind::Voice),
+            user_id: Some("alice".to_string()),
+        };
+        let stored = StoredMessage::from_chat(&chat);
+        assert_eq!(stored.input_kind, Some(UserInputKind::Voice));
+        assert_eq!(stored.user_id.as_deref(), Some("alice"));
+        let round = stored.into_chat_message();
+        assert_eq!(round.input_kind, Some(UserInputKind::Voice));
+        assert_eq!(round.user_id.as_deref(), Some("alice"));
     }
 
     // ── device-default session routing (#122) ────────────────────────────

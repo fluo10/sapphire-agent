@@ -119,6 +119,8 @@ pub async fn maybe_compress(
         parts: vec![ContentPart::Text(format!(
             "[Context Summary — earlier messages were compressed]\n\n{summary}"
         ))],
+        input_kind: None,
+        user_id: None,
     });
     compressed.push(ChatMessage::assistant(
         "Understood. I have the context from our earlier conversation.",

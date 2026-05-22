@@ -72,11 +72,39 @@ pub enum ContentPart {
     },
 }
 
+/// Input modality of a user-role message. Voice inputs reach the model
+/// via server-side STT and can carry transcription errors, so the
+/// model is told the modality via a prefix label (see
+/// `apply_input_kind_label` in `serve`). `Voice` is a unit variant on
+/// purpose: when voice-print speaker identification is later added,
+/// new variants (`KnownVoice { speaker_id, .. }` / `UnknownVoice`)
+/// will be introduced alongside this one — `Voice` remains the
+/// "identification disabled / not yet run" default and existing
+/// `{"kind":"voice"}` JSONL stays readable without migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UserInputKind {
+    Text,
+    Voice,
+}
+
 /// A message in the conversation history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     pub parts: Vec<ContentPart>,
+    /// Modality this message was authored in. Meaningful only for
+    /// `Role::User`; `None` on assistant/tool messages and on
+    /// channel-side user messages that don't have a meaningful
+    /// modality (e.g. heartbeat-injected user lines).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_kind: Option<UserInputKind>,
+    /// Identifier of the authenticated user this message is attributed
+    /// to. Currently always `None` — populated in a future task once
+    /// API-key / channel-ID → user_id mapping lands. The corresponding
+    /// profile lives in `<workspace>/users/<namespace>/<user_id>.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -84,6 +112,21 @@ impl ChatMessage {
         Self {
             role: Role::User,
             parts: vec![ContentPart::Text(text.into())],
+            input_kind: Some(UserInputKind::Text),
+            user_id: None,
+        }
+    }
+
+    /// User message produced from a voice (STT) input. Speaker
+    /// identification is not implemented yet, so all such messages
+    /// carry `UserInputKind::Voice` — once voice-print clustering
+    /// lands, this constructor will accept a richer variant.
+    pub fn user_voice(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            parts: vec![ContentPart::Text(text.into())],
+            input_kind: Some(UserInputKind::Voice),
+            user_id: None,
         }
     }
 
@@ -108,6 +151,8 @@ impl ChatMessage {
         Self {
             role: Role::User,
             parts,
+            input_kind: Some(UserInputKind::Text),
+            user_id: None,
         }
     }
 
@@ -115,6 +160,8 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             parts: vec![ContentPart::Text(text.into())],
+            input_kind: None,
+            user_id: None,
         }
     }
 
@@ -134,6 +181,8 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             parts,
+            input_kind: None,
+            user_id: None,
         }
     }
 
@@ -168,6 +217,8 @@ impl ChatMessage {
         Self {
             role: Role::User,
             parts,
+            input_kind: None,
+            user_id: None,
         }
     }
 
