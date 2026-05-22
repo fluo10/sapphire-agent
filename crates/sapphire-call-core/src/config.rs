@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,7 +51,10 @@ pub struct CallConfig {
     pub sensitivity: SensitivityConfig,
 }
 
-#[derive(Debug, Default, Deserialize)]
+// Serializable so the desktop client can write `[server]` back out
+// when the user edits endpoint / token in the GUI. The CLI side only
+// ever reads, so adding Serialize is upward-compatible.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Base URL of the sapphire-agent serve endpoint, e.g.
@@ -377,9 +380,6 @@ keyword = "ハロー"
         assert!(cfg.audio.input_device.is_none());
     }
 
-    #[test]
-    fn shipped_example_parses() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
-        let _ = CallConfig::load(&path).expect("config.example.toml should parse");
-    }
+    // The shipped `config.example.toml` lives in the CLI crate; the
+    // equivalent parse-the-example test now lives there.
 }

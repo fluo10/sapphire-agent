@@ -7649,7 +7649,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sapphire-call"
+name = "sapphire-call-cli"
 version = "0.6.1"
 dependencies = [
  "anyhow",
@@ -7661,16 +7661,29 @@ dependencies = [
  "ort",
  "reqwest",
  "sapphire-agent-rpc",
- "serde",
+ "sapphire-call-core",
  "sha2 0.11.0",
  "shellexpand",
  "sherpa-onnx",
  "tar",
  "tempfile",
  "tokio",
- "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "sapphire-call-core"
+version = "0.6.1"
+dependencies = [
+ "anyhow",
+ "directories",
+ "sapphire-agent-rpc",
+ "serde",
+ "shellexpand",
+ "tempfile",
+ "toml 1.1.2+spec-1.1.0",
  "uuid",
 ]
 

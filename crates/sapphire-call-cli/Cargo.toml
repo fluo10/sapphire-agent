@@ -1,8 +1,8 @@
 [package]
-name = "sapphire-call"
+name = "sapphire-call-cli"
 version.workspace = true
 edition.workspace = true
-description = "Standalone CLI client for sapphire-agent"
+description = "Standalone CLI / voice-satellite client for sapphire-agent"
 license.workspace = true
 repository.workspace = true
 
@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 sapphire-agent-rpc = { path = "../sapphire-agent-rpc", version = "0.6.1" }
+sapphire-call-core = { path = "../sapphire-call-core", version = "0.6.1" }
 
 # Async runtime — voice subcommand needs sync, time, and rt features.
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "signal"] }
@@ -50,10 +51,6 @@ shellexpand = "3.1"
 
 # Logging — surface model downloads to the operator.
 tracing = "0.1"
-
-# Config file parsing.
-serde = { version = "1.0", features = ["derive"] }
-toml = "1.0"
 
 # UUID v7 for the per-installation device id.
 uuid = { version = "1", features = ["v7"] }

@@ -1,0 +1,28 @@
+[package]
+name = "sapphire-call-core"
+version.workspace = true
+edition.workspace = true
+description = "Shared config + identity helpers for sapphire-call CLI / desktop clients"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sapphire-agent-rpc = { path = "../sapphire-agent-rpc", version = "0.6.1" }
+
+anyhow.workspace = true
+
+# Config file parsing.
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.0"
+
+# XDG dirs for config / data path resolution.
+directories = "6.0"
+
+# Path expansion for ~/... in user-supplied paths.
+shellexpand = "3.1"
+
+# UUID v7 for the per-installation device id.
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+tempfile = "3"

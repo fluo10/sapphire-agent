@@ -1,5 +1,3 @@
-mod config;
-mod device_id;
 mod voice;
 
 use std::path::PathBuf;
@@ -8,7 +6,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use config::CallConfig;
+use sapphire_call_core::config::CallConfig;
 
 const DEFAULT_SERVER_URL: &str = "http://localhost:9000";
 

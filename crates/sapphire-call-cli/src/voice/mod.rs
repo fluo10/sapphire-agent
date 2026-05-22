@@ -75,11 +75,11 @@ pub struct VoiceOptions {
     /// agent can render "voice channel with <name>" in the system prompt.
     pub device: Option<sapphire_agent_rpc::DeviceMetadata>,
     /// Listen-state UX: confirmation beeps + post-reply follow-up
-    /// listening window. See [`crate::config::BehaviorConfig`].
-    pub behavior: crate::config::BehaviorConfig,
+    /// listening window. See [`sapphire_call_core::config::BehaviorConfig`].
+    pub behavior: sapphire_call_core::config::BehaviorConfig,
     /// Mic gain + wake/VAD sensitivity knobs (issue #87). Defaults
     /// preserve the historical hard-coded values.
-    pub sensitivity: crate::config::SensitivityConfig,
+    pub sensitivity: sapphire_call_core::config::SensitivityConfig,
 }
 
 /// Frequency / duration of the confirmation beeps. Picked to be
@@ -294,7 +294,7 @@ pub async fn run(
     // the satellite picks up where it left off across restarts. The
     // room_profile is resolved server-side from the bearer `token`.
     // `session` (legacy chat session id) is ignored in voice mode.
-    let device_id = crate::device_id::ensure_device_id()
+    let device_id = sapphire_call_core::device_id::ensure_device_id()
         .context("failed to load or generate sapphire-call device id")?;
     eprintln!("sapphire-call voice (device: {device_id})");
 
@@ -567,7 +567,7 @@ struct ListenCtx {
     /// Always false in VAD-only mode.
     awaiting_wake: bool,
     /// Listen-state UX (beeps + follow-up window).
-    behavior: crate::config::BehaviorConfig,
+    behavior: sapphire_call_core::config::BehaviorConfig,
     /// In wake-word mode, when set, the satellite is in the post-reply
     /// follow-up window: VAD is active without requiring another wake
     /// word until this deadline. Cleared when a follow-up utterance
@@ -1008,7 +1008,7 @@ fn ensure_silero_model() -> Result<PathBuf> {
 
 fn build_vad(
     model_path: &std::path::Path,
-    sensitivity: &crate::config::SensitivityConfig,
+    sensitivity: &sapphire_call_core::config::SensitivityConfig,
 ) -> Result<VoiceActivityDetector> {
     let silero = SileroVadModelConfig {
         model: Some(model_path.to_string_lossy().into_owned()),
