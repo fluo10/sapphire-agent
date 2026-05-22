@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Device-default sessions** — a new session kind keyed by
+  `(device_id, room_profile)` that voice satellites and heartbeat
+  pushes route into when no other session is selected. Stored under
+  `sessions/<ns>/device-default/<uuid>.jsonl`; lazy-created (no file
+  appears until a satellite is actually used); daily-rotated by the
+  "most-recent-from-today" lookup, so a satellite that connects after
+  the local-day boundary lands in a fresh session automatically. The
+  previous deterministic `voice-<sha256>.jsonl` scheme is retired —
+  voice traffic now flows through the same `SessionStore` surface as
+  every other kind. (#122)
+
 ### Changed
 
 - **`sapphire-agent-api` crate renamed to `sapphire-agent-rpc`** to match
@@ -17,6 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   visible. The `api_keys` config field on `[room_profile.<n>]` is
   deliberately unchanged — it gates `/rpc`, `/mcp`, and `/a2a` together
   and the broad "api" name still fits. (#112)
+- **`ServeState::rpc_session_store` → `cross_device_session_store`** —
+  user-selectable, multi-device sessions resumed via `--resume
+  <grain-id>` are now logically separated from device-default sessions.
+  On-disk directory moves to `sessions/<ns>/cross-device/`; the bundled
+  session migration relocates pre-existing files. (#122)
+
+### Migration
+
+- **One-shot session-store migration** runs on first startup of this
+  version, completing both #112 and #122:
+  - `sessions/<ns>/api/<uuid>.jsonl` and `sessions/<ns>/rpc/<uuid>.jsonl`
+    cross-device files move to `sessions/<ns>/cross-device/<uuid>.jsonl`.
+    Stored `meta.channel = "api"` is rewritten to `"rpc"` along the way.
+  - Pre-redesign voice files (`voice-<hash>.jsonl`) are quarantined to
+    `sessions/<ns>/legacy-voice/`. Their `(device_id, room_profile)`
+    routing key was hashed into the filename and is unrecoverable; the
+    daily-log archive still indexes their content so nothing is lost
+    for FTS / semantic search, only the live conversation continuation.
+  - The PR-1 dual-read shim and dual-accept `"api"`/`"rpc"` fallbacks
+    are removed after this migration runs.
+  - Idempotent and safe to interrupt. No backup is taken — the
+    workspace is expected to be under git.
 
 ## [0.6.1] - 2026-05-18
 

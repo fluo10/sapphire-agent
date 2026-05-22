@@ -62,6 +62,19 @@ pub struct SessionMeta {
     /// chat/API/voice sessions.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub project: Option<String>,
+    /// Originating device id for device-default sessions (kind =
+    /// `"device-default"`). Combined with `room_profile` below, this
+    /// pair is the routing key — `find_or_create_for_device` returns
+    /// the most-recent file matching both. Absent on every other kind.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub device_id: Option<String>,
+    /// Resolved room_profile name for device-default sessions. Pinned
+    /// at creation time (from the bearer token's `api_keys` match) so
+    /// rotation and `find_or_create_for_device` don't accidentally
+    /// hand a session to a different profile after `[room_profile]`
+    /// reshuffles. Absent on every other kind.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub room_profile: Option<String>,
     /// Short auto-generated title, populated from a later `session_title` line.
     #[serde(skip)]
     pub title: Option<String>,
@@ -174,11 +187,11 @@ pub struct SessionStore {
     /// so retrieve indexing can scope itself by directory and never
     /// accidentally mix NSFW sessions with default-namespace ones.
     pub base_dir: PathBuf,
-    /// Second-level subdirectory: `"channel"` for Matrix/Discord, `"rpc"`
-    /// for HTTP (renamed from `"api"` in #112; readers transparently
-    /// fall through to the legacy `"api"` dir until the bundled session
-    /// migration moves the files). Lets the Agent and ServeState keep
-    /// separate `SessionStore` instances while sharing one base dir.
+    /// Second-level subdirectory: `"channel"` for Matrix/Discord,
+    /// `"cross-device"` for user-selectable RPC sessions,
+    /// `"device-default"` for per-`(device_id, room_profile)` sessions,
+    /// `"mcp"` for MCP project sessions. Lets the Agent and ServeState
+    /// keep separate `SessionStore` instances while sharing one base dir.
     pub kind: &'static str,
     /// Optional sapphire-workspace state. When set, file modifications notify
     /// the workspace so the index/cache and git staging stay in sync.
@@ -337,6 +350,8 @@ impl SessionStore {
             public_id: None,
             namespace: Some(namespace.to_string()),
             project: None,
+            device_id: None,
+            room_profile: None,
             title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta })?;
@@ -598,6 +613,8 @@ impl SessionStore {
             public_id: None,
             namespace: Some(namespace.to_string()),
             project: Some(project.to_string()),
+            device_id: None,
+            room_profile: None,
             title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta })?;
@@ -641,9 +658,9 @@ impl SessionStore {
     /// Ensure a session file exists for the given caller-supplied ID.
     /// Unlike `create_session`, this uses the provided ID rather than generating a new UUID.
     ///
-    /// For RPC sessions (`channel == "rpc"`, or legacy `"api"`), a grain-id
-    /// `public_id` is generated on creation unless `public_id_override` is
-    /// supplied (used to commit a deferred public_id).
+    /// For RPC sessions (`channel == "rpc"`), a grain-id `public_id` is
+    /// generated on creation unless `public_id_override` is supplied
+    /// (used to commit a deferred public_id).
     /// Returns the `public_id` if present (new or existing).
     pub fn ensure_session(
         &self,
@@ -662,7 +679,7 @@ impl SessionStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let public_id = if channel == "rpc" || channel == "api" {
+        let public_id = if channel == "rpc" {
             Some(public_id_override.unwrap_or_else(|| grain_id::GrainId::random().to_string()))
         } else {
             None
@@ -676,6 +693,8 @@ impl SessionStore {
             public_id: public_id.clone(),
             namespace: Some(namespace.to_string()),
             project: None,
+            device_id: None,
+            room_profile: None,
             title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta })?;
@@ -684,6 +703,85 @@ impl SessionStore {
         drop(file);
         self.notify_updated(&path);
         Ok(public_id)
+    }
+
+    /// Find the most-recent device-default session for `(device_id, room_profile)`
+    /// that falls within today's local-day window (per `boundary_hour`), or
+    /// create a new file when none qualifies.
+    ///
+    /// Used by the voice `/rpc` methods and heartbeat fires to route into a
+    /// device's always-on session (#122). Lazy: nothing lands on disk until a
+    /// satellite that's actually used calls this. Closed sessions (those with
+    /// a `closed_at` marker) are skipped so an explicit boundary close still
+    /// rotates the file even before the next day window kicks in.
+    ///
+    /// Returns the resolved session_id. The caller is expected to follow up
+    /// with `append` for the message that triggered the lookup.
+    pub fn find_or_create_for_device(
+        &self,
+        device_id: &str,
+        room_profile: &str,
+        namespace: &str,
+        boundary_hour: u8,
+    ) -> anyhow::Result<String> {
+        let today = local_date_for_timestamp(Local::now(), boundary_hour);
+        let (today_start, today_end) = day_window(today, boundary_hour);
+
+        let mut best: Option<(DateTime<Utc>, String)> = None;
+        for path in collect_session_files(&self.base_dir, self.kind) {
+            let Some((meta, _, is_closed, _)) = load_session_file(&path) else {
+                continue;
+            };
+            if is_closed {
+                continue;
+            }
+            if meta.namespace.as_deref() != Some(namespace) {
+                continue;
+            }
+            if meta.device_id.as_deref() != Some(device_id) {
+                continue;
+            }
+            if meta.room_profile.as_deref() != Some(room_profile) {
+                continue;
+            }
+            if meta.created_at < today_start || meta.created_at >= today_end {
+                continue;
+            }
+            match &best {
+                Some((ts, _)) if *ts >= meta.created_at => {}
+                _ => best = Some((meta.created_at, meta.session_id.clone())),
+            }
+        }
+        if let Some((_, id)) = best {
+            // Seed the path cache so the upcoming `append` skips a rescan.
+            let _ = self.resolve_path(&id);
+            return Ok(id);
+        }
+
+        let session_id = Uuid::now_v7().to_string();
+        let path = self.path_for_new(&session_id, namespace);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let meta = SessionMeta {
+            session_id: session_id.clone(),
+            room_id: String::new(),
+            thread_id: None,
+            channel: "device-default".to_string(),
+            created_at: Utc::now(),
+            public_id: None,
+            namespace: Some(namespace.to_string()),
+            project: None,
+            device_id: Some(device_id.to_string()),
+            room_profile: Some(room_profile.to_string()),
+            title: None,
+        };
+        let line = serde_json::to_string(&MetaLine { meta })?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(file, "{line}")?;
+        drop(file);
+        self.notify_updated(&path);
+        Ok(session_id)
     }
 
     /// Append a title for a session (append-only; last line wins on read).
@@ -888,36 +986,24 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Enumerate `<base_dir>/<namespace>/<kind>/*.jsonl` across every namespace
 /// directory. Returns an empty Vec when `base_dir` doesn't exist yet (fresh
 /// install) or has no namespace subdirs. Each returned path is absolute.
-///
-/// Dual-read shim for #112: when `kind == "rpc"`, the legacy `"api"` directory
-/// is also scanned so post-rename builds keep surfacing pre-migration files.
-/// The bundled session-store migration removes the shim once it has moved the
-/// files into the new layout.
 fn collect_session_files(base_dir: &Path, kind: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(base_dir) else {
         return out;
-    };
-    let scan_kinds: &[&str] = if kind == "rpc" {
-        &["rpc", "api"]
-    } else {
-        std::slice::from_ref(&kind)
     };
     for entry in entries.flatten() {
         let ns_dir = entry.path();
         if !ns_dir.is_dir() {
             continue;
         }
-        for k in scan_kinds {
-            let kind_dir = ns_dir.join(k);
-            let Ok(kind_entries) = fs::read_dir(&kind_dir) else {
-                continue;
-            };
-            for k_entry in kind_entries.flatten() {
-                let path = k_entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    out.push(path);
-                }
+        let kind_dir = ns_dir.join(kind);
+        let Ok(kind_entries) = fs::read_dir(&kind_dir) else {
+            continue;
+        };
+        for k_entry in kind_entries.flatten() {
+            let path = k_entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                out.push(path);
             }
         }
     }
@@ -1135,35 +1221,129 @@ mod tests {
         );
     }
 
-    /// Post-#112 dual-read shim: when scanning for `"rpc"` files, the
-    /// legacy `"api"` sub-directory must also be visible so existing
-    /// sessions stay reachable until the bundled migration moves them.
-    #[test]
-    fn collect_session_files_dual_reads_legacy_api_dir() {
+    // ── device-default session routing (#122) ────────────────────────────
+
+    fn new_device_default_store() -> (tempfile::TempDir, SessionStore) {
         let tmp = tempfile::TempDir::new().unwrap();
-        let ns = tmp.path().join("default");
-        let api_dir = ns.join("api");
-        let rpc_dir = ns.join("rpc");
-        fs::create_dir_all(&api_dir).unwrap();
-        fs::create_dir_all(&rpc_dir).unwrap();
-        let legacy = api_dir.join("old.jsonl");
-        let fresh = rpc_dir.join("new.jsonl");
-        std::fs::write(&legacy, b"").unwrap();
-        std::fs::write(&fresh, b"").unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf(), "device-default");
+        (tmp, store)
+    }
 
-        // Stray file that should NOT be picked up (wrong extension).
-        std::fs::write(rpc_dir.join("ignore.txt"), b"").unwrap();
+    /// Fresh dir: returns a brand-new UUID, persists meta with the right
+    /// `(device_id, room_profile, channel, namespace)` fields.
+    #[test]
+    fn find_or_create_for_device_creates_new_session() {
+        let (_tmp, store) = new_device_default_store();
+        let sid = store
+            .find_or_create_for_device("device-a", "default", "default", 4)
+            .expect("find_or_create");
+        // Resolve from disk and verify the meta the store wrote.
+        let path = store.absolute_path_for(&sid).expect("path cached");
+        let (meta, _msgs, is_closed, _summary) =
+            load_session_file(&path).expect("meta line present");
+        assert_eq!(meta.session_id, sid);
+        assert_eq!(meta.channel, "device-default");
+        assert_eq!(meta.device_id.as_deref(), Some("device-a"));
+        assert_eq!(meta.room_profile.as_deref(), Some("default"));
+        assert_eq!(meta.namespace.as_deref(), Some("default"));
+        assert!(meta.public_id.is_none(), "device-default has no grain-id");
+        assert!(!is_closed);
+    }
 
-        let mut found = collect_session_files(tmp.path(), "rpc");
-        found.sort();
-        assert_eq!(found, {
-            let mut expected = vec![legacy, fresh];
-            expected.sort();
-            expected
-        });
+    /// Second call within the same local day returns the same session_id.
+    #[test]
+    fn find_or_create_for_device_is_idempotent_within_day() {
+        let (_tmp, store) = new_device_default_store();
+        let first = store
+            .find_or_create_for_device("device-a", "default", "default", 4)
+            .unwrap();
+        let second = store
+            .find_or_create_for_device("device-a", "default", "default", 4)
+            .unwrap();
+        assert_eq!(first, second);
+    }
 
-        // Sanity: scanning a non-rpc kind does NOT pull in the api dir.
-        let channel_only = collect_session_files(tmp.path(), "channel");
-        assert!(channel_only.is_empty(), "channel scan must not see rpc/api dirs");
+    /// Different device_id ⇒ separate file.
+    #[test]
+    fn find_or_create_for_device_distinguishes_devices() {
+        let (_tmp, store) = new_device_default_store();
+        let a = store
+            .find_or_create_for_device("device-a", "default", "default", 4)
+            .unwrap();
+        let b = store
+            .find_or_create_for_device("device-b", "default", "default", 4)
+            .unwrap();
+        assert_ne!(a, b);
+    }
+
+    /// Different room_profile ⇒ separate file (NSFW isolation).
+    #[test]
+    fn find_or_create_for_device_distinguishes_room_profiles() {
+        let (_tmp, store) = new_device_default_store();
+        let sfw = store
+            .find_or_create_for_device("device-a", "default", "default", 4)
+            .unwrap();
+        let nsfw = store
+            .find_or_create_for_device("device-a", "private_nsfw", "user_nsfw", 4)
+            .unwrap();
+        assert_ne!(sfw, nsfw);
+    }
+
+    /// Closing the active session ⇒ next call rotates to a fresh UUID.
+    #[test]
+    fn find_or_create_for_device_skips_closed_sessions() {
+        let (_tmp, store) = new_device_default_store();
+        let first = store
+            .find_or_create_for_device("device-a", "default", "default", 4)
+            .unwrap();
+        store.close_session(&first).expect("close");
+        let second = store
+            .find_or_create_for_device("device-a", "default", "default", 4)
+            .unwrap();
+        assert_ne!(
+            first, second,
+            "closed session must not be reused — boundary rotation depends on this"
+        );
+    }
+
+    /// A meta file dated outside today's local window must not be reused —
+    /// next call must create a fresh session.
+    #[test]
+    fn find_or_create_for_device_skips_yesterday_session() {
+        let (tmp, store) = new_device_default_store();
+        let boundary = 4u8;
+
+        // Hand-craft a meta file whose `created_at` falls in yesterday's
+        // local-day window so the most-recent scan rejects it.
+        let yesterday_date =
+            local_date_for_timestamp(Local::now(), boundary) - Duration::days(1);
+        let (yesterday_start, _) = day_window(yesterday_date, boundary);
+        let stale_id = Uuid::now_v7().to_string();
+        let stale_dir = tmp.path().join("default").join("device-default");
+        fs::create_dir_all(&stale_dir).unwrap();
+        let stale_path = stale_dir.join(format!("{stale_id}.jsonl"));
+        let stale_meta = SessionMeta {
+            session_id: stale_id.clone(),
+            room_id: String::new(),
+            thread_id: None,
+            channel: "device-default".to_string(),
+            created_at: yesterday_start + Duration::hours(2),
+            public_id: None,
+            namespace: Some("default".to_string()),
+            project: None,
+            device_id: Some("device-a".to_string()),
+            room_profile: Some("default".to_string()),
+            title: None,
+        };
+        let line = serde_json::to_string(&MetaLine { meta: stale_meta }).unwrap();
+        std::fs::write(&stale_path, format!("{line}\n")).unwrap();
+
+        let fresh = store
+            .find_or_create_for_device("device-a", "default", "default", boundary)
+            .unwrap();
+        assert_ne!(
+            stale_id, fresh,
+            "yesterday's session must not be picked up; daily rotation depends on it"
+        );
     }
 }
