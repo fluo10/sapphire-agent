@@ -544,6 +544,8 @@ impl Agent {
         let filtered = ChatMessage {
             role: msg.role.clone(),
             parts: kept,
+            input_kind: msg.input_kind.clone(),
+            user_id: msg.user_id.clone(),
         };
         if let Err(e) = self.session_store.append(session_id, &filtered) {
             warn!("Failed to persist message: {e}");
@@ -658,6 +660,8 @@ impl Agent {
                 parts: vec![ContentPart::Text(format!(
                     "[Context Summary — prior-day messages were compacted]\n\n{summary}"
                 ))],
+                input_kind: None,
+                user_id: None,
             },
             ChatMessage::assistant(
                 "Understood. I have the context from the prior day's conversation.",

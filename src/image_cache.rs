@@ -165,6 +165,8 @@ pub fn hydrate_history(history: &[ChatMessage]) -> Vec<ChatMessage> {
                     other => other.clone(),
                 })
                 .collect(),
+            input_kind: msg.input_kind.clone(),
+            user_id: msg.user_id.clone(),
         })
         .collect()
 }
@@ -262,6 +264,8 @@ mod tests {
                 media_type: "image/jpeg".to_string(),
                 sha256: "abc123".to_string(),
             }],
+            input_kind: None,
+            user_id: None,
         }];
         let hydrated = hydrate_history(&history);
         match &hydrated[0].parts[0] {

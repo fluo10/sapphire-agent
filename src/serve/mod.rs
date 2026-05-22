@@ -16,7 +16,7 @@ use crate::channel::RoomInfo;
 use crate::config::Config;
 use crate::context_compression::{generate_summary, maybe_compress};
 use crate::provider::registry::ProviderRegistry;
-use crate::provider::{ChatMessage, ContentPart, Provider};
+use crate::provider::{ChatMessage, ContentPart, Provider, UserInputKind};
 use crate::session::{ConversationKey, SessionStore};
 use crate::tools::ToolSet;
 use crate::voice::VoiceProviders;
@@ -1247,7 +1247,7 @@ async fn run_voice_turn_from_text_sse(
     let outcome = run_llm_turn(
         Arc::clone(&state),
         session_id.clone(),
-        ChatMessage::user(&user_text),
+        ChatMessage::user_voice(&user_text),
         req_id.clone(),
         tx.clone(),
         device_id
@@ -1471,10 +1471,18 @@ pub(crate) async fn push_voice_text_to_subscriber(
     // notifications by draining the sink in a background task).
     let (sink_tx, mut sink_rx) = mpsc::channel::<Result<Event, Infallible>>(32);
     let drain_handle = tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+    // Heartbeat-injected user line — synthesised by the timer pipeline,
+    // not authored by a human, so no input modality applies.
+    let injected_msg = ChatMessage {
+        role: crate::provider::Role::User,
+        parts: vec![crate::provider::ContentPart::Text(user_text.clone())],
+        input_kind: None,
+        user_id: None,
+    };
     let outcome = run_llm_turn(
         Arc::clone(&state),
         session_id.clone(),
-        ChatMessage::user(&user_text),
+        injected_msg,
         Value::Null,
         sink_tx,
         Some(crate::timer::TimerOrigin::Voice {
@@ -1556,6 +1564,27 @@ pub(crate) async fn push_voice_text_to_subscriber(
 // ---------------------------------------------------------------------------
 // Turn processing (tool-calling loop)
 // ---------------------------------------------------------------------------
+
+/// Rewrite a user-role message so the model sees the input modality.
+/// Voice transcripts are prefixed with `[voice input]` (English, since
+/// the model is more reliable with English meta-tags) so the assistant
+/// can treat the body as STT output rather than typed text. Text and
+/// modality-less messages pass through unchanged.
+fn apply_input_kind_label(mut msg: ChatMessage) -> ChatMessage {
+    let prefix = match &msg.input_kind {
+        Some(UserInputKind::Voice) => "[voice input]\n",
+        _ => return msg,
+    };
+    for part in msg.parts.iter_mut() {
+        if let ContentPart::Text(s) = part {
+            *s = format!("{prefix}{s}");
+            return msg;
+        }
+    }
+    msg.parts
+        .insert(0, ContentPart::Text(prefix.trim_end().to_string()));
+    msg
+}
 
 /// Outcome of [`run_llm_turn`].
 struct LlmTurnOutcome {
@@ -1704,7 +1733,13 @@ async fn run_llm_turn(
         // `ImageRef` parts are intentionally degraded to text markers
         // so historical images aren't re-billed every turn (the cache
         // still retains the bytes for an on-demand recall tool).
-        let history_for_provider = crate::image_cache::hydrate_history(&history);
+        // After hydration, fold each user message's input modality
+        // into a textual prefix so the model knows when a body is a
+        // voice transcript (likely to contain STT errors).
+        let history_for_provider: Vec<ChatMessage> = crate::image_cache::hydrate_history(&history)
+            .into_iter()
+            .map(apply_input_kind_label)
+            .collect();
         let response = provider
             .chat(system.as_deref(), &history_for_provider, Some(&tool_specs))
             .await;
@@ -1902,5 +1937,70 @@ async fn generate_session_title(
             warn!("Title generation failed: {e:#}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{Role, UserInputKind};
+
+    #[test]
+    fn apply_label_passes_text_through_unchanged() {
+        let msg = ChatMessage::user("hello");
+        let labeled = apply_input_kind_label(msg.clone());
+        assert_eq!(labeled.parts.len(), 1);
+        match &labeled.parts[0] {
+            ContentPart::Text(s) => assert_eq!(s, "hello"),
+            _ => panic!("expected Text part"),
+        }
+    }
+
+    #[test]
+    fn apply_label_passes_none_input_kind_through_unchanged() {
+        let msg = ChatMessage {
+            role: Role::User,
+            parts: vec![ContentPart::Text("hi".to_string())],
+            input_kind: None,
+            user_id: None,
+        };
+        let labeled = apply_input_kind_label(msg);
+        match &labeled.parts[0] {
+            ContentPart::Text(s) => assert_eq!(s, "hi"),
+            _ => panic!("expected Text part"),
+        }
+    }
+
+    #[test]
+    fn apply_label_voice_prefixes_first_text_part() {
+        let msg = ChatMessage::user_voice("what's the weather");
+        let labeled = apply_input_kind_label(msg);
+        match &labeled.parts[0] {
+            ContentPart::Text(s) => {
+                assert!(s.starts_with("[voice input]\n"), "got: {s}");
+                assert!(s.ends_with("what's the weather"));
+            }
+            _ => panic!("expected Text part"),
+        }
+    }
+
+    #[test]
+    fn apply_label_voice_inserts_label_when_no_text_part_present() {
+        let msg = ChatMessage {
+            role: Role::User,
+            parts: vec![ContentPart::Image {
+                media_type: "image/png".to_string(),
+                data_base64: "AAAA".to_string(),
+            }],
+            input_kind: Some(UserInputKind::Voice),
+            user_id: None,
+        };
+        let labeled = apply_input_kind_label(msg);
+        assert_eq!(labeled.parts.len(), 2);
+        match &labeled.parts[0] {
+            ContentPart::Text(s) => assert_eq!(s, "[voice input]"),
+            _ => panic!("expected inserted Text part"),
+        }
+        assert!(matches!(labeled.parts[1], ContentPart::Image { .. }));
     }
 }
