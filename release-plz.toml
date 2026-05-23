@@ -4,8 +4,11 @@
 git_tag_name = "{{ package }}-v{{ version }}"
 git_release_name = "{{ package }}-v{{ version }}"
 
-# One PR per release cycle that bundles every package being bumped.
-pr_name = "chore(release): {% for release in releases %}{{ release.package }} {{ release.next_version }}{% if not loop.last %}, {% endif %}{% endfor %}"
+# Static PR title. release-plz's `pr_name` context doesn't expose a per-package
+# list (the `releases` variable is only available in `pr_body`), so dynamic
+# titles for multi-package bumps aren't possible. The PR body lists the bumps,
+# and per-package tags / GH releases use `{{ package }}-v{{ version }}` above.
+pr_name = "chore(release): version bump"
 
 [[package]]
 name = "sapphire-agent"
