@@ -7,28 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.2](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.6.1...sapphire-agent-v0.6.2) - 2026-05-23
-
-### Added
-
-- *(messages)* tag user messages with input modality and user_id
-- *(sessions)* bundled migration for cross-device + legacy-voice split
-- *(sessions)* introduce device-default sessions for voice/heartbeat routing
-- *(features)* promote voice-sherpa to default
-- *(image-cache)* drop historical images from input, add recall_image tool
-
-### Fixed
-
-- *(release-plz)* replace pr_name template with static title
-
-### Other
-
-- *(release)* introduce release-plz for sapphire-agent + sapphire-agent-rpc
-- Merge pull request #132 from fluo10/feat/message-input-kind
-- *(deps)* bump sapphire-workspace to 0.12.0
-- *(deps)* bump the cargo-patch group with 3 updates ([#131](https://github.com/fluo10/sapphire-agent/pull/131))
-- Merge pull request #123 from fluo10/refactor/rename-api-to-rpc
-- *(rpc)* rename sapphire-agent-api crate to sapphire-agent-rpc
+## [0.7.0](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.6.1...sapphire-agent-v0.7.0) - 2026-05-23
 
 ### Added
 
@@ -42,6 +21,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previous deterministic `voice-<sha256>.jsonl` scheme is retired —
   voice traffic now flows through the same `SessionStore` surface as
   every other kind. (#122)
+- **User-message metadata: input modality + user_id** — `StoredMessage`
+  / `ChatMessage` gain optional `input_kind` (`Text` / `Voice`) and
+  `user_id` fields. Voice transcripts get a `[voice input]` English
+  prefix right before the provider call so the model knows the body
+  may carry STT errors. Voice-print speaker variants
+  (`KnownVoice` / `UnknownVoice`) are deferred — adding them later
+  stays source-compatible with existing `{"kind":"voice"}` JSONL.
+  `user_id` is a placeholder for the future per-user profile mapping
+  under `<workspace>/users/<namespace>/<user_id>.md`; currently always
+  `None`. Both fields are `serde(default, skip_serializing_if =
+  "Option::is_none")` so legacy JSONL parses cleanly and channel
+  sessions write the exact same bytes as before. (#127)
+- **`recall_image` tool + on-demand historical image recall** —
+  `hydrate_history` now degrades past `ImageRef` parts to a stable
+  `[image: <media_type> sha256=<hex>]` text marker instead of
+  re-inflating the bytes on every turn, dropping input-token cost on
+  long sessions with attachments. The bytes still live in the
+  workspace-external image cache, addressable by SHA-256; the new
+  `recall_image(sha256, media_type)` tool (registered only when the
+  cache is enabled) fetches a specific past image on demand and
+  Anthropic accepts the image as a sibling content block to the
+  `tool_result`. The `Tool` trait gains `execute_full` with a default
+  impl that wraps the existing `execute`, so the ~20 existing tools
+  need no changes. (#119)
 
 ### Changed
 
@@ -58,6 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <grain-id>` are now logically separated from device-default sessions.
   On-disk directory moves to `sessions/<ns>/cross-device/`; the bundled
   session migration relocates pre-existing files. (#122)
+- **`voice-sherpa` feature promoted to default.** Local sherpa-onnx
+  STT + TTS are now part of the default feature set so voice works
+  out of the box. Note the longer cold-cache build (~5–10 min for
+  `sherpa-onnx-sys`); opt out via `--no-default-features` plus the
+  other defaults if you only run the Gradio TTS path or don't need
+  voice at all. (#120)
 
 ### Migration
 
