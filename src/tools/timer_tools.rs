@@ -112,9 +112,8 @@ impl Tool for TimerSetTool {
             .as_str()
             .map(str::to_string)
             .unwrap_or_else(|| "timer".to_string());
-        let origin = current_origin().ok_or_else(|| {
-            anyhow!("timer_set can only be called from a chat or voice turn")
-        })?;
+        let origin = current_origin()
+            .ok_or_else(|| anyhow!("timer_set can only be called from a chat or voice turn"))?;
         let snap = self
             .manager
             .set_single(minutes, label.clone(), origin)
@@ -187,16 +186,15 @@ impl Tool for TimerPresetTool {
         let name = input["name"].as_str().context("missing 'name'")?;
         let cycles_override = input["cycles"].as_u64().map(|n| n as u32);
         let preset = find_preset(&self.presets, name)?.clone();
-        let origin = current_origin().ok_or_else(|| {
-            anyhow!("timer_preset can only be called from a chat or voice turn")
-        })?;
+        let origin = current_origin()
+            .ok_or_else(|| anyhow!("timer_preset can only be called from a chat or voice turn"))?;
         let snap = self
             .manager
             .set_preset(preset.clone(), cycles_override, origin)
             .await?;
         let total_cycles = cycles_override.unwrap_or(preset.cycles).max(1);
-        let total_min: f64 = preset.steps.iter().map(|s| s.minutes).sum::<f64>()
-            * total_cycles as f64;
+        let total_min: f64 =
+            preset.steps.iter().map(|s| s.minutes).sum::<f64>() * total_cycles as f64;
         Ok(format!(
             "Preset '{}' started: {} cycle(s) of {} step(s) (~{:.1} min total). First step '{}' fires at {}.",
             preset.name,

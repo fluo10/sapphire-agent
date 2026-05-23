@@ -1237,7 +1237,9 @@ impl Tool for RecallImageTool {
 }
 
 fn is_hex_sha256(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    s.len() == 64
+        && s.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 #[cfg(test)]
@@ -1265,10 +1267,7 @@ mod recall_image_tests {
             .unwrap();
         assert_eq!(out.images.len(), 1);
         assert_eq!(out.images[0].0, "image/jpeg");
-        assert_eq!(
-            BASE64_STANDARD.decode(&out.images[0].1).unwrap(),
-            bytes
-        );
+        assert_eq!(BASE64_STANDARD.decode(&out.images[0].1).unwrap(), bytes);
         assert!(out.text.contains(&sha));
     }
 

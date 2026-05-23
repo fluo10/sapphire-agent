@@ -159,9 +159,9 @@ pub fn hydrate_history(history: &[ChatMessage]) -> Vec<ChatMessage> {
                 .parts
                 .iter()
                 .map(|p| match p {
-                    ContentPart::ImageRef { media_type, sha256 } => ContentPart::Text(
-                        format!("[image: {media_type} sha256={sha256}]"),
-                    ),
+                    ContentPart::ImageRef { media_type, sha256 } => {
+                        ContentPart::Text(format!("[image: {media_type} sha256={sha256}]"))
+                    }
                     other => other.clone(),
                 })
                 .collect(),

@@ -1250,8 +1250,7 @@ mod tests {
     fn stored_message_without_input_kind_or_user_id_deserializes_as_none() {
         // Legacy JSONL written before these fields existed must still
         // load: no `input_kind`, no `user_id`.
-        let legacy =
-            r#"{"timestamp":"2026-04-08T11:30:22.372570890Z","role":"user","parts":[{"Text":"hello"}]}"#;
+        let legacy = r#"{"timestamp":"2026-04-08T11:30:22.372570890Z","role":"user","parts":[{"Text":"hello"}]}"#;
         let msg: StoredMessage = serde_json::from_str(legacy).expect("legacy JSONL parses");
         assert!(msg.input_kind.is_none());
         assert!(msg.user_id.is_none());
@@ -1429,8 +1428,7 @@ mod tests {
 
         // Hand-craft a meta file whose `created_at` falls in yesterday's
         // local-day window so the most-recent scan rejects it.
-        let yesterday_date =
-            local_date_for_timestamp(Local::now(), boundary) - Duration::days(1);
+        let yesterday_date = local_date_for_timestamp(Local::now(), boundary) - Duration::days(1);
         let (yesterday_start, _) = day_window(yesterday_date, boundary);
         let stale_id = Uuid::now_v7().to_string();
         let stale_dir = tmp.path().join("default").join("device-default");

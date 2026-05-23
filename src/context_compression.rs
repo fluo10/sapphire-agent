@@ -318,10 +318,7 @@ mod tests {
                     input: json!({}),
                 }],
             ),
-            ChatMessage::tool_results_with_images(
-                vec![("t1".into(), "result".into())],
-                vec![],
-            ),
+            ChatMessage::tool_results_with_images(vec![("t1".into(), "result".into())], vec![]),
             ChatMessage::assistant("final answer"),
         ];
 

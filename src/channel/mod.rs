@@ -294,7 +294,10 @@ mod tests {
 
     #[test]
     fn sniffs_jpeg() {
-        assert_eq!(sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]), Some("image/jpeg"));
+        assert_eq!(
+            sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]),
+            Some("image/jpeg")
+        );
     }
 
     #[test]

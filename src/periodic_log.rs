@@ -1207,9 +1207,9 @@ where
             continue;
         }
         let room_label = if is_rpc || is_device_default {
-            meta.title.clone().unwrap_or_else(|| {
-                format!("{}/{}", meta.channel, short_id(&meta.session_id))
-            })
+            meta.title
+                .clone()
+                .unwrap_or_else(|| format!("{}/{}", meta.channel, short_id(&meta.session_id)))
         } else {
             format!("{}/{}", meta.channel, short_id(&meta.room_id))
         };
