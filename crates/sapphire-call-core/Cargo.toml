@@ -1,6 +1,6 @@
 [package]
 name = "sapphire-call-core"
-version.workspace = true
+version = "0.6.1"
 edition.workspace = true
 description = "Shared config + identity helpers for sapphire-call CLI / desktop clients"
 license.workspace = true

@@ -1,0 +1,44 @@
+[workspace]
+# Per-package tags / GitHub releases. Existing single-version tags like
+# `v0.6.1` stay as historical anchors; new tags use the per-package form.
+git_tag_name = "{{ package }}-v{{ version }}"
+git_release_name = "{{ package }}-v{{ version }}"
+
+# One PR per release cycle that bundles every package being bumped.
+pr_name = "chore(release): {% for release in releases %}{{ release.package }} {{ release.next_version }}{% if not loop.last %}, {% endif %}{% endfor %}"
+
+[[package]]
+name = "sapphire-agent"
+changelog_path = "./CHANGELOG.md"
+
+[[package]]
+name = "sapphire-agent-rpc"
+changelog_path = "./crates/sapphire-agent-rpc/CHANGELOG.md"
+
+# sapphire-call-* crates are intentionally excluded from release-plz for now.
+# Versions are managed manually until we explicitly opt them in.
+# release-plz will still keep their `version = "x.y.z"` path-dep constraints
+# on sapphire-agent-rpc in sync when rpc gets bumped.
+[[package]]
+name = "sapphire-call-core"
+release = false
+publish = false
+changelog_update = false
+git_release_enable = false
+git_tag_enable = false
+
+[[package]]
+name = "sapphire-call-cli"
+release = false
+publish = false
+changelog_update = false
+git_release_enable = false
+git_tag_enable = false
+
+[[package]]
+name = "sapphire-call-desktop"
+release = false
+publish = false
+changelog_update = false
+git_release_enable = false
+git_tag_enable = false

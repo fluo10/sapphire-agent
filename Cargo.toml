@@ -28,14 +28,13 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 
 [workspace.package]
-version = "0.6.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fluo10/sapphire-agent"
 
 [package]
 name = "sapphire-agent"
-version.workspace = true
+version = "0.6.1"
 edition.workspace = true
 description = "A personal AI assistant agent with Matrix/Discord channels, Anthropic backend, and a sapphire-workspace memory layer"
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "sapphire-call-desktop"
-version.workspace = true
+version = "0.6.1"
 edition.workspace = true
 description = "Desktop GUI client for sapphire-agent (bevy + egui)"
 license.workspace = true
