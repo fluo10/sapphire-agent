@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.7.0...sapphire-agent-v0.7.1) - 2026-05-23
+
+### Other
+
+- *(release)* add sapphire-call-core and -cli to release-plz at 0.7.0
+
 ## [0.7.0](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.6.1...sapphire-agent-v0.7.0) - 2026-05-23
 
 ### Added
