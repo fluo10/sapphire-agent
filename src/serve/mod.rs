@@ -650,11 +650,23 @@ async fn handle_chat(
         }
     };
 
+    // Clients may opt into out-of-band TTS by setting
+    // `modalities: ["text", "audio"]`. Default = text-only (existing
+    // behaviour preserved for the CLI REPL / one-shot / channel paths).
+    // Unknown modality strings are silently dropped — additive future
+    // modalities won't break older clients that don't recognise them.
+    let want_audio = params
+        .as_ref()
+        .and_then(|p| p.get("modalities"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().any(|m| m.as_str() == Some("audio")))
+        .unwrap_or(false);
+
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
 
     // Spawn the turn processor
     tokio::spawn(async move {
-        run_turn(state, session_id, content, req_id, tx).await;
+        run_turn(state, session_id, content, want_audio, req_id, tx).await;
     });
 
     let stream = ReceiverStream::new(rx);
@@ -1859,6 +1871,7 @@ async fn run_turn(
     state: Arc<ServeState>,
     session_id: String,
     user_message: String,
+    want_audio: bool,
     req_id: Value,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) {
@@ -1878,6 +1891,21 @@ async fn run_turn(
         None,
     )
     .await;
+
+    // GUI clients that asked for `audio` get the text-then-audio
+    // sequence over progress notifications before the final result.
+    // TTS failures here are non-fatal: text is still useful, so we
+    // surface a `tts_error` notification and continue to the result.
+    if want_audio
+        && let Some(text) = outcome.text.as_deref()
+    {
+        send(notification_event(
+            "notifications/progress",
+            json!({"kind": "assistant_text", "text": text}),
+        ))
+        .await;
+        stream_chat_tts(&state, &session_id, text, &tx).await;
+    }
 
     // Send final result
     match &outcome.text {
@@ -1904,6 +1932,121 @@ async fn run_turn(
                 warn!("Failed to store session title: {e}");
             }
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chat → TTS bridge (modalities=["text","audio"])
+// ---------------------------------------------------------------------------
+
+/// Synthesize `reply_text` via the session's voice_pipeline TTS provider
+/// and stream the resulting PCM as `audio_chunk` progress notifications.
+///
+/// Best-effort: any failure (no voice configured, provider missing,
+/// synth error, zero chunks) surfaces as a `tts_error` progress
+/// notification and returns — the caller still emits the text result,
+/// since GUI clients prefer "text without audio" over "no answer at
+/// all" when TTS is misconfigured.
+///
+/// Intentionally separate from `run_voice_turn_from_text_sse`'s TTS
+/// block: the voice path emits `stage` markers and treats TTS failure
+/// as fatal (it aborts the JSON-RPC result). Sharing would risk
+/// regressing that behaviour.
+async fn stream_chat_tts(
+    state: &Arc<ServeState>,
+    session_id: &str,
+    reply_text: &str,
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+) {
+    use base64::Engine;
+
+    let send = |evt: Event| {
+        let tx = tx.clone();
+        async move {
+            let _ = tx.send(Ok(evt)).await;
+        }
+    };
+    let emit_tts_error = |message: String| {
+        let tx = tx.clone();
+        async move {
+            let _ = tx
+                .send(Ok(notification_event(
+                    "notifications/progress",
+                    json!({"kind": "tts_error", "message": message}),
+                )))
+                .await;
+        }
+    };
+
+    let pipeline = match resolve_voice_pipeline(state, session_id).await {
+        Ok(p) => p,
+        Err(VoicePipelineLookup::NoVoice) => {
+            emit_tts_error(
+                "voice unavailable: no STT/TTS providers configured server-side".to_string(),
+            )
+            .await;
+            return;
+        }
+        Err(VoicePipelineLookup::NotConfigured) => {
+            emit_tts_error(
+                "session's room_profile has no voice_pipeline configured".to_string(),
+            )
+            .await;
+            return;
+        }
+    };
+    let voice_registry = match state.voice.as_ref() {
+        Some(v) => v.clone(),
+        None => {
+            emit_tts_error("voice registry unavailable".to_string()).await;
+            return;
+        }
+    };
+    let tts = match voice_registry.tts(&pipeline.tts_provider) {
+        Some(p) => p,
+        None => {
+            emit_tts_error(format!(
+                "tts_provider '{}' not instantiated",
+                pipeline.tts_provider
+            ))
+            .await;
+            return;
+        }
+    };
+
+    let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<i16>>(32);
+    let reply_for_tts = reply_text.to_string();
+    let synth_handle =
+        tokio::spawn(async move { tts.synthesize_stream(&reply_for_tts, pcm_tx).await });
+    let mut chunks_emitted = 0usize;
+    while let Some(chunk) = pcm_rx.recv().await {
+        let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        send(notification_event(
+            "notifications/progress",
+            json!({"kind": "audio_chunk", "data": b64}),
+        ))
+        .await;
+        chunks_emitted += 1;
+    }
+    match synth_handle.await {
+        Ok(Ok(())) => {
+            if chunks_emitted == 0 {
+                emit_tts_error(format!(
+                    "TTS provider '{}' produced no audio",
+                    pipeline.tts_provider
+                ))
+                .await;
+            }
+        }
+        Ok(Err(e)) => {
+            error!("chat TTS synthesis error: {e:#}");
+            emit_tts_error(format!("TTS synthesis failed: {e:#}")).await;
+        }
+        Err(join_err) => {
+            error!("chat TTS task panicked: {join_err}");
+            emit_tts_error(format!("TTS task panicked: {join_err}")).await;
+        }
     }
 }
 

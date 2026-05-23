@@ -5,6 +5,7 @@
 //! in any binary (`sapphire-agent call` or the standalone
 //! `sapphire-call`).
 
+pub mod chat;
 pub mod voice;
 
 use anyhow::{Context, Result};
@@ -17,6 +18,7 @@ use std::borrow::Cow;
 use std::io::{Write, stderr, stdout};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use chat::{ChatEvent, ChatModality, chat_stream};
 pub use voice::{
     VoiceEvent, VoicePushEvent, WakeWordConfig, WakeWordModel, voice_config, voice_pipeline_run,
     voice_subscribe,

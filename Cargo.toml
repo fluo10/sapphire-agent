@@ -1,5 +1,11 @@
 [workspace]
-members = [".", "crates/sapphire-agent-rpc", "crates/sapphire-call"]
+members = [
+    ".",
+    "crates/sapphire-agent-rpc",
+    "crates/sapphire-call-core",
+    "crates/sapphire-call-cli",
+    "crates/sapphire-call-desktop",
+]
 
 [workspace.dependencies]
 anyhow = "1.0"
