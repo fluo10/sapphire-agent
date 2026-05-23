@@ -117,9 +117,9 @@ fn main() {
         .insert_resource(state)
         .insert_resource(BridgeEventQueue(Mutex::new(event_rx)))
         .insert_non_send_resource(bridge)
-        .add_systems(Startup, (spawn_camera, setup_fonts))
+        .add_systems(Startup, spawn_camera)
         .add_systems(Update, drain_bridge_events)
-        .add_systems(EguiPrimaryContextPass, route_ui)
+        .add_systems(EguiPrimaryContextPass, (setup_fonts, route_ui).chain())
         .run();
 }
 
@@ -146,7 +146,16 @@ const BUNDLED_CJK_FONT: &[u8] = include_bytes!("../assets/NotoSansJP-Regular.otf
 /// render as tofu. Appended last in each family so Latin glyphs keep
 /// using egui's bundled font (better hinting) and only missing-glyph
 /// lookups fall through to Noto.
-fn setup_fonts(mut contexts: bevy_egui::EguiContexts) {
+///
+/// Runs in `EguiPrimaryContextPass` (not `Startup`) because bevy_egui
+/// only attaches `EguiContext` to the camera during `PreUpdate` of the
+/// first frame — at `Startup` time `ctx_mut()` errors with `NoEntities`
+/// and the font registration is silently skipped, leaving JP as tofu.
+/// The `Local<bool>` guard makes it a one-shot.
+fn setup_fonts(mut contexts: bevy_egui::EguiContexts, mut done: Local<bool>) {
+    if *done {
+        return;
+    }
     let Ok(ctx) = contexts.ctx_mut() else {
         warn!("egui primary context unavailable; skipping font setup");
         return;
@@ -165,6 +174,7 @@ fn setup_fonts(mut contexts: bevy_egui::EguiContexts) {
     }
     ctx.set_fonts(fonts);
     info!("loaded bundled Noto Sans JP Regular ({} KB)", BUNDLED_CJK_FONT.len() / 1024);
+    *done = true;
 }
 
 /// Drains every event the tokio side has produced this frame and
