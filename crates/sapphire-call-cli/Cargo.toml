@@ -1,6 +1,6 @@
 [package]
 name = "sapphire-call-cli"
-version = "0.6.1"
+version = "0.7.0"
 edition.workspace = true
 description = "Standalone CLI / voice-satellite client for sapphire-agent"
 license.workspace = true
@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 sapphire-agent-rpc = { path = "../sapphire-agent-rpc", version = "0.7.0" }
-sapphire-call-core = { path = "../sapphire-call-core", version = "0.6.1" }
+sapphire-call-core = { path = "../sapphire-call-core", version = "0.7.0" }
 
 # Async runtime — voice subcommand needs sync, time, and rt features.
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "signal"] }

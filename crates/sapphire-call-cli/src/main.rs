@@ -121,17 +121,13 @@ async fn main() -> Result<()> {
         .or(file_cfg.server.url)
         .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
     let session = cli.session.clone().or(file_cfg.server.session);
-    let token = cli
-        .token
-        .clone()
-        .or(file_cfg.server.token)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "missing bearer token — set [server].token in the config, pass --token <TOKEN>, \
+    let token = cli.token.clone().or(file_cfg.server.token).ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing bearer token — set [server].token in the config, pass --token <TOKEN>, \
                  or export SAPPHIRE_AGENT_TOKEN; the agent uses it to look up your room_profile \
                  (api_keys on [room_profile.<n>])"
-            )
-        })?;
+        )
+    })?;
     let device = file_cfg.device.to_api();
 
     if let Some(Command::Voice {

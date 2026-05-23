@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 sapphire-agent-rpc = { path = "../sapphire-agent-rpc", version = "0.7.0" }
-sapphire-call-core = { path = "../sapphire-call-core", version = "0.6.1" }
+sapphire-call-core = { path = "../sapphire-call-core", version = "0.7.0" }
 
 # Game engine — needed up front for the eventual 3D character work
 # (desktop-mate-style avatar). For the chat-only first cut we use only
