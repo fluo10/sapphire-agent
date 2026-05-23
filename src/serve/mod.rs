@@ -428,9 +428,7 @@ async fn rpc_post(
         "voice/pipeline_run" => {
             handle_voice_pipeline_run(state, req_id, req.params, profile_name).await
         }
-        "voice/subscribe" => {
-            handle_voice_subscribe(state, req_id, req.params, profile_name).await
-        }
+        "voice/subscribe" => handle_voice_subscribe(state, req_id, req.params, profile_name).await,
         _ => {
             let body = error_response(req_id, -32601, "Method not found");
             body.into_response()
@@ -498,13 +496,15 @@ async fn handle_initialize(
 
         match param_id {
             None => None,
-            Some(ref id) if id.len() == 7 => match state.cross_device_session_store.find_by_public_id(id) {
-                Some(uuid) => Some(uuid),
-                None => {
-                    let body = error_response(req_id, -32602, "Session not found");
-                    return body.into_response();
+            Some(ref id) if id.len() == 7 => {
+                match state.cross_device_session_store.find_by_public_id(id) {
+                    Some(uuid) => Some(uuid),
+                    None => {
+                        let body = error_response(req_id, -32602, "Session not found");
+                        return body.into_response();
+                    }
                 }
-            },
+            }
             Some(_) => {
                 let body = error_response(
                     req_id,
@@ -878,12 +878,14 @@ async fn handle_voice_pipeline_run(
         .config
         .namespace_for_room_profile(&room_profile)
         .to_string();
-    let session_id = match state.device_default_session_store.find_or_create_for_device(
-        &device_id,
-        &room_profile,
-        &namespace,
-        state.config.day_boundary_hour,
-    ) {
+    let session_id = match state
+        .device_default_session_store
+        .find_or_create_for_device(
+            &device_id,
+            &room_profile,
+            &namespace,
+            state.config.day_boundary_hour,
+        ) {
         Ok(id) => id,
         Err(e) => {
             let body = error_response(
@@ -1050,7 +1052,6 @@ async fn translate_voice_pushes(
         }
     }
 }
-
 
 async fn run_voice_turn(
     state: Arc<ServeState>,
@@ -1896,9 +1897,7 @@ async fn run_turn(
     // sequence over progress notifications before the final result.
     // TTS failures here are non-fatal: text is still useful, so we
     // surface a `tts_error` notification and continue to the result.
-    if want_audio
-        && let Some(text) = outcome.text.as_deref()
-    {
+    if want_audio && let Some(text) = outcome.text.as_deref() {
         send(notification_event(
             "notifications/progress",
             json!({"kind": "assistant_text", "text": text}),
@@ -1988,10 +1987,8 @@ async fn stream_chat_tts(
             return;
         }
         Err(VoicePipelineLookup::NotConfigured) => {
-            emit_tts_error(
-                "session's room_profile has no voice_pipeline configured".to_string(),
-            )
-            .await;
+            emit_tts_error("session's room_profile has no voice_pipeline configured".to_string())
+                .await;
             return;
         }
     };

@@ -813,9 +813,7 @@ fn migrate_to_device_default_layout(sessions_base: &std::path::Path) -> anyhow::
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.is_file()
-                    || path.extension().and_then(|e| e.to_str()) != Some("jsonl")
-                {
+                if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                     continue;
                 }
                 let Some(file_name) = path.file_name() else {

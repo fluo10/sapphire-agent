@@ -251,8 +251,7 @@ impl TimerManager {
 
                 tokio::time::sleep(duration).await;
 
-                let is_last_step =
-                    cycle == cycles && i + 1 == total_steps;
+                let is_last_step = cycle == cycles && i + 1 == total_steps;
                 let next_label = if is_last_step {
                     None
                 } else if i + 1 < total_steps {
@@ -322,47 +321,48 @@ impl TimerManager {
                     "Timer fire (chat) skipped for {task_name}: agent not wired into TimerManager"
                 ),
             },
-            TimerOrigin::Voice { device_id } => match self
-                .serve_state
-                .get()
-                .and_then(Weak::upgrade)
-            {
-                Some(state) => {
-                    let task_name = task_name.to_string();
-                    let prompt = prompt.to_string();
-                    let device_id = device_id.clone();
-                    tokio::spawn(async move {
-                        match crate::serve::push_voice_text_to_subscriber(
-                            state,
-                            device_id.clone(),
-                            Some(task_name.clone()),
-                            prompt,
-                        )
-                        .await
-                        {
-                            Ok(()) => {}
-                            Err(e) => {
-                                let reason = match e {
-                                    crate::serve::VoicePushError::Offline => "offline".to_string(),
-                                    crate::serve::VoicePushError::NoVoice => {
-                                        "no voice providers".to_string()
-                                    }
-                                    crate::serve::VoicePushError::NotConfigured => {
-                                        "voice_pipeline not configured for room_profile".to_string()
-                                    }
-                                    crate::serve::VoicePushError::Other(msg) => msg,
-                                };
-                                warn!(
-                                    "Timer fire (voice) failed for {task_name} -> device={device_id}: {reason}"
-                                );
+            TimerOrigin::Voice { device_id } => {
+                match self.serve_state.get().and_then(Weak::upgrade) {
+                    Some(state) => {
+                        let task_name = task_name.to_string();
+                        let prompt = prompt.to_string();
+                        let device_id = device_id.clone();
+                        tokio::spawn(async move {
+                            match crate::serve::push_voice_text_to_subscriber(
+                                state,
+                                device_id.clone(),
+                                Some(task_name.clone()),
+                                prompt,
+                            )
+                            .await
+                            {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    let reason = match e {
+                                        crate::serve::VoicePushError::Offline => {
+                                            "offline".to_string()
+                                        }
+                                        crate::serve::VoicePushError::NoVoice => {
+                                            "no voice providers".to_string()
+                                        }
+                                        crate::serve::VoicePushError::NotConfigured => {
+                                            "voice_pipeline not configured for room_profile"
+                                                .to_string()
+                                        }
+                                        crate::serve::VoicePushError::Other(msg) => msg,
+                                    };
+                                    warn!(
+                                        "Timer fire (voice) failed for {task_name} -> device={device_id}: {reason}"
+                                    );
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
+                    None => warn!(
+                        "Timer fire (voice) skipped for {task_name}: serve_state not wired into TimerManager"
+                    ),
                 }
-                None => warn!(
-                    "Timer fire (voice) skipped for {task_name}: serve_state not wired into TimerManager"
-                ),
-            },
+            }
         }
     }
 
@@ -398,8 +398,6 @@ pub fn find_preset<'a>(presets: &'a [TimerPreset], name: &str) -> Result<&'a Tim
         .find(|p| p.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| {
             let known: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
-            anyhow!(
-                "unknown timer preset '{name}'. Known presets: {known:?}"
-            )
+            anyhow!("unknown timer preset '{name}'. Known presets: {known:?}")
         })
 }

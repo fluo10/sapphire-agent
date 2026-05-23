@@ -97,7 +97,11 @@ pub async fn handle_mcp_post(
     };
     let req_id = envelope.id.clone().unwrap_or(Value::Null);
     if envelope.jsonrpc.as_deref() != Some("2.0") {
-        return jsonrpc_error(req_id, codes::INVALID_REQUEST, "jsonrpc field must be \"2.0\"");
+        return jsonrpc_error(
+            req_id,
+            codes::INVALID_REQUEST,
+            "jsonrpc field must be \"2.0\"",
+        );
     }
 
     // Notifications carry no id and expect no response body. MCP sends
@@ -129,9 +133,7 @@ pub async fn handle_mcp_post(
     match envelope.method.as_str() {
         "initialize" => handle_initialize(req_id),
         "tools/list" => handle_tools_list(req_id),
-        "tools/call" => {
-            handle_tools_call(state, req_id, envelope.params, profile_name).await
-        }
+        "tools/call" => handle_tools_call(state, req_id, envelope.params, profile_name).await,
         other => jsonrpc_error(
             req_id,
             codes::METHOD_NOT_FOUND,
@@ -280,10 +282,7 @@ async fn handle_tools_call(
             };
             jsonrpc_result(req_id, result)
         }
-        other => jsonrpc_result(
-            req_id,
-            tool_text_error(&format!("unknown tool '{other}'")),
-        ),
+        other => jsonrpc_result(req_id, tool_text_error(&format!("unknown tool '{other}'"))),
     }
 }
 
@@ -300,8 +299,7 @@ const DEFAULT_SOURCE: &str = "claude-code";
 /// short so the model focuses on warmth and brevity rather than
 /// reproducing the report content. Language is left to the model
 /// because reports themselves may come in any language.
-const ACK_SYSTEM_PROMPT: &str =
-    "You are sapphire-agent, the user's personal partner AI. Their external AI \
+const ACK_SYSTEM_PROMPT: &str = "You are sapphire-agent, the user's personal partner AI. Their external AI \
      assistant (such as Claude Code) is reporting a unit of coding work it just \
      completed on the user's behalf. Acknowledge the report warmly and briefly \
      (1-3 sentences). Speak naturally — your reply is shown both to the assistant \
@@ -451,9 +449,7 @@ async fn call_recall_memory(
         .namespace_for_room_profile(&profile_name)
         .to_string();
 
-    let session_id = state
-        .mcp_session_for_project(&namespace, &project)
-        .await;
+    let session_id = state.mcp_session_for_project(&namespace, &project).await;
 
     let Some(session_id) = session_id else {
         // Unknown project is the normal first-call shape — return an
@@ -525,7 +521,10 @@ fn render_briefing(
         return out;
     }
 
-    out.push_str(&format!("\n## Recent reports ({} entries)\n", reports.len()));
+    out.push_str(&format!(
+        "\n## Recent reports ({} entries)\n",
+        reports.len()
+    ));
     for (idx, msg) in reports.iter().enumerate() {
         let Some(meta) = &msg.report_meta else {
             continue;

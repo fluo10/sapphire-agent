@@ -177,7 +177,10 @@ async fn dispatch_event(val: &Value, tx: &mpsc::Sender<ChatEvent>) -> bool {
                     }
                 }
                 Some("tts_error") => {
-                    let message = params["message"].as_str().unwrap_or("TTS failed").to_string();
+                    let message = params["message"]
+                        .as_str()
+                        .unwrap_or("TTS failed")
+                        .to_string();
                     let _ = tx.send(ChatEvent::TtsError { message }).await;
                 }
                 _ => {}
@@ -186,14 +189,14 @@ async fn dispatch_event(val: &Value, tx: &mpsc::Sender<ChatEvent>) -> bool {
         }
         false
     } else if val.get("result").is_some() {
-        let content = val["result"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let content = val["result"]["content"].as_str().unwrap_or("").to_string();
         let _ = tx.send(ChatEvent::Done { content }).await;
         true
     } else if let Some(err) = val.get("error") {
-        let message = err["message"].as_str().unwrap_or("unknown error").to_string();
+        let message = err["message"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string();
         let _ = tx.send(ChatEvent::Error { message }).await;
         true
     } else {
