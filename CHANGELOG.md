@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.6.1...sapphire-agent-v0.6.2) - 2026-05-23
+
+### Added
+
+- *(messages)* tag user messages with input modality and user_id
+- *(sessions)* bundled migration for cross-device + legacy-voice split
+- *(sessions)* introduce device-default sessions for voice/heartbeat routing
+- *(features)* promote voice-sherpa to default
+- *(image-cache)* drop historical images from input, add recall_image tool
+
+### Fixed
+
+- *(release-plz)* replace pr_name template with static title
+
+### Other
+
+- *(release)* introduce release-plz for sapphire-agent + sapphire-agent-rpc
+- Merge pull request #132 from fluo10/feat/message-input-kind
+- *(deps)* bump sapphire-workspace to 0.12.0
+- *(deps)* bump the cargo-patch group with 3 updates ([#131](https://github.com/fluo10/sapphire-agent/pull/131))
+- Merge pull request #123 from fluo10/refactor/rename-api-to-rpc
+- *(rpc)* rename sapphire-agent-api crate to sapphire-agent-rpc
+
 ### Added
 
 - **Device-default sessions** — a new session kind keyed by
