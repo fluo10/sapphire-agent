@@ -2056,8 +2056,8 @@ async fn generate_session_title(
     user_message: &str,
     assistant_response: &str,
 ) -> Option<String> {
-    let user_snippet = &user_message[..user_message.len().min(300)];
-    let asst_snippet = &assistant_response[..assistant_response.len().min(300)];
+    let user_snippet: String = user_message.chars().take(300).collect();
+    let asst_snippet: String = assistant_response.chars().take(300).collect();
     let prompt = format!(
         "Generate a concise title (max 60 characters) for this conversation. \
         Respond with only the title text — no quotes, no punctuation at the end.\n\n\
