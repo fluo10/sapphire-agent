@@ -602,9 +602,8 @@ async fn listen_loop(mut ctx: ListenCtx) -> Result<()> {
                     // segment has time to close (min_silence_duration)
                     // and ship to STT normally.
                     if ctx.vad.detected() {
-                        ctx.follow_up_until = Some(
-                            now + Duration::from_secs(SPEECH_IN_PROGRESS_GRACE_SECS),
-                        );
+                        ctx.follow_up_until =
+                            Some(now + Duration::from_secs(SPEECH_IN_PROGRESS_GRACE_SECS));
                         continue;
                     }
                     expire_follow_up(&mut ctx, &mut window_buf).await;
@@ -1651,8 +1650,7 @@ fn enqueue_beep(queue: &Arc<std::sync::Mutex<VecDeque<i16>>>, freq_hz: f32, outp
 /// off / not heard" from "I shipped your utterance".
 fn generate_timeout_beep() -> Vec<i16> {
     let beep = generate_beep(BEEP_TIMEOUT_HZ, BEEP_TIMEOUT_DURATION_MS);
-    let gap_samples =
-        (PIPELINE_SAMPLE_RATE as f32 * BEEP_TIMEOUT_GAP_MS as f32 / 1000.0) as usize;
+    let gap_samples = (PIPELINE_SAMPLE_RATE as f32 * BEEP_TIMEOUT_GAP_MS as f32 / 1000.0) as usize;
     let mut out = Vec::with_capacity(beep.len() * 2 + gap_samples);
     out.extend_from_slice(&beep);
     out.extend(std::iter::repeat_n(0i16, gap_samples));
@@ -1775,8 +1773,8 @@ mod tests {
         // beeps separated by a silence gap. The total length must
         // match 2 × beep + gap, and the gap region must be silent.
         let pcm = generate_timeout_beep();
-        let beep_samples = (PIPELINE_SAMPLE_RATE as usize) * BEEP_TIMEOUT_DURATION_MS as usize
-            / 1000;
+        let beep_samples =
+            (PIPELINE_SAMPLE_RATE as usize) * BEEP_TIMEOUT_DURATION_MS as usize / 1000;
         let gap_samples =
             (PIPELINE_SAMPLE_RATE as f32 * BEEP_TIMEOUT_GAP_MS as f32 / 1000.0) as usize;
         assert_eq!(pcm.len(), beep_samples * 2 + gap_samples);

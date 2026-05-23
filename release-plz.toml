@@ -18,26 +18,18 @@ changelog_path = "./CHANGELOG.md"
 name = "sapphire-agent-rpc"
 changelog_path = "./crates/sapphire-agent-rpc/CHANGELOG.md"
 
-# sapphire-call-* crates are intentionally excluded from release-plz for now.
-# Versions are managed manually until we explicitly opt them in.
-# release-plz will still keep their `version = "x.y.z"` path-dep constraints
-# on sapphire-agent-rpc in sync when rpc gets bumped.
 [[package]]
 name = "sapphire-call-core"
-release = false
-publish = false
-changelog_update = false
-git_release_enable = false
-git_tag_enable = false
+changelog_path = "./crates/sapphire-call-core/CHANGELOG.md"
 
 [[package]]
 name = "sapphire-call-cli"
-release = false
-publish = false
-changelog_update = false
-git_release_enable = false
-git_tag_enable = false
+changelog_path = "./crates/sapphire-call-cli/CHANGELOG.md"
 
+# sapphire-call-desktop stays opted out: it carries `publish = false` in its
+# Cargo.toml (bevy + bundled font, not intended for crates.io) and iterates
+# on its own cadence. release-plz still keeps its path-dep version
+# constraints on sapphire-agent-rpc / sapphire-call-core in sync.
 [[package]]
 name = "sapphire-call-desktop"
 release = false

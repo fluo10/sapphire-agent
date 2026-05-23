@@ -9986,7 +9986,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-call-cli"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "bzip2 0.6.1",
@@ -10011,7 +10011,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-call-core"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "directories",
