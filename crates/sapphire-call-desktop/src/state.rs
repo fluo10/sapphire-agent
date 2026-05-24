@@ -63,7 +63,9 @@ pub enum TurnState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MicUiState {
     Idle,
-    Recording { speech_detected: bool },
+    Recording {
+        speech_detected: bool,
+    },
     /// Audio captured; waiting for `voice/pipeline_run` to return.
     Uploading,
 }

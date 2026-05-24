@@ -223,7 +223,10 @@ fn setup_fonts(mut contexts: bevy_egui::EguiContexts, mut done: Local<bool>) {
         family.push("cjk".to_owned());
     }
     ctx.set_fonts(fonts);
-    info!("loaded bundled Noto Sans JP Regular ({} KB)", BUNDLED_CJK_FONT.len() / 1024);
+    info!(
+        "loaded bundled Noto Sans JP Regular ({} KB)",
+        BUNDLED_CJK_FONT.len() / 1024
+    );
     *done = true;
 }
 

@@ -46,41 +46,63 @@ pub enum BridgeEvent {
         display_id: String,
     },
     /// `initialize` failed — the user has to fix Settings and retry.
-    SessionFailed { message: String },
+    SessionFailed {
+        message: String,
+    },
     /// A chat turn produced text (final result). Always the last event
     /// for a successful turn.
-    ChatText { text: String },
+    ChatText {
+        text: String,
+    },
     /// Server emitted a tool call notification. Reserved for future
     /// "AI is using tool X" affordance; ignored by the chat panel for
     /// now but parsed so the dispatch is exhaustive.
-    ToolStart { name: String },
-    ToolEnd { name: String },
+    ToolStart {
+        name: String,
+    },
+    ToolEnd {
+        name: String,
+    },
     /// Server emitted `assistant_text` as a progress notification —
     /// fires when the GUI requested audio, so text can land before
     /// audio finishes streaming. Ignored when `ChatText` follows it
     /// (both carry the same string); included so future split-text-
     /// while-audio-streams UX has a hook.
-    AssistantTextPreview { text: String },
+    AssistantTextPreview {
+        text: String,
+    },
     /// One PCM chunk (mono s16le @ 16 kHz). Reserved for the audio
     /// playback wiring (phase 2 of the desktop work).
-    AudioChunk { pcm: Vec<i16> },
+    AudioChunk {
+        pcm: Vec<i16>,
+    },
     /// Audio was requested but the server couldn't produce it.
-    TtsError { message: String },
+    TtsError {
+        message: String,
+    },
     /// JSON-RPC error during a chat turn.
-    ChatError { message: String },
+    ChatError {
+        message: String,
+    },
     /// `voice/pipeline_run` STT finished — server side has a transcript.
-    VoiceTranscript { text: String },
+    VoiceTranscript {
+        text: String,
+    },
     /// `voice/pipeline_run` produced an assistant reply (text part).
     /// Audio is delivered via the same `AudioChunk` events as the
     /// chat-turn TTS path.
-    VoiceAssistantText { text: String },
+    VoiceAssistantText {
+        text: String,
+    },
     /// Voice pipeline completed; carries the final reply text.
     VoiceDone {
         transcript: String,
         assistant_text: String,
     },
     /// Voice pipeline failed.
-    VoiceError { message: String },
+    VoiceError {
+        message: String,
+    },
 }
 
 /// Owns the tokio runtime + outgoing event channel.
@@ -121,7 +143,14 @@ impl RpcBridge {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         self.runtime.spawn(async move {
-            let evt = match initialize(&client, &endpoint.base, resume_session, &endpoint.token, device.as_ref()).await
+            let evt = match initialize(
+                &client,
+                &endpoint.base,
+                resume_session,
+                &endpoint.token,
+                device.as_ref(),
+            )
+            .await
             {
                 Ok((session_id, display_id, _is_new)) => BridgeEvent::SessionReady {
                     session_id,

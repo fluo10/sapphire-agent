@@ -520,8 +520,7 @@ fn ensure_silero_model() -> Result<PathBuf> {
         return Ok(dest);
     }
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     tracing::info!(
         "downloading Silero VAD model from {SILERO_VAD_URL} → {} (one-time)",
@@ -550,9 +549,7 @@ fn cache_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("no XDG data dir available"))
 }
 
-fn open_input_stream(
-    tx: std::sync::mpsc::Sender<Vec<i16>>,
-) -> Result<(cpal::Stream, u32, u16)> {
+fn open_input_stream(tx: std::sync::mpsc::Sender<Vec<i16>>) -> Result<(cpal::Stream, u32, u16)> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -599,8 +596,7 @@ fn open_input_stream(
             device.build_input_stream(
                 &config,
                 move |data: &[u16], _| {
-                    let pcm: Vec<i16> =
-                        data.iter().map(|s| (*s as i32 - 32768) as i16).collect();
+                    let pcm: Vec<i16> = data.iter().map(|s| (*s as i32 - 32768) as i16).collect();
                     let _ = tx.send(pcm);
                 },
                 err_fn,

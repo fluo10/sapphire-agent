@@ -186,9 +186,10 @@ fn submit_chat(state: &mut AppState, bridge: &RpcBridge) {
     let Session::Ready { session_id, .. } = &state.session else {
         return;
     };
-    let (Some(url), Some(token)) =
-        (state.config.server.url.clone(), state.config.server.token.clone())
-    else {
+    let (Some(url), Some(token)) = (
+        state.config.server.url.clone(),
+        state.config.server.token.clone(),
+    ) else {
         return;
     };
     let content = std::mem::take(&mut state.draft);
