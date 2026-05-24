@@ -10047,7 +10047,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "a2a-lf",
  "anyhow",

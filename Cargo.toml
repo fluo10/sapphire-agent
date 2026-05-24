@@ -34,7 +34,7 @@ repository = "https://github.com/fluo10/sapphire-agent"
 
 [package]
 name = "sapphire-agent"
-version = "0.7.1"
+version = "0.7.2"
 edition.workspace = true
 description = "A personal AI assistant agent with Matrix/Discord channels, Anthropic backend, and a sapphire-workspace memory layer"
 license.workspace = true
