@@ -1,0 +1,88 @@
+# git-cliff configuration consumed by release-plz via the
+# `changelog_config` setting in release-plz.toml.
+#
+# Scope: this filters the CHANGELOG output only. release-plz's decision
+# of whether to bump a package's version is based on whether commits
+# touched files inside the package's directory, which `skip = true`
+# here does NOT override. In particular: `sapphire-agent`'s package
+# manifest lives at the workspace root, so any commit that touches
+# Cargo.lock or release-plz.toml still triggers an agent bump even
+# when this file filters every commit out of agent's changelog. The
+# trade-off accepted: cliff.toml keeps the changelog clean; the
+# resulting empty / minor-only release PR is left for a human to close
+# or merge. See closed PR #143 / #144 for the history.
+
+[changelog]
+header = ""
+body = """
+{% if version %}\
+    ## [{{ version | trim_start_matches(pat="v") }}]\
+    {%- if release_link -%}\
+        ({{ release_link }})\
+    {% endif %}\
+    {%- if timestamp %} - {{ timestamp | date(format="%Y-%m-%d") }}{% endif %}
+{% else %}\
+    ## [unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | upper_first }}
+    {% for commit in commits %}
+        - {% if commit.breaking %}[**breaking**] {% endif %}\
+            {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+            {{ commit.message | upper_first }}\
+    {% endfor %}
+{% endfor %}\n
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+protect_breaking_commits = false
+filter_commits = false
+topo_order = false
+sort_commits = "oldest"
+
+# Skip commits whose scope targets a sibling crate or pure workspace
+# infrastructure. The first matching parser wins, so this block must
+# come before the conventional-type group mappings below.
+#
+# Extend the alternation list when introducing a new sibling-crate or
+# workspace-infra scope. New agent-internal scopes (`(messages)`,
+# `(voice)`, ...) need no change here — they fall through to the
+# conventional-type parsers and appear in agent's changelog.
+[[git.commit_parsers]]
+message = '^[a-z]+\((desktop|cli|call|rpc|core|release|release-plz|fmt|ci|test|deps)\):'
+skip = true
+
+# Conventional commit type → changelog group mapping. Mirrors
+# release-plz's defaults so the section ordering stays familiar.
+[[git.commit_parsers]]
+message = '^feat'
+group = "added"
+[[git.commit_parsers]]
+message = '^fix'
+group = "fixed"
+[[git.commit_parsers]]
+message = '^perf'
+group = "performance"
+[[git.commit_parsers]]
+message = '^refactor'
+group = "changed"
+[[git.commit_parsers]]
+message = '^style'
+group = "changed"
+[[git.commit_parsers]]
+message = '^doc'
+group = "documentation"
+[[git.commit_parsers]]
+message = '^test'
+group = "testing"
+[[git.commit_parsers]]
+message = '^chore'
+group = "other"
+[[git.commit_parsers]]
+message = '.*'
+group = "other"

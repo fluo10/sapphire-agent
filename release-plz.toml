@@ -10,6 +10,14 @@ git_release_name = "{{ package }}-v{{ version }}"
 # and per-package tags / GH releases use `{{ package }}-v{{ version }}` above.
 pr_name = "chore(release): version bump"
 
+# Custom git-cliff config to drop sibling-crate-scoped commits from the
+# generated changelog entries. Doesn't suppress the version bump itself
+# (release-plz decides "did this package change?" purely from file
+# paths, and `sapphire-agent` lives at the workspace root so any
+# Cargo.lock touch still counts) — but it keeps the changelog
+# readable. See cliff.toml for details.
+changelog_config = "./cliff.toml"
+
 [[package]]
 name = "sapphire-agent"
 changelog_path = "./CHANGELOG.md"
