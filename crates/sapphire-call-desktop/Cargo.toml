@@ -1,6 +1,6 @@
 [package]
 name = "sapphire-call-desktop"
-version = "0.6.1"
+version = "0.1.0"
 edition.workspace = true
 description = "Desktop GUI client for sapphire-agent (bevy + egui)"
 license.workspace = true
@@ -45,13 +45,22 @@ bevy = { version = "0.18", default-features = false, features = [
 # unless we eventually replace specific panels with native bevy_ui.
 bevy_egui = "0.39"
 
+# egui_extras supplies the image loader plumbing we use to render the
+# bundled Lucide SVG icons (settings / mic / send / stop). The `svg`
+# feature pulls in resvg, which turns each SVG into a texture at the
+# requested DPI on first use. Pinned to 0.33 so it matches the egui
+# 0.33.x re-export from bevy_egui 0.39.
+egui_extras = { version = "0.33", features = ["svg"] }
+
 # Async RPC needs its own runtime because bevy's scheduler is sync.
 # Multi-threaded so streaming chat + audio playback don't block the
 # UI tokio task on the same thread.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 
-# Shared HTTP client.
-reqwest = { workspace = true }
+# Shared HTTP client. Blocking variant is used by the one-shot
+# Silero VAD model download on first mic press (off the tokio runtime
+# via spawn_blocking).
+reqwest = { workspace = true, features = ["blocking"] }
 
 # Error handling
 anyhow.workspace = true
@@ -65,3 +74,14 @@ tracing-subscriber.workspace = true
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 directories = "6"
+
+# Audio I/O: TTS playback (server-streamed s16le mono 16 kHz PCM)
+# and mic capture for the voice button. Same crate the call CLI
+# satellite uses, so the cpal sample-format handling matches.
+cpal = "0.17"
+
+# Silero VAD for mic auto-stop on silence — matches the CLI's
+# detection logic instead of rolling a separate energy-based path.
+# sherpa-onnx statically links its C++ + ONNX runtime, so first
+# build of this crate is slow.
+sherpa-onnx = "1.13"

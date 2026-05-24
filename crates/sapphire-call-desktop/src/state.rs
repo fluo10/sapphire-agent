@@ -56,3 +56,16 @@ pub enum TurnState {
     Idle,
     Sending,
 }
+
+/// Whether the mic capture path is active. `Recording` carries a flag
+/// for whether Silero VAD has seen the start of speech yet — the UI
+/// uses it for the "listening…" affordance vs. the idle mic icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicUiState {
+    Idle,
+    Recording {
+        speech_detected: bool,
+    },
+    /// Audio captured; waiting for `voice/pipeline_run` to return.
+    Uploading,
+}

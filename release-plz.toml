@@ -26,14 +26,13 @@ changelog_path = "./crates/sapphire-call-core/CHANGELOG.md"
 name = "sapphire-call-cli"
 changelog_path = "./crates/sapphire-call-cli/CHANGELOG.md"
 
-# sapphire-call-desktop stays opted out: it carries `publish = false` in its
-# Cargo.toml (bevy + bundled font, not intended for crates.io) and iterates
-# on its own cadence. release-plz still keeps its path-dep version
-# constraints on sapphire-agent-rpc / sapphire-call-core in sync.
+# sapphire-call-desktop ships as a GitHub-release-only binary (bevy +
+# bundled font + ICE-licensed Lucide SVGs — not intended for crates.io,
+# hence `publish = false` in its Cargo.toml). release-plz still creates
+# the `sapphire-call-desktop-v*` tag + GH release; the
+# `.github/workflows/release-desktop.yml` workflow builds the binaries
+# for that tag and attaches them as release assets.
 [[package]]
 name = "sapphire-call-desktop"
-release = false
+changelog_path = "./crates/sapphire-call-desktop/CHANGELOG.md"
 publish = false
-changelog_update = false
-git_release_enable = false
-git_tag_enable = false

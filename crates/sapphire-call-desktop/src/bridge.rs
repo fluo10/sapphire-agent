@@ -13,7 +13,10 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use sapphire_agent_rpc::{ChatEvent, ChatModality, DeviceMetadata, chat_stream, initialize};
+use sapphire_agent_rpc::{
+    ChatEvent, ChatModality, DeviceMetadata, VoiceEvent, chat_stream, initialize,
+    voice_pipeline_run,
+};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
@@ -28,10 +31,12 @@ pub struct Endpoint {
 /// Events flowing tokio → bevy. The UI converts these into `ChatEntry`
 /// updates and `Session` state transitions.
 //
-// `AssistantTextPreview` and `AudioChunk` carry data the chat-only MVP
-// doesn't read yet (phase 2 wires playback + streaming-text UX into
-// them). Allow-dead-code keeps the placeholders visible in the enum
-// instead of being pruned at scaffold time.
+// `AssistantTextPreview.text` and `VoiceDone.{transcript,assistant_text}`
+// are intentionally captured but not yet consumed — the streaming-text
+// affordance and a future "voice turn ended" toast both want them, and
+// pulling them out now would mean re-plumbing the dispatch on the way
+// back. The `#[allow(dead_code)]` keeps clippy quiet without hiding
+// the fields from `Debug` output.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum BridgeEvent {
@@ -41,28 +46,63 @@ pub enum BridgeEvent {
         display_id: String,
     },
     /// `initialize` failed — the user has to fix Settings and retry.
-    SessionFailed { message: String },
+    SessionFailed {
+        message: String,
+    },
     /// A chat turn produced text (final result). Always the last event
     /// for a successful turn.
-    ChatText { text: String },
+    ChatText {
+        text: String,
+    },
     /// Server emitted a tool call notification. Reserved for future
     /// "AI is using tool X" affordance; ignored by the chat panel for
     /// now but parsed so the dispatch is exhaustive.
-    ToolStart { name: String },
-    ToolEnd { name: String },
+    ToolStart {
+        name: String,
+    },
+    ToolEnd {
+        name: String,
+    },
     /// Server emitted `assistant_text` as a progress notification —
     /// fires when the GUI requested audio, so text can land before
     /// audio finishes streaming. Ignored when `ChatText` follows it
     /// (both carry the same string); included so future split-text-
     /// while-audio-streams UX has a hook.
-    AssistantTextPreview { text: String },
+    AssistantTextPreview {
+        text: String,
+    },
     /// One PCM chunk (mono s16le @ 16 kHz). Reserved for the audio
     /// playback wiring (phase 2 of the desktop work).
-    AudioChunk { pcm: Vec<i16> },
+    AudioChunk {
+        pcm: Vec<i16>,
+    },
     /// Audio was requested but the server couldn't produce it.
-    TtsError { message: String },
+    TtsError {
+        message: String,
+    },
     /// JSON-RPC error during a chat turn.
-    ChatError { message: String },
+    ChatError {
+        message: String,
+    },
+    /// `voice/pipeline_run` STT finished — server side has a transcript.
+    VoiceTranscript {
+        text: String,
+    },
+    /// `voice/pipeline_run` produced an assistant reply (text part).
+    /// Audio is delivered via the same `AudioChunk` events as the
+    /// chat-turn TTS path.
+    VoiceAssistantText {
+        text: String,
+    },
+    /// Voice pipeline completed; carries the final reply text.
+    VoiceDone {
+        transcript: String,
+        assistant_text: String,
+    },
+    /// Voice pipeline failed.
+    VoiceError {
+        message: String,
+    },
 }
 
 /// Owns the tokio runtime + outgoing event channel.
@@ -103,7 +143,14 @@ impl RpcBridge {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         self.runtime.spawn(async move {
-            let evt = match initialize(&client, &endpoint.base, resume_session, &endpoint.token, device.as_ref()).await
+            let evt = match initialize(
+                &client,
+                &endpoint.base,
+                resume_session,
+                &endpoint.token,
+                device.as_ref(),
+            )
+            .await
             {
                 Ok((session_id, display_id, _is_new)) => BridgeEvent::SessionReady {
                     session_id,
@@ -167,6 +214,67 @@ impl RpcBridge {
             let (_, run_result) = tokio::join!(pump, run);
             if let Err(e) = run_result {
                 let _ = tx.send(BridgeEvent::ChatError {
+                    message: format!("{e:#}"),
+                });
+            }
+        });
+    }
+
+    /// Upload one mic utterance to `voice/pipeline_run`. STT happens
+    /// server-side; progress + final result land in the same bridge
+    /// event channel as chat events (`VoiceTranscript`,
+    /// `VoiceAssistantText`, `AudioChunk`, `VoiceDone` / `VoiceError`).
+    pub fn submit_voice(
+        &self,
+        endpoint: Endpoint,
+        device_id: String,
+        pcm_16khz: Vec<i16>,
+        device: Option<DeviceMetadata>,
+    ) {
+        let client = self.client.clone();
+        let tx = self.event_tx.clone();
+        self.runtime.spawn(async move {
+            let (inner_tx, mut inner_rx) = mpsc::channel::<VoiceEvent>(64);
+            let pump = async {
+                while let Some(evt) = inner_rx.recv().await {
+                    let bevt = match evt {
+                        VoiceEvent::SttFinal { text } => BridgeEvent::VoiceTranscript { text },
+                        VoiceEvent::AssistantText { text } => {
+                            BridgeEvent::VoiceAssistantText { text }
+                        }
+                        VoiceEvent::AudioChunk { pcm } => BridgeEvent::AudioChunk { pcm },
+                        VoiceEvent::ToolStart { name } => BridgeEvent::ToolStart { name },
+                        VoiceEvent::ToolEnd { name } => BridgeEvent::ToolEnd { name },
+                        VoiceEvent::Done {
+                            transcript,
+                            assistant_text,
+                        } => BridgeEvent::VoiceDone {
+                            transcript,
+                            assistant_text,
+                        },
+                        VoiceEvent::Error { message } => BridgeEvent::VoiceError { message },
+                        // Stage events are useful for debugging but
+                        // don't drive the UI yet.
+                        VoiceEvent::StageStart { .. } | VoiceEvent::StageEnd { .. } => continue,
+                    };
+                    if tx.send(bevt).is_err() {
+                        break;
+                    }
+                }
+            };
+            let run = voice_pipeline_run(
+                &client,
+                &endpoint.base,
+                &endpoint.token,
+                &device_id,
+                &pcm_16khz,
+                None,
+                device.as_ref(),
+                inner_tx,
+            );
+            let (_, run_result) = tokio::join!(pump, run);
+            if let Err(e) = run_result {
+                let _ = tx.send(BridgeEvent::VoiceError {
                     message: format!("{e:#}"),
                 });
             }

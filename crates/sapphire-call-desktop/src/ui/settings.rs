@@ -36,11 +36,9 @@ pub fn ui(mut contexts: EguiContexts, mut state: ResMut<AppState>, bridge: NonSe
         ui.add_space(8.0);
         ui.checkbox(&mut state.config.tts.enabled, "Speak replies (TTS)");
         ui.label(
-            egui::RichText::new(
-                "Requires a voice_pipeline on the server's room_profile.",
-            )
-            .small()
-            .weak(),
+            egui::RichText::new("Requires a voice_pipeline on the server's room_profile.")
+                .small()
+                .weak(),
         );
 
         ui.add_space(12.0);
@@ -95,8 +93,10 @@ pub fn ui(mut contexts: EguiContexts, mut state: ResMut<AppState>, bridge: NonSe
 }
 
 fn kick_off_initialize(state: &mut AppState, bridge: &RpcBridge) {
-    let (Some(url), Some(token)) = (state.config.server.url.clone(), state.config.server.token.clone())
-    else {
+    let (Some(url), Some(token)) = (
+        state.config.server.url.clone(),
+        state.config.server.token.clone(),
+    ) else {
         return;
     };
     state.session = Session::Initializing;
