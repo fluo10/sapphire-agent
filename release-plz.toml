@@ -13,32 +13,6 @@ pr_name = "chore(release): version bump"
 [[package]]
 name = "sapphire-agent"
 changelog_path = "./CHANGELOG.md"
-# Filter which commits count toward an agent release.
-#
-# `sapphire-agent`'s Cargo.toml lives at the workspace root, so
-# release-plz attributes every root-level file change (Cargo.lock,
-# release-plz.toml, README.md, etc.) to this package — including
-# changes that were really driven by a sibling crate. Without this
-# filter, every desktop or CLI commit that bumps Cargo.lock at the
-# root proposes a sapphire-agent bump too (see the closed
-# misattribution PR #143).
-#
-# Allow:
-#  - unscoped conventional commits (`feat:`, `fix:`, ...)
-#  - agent-internal sub-area scopes (`feat(messages):`, `fix(voice):`)
-#  - workspace-wide infra scopes that legitimately affect agent
-#    builds (`chore(deps):`, `feat(workspace):`)
-#
-# Reject:
-#  - sibling-crate scopes (`feat(desktop):`, `refactor(cli):`,
-#    `fix(rpc):`, ...) — those bump their own crate, not agent
-#  - pure cosmetic/release-infra scopes (`chore(release):`,
-#    `style(fmt):`, `chore(ci):`) — no semver impact
-#
-# Extend the alternation list when introducing new agent-internal
-# sub-area scopes. Rust regex doesn't support negative lookahead, so
-# we maintain an allowlist rather than a blocklist.
-release_commits = '^[a-z]+(\((agent|channel|discord|matrix|features|image-cache|mcp|memory|messages|sessions|timer|heartbeat|voice|serve|chat|search|fts|api|tools|workspace|deps)\))?:'
 
 [[package]]
 name = "sapphire-agent-rpc"
