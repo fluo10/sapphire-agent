@@ -4922,6 +4922,9 @@ dependencies = [
  "libc",
  "libgit2-sys",
  "log",
+ "openssl-probe 0.1.6",
+ "openssl-sys",
+ "url",
 ]
 
 [[package]]
@@ -6750,7 +6753,9 @@ checksum = "9b26f66f35e1871b22efcf7191564123d2a446ca0538cde63c23adfefa9b15b7"
 dependencies = [
  "cc",
  "libc",
+ "libssh2-sys",
  "libz-sys",
+ "openssl-sys",
  "pkg-config",
 ]
 
@@ -6789,6 +6794,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f"
 dependencies = [
  "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
+name = "libssh2-sys"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "220e4f05ad4a218192533b300327f5150e809b54c4ec83b5a1d91833601811b9"
+dependencies = [
+ "cc",
+ "libc",
+ "libz-sys",
+ "openssl-sys",
  "pkg-config",
  "vcpkg",
 ]
@@ -7717,7 +7736,7 @@ dependencies = [
  "libc",
  "log",
  "openssl",
- "openssl-probe",
+ "openssl-probe 0.2.1",
  "openssl-sys",
  "schannel",
  "security-framework",
@@ -8431,6 +8450,12 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "openssl-probe"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 
 [[package]]
 name = "openssl-probe"
@@ -9966,7 +9991,7 @@ version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "612460d5f7bea540c490b2b6395d8e34a953e52b491accd6c86c8164c5932a63"
 dependencies = [
- "openssl-probe",
+ "openssl-probe 0.2.1",
  "rustls-pki-types",
  "schannel",
  "security-framework",
@@ -10160,9 +10185,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-retrieve"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0edfee6ac7be799f7bdfc502b18be0e7151a2c71a897d027401ab24a8124ef7"
+checksum = "3db3b019c8de4021a8d661bbbff8c8eb1aeecec9478bb6565692e2099faf5de6"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -10178,9 +10203,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-sync"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3145739c7819d3d921b4e9ed361b89449dc5e020f9022f16c645e61d4018b816"
+checksum = "2f1c9300843a424d37a2e9c7bec068ed26a841c2e78e2cc86d76e72fc28b9cb7"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -10194,9 +10219,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-workspace"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adc078fda1d5dad8c675fea6e365c7921c27c8ae9069b4e215b4a059a9f13bfb"
+checksum = "65dda79c6f01969a9386e7b61f7edc216c50c27d1a017abaca61497a1b8dfa37"
 dependencies = [
  "chrono",
  "indexmap 2.14.0",
