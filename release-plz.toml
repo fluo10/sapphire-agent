@@ -32,7 +32,13 @@ changelog_path = "./crates/sapphire-call-cli/CHANGELOG.md"
 # the `sapphire-call-desktop-v*` tag + GH release; the
 # `.github/workflows/release-desktop.yml` workflow builds the binaries
 # for that tag and attaches them as release assets.
+#
+# `release = true` is load-bearing: release-plz's default behaviour is
+# to skip any crate whose Cargo.toml has `publish = false`, even if it
+# appears in release-plz.toml. Without this line release-plz silently
+# excludes the package from its scan and never tags new versions.
 [[package]]
 name = "sapphire-call-desktop"
 changelog_path = "./crates/sapphire-call-desktop/CHANGELOG.md"
 publish = false
+release = true
