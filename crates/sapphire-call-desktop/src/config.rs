@@ -29,21 +29,11 @@ pub struct DesktopConfig {
 /// Whether to request server-side TTS for each chat reply. Default off
 /// — first-run users get a silent text chat, then enable TTS in
 /// Settings once they confirm the server has a `voice_pipeline`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TtsConfig {
-    #[serde(default = "default_false")]
+    #[serde(default)]
     pub enabled: bool,
-}
-
-impl Default for TtsConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
-}
-
-fn default_false() -> bool {
-    false
 }
 
 impl DesktopConfig {
