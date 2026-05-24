@@ -1,0 +1,94 @@
+name: Release desktop binaries
+
+# Builds the cross-platform sapphire-call-desktop binaries and uploads
+# them as release assets onto an existing GitHub release.
+#
+# Triggered as a reusable workflow from release-plz.yml (right after
+# the tag + release are created) plus a workflow_dispatch fallback for
+# retroactive uploads. `push: tags` is intentionally omitted because
+# release-plz's GITHUB_TOKEN tag pushes don't fire downstream
+# workflows.
+#
+# Compared to release.yml (sapphire-agent), Linux needs extra system
+# packages for bevy + cpal (X11/Wayland/ALSA/udev). The desktop crate
+# is `publish = false`, so this workflow is the only delivery path —
+# users install via `gh release download`, not `cargo install`.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+        description: 'Existing release tag to attach binaries to (e.g. sapphire-call-desktop-v0.1.0).'
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        type: string
+        description: 'Existing release tag to attach binaries to (e.g. sapphire-call-desktop-v0.1.0).'
+
+jobs:
+  build:
+    continue-on-error: ${{ matrix.continue-on-error }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            binary: sapphire-call-desktop
+            asset_name: sapphire-call-desktop-linux-x86_64
+            continue-on-error: false
+          - os: ubuntu-24.04-arm
+            binary: sapphire-call-desktop
+            asset_name: sapphire-call-desktop-linux-aarch64
+            continue-on-error: false
+          - os: macos-latest
+            binary: sapphire-call-desktop
+            asset_name: sapphire-call-desktop-macos-aarch64
+            continue-on-error: true
+          - os: windows-latest
+            binary: sapphire-call-desktop.exe
+            asset_name: sapphire-call-desktop-windows-x86_64.exe
+            continue-on-error: true
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # bevy needs X11 + Wayland + libxkbcommon; cpal needs ALSA; bevy_winit
+      # talks to udev for device hot-plug events. Only required on Linux —
+      # macOS and Windows ship the equivalents in the base SDK.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libudev-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libx11-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --package sapphire-call-desktop
+
+      - name: Rename binary
+        shell: bash
+        run: cp target/release/${{ matrix.binary }} ${{ matrix.asset_name }}
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: ${{ matrix.asset_name }}

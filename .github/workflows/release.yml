@@ -1,12 +1,30 @@
 name: Release binaries
 
-# Triggered by the per-package tag release-plz pushes for sapphire-agent.
-# release-plz creates the GitHub release; this workflow uploads the
-# cross-platform sapphire-agent binaries as assets onto that release.
+# Builds the cross-platform sapphire-agent binaries and uploads them as
+# release assets onto an existing GitHub release.
+#
+# Triggered as a reusable workflow from release-plz.yml (so the run
+# happens immediately after release-plz creates the tag + release),
+# plus a `workflow_dispatch` trigger for retroactive runs against a
+# tag whose binaries weren't uploaded on first release.
+#
+# A `push: tags` trigger is intentionally omitted: release-plz pushes
+# tags using GITHUB_TOKEN, and GitHub Actions does not fire workflows
+# on tags pushed by GITHUB_TOKEN. Using workflow_call from release-plz
+# sidesteps that limitation without needing a PAT.
 on:
-  push:
-    tags:
-      - 'sapphire-agent-v*'
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+        description: 'Existing release tag to attach binaries to (e.g. sapphire-agent-v0.7.1).'
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        type: string
+        description: 'Existing release tag to attach binaries to (e.g. sapphire-agent-v0.7.1).'
 
 jobs:
   build:
@@ -36,6 +54,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
         with:
@@ -50,5 +70,5 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: ${{ matrix.asset_name }}

@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      releases: ${{ steps.release.outputs.releases }}
+      releases_created: ${{ steps.release.outputs.releases_created }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -26,12 +29,74 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: Swatinem/rust-cache@v2
       - name: Run release-plz
+        id: release
         uses: release-plz/action@v0.5
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Fan out to per-package binary build workflows. Each one runs only
+  # when release-plz reported a release for that package on this push.
+  #
+  # Why this isn't done via `on: push: tags` in the build workflows:
+  # release-plz uses GITHUB_TOKEN to push the per-package tags, and
+  # GitHub Actions does not fire downstream workflows on tags pushed
+  # by GITHUB_TOKEN. workflow_call (this fan-out) is the cleanest way
+  # to chain the builds without provisioning a PAT.
+  parse-releases:
+    name: Parse release-plz output
+    needs: release-plz-release
+    if: needs.release-plz-release.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      agent_tag: ${{ steps.parse.outputs.agent_tag }}
+      cli_tag: ${{ steps.parse.outputs.cli_tag }}
+      desktop_tag: ${{ steps.parse.outputs.desktop_tag }}
+    steps:
+      - id: parse
+        env:
+          RELEASES: ${{ needs.release-plz-release.outputs.releases }}
+        run: |
+          agent_tag=$(jq -r '.[] | select(.package_name == "sapphire-agent") | .tag // empty' <<<"$RELEASES")
+          cli_tag=$(jq -r '.[] | select(.package_name == "sapphire-call-cli") | .tag // empty' <<<"$RELEASES")
+          desktop_tag=$(jq -r '.[] | select(.package_name == "sapphire-call-desktop") | .tag // empty' <<<"$RELEASES")
+          {
+            echo "agent_tag=$agent_tag"
+            echo "cli_tag=$cli_tag"
+            echo "desktop_tag=$desktop_tag"
+          } >> "$GITHUB_OUTPUT"
+
+  build-agent:
+    name: Build sapphire-agent binaries
+    needs: parse-releases
+    if: needs.parse-releases.outputs.agent_tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.parse-releases.outputs.agent_tag }}
+
+  build-cli:
+    name: Build sapphire-call CLI binaries
+    needs: parse-releases
+    if: needs.parse-releases.outputs.cli_tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-cli.yml
+    with:
+      tag: ${{ needs.parse-releases.outputs.cli_tag }}
+
+  build-desktop:
+    name: Build sapphire-call-desktop binaries
+    needs: parse-releases
+    if: needs.parse-releases.outputs.desktop_tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      tag: ${{ needs.parse-releases.outputs.desktop_tag }}
 
   release-plz-pr:
     name: Release-plz PR
