@@ -237,6 +237,49 @@ system_prompt = "You are a helpful personal assistant."
 # never leaks back to the external AI.
 
 # ─────────────────────────────────────────────────────────────────────
+# Built-in tools and MCP client (optional)
+# ─────────────────────────────────────────────────────────────────────
+# The `[tools]` table configures the agent's own tool belt. Two
+# concerns live here:
+#
+#   - `tavily_api_key` — enables the `web_search` tool. Omit to leave
+#     the tool unregistered.
+#   - `[[tools.mcp_servers]]` — outbound MCP client. Connects to
+#     external MCP servers and exposes their tools to the agent as
+#     `mcp__<name>__<tool_name>`. Distinct from the inbound MCP
+#     server block above: that lets external AIs call sapphire-agent;
+#     this lets sapphire-agent call external MCP servers.
+#
+# Each `[[tools.mcp_servers]]` entry has a `name` (used as the tool
+# prefix) and a `type` selecting one of two transports:
+#
+#   - `type = "http"`  — Streamable HTTP. Fields: `url`, optional
+#     `api_key` (sent as Bearer).
+#   - `type = "stdio"` — spawn a local child process. Fields:
+#     `command`, optional `args`, optional `env` table.
+#
+# If a server fails to connect at startup the agent logs a warning
+# and continues without its tools — startup is not aborted.
+#
+# [tools]
+# tavily_api_key = "tvly-..."
+#
+# # Example: HTTP transport to a remote MCP server.
+# [[tools.mcp_servers]]
+# name    = "github"
+# type    = "http"
+# url     = "https://mcp.example.com/mcp"
+# api_key = "ghp_..."                       # optional; sent as Bearer
+#
+# # Example: stdio transport, launching a local server via npx.
+# [[tools.mcp_servers]]
+# name    = "filesystem"
+# type    = "stdio"
+# command = "npx"
+# args    = ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/work"]
+# env     = { NODE_ENV = "production" }     # optional; merged into child env
+
+# ─────────────────────────────────────────────────────────────────────
 # Voice pipeline (optional)
 # ─────────────────────────────────────────────────────────────────────
 # Enables the `voice/pipeline_run` MCP method used by `sapphire-call
