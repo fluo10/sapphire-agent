@@ -43,6 +43,13 @@ pub trait McpTransport: Send + Sync {
         on_notification: &NotificationHandler,
     ) -> Result<Value>;
 
+    /// Send a JSON-RPC notification (no `id`, no response expected).
+    ///
+    /// Notifications must not go through [`request`], which blocks waiting
+    /// for a matching response that never arrives — over stdio that hangs
+    /// the whole startup path.
+    async fn notify(&self, body: &Value) -> Result<()>;
+
     /// Gracefully shut down the transport (close connection / kill child).
     async fn shutdown(&self) -> Result<()>;
 }
@@ -204,6 +211,15 @@ impl McpTransport for HttpTransport {
         }
     }
 
+    async fn notify(&self, body: &Value) -> Result<()> {
+        let session_id = self.session_id.lock().await.clone();
+        self.build_request(body, &session_id)
+            .send()
+            .await
+            .context("Failed to send notification to MCP server")?;
+        Ok(())
+    }
+
     async fn shutdown(&self) -> Result<()> {
         // HTTP transport is stateless per-request; nothing to shut down.
         Ok(())
@@ -340,6 +356,18 @@ impl McpTransport for StdioTransport {
                 debug!("stdio message (unrecognized): {data}");
             }
         }
+    }
+
+    async fn notify(&self, body: &Value) -> Result<()> {
+        let mut stdin = self.stdin.lock().await;
+        let mut line = serde_json::to_string(body)?;
+        line.push('\n');
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .context("Failed to write notification to MCP server stdin")?;
+        stdin.flush().await?;
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<()> {

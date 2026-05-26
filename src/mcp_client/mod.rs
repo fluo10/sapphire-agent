@@ -232,16 +232,16 @@ impl McpClient {
         );
 
         // Send initialized notification (no id, no response expected).
+        // Must use `notify` — `request` would block reading stdout for a
+        // response that the spec says will never arrive.
         let notification = json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
         });
-        let req_handler = self.server_request_handler();
-        let notif_handler = self.notification_handler();
         let transport = self.transport.read().await.clone();
-        let _ = transport
-            .request(&notification, &req_handler, &notif_handler)
-            .await;
+        if let Err(e) = transport.notify(&notification).await {
+            warn!("MCP '{}': initialized notification failed: {e:#}", self.name);
+        }
 
         Ok(())
     }
