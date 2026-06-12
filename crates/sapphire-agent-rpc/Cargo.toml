@@ -20,7 +20,7 @@ anyhow.workspace = true
 futures-util.workspace = true
 
 # Readline for the REPL (CJK-safe input, history, cursor movement)
-reedline = "0.47"
+reedline = "0.48"
 
 # Async runtime — only the `sync` feature for mpsc::Sender used by the
 # voice event stream. The agent binary brings in more features; this
