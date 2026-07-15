@@ -1,3 +1,8 @@
+// matrix-sdk's E2EE futures nest deeply enough that proving `Send` on the
+// Matrix channel's `listen` future exceeds the default type-checking recursion
+// limit once the framework's redb/tantivy types are also in the graph.
+#![recursion_limit = "256"]
+
 mod agent;
 mod channel;
 mod config;

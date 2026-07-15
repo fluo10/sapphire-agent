@@ -50,7 +50,11 @@ name = "sapphire-agent"
 path = "src/main.rs"
 
 [features]
-default = ["lancedb-store", "fastembed-embed", "git-sync", "voice-sherpa"]
+default = ["redb-store", "lancedb-store", "fastembed-embed", "git-sync", "voice-sherpa"]
+# Pure-Rust cache backend (redb + tantivy) for the FTS/record store. Without it
+# the workspace falls back to an ephemeral in-memory store; lancedb-store only
+# covers the vector index.
+redb-store = ["sapphire-workspace/redb-store"]
 lancedb-store = ["sapphire-workspace/lancedb-store"]
 fastembed-embed = ["sapphire-workspace/fastembed-embed"]
 git-sync = ["sapphire-workspace/git-sync"]
@@ -129,7 +133,7 @@ uuid = { version = "1", features = ["v7"] }
 
 # Workspace: file indexing, FTS, vector search, git sync
 # lancedb-store is gated behind the "lancedb-store" feature (default on)
-sapphire-workspace = { version = "0.12.1", default-features = false }
+sapphire-workspace = { package = "sapphire-framework-workspace", git = "https://github.com/fluo10/sapphire-framework", branch = "feat/framework-migration", default-features = false }
 
 # Human-readable session IDs for API sessions
 grain-id = { version = "0.14", features = ["serde"] }
