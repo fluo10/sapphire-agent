@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.7.2...sapphire-agent-v0.8.0) - 2026-07-16
+
+### Added
+
+- [**breaking**] *(workspace)* Depend on sapphire-framework and enable the redb store
+
+### Fixed
+
+- *(mcp-client)* Use fire-and-forget for `notifications/initialized`
+
+
+
 ## [0.7.2](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.7.1...sapphire-agent-v0.7.2) - 2026-05-24
 
 ### Documentation

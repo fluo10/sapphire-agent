@@ -14,6 +14,14 @@ wake / VAD / TTS plumbing, and earlier feature work live in the root
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/fluo10/sapphire-agent/compare/sapphire-call-cli-v0.7.0...sapphire-call-cli-v0.7.1) - 2026-07-16
+
+### Other
+
+- Update Cargo.lock dependencies
+
+
+
 ## [0.7.0] - 2026-05-23
 
 First release under the new crate name. The version is aligned with
