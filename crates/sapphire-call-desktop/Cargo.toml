@@ -50,7 +50,7 @@ bevy_egui = "0.39"
 # feature pulls in resvg, which turns each SVG into a texture at the
 # requested DPI on first use. Pinned to 0.33 so it matches the egui
 # 0.33.x re-export from bevy_egui 0.39.
-egui_extras = { version = "0.33", features = ["svg"] }
+egui_extras = { version = "0.34", features = ["svg"] }
 
 # Async RPC needs its own runtime because bevy's scheduler is sync.
 # Multi-threaded so streaming chat + audio playback don't block the
