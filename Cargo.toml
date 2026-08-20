@@ -50,14 +50,13 @@ name = "sapphire-agent"
 path = "src/main.rs"
 
 [features]
-default = ["redb-store", "lancedb-store", "fastembed-embed", "git-sync", "voice-sherpa"]
+default = ["redb-store", "lancedb-store", "fastembed-embed", "voice-sherpa"]
 # Pure-Rust cache backend (redb + tantivy) for the FTS/record store. Without it
 # the workspace falls back to an ephemeral in-memory store; lancedb-store only
 # covers the vector index.
 redb-store = ["sapphire-workspace/redb-store"]
 lancedb-store = ["sapphire-workspace/lancedb-store"]
 fastembed-embed = ["sapphire-workspace/fastembed-embed"]
-git-sync = ["sapphire-workspace/git-sync"]
 # Compile in the local sherpa-onnx STT + TTS providers. Enabled by
 # default, but note that sherpa-onnx-sys pulls in a large C++ build
 # (sherpa-onnx + ONNX runtime, ~5–10 minutes on a cold cache). Users
@@ -118,9 +117,6 @@ clap.workspace = true
 
 # XDG directories for config/data paths
 directories = "6.0"
-
-# System hostname lookup for the sapphire-workspace DeviceDefaults init
-hostname = "0.4"
 
 # Shell path expansion (~/)
 shellexpand = "3.1"

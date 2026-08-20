@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use sapphire_workspace::SyncConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -90,24 +89,13 @@ pub struct Config {
     /// when both test and production instances share the same config.
     #[serde(default = "default_true")]
     pub heartbeat_enabled: bool,
-    /// Workspace sync configuration.
+    /// How often the agent re-indexes the workspace, in minutes. Unset or
+    /// `0` disables the periodic re-index entirely. Each tick runs
+    /// `WorkspaceState::sync`, an mtime-based refresh of the retrieve
+    /// cache — this is what picks up files edited outside the agent.
     ///
-    /// The workspace-level config (`{workspace_dir}/.sapphire-agent/config.toml`)
-    /// provides shared defaults. This per-user `[sync]` section, when present,
-    /// takes precedence — allowing each user to override the workspace defaults.
-    #[serde(default)]
-    pub sync: Option<SyncConfig>,
-    /// How often the agent runs the periodic workspace sync cycle, in
-    /// minutes. Unset or `0` disables periodic sync entirely. Each tick
-    /// runs `WorkspaceState::periodic_sync`, which does a git sync **and**
-    /// an mtime-based refresh of the retrieve cache — one cadence drives
-    /// both.
-    ///
-    /// Lives at the config root (not inside `[sync]`) because the cadence
-    /// spans both `sapphire-sync` and `sapphire-retrieve`; nesting it
-    /// under `[sync]` would have implied a sync-only knob and forced a
-    /// duplicate for the retrieve side. Upstream relocated it out of
-    /// `SyncConfig` for the same reason in sapphire-workspace 0.10.
+    /// There is no git leg any more: the framework removed local-workspace
+    /// auto-sync, so nothing is committed or pushed on this cadence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_interval_minutes: Option<u32>,
     /// How many minutes of inactivity (no incoming user message) before
