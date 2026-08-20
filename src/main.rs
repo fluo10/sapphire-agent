@@ -196,7 +196,7 @@ async fn main() -> Result<()> {
                 .map(|m| std::time::Duration::from_secs(m as u64 * 60));
             let ws_state =
                 WorkspaceState::open(sw_workspace).context("Failed to open WorkspaceState")?;
-            if let Err(e) = ws_state.sync() {
+            if let Err(e) = ws_state.sync_retrieve() {
                 tracing::warn!("Initial workspace re-index failed: {e}");
             }
             let ws_state = Arc::new(Mutex::new(ws_state));
@@ -486,7 +486,7 @@ async fn main() -> Result<()> {
                             tick.tick().await;
                             {
                                 let state = ws.lock().expect("ws_state mutex poisoned");
-                                match state.sync() {
+                                match state.sync_retrieve() {
                                     Ok((u, r)) => tracing::info!(
                                         "Periodic ws sync: {u} upserted, {r} removed"
                                     ),

@@ -576,7 +576,9 @@ impl Tool for WorkspaceSyncTool {
     async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
         let state = lock(&self.state);
 
-        let (upserted, removed) = state.sync().context("Failed to re-index workspace")?;
+        let (upserted, removed) = state
+            .sync_retrieve()
+            .context("Failed to re-index workspace")?;
         Ok(format!(
             "Synced: {upserted} files indexed, {removed} removed."
         ))
