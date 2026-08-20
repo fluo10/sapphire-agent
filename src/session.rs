@@ -209,8 +209,8 @@ pub struct SessionStore {
     /// keep separate `SessionStore` instances while sharing one base dir.
     pub kind: &'static str,
     /// Optional sapphire-framework workspace state. When set, file
-    /// modifications notify the workspace so the index/cache and git
-    /// staging stay in sync.
+    /// modifications notify the workspace so the index/cache stay in
+    /// sync.
     ws_state: Option<Arc<Mutex<WorkspaceState>>>,
     /// `session_id → absolute path` cache. Populated lazily by
     /// `resolve_path` (filesystem scan) and eagerly by `create_session` /
