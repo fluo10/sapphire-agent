@@ -83,7 +83,7 @@ pub struct Workspace {
     cache: Mutex<HashMap<PathBuf, CachedFile>>,
     /// Pre-rendered "today's cross-session digest" per memory namespace.
     /// Populated by an external builder (`main.rs` rebuilds it after the
-    /// periodic workspace sync), consumed by `build_system_prompt` to
+    /// periodic workspace re-index), consumed by `build_system_prompt` to
     /// inject same-day context that the heartbeat daily-log path can't
     /// surface until 04:00 the next morning.
     today_digests: Mutex<HashMap<String, String>>,

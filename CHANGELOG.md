@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- **`standby_mode` removed** — its only purpose was git sync on a backup
+  node, and the framework no longer ships local-workspace auto-sync. An
+  existing config that still sets it now **fails at startup** rather than
+  silently starting a second active agent — delete the line to upgrade.
+- **`[sync]` config section removed.** `sync_interval_minutes` stays and
+  is now purely the workspace re-index cadence; nothing is committed or
+  pushed on that tick.
+- **Sessions are no longer carried between devices.** Keep the workspace
+  on an external sync service if you need that.
+
 ## [0.7.2](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.7.1...sapphire-agent-v0.7.2) - 2026-05-24
 
 ### Documentation
