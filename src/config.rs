@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     /// Matrix channel configuration. Both `matrix` and `discord` may be
     /// configured at once — when set, both run concurrently in the
-    /// same `serve` process. At least one of them is required (unless
-    /// `standby_mode = true`).
+    /// same `serve` process. Both may also be omitted, in which case the
+    /// agent serves only the HTTP API.
     #[serde(default)]
     pub matrix: Option<MatrixConfig>,
     /// Discord channel configuration. May coexist with `matrix`.
@@ -90,11 +90,6 @@ pub struct Config {
     /// when both test and production instances share the same config.
     #[serde(default = "default_true")]
     pub heartbeat_enabled: bool,
-    /// Cold-standby mode: only perform git sync, skip channel listening and
-    /// heartbeat tasks. Useful for maintaining a backup node that stays in
-    /// sync without actively processing messages. Default: false.
-    #[serde(default)]
-    pub standby_mode: bool,
     /// Workspace sync configuration.
     ///
     /// The workspace-level config (`{workspace_dir}/.sapphire-agent/config.toml`)

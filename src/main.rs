@@ -140,7 +140,6 @@ async fn main() -> Result<()> {
                 config.day_boundary_hour
             );
             println!("  Heartbeat enabled : {}", config.heartbeat_enabled);
-            println!("  Standby mode      : {}", config.standby_mode);
             println!();
             let workspace_files = [
                 ("AGENTS.md / AGENT.md", vec!["AGENTS.md", "AGENT.md"]),
@@ -222,31 +221,6 @@ async fn main() -> Result<()> {
             }
             let ws_state = Arc::new(Mutex::new(ws_state));
 
-            // Standby mode runs a minimal periodic-sync loop. The
-            // with-channels code path replaces this with a richer loop
-            // below that also rebuilds today_digests on the same tick
-            // (so we don't pay periodic_sync twice per interval).
-            if config.standby_mode
-                && let Some(dur) = ws_sync_interval
-            {
-                tracing::info!("Periodic workspace sync enabled: every {}s", dur.as_secs());
-                let ws = Arc::clone(&ws_state);
-                tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(dur);
-                    tick.tick().await;
-                    loop {
-                        tick.tick().await;
-                        let state = ws.lock().expect("ws_state mutex poisoned");
-                        match state.periodic_sync() {
-                            Ok((u, r)) => {
-                                tracing::info!("Periodic ws sync: {u} upserted, {r} removed");
-                            }
-                            Err(e) => tracing::warn!("Periodic ws sync failed: {e:#}"),
-                        }
-                    }
-                });
-            }
-
             // ── Timer manager (single-slot, in-memory) ──────────────────────
             // Built before the tool set so the timer_* tools can hold an
             // `Arc<TimerManager>`. The agent / serve_state refs are
@@ -317,7 +291,6 @@ async fn main() -> Result<()> {
             // path that can target voice satellites.
             let voice_providers = if config.stt_providers.is_empty()
                 && config.tts_providers.is_empty()
-                || config.standby_mode
             {
                 None
             } else {
@@ -388,12 +361,6 @@ async fn main() -> Result<()> {
             // timers can push fire messages back to their satellite.
             timer_manager.set_serve_state(Arc::downgrade(&serve_state));
 
-            if config.standby_mode {
-                tracing::info!(
-                    "Standby mode enabled: git sync only, skipping channel and heartbeat"
-                );
-            }
-
             // Captured below so main can await the agent's graceful shutdown
             // (summarize_on_shutdown) before returning. Without this, the
             // tokio runtime drops the spawned task the moment serve::run
@@ -401,7 +368,7 @@ async fn main() -> Result<()> {
             let mut agent_handle: Option<tokio::task::JoinHandle<()>> = None;
 
             // ── Channel + Agent (Matrix and/or Discord, if configured) ──────
-            if !config.standby_mode && (config.matrix.is_some() || config.discord.is_some()) {
+            if config.matrix.is_some() || config.discord.is_some() {
                 // Sessions from every chat channel land under
                 // `sessions/<namespace>/channel/<uuid>.jsonl`. Each session
                 // still records its originating channel name in metadata.
@@ -610,27 +577,17 @@ async fn main() -> Result<()> {
                 }));
             }
 
-            if config.standby_mode {
-                // In standby mode, keep the process alive for periodic git
-                // sync only — no HTTP server, no channel, no heartbeat.
-                tracing::info!("Standby mode: waiting for shutdown signal (Ctrl-C)");
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("Failed to listen for Ctrl-C");
-                tracing::info!("Shutting down standby process");
-            } else {
-                // ── HTTP API server ─────────────────────────────────────────
-                let addr = bind
-                    .or_else(|| {
-                        config
-                            .serve
-                            .as_ref()
-                            .map(|s| format!("{}:{}", s.host, s.port))
-                    })
-                    .unwrap_or_else(|| "127.0.0.1:9000".to_string());
+            // ── HTTP API server ─────────────────────────────────────────────
+            let addr = bind
+                .or_else(|| {
+                    config
+                        .serve
+                        .as_ref()
+                        .map(|s| format!("{}:{}", s.host, s.port))
+                })
+                .unwrap_or_else(|| "127.0.0.1:9000".to_string());
 
-                serve::run(addr, Arc::clone(&serve_state)).await?;
-            }
+            serve::run(addr, Arc::clone(&serve_state)).await?;
 
             // Wait for the agent task's graceful shutdown to finish so its
             // summarize_on_shutdown LLM call isn't aborted by runtime drop.
