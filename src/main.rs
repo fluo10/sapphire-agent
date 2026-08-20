@@ -587,8 +587,9 @@ async fn main() -> Result<()> {
 
 /// Rebuild Workspace's per-namespace "today's digest" cache from the
 /// session JSONLs on disk and notify the agent that its cached system
-/// prompts are now stale. Invoked from the periodic-sync loop so a git
-/// pull on one machine becomes visible on the other within one tick.
+/// prompts are now stale. Invoked from the periodic re-index loop so it
+/// runs on the same tick as `WorkspaceState::sync`, picking up any
+/// session JSONLs or notes written outside the agent since the last tick.
 ///
 /// Cheap when there are no fresh digests: each store walks `sessions/*`
 /// once with an mtime pre-filter that rejects files untouched before
