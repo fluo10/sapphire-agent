@@ -4,7 +4,7 @@ use crate::tools::{Tool, ToolOutput, ToolSet};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use sapphire_workspace::WorkspaceState;
+use sapphire_framework::workspace::WorkspaceState;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};

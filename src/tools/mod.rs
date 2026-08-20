@@ -175,7 +175,7 @@ impl ToolSet {
     }
 }
 
-/// Build the default tool set backed by a sapphire-workspace WorkspaceState.
+/// Build the default tool set backed by a sapphire-framework WorkspaceState.
 ///
 /// `tavily_api_key`: if provided, the `web_search` tool is included.
 /// `mcp_servers`: external MCP servers whose tools are registered with the
@@ -184,7 +184,7 @@ impl ToolSet {
 /// is shared with `main` so the agent/serve fire dispatchers can be
 /// wired in after construction.
 pub async fn default_tool_set(
-    state: Arc<Mutex<sapphire_workspace::WorkspaceState>>,
+    state: Arc<Mutex<sapphire_framework::workspace::WorkspaceState>>,
     tavily_api_key: Option<String>,
     mcp_servers: &[McpServerConfig],
     timer_manager: Arc<crate::timer::TimerManager>,

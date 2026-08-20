@@ -36,7 +36,7 @@ repository = "https://github.com/fluo10/sapphire-agent"
 name = "sapphire-agent"
 version = "0.7.2"
 edition.workspace = true
-description = "A personal AI assistant agent with Matrix/Discord channels, Anthropic backend, and a sapphire-workspace memory layer"
+description = "A personal AI assistant agent with Matrix/Discord channels, Anthropic backend, and a sapphire-framework memory layer"
 license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/fluo10/sapphire-agent"
@@ -54,9 +54,9 @@ default = ["redb-store", "lancedb-store", "fastembed-embed", "voice-sherpa"]
 # Pure-Rust cache backend (redb + tantivy) for the FTS/record store. Without it
 # the workspace falls back to an ephemeral in-memory store; lancedb-store only
 # covers the vector index.
-redb-store = ["sapphire-workspace/redb-store"]
-lancedb-store = ["sapphire-workspace/lancedb-store"]
-fastembed-embed = ["sapphire-workspace/fastembed-embed"]
+redb-store = ["sapphire-framework/redb-store"]
+lancedb-store = ["sapphire-framework/lancedb-store"]
+fastembed-embed = ["sapphire-framework/fastembed-embed"]
 # Compile in the local sherpa-onnx STT + TTS providers. Enabled by
 # default, but note that sherpa-onnx-sys pulls in a large C++ build
 # (sherpa-onnx + ONNX runtime, ~5–10 minutes on a cold cache). Users
@@ -127,9 +127,13 @@ chrono = { version = "0.4", features = ["serde"] }
 # Time-ordered unique IDs for session files
 uuid = { version = "1", features = ["v7"] }
 
-# Workspace: file indexing, FTS, vector search, git sync
+# Local-first workspace framework: file indexing, FTS, vector search.
+# The facade crate (bevy-style) fronts the internal sapphire-framework-*
+# crates; each feature re-exports one as a module. `default-features = false`
+# plus an explicit `workspace` keeps the facade's own default (workspace +
+# redb-store) from bypassing the feature flags below.
 # lancedb-store is gated behind the "lancedb-store" feature (default on)
-sapphire-workspace = { package = "sapphire-framework-workspace", git = "https://github.com/fluo10/sapphire-framework", branch = "feat/framework-migration", default-features = false }
+sapphire-framework = { version = "0.1", git = "https://github.com/fluo10/sapphire-framework", branch = "main", default-features = false, features = ["workspace"] }
 
 # Human-readable session IDs for API sessions
 grain-id = { version = "0.14", features = ["serde"] }

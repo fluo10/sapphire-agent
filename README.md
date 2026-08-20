@@ -1,6 +1,6 @@
 # sapphire-agent
 
-A personal AI assistant agent that lives in a [`sapphire-workspace`](https://crates.io/crates/sapphire-workspace) and talks to me through Matrix and Discord.
+A personal AI assistant agent that lives in a [`sapphire-framework`](https://github.com/fluo10/sapphire-framework) workspace and talks to me through Matrix and Discord.
 
 > **Status: personal project.** This is something I built for my own use. It only has to work in my environment, and that is the only environment I test it in. You are welcome to use it, fork it, or send pull requests, but I am not going to maintain providers, channels, or features I do not personally use. If your use case overlaps with mine, great; if not, fork freely.
 >
@@ -10,7 +10,7 @@ A personal AI assistant agent that lives in a [`sapphire-workspace`](https://cra
 
 - **Channels**: Matrix (E2EE via `matrix-sdk`) and Discord (`serenity`), running concurrently.
 - **Providers**: Anthropic Messages API with SSE streaming and a multi-round tool-use loop, plus OpenAI-compatible backends (local LLMs, OpenRouter, …) selectable per room/session via the `[providers]` / `[profiles]` / `[room_profile]` schema.
-- **Workspace**: backed by [`sapphire-workspace`](https://crates.io/crates/sapphire-workspace) — file index, full-text + vector search (LanceDB), git sync.
+- **Workspace**: backed by [`sapphire-framework`](https://github.com/fluo10/sapphire-framework) — file index, full-text + vector search (redb + tantivy, optional LanceDB).
 - **Built-in tools**: `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `web_search`, `weather`, `shell`, `timer_set` / `timer_preset` / `timer_cancel` / `timer_status` (incl. Pomodoro presets), plus workspace memory / search / sync tools.
 - **Sessions**: human-readable [`grain-id`](https://crates.io/crates/grain-id) aliases, auto-generated titles, history dump on resume.
 - **Background**: heartbeat cron tasks, periodic memory compaction, periodic workspace sync, daily / weekly / monthly / yearly logs with catch-up.

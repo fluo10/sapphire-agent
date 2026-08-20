@@ -10120,7 +10120,7 @@ dependencies = [
  "hound",
  "matrix-sdk",
  "reqwest",
- "sapphire-framework-workspace",
+ "sapphire-framework",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -10213,9 +10213,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "sapphire-framework"
+version = "0.1.0"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
+dependencies = [
+ "sapphire-framework-backend",
+ "sapphire-framework-workspace",
+]
+
+[[package]]
+name = "sapphire-framework-backend"
+version = "0.1.0"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "indexmap 2.14.0",
+ "sapphire-framework-remote-client",
+ "sapphire-framework-rpc",
+ "sapphire-framework-workspace",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sapphire-framework-remote-client"
+version = "0.1.0"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
+dependencies = [
+ "base64 0.22.1",
+ "reqwest",
+ "sapphire-framework-rpc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "sapphire-framework-retrieve"
 version = "0.1.0"
-source = "git+https://github.com/fluo10/sapphire-framework?branch=feat%2Fframework-migration#5b5d82666fa632faca15c52e5d13eab219f2cb4f"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -10232,22 +10272,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "sapphire-framework-sync"
+name = "sapphire-framework-rpc"
 version = "0.1.0"
-source = "git+https://github.com/fluo10/sapphire-framework?branch=feat%2Fframework-migration#5b5d82666fa632faca15c52e5d13eab219f2cb4f"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
 dependencies = [
  "chrono",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
- "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "sapphire-framework-track"
 version = "0.1.0"
-source = "git+https://github.com/fluo10/sapphire-framework?branch=feat%2Fframework-migration#5b5d82666fa632faca15c52e5d13eab219f2cb4f"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
 dependencies = [
  "redb",
  "thiserror 2.0.18",
@@ -10257,13 +10295,12 @@ dependencies = [
 [[package]]
 name = "sapphire-framework-workspace"
 version = "0.1.0"
-source = "git+https://github.com/fluo10/sapphire-framework?branch=feat%2Fframework-migration#5b5d82666fa632faca15c52e5d13eab219f2cb4f"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
 dependencies = [
  "chrono",
  "indexmap 2.14.0",
  "md-5 0.11.0",
  "sapphire-framework-retrieve",
- "sapphire-framework-sync",
  "sapphire-framework-track",
  "serde",
  "thiserror 2.0.18",

@@ -3,7 +3,7 @@ use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sapphire_workspace::{FtsQuery, VectorQuery, WorkspaceState};
+use sapphire_framework::workspace::{FtsQuery, VectorQuery, WorkspaceState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;

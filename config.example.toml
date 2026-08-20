@@ -186,7 +186,7 @@ system_prompt = "You are a helpful personal assistant."
 # api_keys         = ["sa-mcp-<long random>"]
 #
 # Caveat: workspace retrieve (FTS / vector search) currently spans every
-# namespace because sapphire-workspace 0.10.x has no path_prefix filter.
+# namespace because sapphire-framework has no path_prefix filter.
 # Contamination prevention is digest- and MEMORY.md-only in this
 # release; retrieve hits may still leak across namespaces.
 

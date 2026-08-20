@@ -34,7 +34,7 @@ use periodic_log::{
     catchup_pending_monthly_logs, catchup_pending_weekly_logs, catchup_pending_yearly_logs,
 };
 use provider::registry::ProviderRegistry;
-use sapphire_workspace::{AppContext, Workspace as SwWorkspace, WorkspaceState};
+use sapphire_framework::workspace::{AppContext, Workspace as SwWorkspace, WorkspaceState};
 
 static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
 

@@ -19,7 +19,7 @@
 use crate::provider::{ChatMessage, ContentPart, Role, UserInputKind};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
-use sapphire_workspace::WorkspaceState;
+use sapphire_framework::workspace::WorkspaceState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -208,8 +208,9 @@ pub struct SessionStore {
     /// `"mcp"` for MCP project sessions. Lets the Agent and ServeState
     /// keep separate `SessionStore` instances while sharing one base dir.
     pub kind: &'static str,
-    /// Optional sapphire-workspace state. When set, file modifications notify
-    /// the workspace so the index/cache and git staging stay in sync.
+    /// Optional sapphire-framework workspace state. When set, file
+    /// modifications notify the workspace so the index/cache and git
+    /// staging stay in sync.
     ws_state: Option<Arc<Mutex<WorkspaceState>>>,
     /// `session_id → absolute path` cache. Populated lazily by
     /// `resolve_path` (filesystem scan) and eagerly by `create_session` /
@@ -285,7 +286,7 @@ impl SessionStore {
         None
     }
 
-    /// Notify sapphire-workspace that a session file was created or modified.
+    /// Notify the sapphire-framework workspace that a session file was created or modified.
     /// No-op if no WorkspaceState is attached or the path is outside the workspace.
     fn notify_updated(&self, abs_path: &Path) {
         let Some(state) = &self.ws_state else { return };
@@ -307,7 +308,7 @@ impl SessionStore {
         }
     }
 
-    /// Notify sapphire-workspace that a session file was deleted.
+    /// Notify the sapphire-framework workspace that a session file was deleted.
     #[allow(dead_code)]
     fn notify_deleted(&self, abs_path: &Path) {
         let Some(state) = &self.ws_state else { return };
