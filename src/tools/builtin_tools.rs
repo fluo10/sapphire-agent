@@ -175,8 +175,8 @@ impl FileWriteTool {
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
                     (resolved against the workspace root). \
                     Creates the file and any missing parent directories automatically. \
-                    When the target file is inside the workspace, the search index and git sync \
-                    are updated automatically. \
+                    When the target file is inside the workspace, the search index \
+                    is updated automatically. \
                     Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.)."
                     .into(),
                 input_schema: json!({
@@ -252,7 +252,7 @@ impl FileDeleteTool {
                 description: "Delete a file from the filesystem. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
                     (resolved against the workspace root). \
-                    When the file is inside the workspace, it is also removed from the search index and git sync \
+                    When the file is inside the workspace, it is also removed from the search index \
                     automatically. \
                     Cannot delete directories.".into(),
                 input_schema: json!({
@@ -309,8 +309,8 @@ impl FileAppendTool {
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
                     (resolved against the workspace root). \
                     Creates any missing parent directories automatically. \
-                    When the target file is inside the workspace, the search index and git sync \
-                    are updated automatically. \
+                    When the target file is inside the workspace, the search index \
+                    is updated automatically. \
                     Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.)."
                     .into(),
                 input_schema: json!({
