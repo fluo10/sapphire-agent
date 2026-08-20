@@ -98,6 +98,13 @@ pub struct Config {
     /// auto-sync, so nothing is committed or pushed on this cadence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_interval_minutes: Option<u32>,
+    /// Removed in the sapphire-framework `main` migration. Retained only so an
+    /// existing config that still sets it fails loudly instead of silently
+    /// coming up as a second active agent: cold standby was the primary's
+    /// config with this flag flipped, so ignoring it would start duplicate
+    /// channel listeners and race on MEMORY.md in a shared workspace.
+    #[serde(default)]
+    pub standby_mode: Option<bool>,
     /// How many minutes of inactivity (no incoming user message) before
     /// the agent emits a same-day digest line summarising the session
     /// so far. The digest is read back across sessions and injected

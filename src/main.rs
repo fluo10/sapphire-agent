@@ -102,6 +102,20 @@ async fn main() -> Result<()> {
     let config = Config::load(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
+    if config.standby_mode == Some(true) {
+        anyhow::bail!(
+            "config at {} sets `standby_mode = true`, which was removed in the \
+             sapphire-framework `main` migration: the framework no longer ships \
+             local-workspace auto-sync, so a standby node has nothing left to \
+             sync and would instead come up as a second fully-active agent \
+             (duplicate Matrix/Discord replies, two processes racing on \
+             MEMORY.md compaction and daily-log generation in the same \
+             workspace). Delete the `standby_mode` line from this config to \
+             upgrade.",
+            config_path.display()
+        );
+    }
+
     match cli.command {
         Some(Command::Verify) => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
