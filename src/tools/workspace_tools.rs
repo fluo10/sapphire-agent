@@ -3,7 +3,7 @@ use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sapphire_workspace::{FtsQuery, VectorQuery, WorkspaceState};
+use sapphire_framework::workspace::{FtsQuery, VectorQuery, WorkspaceState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
@@ -542,7 +542,8 @@ impl Tool for WorkspaceSearchTool {
 // workspace_sync
 // ---------------------------------------------------------------------------
 
-/// Sync the workspace via the configured backend (git commit + push).
+/// Re-index the workspace so files edited outside the agent become
+/// searchable. There is no git leg — the framework removed auto-sync.
 pub struct WorkspaceSyncTool {
     state: Arc<Mutex<WorkspaceState>>,
     spec: ToolSpec,
@@ -554,8 +555,8 @@ impl WorkspaceSyncTool {
             state,
             spec: ToolSpec {
                 name: "workspace_sync".into(),
-                description: "Sync the workspace: index all files and, if a git \
-                    remote is configured, commit and push changes."
+                description: "Re-index the workspace so files changed outside \
+                    the agent become searchable. Does not touch git."
                     .into(),
                 input_schema: json!({
                     "type": "object",
@@ -575,7 +576,9 @@ impl Tool for WorkspaceSyncTool {
     async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
         let state = lock(&self.state);
 
-        let (upserted, removed) = state.periodic_sync().context("Failed to sync workspace")?;
+        let (upserted, removed) = state
+            .sync_retrieve()
+            .context("Failed to re-index workspace")?;
         Ok(format!(
             "Synced: {upserted} files indexed, {removed} removed."
         ))

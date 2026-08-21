@@ -20,7 +20,7 @@ use crate::provider::Provider;
 use crate::provider::registry::ProviderRegistry;
 use crate::session::SessionStore;
 use chrono::{Datelike, Duration, Local, NaiveTime, Timelike, Weekday};
-use sapphire_workspace::WorkspaceState;
+use sapphire_framework::workspace::WorkspaceState;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;

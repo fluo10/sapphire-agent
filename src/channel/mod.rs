@@ -163,8 +163,7 @@ impl Channels {
         self.list.iter().map(|(n, _)| n.as_str()).collect()
     }
 
-    /// True when no channels are registered (e.g. standby mode or
-    /// API-only deployment).
+    /// True when no channels are registered (e.g. API-only deployment).
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()

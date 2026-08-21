@@ -19,7 +19,7 @@
 use crate::provider::{ChatMessage, ContentPart, Provider, Role};
 use crate::session::{SessionMeta, SessionStore, StoredMessage};
 use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
-use sapphire_workspace::WorkspaceState;
+use sapphire_framework::workspace::WorkspaceState;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

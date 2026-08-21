@@ -34,15 +34,13 @@ use periodic_log::{
     catchup_pending_monthly_logs, catchup_pending_weekly_logs, catchup_pending_yearly_logs,
 };
 use provider::registry::ProviderRegistry;
-use sapphire_workspace::{AppContext, DeviceDefaults, Workspace as SwWorkspace, WorkspaceState};
+use sapphire_framework::workspace::{AppContext, Workspace as SwWorkspace, WorkspaceState};
 
 static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
 
-/// Inject host-platform paths and device facts into [`APP_CTX`] before any
-/// code touches a [`SwWorkspace`]. The sapphire-workspace library deliberately
-/// does not depend on `dirs` / `hostname`, so each host app has to wire these
-/// up itself at startup. Missing this made `APP_CTX.device()` panic the first
-/// time the git sync backend tried to record device info.
+/// Inject host-platform paths into [`APP_CTX`] before any code touches a
+/// [`SwWorkspace`]. The framework deliberately does not depend on `dirs`, so
+/// each host app resolves its own cache / data directories at startup.
 fn init_app_ctx() {
     let base = directories::BaseDirs::new();
     let cache_dir = base
@@ -57,18 +55,6 @@ fn init_app_ctx() {
         .join(env!("CARGO_PKG_NAME"));
     APP_CTX.set_cache_dir(cache_dir);
     APP_CTX.set_data_dir(data_dir);
-
-    let hostname = hostname::get()
-        .ok()
-        .and_then(|s| s.into_string().ok())
-        .unwrap_or_default();
-    APP_CTX.set_device_defaults(DeviceDefaults {
-        hostname,
-        app_id: env!("CARGO_PKG_NAME").to_owned(),
-        app_version: env!("CARGO_PKG_VERSION").to_owned(),
-        platform: std::env::consts::OS.to_owned(),
-        arch: std::env::consts::ARCH.to_owned(),
-    });
 }
 use session::SessionStore;
 use std::path::PathBuf;
@@ -116,6 +102,20 @@ async fn main() -> Result<()> {
     let config = Config::load(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
+    if config.standby_mode == Some(true) {
+        anyhow::bail!(
+            "config at {} sets `standby_mode = true`, which was removed in the \
+             sapphire-framework `main` migration: the framework no longer ships \
+             local-workspace auto-sync, so a standby node has nothing left to \
+             sync and would instead come up as a second fully-active agent \
+             (duplicate Matrix/Discord replies, two processes racing on \
+             MEMORY.md compaction and daily-log generation in the same \
+             workspace). Delete the `standby_mode` line from this config to \
+             upgrade.",
+            config_path.display()
+        );
+    }
+
     match cli.command {
         Some(Command::Verify) => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
@@ -140,7 +140,6 @@ async fn main() -> Result<()> {
                 config.day_boundary_hour
             );
             println!("  Heartbeat enabled : {}", config.heartbeat_enabled);
-            println!("  Standby mode      : {}", config.standby_mode);
             println!();
             let workspace_files = [
                 ("AGENTS.md / AGENT.md", vec!["AGENTS.md", "AGENT.md"]),
@@ -199,53 +198,22 @@ async fn main() -> Result<()> {
             // ── Bootstrap file loader (AGENTS.md, SOUL.md, MEMORY.md …) ────
             let workspace = Arc::new(Workspace::new(workspace_dir.clone(), config.digest.clone()));
 
-            // ── sapphire-workspace (search, file ops, git sync) ─────────────
+            // ── framework workspace (search, file ops) ──────────────────────
             let sw_workspace = SwWorkspace::resolve(&APP_CTX, Some(&workspace_dir))
-                .context("Failed to resolve sapphire-workspace")?;
-            // Use the [sync] section from the agent config directly.
-            // WorkspaceConfig was removed in sapphire-workspace 0.8.0;
-            // open_configured now takes &SyncConfig. In 0.10 the periodic
-            // cadence moved out of SyncConfig because it drives both
-            // sapphire-sync and sapphire-retrieve — keeping one knob
-            // avoids a duplicate `[retrieve]` cadence. It now lives at
-            // the agent config root as `sync_interval_minutes`, and each
-            // `periodic_sync()` call refreshes the retrieve cache too.
-            let sync_config = config.sync.clone().unwrap_or_default();
+                .context("Failed to resolve the framework workspace")?;
+            // `sync_interval_minutes` is the re-index cadence. The framework
+            // removed local-workspace auto-sync, so a tick is an mtime-based
+            // refresh of the retrieve cache and nothing else.
             let ws_sync_interval = config
                 .sync_interval_minutes
                 .filter(|&m| m > 0)
                 .map(|m| std::time::Duration::from_secs(m as u64 * 60));
-            let ws_state = WorkspaceState::open_configured(sw_workspace, &sync_config)
-                .context("Failed to open WorkspaceState")?;
-            if let Err(e) = ws_state.periodic_sync() {
-                tracing::warn!("Initial workspace sync failed: {e}");
+            let ws_state =
+                WorkspaceState::open(sw_workspace).context("Failed to open WorkspaceState")?;
+            if let Err(e) = ws_state.sync_retrieve() {
+                tracing::warn!("Initial workspace re-index failed: {e}");
             }
             let ws_state = Arc::new(Mutex::new(ws_state));
-
-            // Standby mode runs a minimal periodic-sync loop. The
-            // with-channels code path replaces this with a richer loop
-            // below that also rebuilds today_digests on the same tick
-            // (so we don't pay periodic_sync twice per interval).
-            if config.standby_mode
-                && let Some(dur) = ws_sync_interval
-            {
-                tracing::info!("Periodic workspace sync enabled: every {}s", dur.as_secs());
-                let ws = Arc::clone(&ws_state);
-                tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(dur);
-                    tick.tick().await;
-                    loop {
-                        tick.tick().await;
-                        let state = ws.lock().expect("ws_state mutex poisoned");
-                        match state.periodic_sync() {
-                            Ok((u, r)) => {
-                                tracing::info!("Periodic ws sync: {u} upserted, {r} removed");
-                            }
-                            Err(e) => tracing::warn!("Periodic ws sync failed: {e:#}"),
-                        }
-                    }
-                });
-            }
 
             // ── Timer manager (single-slot, in-memory) ──────────────────────
             // Built before the tool set so the timer_* tools can hold an
@@ -317,7 +285,6 @@ async fn main() -> Result<()> {
             // path that can target voice satellites.
             let voice_providers = if config.stt_providers.is_empty()
                 && config.tts_providers.is_empty()
-                || config.standby_mode
             {
                 None
             } else {
@@ -388,12 +355,6 @@ async fn main() -> Result<()> {
             // timers can push fire messages back to their satellite.
             timer_manager.set_serve_state(Arc::downgrade(&serve_state));
 
-            if config.standby_mode {
-                tracing::info!(
-                    "Standby mode enabled: git sync only, skipping channel and heartbeat"
-                );
-            }
-
             // Captured below so main can await the agent's graceful shutdown
             // (summarize_on_shutdown) before returning. Without this, the
             // tokio runtime drops the spawned task the moment serve::run
@@ -401,7 +362,7 @@ async fn main() -> Result<()> {
             let mut agent_handle: Option<tokio::task::JoinHandle<()>> = None;
 
             // ── Channel + Agent (Matrix and/or Discord, if configured) ──────
-            if !config.standby_mode && (config.matrix.is_some() || config.discord.is_some()) {
+            if config.matrix.is_some() || config.discord.is_some() {
                 // Sessions from every chat channel land under
                 // `sessions/<namespace>/channel/<uuid>.jsonl`. Each session
                 // still records its originating channel name in metadata.
@@ -513,14 +474,17 @@ async fn main() -> Result<()> {
                 // timers fire through `Agent::trigger`.
                 timer_manager.set_agent(Arc::downgrade(&agent));
 
-                // ── Periodic workspace sync + today-digest rebuild ──────
-                // Same cadence drives both: when `periodic_sync` pulls
-                // session JSONLs from another device via git, the digest
-                // builder picks them up on the same tick so cross-device
-                // "today's notes" become visible without waiting for the
+                // ── Periodic workspace re-index + today-digest rebuild ──
+                // Same cadence drives both: `sync()` picks up session
+                // JSONLs and notes written outside the agent, and the
+                // digest builder folds them in on the same tick so
+                // "today's notes" stay current without waiting for the
                 // next day-boundary daily-log generation.
                 if let Some(dur) = ws_sync_interval {
-                    tracing::info!("Periodic workspace sync enabled: every {}s", dur.as_secs());
+                    tracing::info!(
+                        "Periodic workspace re-index enabled: every {}s",
+                        dur.as_secs()
+                    );
                     let ws = Arc::clone(&ws_state);
                     let cfg_for_loop = config.clone();
                     let workspace_for_loop = Arc::clone(&workspace);
@@ -536,7 +500,7 @@ async fn main() -> Result<()> {
                             tick.tick().await;
                             {
                                 let state = ws.lock().expect("ws_state mutex poisoned");
-                                match state.periodic_sync() {
+                                match state.sync_retrieve() {
                                     Ok((u, r)) => tracing::info!(
                                         "Periodic ws sync: {u} upserted, {r} removed"
                                     ),
@@ -610,27 +574,17 @@ async fn main() -> Result<()> {
                 }));
             }
 
-            if config.standby_mode {
-                // In standby mode, keep the process alive for periodic git
-                // sync only — no HTTP server, no channel, no heartbeat.
-                tracing::info!("Standby mode: waiting for shutdown signal (Ctrl-C)");
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("Failed to listen for Ctrl-C");
-                tracing::info!("Shutting down standby process");
-            } else {
-                // ── HTTP API server ─────────────────────────────────────────
-                let addr = bind
-                    .or_else(|| {
-                        config
-                            .serve
-                            .as_ref()
-                            .map(|s| format!("{}:{}", s.host, s.port))
-                    })
-                    .unwrap_or_else(|| "127.0.0.1:9000".to_string());
+            // ── HTTP API server ─────────────────────────────────────────────
+            let addr = bind
+                .or_else(|| {
+                    config
+                        .serve
+                        .as_ref()
+                        .map(|s| format!("{}:{}", s.host, s.port))
+                })
+                .unwrap_or_else(|| "127.0.0.1:9000".to_string());
 
-                serve::run(addr, Arc::clone(&serve_state)).await?;
-            }
+            serve::run(addr, Arc::clone(&serve_state)).await?;
 
             // Wait for the agent task's graceful shutdown to finish so its
             // summarize_on_shutdown LLM call isn't aborted by runtime drop.
@@ -647,8 +601,9 @@ async fn main() -> Result<()> {
 
 /// Rebuild Workspace's per-namespace "today's digest" cache from the
 /// session JSONLs on disk and notify the agent that its cached system
-/// prompts are now stale. Invoked from the periodic-sync loop so a git
-/// pull on one machine becomes visible on the other within one tick.
+/// prompts are now stale. Invoked from the periodic re-index loop so it
+/// runs on the same tick as `WorkspaceState::sync`, picking up any
+/// session JSONLs or notes written outside the agent since the last tick.
 ///
 /// Cheap when there are no fresh digests: each store walks `sessions/*`
 /// once with an mtime pre-filter that rejects files untouched before
