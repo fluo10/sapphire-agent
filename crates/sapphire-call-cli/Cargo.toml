@@ -1,6 +1,6 @@
 [package]
 name = "sapphire-call-cli"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 description = "Standalone CLI / voice-satellite client for sapphire-agent"
 license.workspace = true
