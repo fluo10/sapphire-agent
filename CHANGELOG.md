@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.7.2...sapphire-agent-v0.8.0) - 2026-08-21
+
+### Added
+
+- [**breaking**] *(workspace)* Depend on sapphire-framework and enable the redb store
+- [**breaking**] *(workspace)* Depend on the sapphire-framework facade crate on main
+- *(config)* Guard against a silently reactivated standby node
+
+### Changed
+
+- [**breaking**] Remove standby_mode (framework #90 removed git sync)
+- [**breaking**] Drop the sync/git/device APIs removed in framework #90
+
+### Documentation
+
+- *(spec)* Migrate to framework main via the facade crate, drop git auto-sync
+- *(spec)* Roadmap for Zed ACP via local agent + remote-workspace
+- *(plan)* Framework main migration implementation plan
+- *(tools)* Drop the stale git-sync claim from file tool descriptions
+- *(main)* Drop the stale cross-machine git-pull claim from rebuild_today_digests
+- Record breaking changes and finish the sync->re-index rewording
+
+### Fixed
+
+- *(mcp-client)* Use fire-and-forget for `notifications/initialized`
+- *(workspace)* Correct two inaccurate doc/comment rewordings from the framework migration
+- Use sync_retrieve instead of full sync on the periodic re-index tick
+
+
+
 ### Breaking
 
 - **`standby_mode` removed** — its only purpose was git sync on a backup
