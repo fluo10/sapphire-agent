@@ -613,8 +613,16 @@ enabled = true
 [digest]
 daily_items = 7
 
-[timer]
+# `cycles` belongs to a preset, not to `[timer]` itself, and `steps` is a
+# required field — this block has to deserialize into `Config` for the
+# round-trip test below.
+[[timer.preset]]
+name = "pomodoro"
 cycles = 4
+
+[[timer.preset.steps]]
+label = "Focus"
+minutes = 25.0
 
 [profiles.default]
 provider = "anthropic"
