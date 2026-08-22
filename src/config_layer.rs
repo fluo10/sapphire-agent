@@ -127,6 +127,28 @@ fn filter_inner(
     }
 }
 
+/// Merge `over` onto `base`, with `over` winning.
+///
+/// Tables merge key by key, recursively. Every other value — scalars and arrays
+/// alike — is replaced wholesale by `over`. Arrays are deliberately not
+/// concatenated: concatenation cannot express removing an entry, and it silently
+/// duplicates values both layers list.
+pub fn deep_merge(base: toml::Value, over: toml::Value) -> toml::Value {
+    match (base, over) {
+        (toml::Value::Table(mut base_table), toml::Value::Table(over_table)) => {
+            for (key, over_child) in over_table {
+                let merged = match base_table.remove(&key) {
+                    Some(base_child) => deep_merge(base_child, over_child),
+                    None => over_child,
+                };
+                base_table.insert(key, merged);
+            }
+            toml::Value::Table(base_table)
+        }
+        (_, over) => over,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +308,71 @@ access_token = "t"
                 "workspace_dir".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn host_wins_on_a_scalar() {
+        let merged = deep_merge(
+            parse("day_boundary_hour = 4"),
+            parse("day_boundary_hour = 6"),
+        );
+        assert_eq!(merged["day_boundary_hour"].as_integer(), Some(6));
+    }
+
+    #[test]
+    fn workspace_supplies_what_the_host_omits() {
+        let merged = deep_merge(
+            parse("day_boundary_hour = 4\nsession_policy = \"compact\""),
+            parse("day_boundary_hour = 6"),
+        );
+        assert_eq!(merged["day_boundary_hour"].as_integer(), Some(6));
+        assert_eq!(merged["session_policy"].as_str(), Some("compact"));
+    }
+
+    #[test]
+    fn tables_merge_key_by_key() {
+        // The case that forces deep merge: the workspace supplies the shared
+        // fields of a room profile, the host adds its bearer token, and neither
+        // has to restate the other.
+        let merged = deep_merge(
+            parse(
+                r#"
+[room_profile.work]
+profile = "default"
+rooms = ["!a:example.org"]
+"#,
+            ),
+            parse(
+                r#"
+[room_profile.work]
+api_keys = ["sa-host-only"]
+"#,
+            ),
+        );
+        assert_eq!(merged["room_profile"]["work"]["profile"].as_str(), Some("default"));
+        assert_eq!(
+            merged["room_profile"]["work"]["api_keys"][0].as_str(),
+            Some("sa-host-only")
+        );
+    }
+
+    #[test]
+    fn arrays_are_replaced_not_concatenated() {
+        // Concatenation cannot express removal, so the host replaces.
+        let merged = deep_merge(
+            parse(r#"[room_profile.work]
+rooms = ["!a:example.org", "!b:example.org"]"#),
+            parse(r#"[room_profile.work]
+rooms = ["!c:example.org"]"#),
+        );
+        let rooms = merged["room_profile"]["work"]["rooms"].as_array().unwrap();
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].as_str(), Some("!c:example.org"));
+    }
+
+    #[test]
+    fn a_host_scalar_replaces_a_workspace_table() {
+        let merged = deep_merge(parse("[digest]\nkeep = 3"), parse("digest = 7"));
+        assert_eq!(merged["digest"].as_integer(), Some(7));
     }
 }
