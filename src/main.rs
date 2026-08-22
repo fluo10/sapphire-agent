@@ -87,6 +87,15 @@ enum Command {
     Verify,
 }
 
+/// One-word tag naming where a setting's effective value came from, for `verify`.
+fn layer_tag(provenance: &std::collections::BTreeMap<String, config_layer::Layer>, path: &str) -> &'static str {
+    match provenance.get(path) {
+        Some(config_layer::Layer::Workspace) => "workspace",
+        Some(config_layer::Layer::Host) => "host",
+        None => "default",
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     fmt()
@@ -103,7 +112,7 @@ async fn main() -> Result<()> {
     let LoadedConfig {
         config,
         rejected,
-        provenance: _provenance,
+        provenance,
     } = Config::load_layered(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
@@ -136,6 +145,12 @@ async fn main() -> Result<()> {
         Some(Command::Verify) => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
             println!("Config OK");
+            let ws_config = config::workspace_config_path(&workspace_dir);
+            if ws_config.is_file() {
+                println!("  Workspace config  : {}", ws_config.display());
+            } else {
+                println!("  Workspace config  : none ({} absent)", ws_config.display());
+            }
             if let Some(m) = &config.matrix {
                 println!("  Channel           : matrix");
                 println!("  Matrix homeserver : {}", m.homeserver);
@@ -148,14 +163,27 @@ async fn main() -> Result<()> {
             } else {
                 println!("  Channel           : NONE (add [discord] or [matrix] to config)");
             }
-            println!("  Anthropic model   : {}", config.anthropic.model);
-            println!("  Anthropic max_tok : {}", config.anthropic.max_tokens);
+            println!(
+                "  Anthropic model   : {} [{}]",
+                config.anthropic.model,
+                layer_tag(&provenance, "anthropic.model")
+            );
+            println!(
+                "  Anthropic max_tok : {} [{}]",
+                config.anthropic.max_tokens,
+                layer_tag(&provenance, "anthropic.max_tokens")
+            );
             println!("  Workspace dir     : {}", workspace_dir.display());
             println!(
-                "  Day boundary hour : {}:00 local",
-                config.day_boundary_hour
+                "  Day boundary hour : {}:00 local [{}]",
+                config.day_boundary_hour,
+                layer_tag(&provenance, "day_boundary_hour")
             );
-            println!("  Heartbeat enabled : {}", config.heartbeat_enabled);
+            println!(
+                "  Heartbeat enabled : {} [{}]",
+                config.heartbeat_enabled,
+                layer_tag(&provenance, "heartbeat_enabled")
+            );
             println!();
             let workspace_files = [
                 ("AGENTS.md / AGENT.md", vec!["AGENTS.md", "AGENT.md"]),
