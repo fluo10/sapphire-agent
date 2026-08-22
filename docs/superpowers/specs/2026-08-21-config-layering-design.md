@@ -227,12 +227,20 @@ unchanged.
   odd for the agent to sound different depending on which host answers, and settings like
   speaker id, speed and language belong to the agent rather than the machine, exactly as the
   system prompt does. Splitting those from the model paths is deliberately deferred as low
-  priority.
+  priority — tracked as issue #173.
 - **Env-var layering.** No third layer. Existing per-setting env overrides are unchanged.
 - **Writing the workspace config.** Nothing creates or edits it; users write it by hand.
 - **Any remote-workspace behaviour.** The workspace config is read from the local filesystem.
   It becomes remote-controlled input at phase 4, which is why the trust boundary is decided
   now, but nothing here syncs anything.
+- **Reloading the config while running.** It is read once, at startup. Once the workspace
+  syncs remotely the startup-only read stops being sufficient — the agent is itself what
+  performs the sync, so a shared config that changes server-side would need a restart, and a
+  freshly provisioned host would be refused startup by validation for settings that have
+  simply not arrived yet. Both are tracked as issue #174. Note that the allowlist decided
+  here already bounds that work: the settings the workspace layer may set are exactly the
+  ones a subsystem could re-read, because everything host-only belongs to something already
+  bound, authenticated or loaded into memory.
 
 ## Verification
 
