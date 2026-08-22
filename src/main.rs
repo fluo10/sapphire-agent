@@ -6,6 +6,7 @@
 mod agent;
 mod channel;
 mod config;
+mod config_layer;
 mod context_compression;
 mod frontmatter;
 mod heartbeat;
