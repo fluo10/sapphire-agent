@@ -118,6 +118,13 @@ convention for the agent: `src/config.rs` already defaults Matrix state to
 
 Paths use `*` to match any key of a map.
 
+**Paths are TOML key paths, not Rust field names.** Several map fields are renamed by serde,
+so the allowlist must use the renamed form: `room_profiles` is `room_profile` in TOML,
+`memory_namespaces` is `memory_namespace`, `voice_pipelines` is `voice_pipeline`, and
+`stt_providers` / `tts_providers` are `stt_provider` / `tts_provider`. `providers` and
+`profiles` are not renamed. The round-trip test described under Testing exists precisely to
+catch a path written in the wrong namespace.
+
 ### Allowed in the workspace layer
 
 | Path | What it is |
@@ -129,10 +136,10 @@ Paths use `*` to match any key of a map.
 | `intraday_idle_minutes`, `sync_interval_minutes` | Cadences |
 | `digest.*`, `timer.*` | Digest and timer behaviour |
 | `profiles.*.*` | Provider presets (`provider`, `fallback_provider`) |
-| `memory_namespaces.*.*` | Namespace DAG and background profile |
+| `memory_namespace.*.*` | Namespace DAG and background profile |
 | `room_profile.*.profile`, `.memory_namespace`, `.rooms`, `.session_policy`, `.voice_pipeline` | Room routing |
 | `providers.*.type`, `.base_url`, `.model`, `.provider_name`, `.max_tokens` | Provider definitions |
-| `voice_pipelines.*.*` | Which STT/TTS provider names a pipeline uses, language, capture window |
+| `voice_pipeline.*.*` | Which STT/TTS provider names a pipeline uses, language, capture window |
 
 `providers.*.base_url` is shared deliberately. A private-network DNS name for a
 self-hosted llama.cpp resolves identically from every host, so the URL describes the fleet's
@@ -148,7 +155,7 @@ infrastructure rather than one machine.
 | `serve.*` | Bind address and port |
 | `image_cache.*` | Local cache directory |
 | `workspace_dir`, `sessions_dir` | Filesystem paths; `workspace_dir` is also structurally impossible (see Load order) |
-| `stt_providers.*`, `tts_providers.*`, `voice.*` | Model files and directories that exist per machine |
+| `stt_provider.*`, `tts_provider.*`, `voice.*` | Model files and directories that exist per machine |
 | `standby_mode` | Removed; retained only as a startup guard (issue #171) |
 
 ## Diagnosability
