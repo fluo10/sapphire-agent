@@ -72,6 +72,58 @@ pub fn path_allowed(path: &[&str]) -> bool {
     })
 }
 
+/// Drop every leaf of `workspace` the allowlist does not authorise.
+///
+/// Returns the filtered document and the sorted dot-joined paths that were
+/// dropped, so the caller can name them all in one warning.
+///
+/// A "leaf" is any value that is not a table — arrays included, because arrays
+/// are replaced wholesale rather than merged, so they are authorised or rejected
+/// as a unit. Tables left empty by filtering are pruned; an empty table would
+/// contribute nothing to the merge anyway.
+pub fn filter_allowed(workspace: toml::Value) -> (toml::Value, Vec<String>) {
+    let mut rejected = Vec::new();
+    let mut trail = Vec::new();
+    let kept = filter_inner(workspace, &mut trail, &mut rejected)
+        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+    rejected.sort();
+    (kept, rejected)
+}
+
+/// Returns `None` when the value was dropped entirely.
+fn filter_inner(
+    value: toml::Value,
+    trail: &mut Vec<String>,
+    rejected: &mut Vec<String>,
+) -> Option<toml::Value> {
+    match value {
+        toml::Value::Table(table) => {
+            let mut kept = toml::map::Map::new();
+            for (key, child) in table {
+                trail.push(key.clone());
+                if let Some(child) = filter_inner(child, trail, rejected) {
+                    kept.insert(key, child);
+                }
+                trail.pop();
+            }
+            if kept.is_empty() {
+                None
+            } else {
+                Some(toml::Value::Table(kept))
+            }
+        }
+        leaf => {
+            let segments: Vec<&str> = trail.iter().map(String::as_str).collect();
+            if path_allowed(&segments) {
+                Some(leaf)
+            } else {
+                rejected.push(trail.join("."));
+                None
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +180,108 @@ mod tests {
         // Only leaves are ever tested, so this case cannot arise in practice;
         // pinning it keeps the matcher total.
         assert!(!path_allowed(&["room_profile", "work"]));
+    }
+
+    fn parse(s: &str) -> toml::Value {
+        toml::from_str::<toml::Value>(s.trim()).expect("fixture parses")
+    }
+
+    #[test]
+    fn allowed_leaves_survive_filtering() {
+        let (kept, rejected) = filter_allowed(parse(
+            r#"
+day_boundary_hour = 4
+
+[anthropic]
+system_prompt = "you are sapphire"
+"#,
+        ));
+        assert!(rejected.is_empty());
+        assert_eq!(kept["day_boundary_hour"].as_integer(), Some(4));
+        assert_eq!(
+            kept["anthropic"]["system_prompt"].as_str(),
+            Some("you are sapphire")
+        );
+    }
+
+    #[test]
+    fn non_allowlisted_leaves_are_dropped_and_reported() {
+        let (kept, rejected) = filter_allowed(parse(
+            r#"
+[anthropic]
+model = "claude-opus-5"
+api_key = "sk-should-not-travel"
+
+[tools]
+tavily_api_key = "also-not"
+"#,
+        ));
+        assert_eq!(
+            rejected,
+            vec![
+                "anthropic.api_key".to_string(),
+                "tools.tavily_api_key".to_string()
+            ]
+        );
+        assert_eq!(kept["anthropic"]["model"].as_str(), Some("claude-opus-5"));
+        assert!(kept["anthropic"].get("api_key").is_none());
+        // `tools` had nothing allowed in it, so the empty table is pruned too.
+        assert!(kept.get("tools").is_none());
+    }
+
+    #[test]
+    fn filtering_is_per_leaf_inside_a_wildcard_table() {
+        let (kept, rejected) = filter_allowed(parse(
+            r#"
+[room_profile.work]
+profile = "default"
+rooms = ["!a:example.org"]
+api_keys = ["sa-secret"]
+"#,
+        ));
+        assert_eq!(rejected, vec!["room_profile.work.api_keys".to_string()]);
+        assert_eq!(kept["room_profile"]["work"]["profile"].as_str(), Some("default"));
+        assert!(kept["room_profile"]["work"].get("api_keys").is_none());
+    }
+
+    #[test]
+    fn an_array_is_authorised_as_a_unit() {
+        // Arrays are replaced wholesale rather than merged, so they are a leaf.
+        let (kept, rejected) = filter_allowed(parse(
+            r#"
+[[timer.preset]]
+name = "pomodoro"
+
+[[tools.mcp_servers]]
+name = "evil"
+type = "stdio"
+command = "rm"
+"#,
+        ));
+        assert_eq!(rejected, vec!["tools.mcp_servers".to_string()]);
+        assert!(kept["timer"]["preset"].is_array());
+    }
+
+    #[test]
+    fn rejected_paths_are_sorted() {
+        let (_, rejected) = filter_allowed(parse(
+            r#"
+workspace_dir = "/tmp/ws"
+
+[serve]
+port = 9000
+
+[matrix]
+access_token = "t"
+"#,
+        ));
+        assert_eq!(
+            rejected,
+            vec![
+                "matrix.access_token".to_string(),
+                "serve.port".to_string(),
+                "workspace_dir".to_string()
+            ]
+        );
     }
 }
