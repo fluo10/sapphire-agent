@@ -20,8 +20,12 @@ use std::collections::BTreeMap;
 ///
 /// These are **TOML** names, which are not always the Rust field names: serde
 /// renames `room_profiles` to `room_profile`, `memory_namespaces` to
-/// `memory_namespace` and `voice_pipelines` to `voice_pipeline`. The fixture test
-/// in this module exists to catch a path written in the wrong namespace.
+/// `memory_namespace`, `voice_pipelines` to `voice_pipeline`, and
+/// `stt_providers` / `tts_providers` to `stt_provider` / `tts_provider`. Whoever
+/// adds voice-identity sharing to this allowlist (issue #173) needs the Rust
+/// name translated the same way, or the new entries will silently miss every
+/// leaf. The fixture test in this module exists to catch a path written in the
+/// wrong namespace.
 pub const WORKSPACE_ALLOWLIST: &[&[&str]] = &[
     // The agent's identity and model choice.
     &["anthropic", "model"],
@@ -186,6 +190,14 @@ pub fn merge_layers(workspace: toml::Value, host: toml::Value) -> MergeOutcome {
 ///
 /// `workspace` is expected to be the **filtered** document, so a rejected key
 /// is never attributed to the workspace layer.
+///
+/// The map keys are the **union of both layers' leaves**, not the leaves of
+/// the merged document: a workspace sub-leaf that a host scalar discards
+/// wholesale during `deep_merge` (a host `digest = 7` replacing a workspace
+/// `[digest]` table, say) can still appear here, attributed to whichever layer
+/// actually won. That is latent today because `verify` only ever queries a
+/// handful of fixed paths, but a caller that iterates the whole map — as
+/// `verify`'s workspace-supplied-settings listing does — will see it.
 pub fn provenance_of(workspace: &toml::Value, host: &toml::Value) -> BTreeMap<String, Layer> {
     let mut workspace_paths = Vec::new();
     leaf_paths(workspace, &mut Vec::new(), &mut workspace_paths);
@@ -333,7 +345,10 @@ api_keys = ["sa-secret"]
 "#,
         ));
         assert_eq!(rejected, vec!["room_profile.work.api_keys".to_string()]);
-        assert_eq!(kept["room_profile"]["work"]["profile"].as_str(), Some("default"));
+        assert_eq!(
+            kept["room_profile"]["work"]["profile"].as_str(),
+            Some("default")
+        );
         assert!(kept["room_profile"]["work"].get("api_keys").is_none());
     }
 
@@ -417,7 +432,10 @@ api_keys = ["sa-host-only"]
 "#,
             ),
         );
-        assert_eq!(merged["room_profile"]["work"]["profile"].as_str(), Some("default"));
+        assert_eq!(
+            merged["room_profile"]["work"]["profile"].as_str(),
+            Some("default")
+        );
         assert_eq!(
             merged["room_profile"]["work"]["api_keys"][0].as_str(),
             Some("sa-host-only")
@@ -428,10 +446,14 @@ api_keys = ["sa-host-only"]
     fn arrays_are_replaced_not_concatenated() {
         // Concatenation cannot express removal, so the host replaces.
         let merged = deep_merge(
-            parse(r#"[room_profile.work]
-rooms = ["!a:example.org", "!b:example.org"]"#),
-            parse(r#"[room_profile.work]
-rooms = ["!c:example.org"]"#),
+            parse(
+                r#"[room_profile.work]
+rooms = ["!a:example.org", "!b:example.org"]"#,
+            ),
+            parse(
+                r#"[room_profile.work]
+rooms = ["!c:example.org"]"#,
+            ),
         );
         let rooms = merged["room_profile"]["work"]["rooms"].as_array().unwrap();
         assert_eq!(rooms.len(), 1);
@@ -463,7 +485,7 @@ rooms = ["!c:example.org"]"#),
     #[test]
     fn a_setting_in_neither_layer_has_no_provenance_entry() {
         let outcome = merge_layers(parse(""), parse("day_boundary_hour = 6"));
-        assert!(outcome.provenance.get("heartbeat_enabled").is_none());
+        assert!(!outcome.provenance.contains_key("heartbeat_enabled"));
     }
 
     #[test]
@@ -473,7 +495,10 @@ rooms = ["!c:example.org"]"#),
             parse("[anthropic]\napi_key = \"sk-host\""),
         );
         assert_eq!(outcome.rejected, vec!["anthropic.api_key".to_string()]);
-        assert_eq!(outcome.merged["anthropic"]["api_key"].as_str(), Some("sk-host"));
+        assert_eq!(
+            outcome.merged["anthropic"]["api_key"].as_str(),
+            Some("sk-host")
+        );
         assert_eq!(
             outcome.provenance.get("anthropic.api_key"),
             Some(&Layer::Host)
@@ -545,7 +570,10 @@ tts_provider = "piper"
     #[test]
     fn the_fixture_is_entirely_allowlisted() {
         let (_, rejected) = filter_allowed(parse(FIXTURE));
-        assert!(rejected.is_empty(), "fixture has non-allowlisted keys: {rejected:?}");
+        assert!(
+            rejected.is_empty(),
+            "fixture has non-allowlisted keys: {rejected:?}"
+        );
     }
 
     #[test]
@@ -571,13 +599,17 @@ tts_provider = "piper"
         // fields, so a path naming a renamed or deleted field would otherwise be
         // ignored in silence. Round-tripping through the type catches it: serde
         // drops an unknown key on the way in, so it is missing on the way out.
-        let host = parse(r#"
+        let host = parse(
+            r#"
 [anthropic]
 api_key = "sk-test"
-"#);
+"#,
+        );
         let outcome = merge_layers(parse(FIXTURE), host);
-        let config: crate::config::Config =
-            outcome.merged.try_into().expect("merged fixture deserializes");
+        let config: crate::config::Config = outcome
+            .merged
+            .try_into()
+            .expect("merged fixture deserializes");
         let round_tripped = toml::Value::try_from(&config).expect("Config re-serializes");
 
         let mut paths = Vec::new();
@@ -585,9 +617,9 @@ api_key = "sk-test"
         for path in paths {
             let mut cursor = &round_tripped;
             for segment in path.split('.') {
-                cursor = cursor
-                    .get(segment)
-                    .unwrap_or_else(|| panic!("`{path}` did not survive the round trip through Config"));
+                cursor = cursor.get(segment).unwrap_or_else(|| {
+                    panic!("`{path}` did not survive the round trip through Config")
+                });
             }
         }
     }
