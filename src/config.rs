@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
+use crate::config_layer::{self, Layer};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -903,14 +904,7 @@ impl Config {
 
     /// Resolve the workspace directory: explicit config > config file's parent directory.
     pub fn resolved_workspace_dir(&self, config_path: &Path) -> PathBuf {
-        if let Some(dir) = &self.workspace_dir {
-            PathBuf::from(shellexpand::tilde(dir).as_ref())
-        } else {
-            config_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        }
+        resolve_workspace_dir(self.workspace_dir.as_deref(), config_path)
     }
 
     /// Resolve the sessions directory for JSONL persistence.
@@ -1280,6 +1274,91 @@ impl Config {
         } else {
             PathBuf::from("config.toml")
         }
+    }
+}
+
+/// Resolve the workspace directory from an explicit setting, falling back to the
+/// config file's own directory.
+///
+/// Free-standing because the layered loader needs it before a `Config` exists:
+/// the workspace directory has to be known to find the workspace config, so it
+/// can only ever come from the host layer.
+pub fn resolve_workspace_dir(explicit: Option<&str>, config_path: &Path) -> PathBuf {
+    match explicit {
+        Some(dir) => PathBuf::from(shellexpand::tilde(dir).as_ref()),
+        None => config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+    }
+}
+
+/// Path of the workspace-level config: `{workspace_dir}/.sapphire-agent/config.toml`.
+///
+/// This mirrors the framework's `Workspace::config_path()` convention. It is not
+/// called through the framework because reaching a `Workspace` value goes via
+/// `from_root`, which fails when the marker directory is absent — and the agent
+/// resolves its workspace through the marker-free path.
+pub fn workspace_config_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(".sapphire-agent").join("config.toml")
+}
+
+/// A `Config` plus what the layering did to produce it.
+pub struct LoadedConfig {
+    pub config: Config,
+    /// Workspace-layer keys refused by the allowlist. Reported at startup.
+    pub rejected: Vec<String>,
+    /// Which layer supplied each setting, for `verify`.
+    pub provenance: BTreeMap<String, Layer>,
+}
+
+impl Config {
+    /// Load the host config, then layer the workspace config under it.
+    ///
+    /// The workspace layer is opt-in by existence: with no
+    /// `{workspace_dir}/.sapphire-agent/config.toml` this behaves exactly like
+    /// [`Config::load`].
+    ///
+    /// A malformed **host** config is an error, as it always was. A malformed
+    /// **workspace** config is a warning: from the point the workspace syncs from
+    /// a server it is remote input, and one bad file must not stop every host.
+    pub fn load_layered(host_path: &Path) -> Result<LoadedConfig> {
+        let host_text = std::fs::read_to_string(host_path)
+            .with_context(|| format!("Failed to read config file: {}", host_path.display()))?;
+        let host: toml::Value = toml::from_str(&host_text)
+            .with_context(|| format!("Failed to parse config file: {}", host_path.display()))?;
+
+        let workspace_dir = resolve_workspace_dir(
+            host.get("workspace_dir").and_then(toml::Value::as_str),
+            host_path,
+        );
+        let ws_path = workspace_config_path(&workspace_dir);
+
+        let workspace = match std::fs::read_to_string(&ws_path) {
+            Ok(text) => match toml::from_str::<toml::Value>(&text) {
+                Ok(value) => value,
+                Err(e) => {
+                    tracing::warn!(
+                        "Ignoring malformed workspace config at {}: {e}",
+                        ws_path.display()
+                    );
+                    toml::Value::Table(toml::map::Map::new())
+                }
+            },
+            Err(_) => toml::Value::Table(toml::map::Map::new()),
+        };
+
+        let outcome = config_layer::merge_layers(workspace, host);
+        let config: Config = outcome
+            .merged
+            .try_into()
+            .with_context(|| "Failed to parse config file")?;
+
+        Ok(LoadedConfig {
+            config,
+            rejected: outcome.rejected,
+            provenance: outcome.provenance,
+        })
     }
 }
 
@@ -2017,5 +2096,83 @@ model = "gemma-4-31b-it"
                 assert!(c.api_key.is_none());
             }
         }
+    }
+
+    #[test]
+    fn load_layered_without_a_workspace_config_matches_plain_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            "day_boundary_hour = 5\n\n[anthropic]\napi_key = \"sk-test\"\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        assert_eq!(loaded.config.day_boundary_hour, 5);
+        assert!(loaded.rejected.is_empty());
+        // With no workspace file every value can only have come from the host.
+        assert!(
+            loaded
+                .provenance
+                .values()
+                .all(|l| *l == crate::config_layer::Layer::Host)
+        );
+    }
+
+    #[test]
+    fn load_layered_merges_the_workspace_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            "day_boundary_hour = 6\n\n[anthropic]\napi_key = \"sk-host\"\n",
+        )
+        .unwrap();
+        let marker = dir.path().join(".sapphire-agent");
+        std::fs::create_dir_all(&marker).unwrap();
+        std::fs::write(
+            marker.join("config.toml"),
+            "day_boundary_hour = 4\n\n[anthropic]\nsystem_prompt = \"shared\"\napi_key = \"sk-should-not-travel\"\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        // Host wins where both set a key.
+        assert_eq!(loaded.config.day_boundary_hour, 6);
+        // Workspace supplies what the host omits.
+        assert_eq!(loaded.config.anthropic.system_prompt.as_deref(), Some("shared"));
+        // The host's secret is untouched and the workspace's is refused.
+        assert_eq!(loaded.config.anthropic.api_key.as_deref(), Some("sk-host"));
+        assert_eq!(loaded.rejected, vec!["anthropic.api_key".to_string()]);
+        assert_eq!(
+            loaded.provenance.get("anthropic.system_prompt"),
+            Some(&crate::config_layer::Layer::Workspace)
+        );
+    }
+
+    #[test]
+    fn workspace_dir_from_the_host_layer_locates_the_workspace_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("elsewhere");
+        std::fs::create_dir_all(ws.join(".sapphire-agent")).unwrap();
+        std::fs::write(
+            ws.join(".sapphire-agent").join("config.toml"),
+            "session_policy = \"none\"\n",
+        )
+        .unwrap();
+
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            format!(
+                "workspace_dir = \"{}\"\n\n[anthropic]\napi_key = \"sk-test\"\n",
+                ws.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        assert_eq!(loaded.config.session_policy, SessionPolicy::None);
     }
 }

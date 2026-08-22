@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use channel::discord::DiscordChannel;
 use channel::matrix::MatrixChannel;
 use clap::{Parser, Subcommand};
-use config::Config;
+use config::{Config, LoadedConfig};
 use heartbeat::Heartbeat;
 use periodic_log::{
     build_all_today_digests, catchup_missing_daily_digests, catchup_pending_daily_logs,
@@ -100,8 +100,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let config_path = cli.config.unwrap_or_else(Config::default_path);
-    let config = Config::load(&config_path)
+    let LoadedConfig {
+        config,
+        rejected,
+        provenance: _provenance,
+    } = Config::load_layered(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+
+    if !rejected.is_empty() {
+        tracing::warn!(
+            "Ignoring {} key(s) in the workspace config that the workspace layer may not set: {}. \
+             Credentials, MCP servers, bind addresses and machine paths are host-local by design; \
+             set them in {} instead.",
+            rejected.len(),
+            rejected.join(", "),
+            config_path.display()
+        );
+    }
 
     if config.standby_mode == Some(true) {
         anyhow::bail!(

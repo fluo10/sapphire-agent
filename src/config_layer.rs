@@ -6,11 +6,6 @@
 //! came from. Nothing in this module touches the filesystem — `Config::load_layered`
 //! reads the files and calls in.
 
-// Every item here is unreachable from `main` until Task 5 wires `load_layered`
-// into the binary, and this is a bin-only crate, so the whole module reads as
-// dead code until then. Remove this attribute in Task 5.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
 /// TOML key paths the workspace-level config layer is permitted to set.
