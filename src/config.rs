@@ -894,14 +894,6 @@ fn default_digest_yearly_items() -> usize {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let config: Config =
-            toml::from_str(&content).with_context(|| "Failed to parse config file")?;
-        Ok(config)
-    }
-
     /// Resolve the workspace directory: explicit config > config file's parent directory.
     pub fn resolved_workspace_dir(&self, config_path: &Path) -> PathBuf {
         resolve_workspace_dir(self.workspace_dir.as_deref(), config_path)
@@ -1317,7 +1309,7 @@ impl Config {
     ///
     /// The workspace layer is opt-in by existence: with no
     /// `{workspace_dir}/.sapphire-agent/config.toml` this behaves exactly like
-    /// [`Config::load`].
+    /// a single-file load of the host config.
     ///
     /// A malformed **host** config is an error, as it always was. A malformed
     /// **workspace** config is a warning: from the point the workspace syncs from
@@ -1630,11 +1622,19 @@ api_keys = ["sa-a2a-dev"]
 
     #[test]
     fn shipped_example_parses() {
-        // Sanity check: the example file we ship in the repo must parse
-        // and validate without errors so first-time users aren't greeted
-        // with a confusing TOML error.
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
-        let cfg = Config::load(&path).expect("config.example.toml should parse");
+        // Sanity check: the example file we ship in the repo must parse and
+        // validate without errors so first-time users aren't greeted with a
+        // confusing TOML error. Loaded through `load_layered` from a tempdir,
+        // which also exercises the no-workspace-layer path — the case that has
+        // to behave exactly as a single-file load always did.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::copy(&src, &path).expect("copy the shipped example");
+
+        let cfg = Config::load_layered(&path)
+            .expect("config.example.toml should parse")
+            .config;
         assert!(
             cfg.validate_profiles().is_empty(),
             "validation errors: {:?}",
