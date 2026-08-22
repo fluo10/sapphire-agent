@@ -6,6 +6,11 @@
 //! came from. Nothing in this module touches the filesystem — `Config::load_layered`
 //! reads the files and calls in.
 
+// Every item here is unreachable from `main` until Task 5 wires `load_layered`
+// into the binary, and this is a bin-only crate, so the whole module reads as
+// dead code until then. Remove this attribute in Task 5.
+#![allow(dead_code)]
+
 /// TOML key paths the workspace-level config layer is permitted to set.
 ///
 /// An entry authorises that path **and everything beneath it**. A key that must
@@ -20,7 +25,6 @@
 /// renames `room_profiles` to `room_profile`, `memory_namespaces` to
 /// `memory_namespace` and `voice_pipelines` to `voice_pipeline`. The fixture test
 /// in this module exists to catch a path written in the wrong namespace.
-#[allow(dead_code)]
 pub const WORKSPACE_ALLOWLIST: &[&[&str]] = &[
     // The agent's identity and model choice.
     &["anthropic", "model"],
@@ -61,7 +65,6 @@ pub const WORKSPACE_ALLOWLIST: &[&[&str]] = &[
 ///
 /// `path` is a TOML key path split into segments. A path is authorised when some
 /// allowlist entry is a segment-wise prefix of it.
-#[allow(dead_code)]
 pub fn path_allowed(path: &[&str]) -> bool {
     WORKSPACE_ALLOWLIST.iter().any(|entry| {
         entry.len() <= path.len()
