@@ -88,7 +88,10 @@ enum Command {
 }
 
 /// One-word tag naming where a setting's effective value came from, for `verify`.
-fn layer_tag(provenance: &std::collections::BTreeMap<String, config_layer::Layer>, path: &str) -> &'static str {
+fn layer_tag(
+    provenance: &std::collections::BTreeMap<String, config_layer::Layer>,
+    path: &str,
+) -> &'static str {
     match provenance.get(path) {
         Some(config_layer::Layer::Workspace) => "workspace",
         Some(config_layer::Layer::Host) => "host",
@@ -113,15 +116,20 @@ async fn main() -> Result<()> {
         config,
         rejected,
         provenance,
+        workspace_path,
     } = Config::load_layered(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
     if !rejected.is_empty() {
         tracing::warn!(
-            "Ignoring {} key(s) in the workspace config that the workspace layer may not set: {}. \
-             Credentials, MCP servers, bind addresses and machine paths are host-local by design; \
-             set them in {} instead.",
+            "Ignoring {} key(s) in the workspace config at {} that the workspace layer may not \
+             set: {}. Credentials, MCP servers, bind addresses and machine paths are host-local \
+             by design; set them in {} instead.",
             rejected.len(),
+            workspace_path
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
             rejected.join(", "),
             config_path.display()
         );
@@ -144,12 +152,24 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Verify) => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
-            println!("Config OK");
-            let ws_config = config::workspace_config_path(&workspace_dir);
-            if ws_config.is_file() {
-                println!("  Workspace config  : {}", ws_config.display());
+            let profile_errors = config.validate_profiles();
+            if profile_errors.is_empty() {
+                println!("Config OK");
             } else {
-                println!("  Workspace config  : none ({} absent)", ws_config.display());
+                println!("Config INVALID:");
+                for err in &profile_errors {
+                    println!("  - {err}");
+                }
+            }
+            match &workspace_path {
+                Some(p) => println!("  Workspace config  : {}", p.display()),
+                None => {
+                    let ws_config = config::workspace_config_path(&workspace_dir);
+                    println!(
+                        "  Workspace config  : none ({} absent)",
+                        ws_config.display()
+                    );
+                }
             }
             if let Some(m) = &config.matrix {
                 println!("  Channel           : matrix");
@@ -184,6 +204,20 @@ async fn main() -> Result<()> {
                 config.heartbeat_enabled,
                 layer_tag(&provenance, "heartbeat_enabled")
             );
+            println!();
+            println!("Workspace-supplied settings:");
+            let ws_settings: Vec<&String> = provenance
+                .iter()
+                .filter(|(_, layer)| **layer == config_layer::Layer::Workspace)
+                .map(|(path, _)| path)
+                .collect();
+            if ws_settings.is_empty() {
+                println!("  (none)");
+            } else {
+                for path in ws_settings {
+                    println!("  {path}");
+                }
+            }
             println!();
             let workspace_files = [
                 ("AGENTS.md / AGENT.md", vec!["AGENTS.md", "AGENT.md"]),
