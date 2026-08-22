@@ -823,7 +823,7 @@ Add to the `tests` module at the bottom of `src/config.rs`:
         let host_path = dir.path().join("config.toml");
         std::fs::write(
             &host_path,
-            "[anthropic]\napi_key = \"sk-test\"\nday_boundary_hour = 5\n",
+            "day_boundary_hour = 5\n\n[anthropic]\napi_key = \"sk-test\"\n",
         )
         .unwrap();
 
@@ -845,7 +845,7 @@ Add to the `tests` module at the bottom of `src/config.rs`:
         let host_path = dir.path().join("config.toml");
         std::fs::write(
             &host_path,
-            "[anthropic]\napi_key = \"sk-host\"\nday_boundary_hour = 6\n",
+            "day_boundary_hour = 6\n\n[anthropic]\napi_key = \"sk-host\"\n",
         )
         .unwrap();
         let marker = dir.path().join(".sapphire-agent");
