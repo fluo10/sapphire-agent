@@ -11,6 +11,8 @@
 // dead code until then. Remove this attribute in Task 5.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+
 /// TOML key paths the workspace-level config layer is permitted to set.
 ///
 /// An entry authorises that path **and everything beneath it**. A key that must
@@ -146,6 +148,77 @@ pub fn deep_merge(base: toml::Value, over: toml::Value) -> toml::Value {
             toml::Value::Table(base_table)
         }
         (_, over) => over,
+    }
+}
+
+/// Which layer supplied the effective value for a setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    /// The workspace-level config, shared by every host using this workspace.
+    Workspace,
+    /// The host-local config.
+    Host,
+}
+
+/// The result of layering the workspace config under the host config.
+pub struct MergeOutcome {
+    /// The merged document, ready to deserialize into `Config`.
+    pub merged: toml::Value,
+    /// Dot-joined paths dropped from the workspace layer because the allowlist
+    /// does not authorise them. Sorted.
+    pub rejected: Vec<String>,
+    /// Which layer supplied each leaf. See [`provenance_of`].
+    pub provenance: BTreeMap<String, Layer>,
+}
+
+/// Filter the workspace layer, merge the host over it, and record where each
+/// value came from.
+pub fn merge_layers(workspace: toml::Value, host: toml::Value) -> MergeOutcome {
+    let (workspace, rejected) = filter_allowed(workspace);
+    let provenance = provenance_of(&workspace, &host);
+    let merged = deep_merge(workspace, host);
+    MergeOutcome {
+        merged,
+        rejected,
+        provenance,
+    }
+}
+
+/// Which layer supplied each leaf, keyed by dot-joined TOML path.
+///
+/// Only leaves present in one of the two layers appear. A setting absent from
+/// both takes its serde default, and callers report that by finding no entry.
+///
+/// `workspace` is expected to be the **filtered** document, so a rejected key
+/// is never attributed to the workspace layer.
+pub fn provenance_of(workspace: &toml::Value, host: &toml::Value) -> BTreeMap<String, Layer> {
+    let mut workspace_paths = Vec::new();
+    leaf_paths(workspace, &mut Vec::new(), &mut workspace_paths);
+    let mut host_paths = Vec::new();
+    leaf_paths(host, &mut Vec::new(), &mut host_paths);
+
+    let mut out: BTreeMap<String, Layer> = workspace_paths
+        .into_iter()
+        .map(|path| (path, Layer::Workspace))
+        .collect();
+    // The host wins in `deep_merge`, so it wins here too.
+    for path in host_paths {
+        out.insert(path, Layer::Host);
+    }
+    out
+}
+
+/// Collect the dot-joined path of every leaf (non-table) value.
+fn leaf_paths(value: &toml::Value, trail: &mut Vec<String>, out: &mut Vec<String>) {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, child) in table {
+                trail.push(key.clone());
+                leaf_paths(child, trail, out);
+                trail.pop();
+            }
+        }
+        _ => out.push(trail.join(".")),
     }
 }
 
@@ -374,5 +447,153 @@ rooms = ["!c:example.org"]"#),
     fn a_host_scalar_replaces_a_workspace_table() {
         let merged = deep_merge(parse("[digest]\nkeep = 3"), parse("digest = 7"));
         assert_eq!(merged["digest"].as_integer(), Some(7));
+    }
+
+    #[test]
+    fn provenance_names_the_winning_layer() {
+        let outcome = merge_layers(
+            parse("day_boundary_hour = 4\nsession_policy = \"compact\""),
+            parse("day_boundary_hour = 6"),
+        );
+        assert_eq!(
+            outcome.provenance.get("day_boundary_hour"),
+            Some(&Layer::Host)
+        );
+        assert_eq!(
+            outcome.provenance.get("session_policy"),
+            Some(&Layer::Workspace)
+        );
+    }
+
+    #[test]
+    fn a_setting_in_neither_layer_has_no_provenance_entry() {
+        let outcome = merge_layers(parse(""), parse("day_boundary_hour = 6"));
+        assert!(outcome.provenance.get("heartbeat_enabled").is_none());
+    }
+
+    #[test]
+    fn a_rejected_key_is_neither_merged_nor_attributed() {
+        let outcome = merge_layers(
+            parse("[anthropic]\napi_key = \"sk-should-not-travel\""),
+            parse("[anthropic]\napi_key = \"sk-host\""),
+        );
+        assert_eq!(outcome.rejected, vec!["anthropic.api_key".to_string()]);
+        assert_eq!(outcome.merged["anthropic"]["api_key"].as_str(), Some("sk-host"));
+        assert_eq!(
+            outcome.provenance.get("anthropic.api_key"),
+            Some(&Layer::Host)
+        );
+    }
+
+    /// A realistic workspace-level config exercising every allowlist entry.
+    ///
+    /// Written by hand so the values carry the types the real `Config` expects.
+    const FIXTURE: &str = r#"
+day_boundary_hour = 4
+session_policy = "compact"
+daily_log_enabled = true
+memory_compaction_enabled = true
+heartbeat_enabled = true
+intraday_idle_minutes = 45
+sync_interval_minutes = 15
+
+[anthropic]
+model = "claude-opus-5"
+light_model = "claude-haiku-4-5-20251001"
+max_tokens = 8192
+system_prompt = "you are sapphire"
+
+[compression]
+enabled = true
+
+[digest]
+daily_items = 7
+
+# `cycles` belongs to a preset, not to `[timer]` itself, and `steps` is a
+# required field — this block has to deserialize into `Config` for the
+# round-trip test below.
+[[timer.preset]]
+name = "pomodoro"
+cycles = 4
+
+[[timer.preset.steps]]
+label = "Focus"
+minutes = 25.0
+
+[profiles.default]
+provider = "anthropic"
+fallback_provider = "local"
+
+[memory_namespace.work]
+include = ["default"]
+background_profile = "default"
+
+[room_profile.work]
+profile = "default"
+memory_namespace = "work"
+rooms = ["!a:example.org"]
+session_policy = "compact"
+voice_pipeline = "desk"
+
+[providers.local]
+type = "openai_compatible"
+base_url = "http://llm.lan:8080/v1"
+model = "qwen"
+provider_name = "local"
+max_tokens = 4096
+
+[voice_pipeline.desk]
+stt_provider = "whisper"
+tts_provider = "piper"
+"#;
+
+    #[test]
+    fn the_fixture_is_entirely_allowlisted() {
+        let (_, rejected) = filter_allowed(parse(FIXTURE));
+        assert!(rejected.is_empty(), "fixture has non-allowlisted keys: {rejected:?}");
+    }
+
+    #[test]
+    fn every_allowlist_entry_is_exercised_by_the_fixture() {
+        let mut paths = Vec::new();
+        leaf_paths(&parse(FIXTURE), &mut Vec::new(), &mut paths);
+        for entry in WORKSPACE_ALLOWLIST {
+            let hit = paths.iter().any(|p| {
+                let segments: Vec<&str> = p.split('.').collect();
+                entry.len() <= segments.len()
+                    && entry
+                        .iter()
+                        .zip(segments.iter())
+                        .all(|(e, s)| *e == "*" || e == s)
+            });
+            assert!(hit, "no fixture key exercises allowlist entry {entry:?}");
+        }
+    }
+
+    #[test]
+    fn every_fixture_key_reaches_a_real_config_field() {
+        // The allowlist is string paths, and `Config` does not deny unknown
+        // fields, so a path naming a renamed or deleted field would otherwise be
+        // ignored in silence. Round-tripping through the type catches it: serde
+        // drops an unknown key on the way in, so it is missing on the way out.
+        let host = parse(r#"
+[anthropic]
+api_key = "sk-test"
+"#);
+        let outcome = merge_layers(parse(FIXTURE), host);
+        let config: crate::config::Config =
+            outcome.merged.try_into().expect("merged fixture deserializes");
+        let round_tripped = toml::Value::try_from(&config).expect("Config re-serializes");
+
+        let mut paths = Vec::new();
+        leaf_paths(&parse(FIXTURE), &mut Vec::new(), &mut paths);
+        for path in paths {
+            let mut cursor = &round_tripped;
+            for segment in path.split('.') {
+                cursor = cursor
+                    .get(segment)
+                    .unwrap_or_else(|| panic!("`{path}` did not survive the round trip through Config"));
+            }
+        }
     }
 }
