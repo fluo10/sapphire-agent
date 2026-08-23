@@ -51,9 +51,13 @@ pub const WORKSPACE_ALLOWLIST: &[&[&str]] = &[
     &["room_profile", "*", "rooms"],
     &["room_profile", "*", "session_policy"],
     &["room_profile", "*", "voice_pipeline"],
-    // Provider definitions. `api_key` is deliberately absent.
+    // Provider refinements. `api_key` and `base_url` are deliberately absent:
+    // the endpoint a provider talks to is the one thing that turns a shareable
+    // config into remote code execution, because a redirected provider's
+    // responses drive tool calls and the tool set includes `shell`. The host
+    // decides where a provider lives; the workspace may only refine what it
+    // does there.
     &["providers", "*", "type"],
-    &["providers", "*", "base_url"],
     &["providers", "*", "model"],
     &["providers", "*", "provider_name"],
     &["providers", "*", "max_tokens"],
@@ -261,12 +265,15 @@ mod tests {
     fn wildcard_does_not_authorise_a_host_only_sibling() {
         assert!(!path_allowed(&["room_profile", "work", "api_keys"]));
         assert!(!path_allowed(&["providers", "local", "api_key"]));
+        // The endpoint is host-only: a workspace that could redirect a provider
+        // could point it at a hostile server, whose responses drive tool calls.
+        assert!(!path_allowed(&["providers", "local", "base_url"]));
     }
 
     #[test]
     fn provider_definition_fields_are_allowed() {
         assert!(path_allowed(&["providers", "local", "type"]));
-        assert!(path_allowed(&["providers", "local", "base_url"]));
+        assert!(path_allowed(&["providers", "local", "model"]));
         assert!(path_allowed(&["providers", "local", "model"]));
     }
 
@@ -557,7 +564,6 @@ voice_pipeline = "desk"
 
 [providers.local]
 type = "openai_compatible"
-base_url = "http://llm.lan:8080/v1"
 model = "qwen"
 provider_name = "local"
 max_tokens = 4096
@@ -599,10 +605,17 @@ tts_provider = "piper"
         // fields, so a path naming a renamed or deleted field would otherwise be
         // ignored in silence. Round-tripping through the type catches it: serde
         // drops an unknown key on the way in, so it is missing on the way out.
+        // `providers.local.base_url` is host-only, so the host layer has to
+        // supply it for the merged provider to deserialize at all — which is the
+        // shape a real deployment takes: the host says where a provider lives,
+        // the workspace says what to run there.
         let host = parse(
             r#"
 [anthropic]
 api_key = "sk-test"
+
+[providers.local]
+base_url = "http://llm.lan:8080/v1"
 "#,
         );
         let outcome = merge_layers(parse(FIXTURE), host);

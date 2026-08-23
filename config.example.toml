@@ -22,6 +22,17 @@
 # paths, and STT/TTS model paths are host-local: if the workspace file
 # sets one, it is ignored and named in a warning at startup.
 #
+# [providers.<n>].base_url is host-local too, and deliberately so even
+# though a private-network DNS name would work from every host: a
+# workspace that could redirect a provider could point it at a hostile
+# server, and that server's replies drive tool calls. Declare each
+# provider completely here — the shared file may refine `model`,
+# `provider_name` and `max_tokens`, not say where the provider lives.
+#
+# Keep each host-local table complete for the same reason the fallback
+# exists: if the shared file is missing or invalid, the agent runs on
+# this file alone, so this file has to be valid on its own.
+#
 # `sapphire-agent verify` prints where each setting's effective value came
 # from.
 
