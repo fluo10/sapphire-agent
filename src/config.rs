@@ -1296,6 +1296,7 @@ pub fn workspace_config_path(workspace_dir: &Path) -> PathBuf {
 }
 
 /// A `Config` plus what the layering did to produce it.
+#[derive(Debug)]
 pub struct LoadedConfig {
     pub config: Config,
     /// Workspace-layer keys refused by the allowlist. Reported at startup.
@@ -1383,19 +1384,34 @@ impl Config {
         let deserialized: std::result::Result<Config, toml::de::Error> =
             outcome.merged.clone().try_into();
 
+        // Drop the workspace layer and continue on the host config alone — but
+        // only once the host config is known to be good on its own. Blaming the
+        // workspace file before checking that would misattribute a host-side
+        // bug to it: a host with its own broken profile reference fails the
+        // merged check too, and the mere existence of an unrelated workspace
+        // file would otherwise put its name in the message.
         let fall_back_to_host_only = |reason: String| -> Result<LoadedConfig> {
+            let host_config: Config = host.clone().try_into().with_context(|| {
+                format!(
+                    "Failed to parse config file: {} (the workspace layer had already been \
+                     dropped because it {reason})",
+                    host_path.display()
+                )
+            })?;
+            let host_errors = host_config.validate_profiles();
+            if !host_errors.is_empty() {
+                anyhow::bail!(
+                    "invalid configuration in {}: {}",
+                    host_path.display(),
+                    host_errors.join("; ")
+                );
+            }
             tracing::warn!(
                 "Workspace config at {} produces an invalid merged configuration ({reason}); \
                  falling back to the host config alone at {}.",
                 ws_path.display(),
                 host_path.display()
             );
-            let host_config: Config = host.clone().try_into().with_context(|| {
-                format!(
-                    "Failed to parse config file: {} (host-only fallback also failed)",
-                    host_path.display()
-                )
-            })?;
             let empty = toml::Value::Table(toml::map::Map::new());
             let provenance = config_layer::provenance_of(&empty, &host);
             Ok(LoadedConfig {
@@ -2303,6 +2319,37 @@ model = "gemma-4-31b-it"
             loaded.config.validate_profiles().is_empty(),
             "{:?}",
             loaded.config.validate_profiles()
+        );
+    }
+
+    #[test]
+    fn a_host_config_that_fails_validation_is_fatal_and_blames_the_host_file() {
+        // The bad profile reference is the *host's*, and the workspace file is
+        // innocent — it only sets an unrelated key. Falling back would return a
+        // config that is still invalid while naming the workspace file as the
+        // culprit, so the fallback has to re-validate and let a host-side
+        // failure stay fatal.
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            "[anthropic]\napi_key = \"sk-test\"\n\n[room_profile.x]\nprofile = \"does-not-exist\"\n",
+        )
+        .unwrap();
+        let marker = dir.path().join(".sapphire-agent");
+        std::fs::create_dir_all(&marker).unwrap();
+        std::fs::write(marker.join("config.toml"), "day_boundary_hour = 4\n").unwrap();
+
+        let err = Config::load_layered(&host_path)
+            .expect_err("a host config that fails validation must not load");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&host_path.display().to_string()),
+            "error should name the host config, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("does-not-exist"),
+            "error should carry the validation failure, got: {rendered}"
         );
     }
 }
