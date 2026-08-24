@@ -1676,6 +1676,33 @@ impl TurnProgress for NullProgress {
     async fn turn_error(&self, _message: &str) {}
 }
 
+/// Why a turn stopped.
+///
+/// Exists because `text: None` conflates two materially different endings:
+/// the provider broke, and the model was still working when its tool-round
+/// budget ran out. A transport that has a way to say "budget" — ACP's
+/// `StopReason::MaxTurnRequests` — cannot tell them apart from the text
+/// alone, and answering "internal error" for a turn that was merely long is
+/// wrong in a way the user sees.
+///
+/// Callers that don't care may keep reading `text` alone: this is an extra
+/// field on the outcome, not a replacement, and every existing caller
+/// ignores it.
+pub(crate) enum TurnStop {
+    /// The model produced its final message; `text` is `Some`.
+    Replied,
+    /// A `Provider::chat` call failed. `TurnProgress::turn_error` has
+    /// already been handed the message, so the cause is available to
+    /// whoever is reporting; `text` is `None`.
+    ProviderError,
+    /// [`MAX_TOOL_ROUNDS`] was reached with the model still calling tools.
+    /// `text` is `None` — deliberately, because every caller that predates
+    /// ACP treats this as a failed turn and must keep doing so — but the
+    /// prose the model emitted alongside its tool calls is real work, and
+    /// is carried here rather than discarded. It may be empty.
+    BudgetExhausted { partial_text: String },
+}
+
 /// Outcome of [`run_llm_turn`].
 pub(crate) struct LlmTurnOutcome {
     /// Final assistant text, when the turn completed successfully. `None`
@@ -1684,6 +1711,8 @@ pub(crate) struct LlmTurnOutcome {
     /// True iff the session had no prior turns before this one. Used by
     /// callers to decide whether to spawn a title-generation task.
     was_first_turn: bool,
+    /// Which of those endings this was. See [`TurnStop`].
+    stop: TurnStop,
 }
 
 /// Execute one full LLM turn for an established session: hydrate history,
@@ -1780,7 +1809,7 @@ pub(crate) async fn run_llm_turn(
     let tool_specs = state.tools.specs().await;
     let compression_config = &state.config.compression;
     let mut accumulated_text: Vec<String> = Vec::new();
-    let final_text = loop {
+    let (final_text, stop) = loop {
         let round = history
             .iter()
             .filter(|m| {
@@ -1792,7 +1821,16 @@ pub(crate) async fn run_llm_turn(
 
         if round >= MAX_TOOL_ROUNDS {
             warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS})");
-            break None;
+            // `None` for the text, as before — callers that predate ACP
+            // report this as a failed turn and must keep doing so — but the
+            // prose accumulated so far rides along on the stop reason for
+            // transports that can show partial work.
+            break (
+                None,
+                TurnStop::BudgetExhausted {
+                    partial_text: accumulated_text.join("\n\n"),
+                },
+            );
         }
 
         // Check if context compression is needed
@@ -1830,7 +1868,7 @@ pub(crate) async fn run_llm_turn(
             Err(e) => {
                 error!("Provider error: {e:#}");
                 progress.turn_error(&e.to_string()).await;
-                break None;
+                break (None, TurnStop::ProviderError);
             }
             Ok(resp) if !resp.has_tool_calls() => {
                 let text = resp.text.unwrap_or_default();
@@ -1842,7 +1880,7 @@ pub(crate) async fn run_llm_turn(
                 if !text.is_empty() {
                     accumulated_text.push(text);
                 }
-                break Some(accumulated_text.join("\n\n"));
+                break (Some(accumulated_text.join("\n\n")), TurnStop::Replied);
             }
             Ok(resp) => {
                 let tool_calls = resp.tool_calls.clone();
@@ -1926,6 +1964,7 @@ pub(crate) async fn run_llm_turn(
     LlmTurnOutcome {
         text: final_text,
         was_first_turn,
+        stop,
     }
 }
 

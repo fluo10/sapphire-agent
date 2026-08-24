@@ -610,6 +610,40 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                                             .respond(PromptResponse::new(StopReason::Cancelled)),
                                     );
                                 }
+
+                                // Running out of tool rounds is not a
+                                // failure, and ACP has the exact word for
+                                // it: `MaxTurnRequests`, "the agent reached
+                                // the maximum number of allowed agent
+                                // requests between user turns". The budget
+                                // is `MAX_TOOL_ROUNDS` — ten — which an
+                                // editor reaches on an ordinary "search,
+                                // read a few files, edit two" prompt, so
+                                // this is a routine ending, not an
+                                // exceptional one, and showing the user an
+                                // error dialog for it is wrong twice over:
+                                // the agent is fine, and the work it did do
+                                // would go on the floor. The prose it
+                                // emitted alongside its tool calls is
+                                // delivered as the reply.
+                                if let super::TurnStop::BudgetExhausted { partial_text } =
+                                    &outcome.stop
+                                {
+                                    if !partial_text.is_empty() {
+                                        progress.notify(SessionUpdate::AgentMessageChunk(
+                                            ContentChunk::new(ContentBlock::Text(
+                                                TextContent::new(partial_text.clone()),
+                                            )),
+                                        ));
+                                    }
+                                    return answered(
+                                        &session_id,
+                                        responder.respond(PromptResponse::new(
+                                            StopReason::MaxTurnRequests,
+                                        )),
+                                    );
+                                }
+
                                 // A failed turn is a JSON-RPC error, not a
                                 // stop reason: none of ACP v1's stop reasons
                                 // means "the agent broke", and `Refusal` would
@@ -1270,6 +1304,54 @@ mod tests {
         assert_eq!(updates[completed]["toolCallId"], "call-1");
         assert_eq!(updates[completed]["status"], "completed");
         assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
+    }
+
+    /// Running out of tool rounds is an ordinary ending, not a broken agent.
+    /// The budget is ten, which "search, read four files, edit two" reaches
+    /// on its own, so this is the routine case — and ACP has a stop reason
+    /// for exactly it. Answering a JSON-RPC error instead would put an
+    /// internal-error dialog in front of the user *and* throw away the prose
+    /// the model produced on the way, so both halves are pinned here.
+    #[tokio::test]
+    async fn exhausting_the_tool_budget_ends_the_turn_with_max_turn_requests() {
+        // One scripted response per permitted round, each calling the
+        // fixture's `echo` tool and saying something first. The count is
+        // exact: an eleventh provider call would find the script empty and
+        // fail the turn as a provider error, which this test would see.
+        let script: Vec<crate::provider::ChatResponse> = (0..super::super::MAX_TOOL_ROUNDS)
+            .map(|i| crate::provider::ChatResponse {
+                text: Some(format!("step {i}")),
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: format!("call-{i}"),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({ "text": "ping" }),
+                }],
+                stop_reason: None,
+            })
+            .collect();
+        let addr = spawn(ServeState::for_test_scripted(true, script)).await;
+        let (_session_id, updates, reply) = drive(&addr, text_prompt("do a big refactor")).await;
+
+        assert!(
+            reply.get("error").is_none(),
+            "a spent budget is not an error, got {reply}"
+        );
+        assert_eq!(
+            reply["result"]["stopReason"], "max_turn_requests",
+            "got {reply}"
+        );
+
+        // The work done before the budget ran out reaches the editor.
+        let expected: String = (0..super::super::MAX_TOOL_ROUNDS)
+            .map(|i| format!("step {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let chunks: Vec<&str> = updates
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+            .map(|u| u["content"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(chunks, vec![expected.as_str()], "got {chunks:?}");
     }
 
     /// A session id this connection never minted is answered — not queued
