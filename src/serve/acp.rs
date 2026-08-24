@@ -15,9 +15,12 @@
 //! transport expects, so [`lines_transport`] adapts the socket without
 //! reframing anything.
 //!
-//! `initialize` and `session/new` are answered here; `session/prompt` and
-//! cancellation land in later tasks and currently come back as JSON-RPC
-//! `method not found`.
+//! `initialize` and `session/new` are answered here. `session/prompt` and
+//! cancellation land in later tasks; until then, any request carrying a
+//! `sessionId` field (which both do) hits the SDK's session-scoped retry
+//! instead of a definitive answer — it is queued, waiting for a dynamic
+//! per-session handler that never arrives on this connection, rather than
+//! being rejected with JSON-RPC `method not found`.
 
 use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
@@ -564,7 +567,8 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_returns_a_session_id() {
-        let addr = spawn(ServeState::for_test(true)).await;
+        let state = ServeState::for_test(true);
+        let addr = spawn(Arc::clone(&state)).await;
         let responses =
             conversation(&addr, vec![initialize_request(0), new_session_request(1)]).await;
 
@@ -572,5 +576,18 @@ mod tests {
             .as_str()
             .expect("sessionId present");
         assert!(!session_id.is_empty());
+
+        // The central new behaviour of this task: `session/new` must pin the
+        // agent-side session id to the room profile the bearer token
+        // resolved to (the fixture's `sa-acp-token` resolves to
+        // `"developer"`). Asserting the exact mapping, not just that the map
+        // is non-empty, so a swapped key/value or a write into the wrong map
+        // fails this test.
+        let profiles = state.session_room_profiles.lock().await;
+        assert_eq!(
+            profiles.get(session_id).map(String::as_str),
+            Some("developer"),
+            "session/new must pin the session to the token's room profile, got {profiles:?}"
+        );
     }
 }
