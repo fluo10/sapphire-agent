@@ -129,6 +129,43 @@ with three implementations: the existing SSE shape (holding `tx` and `req_id`), 
 already called at `src/serve/mod.rs:1483` with a throwaway channel purely to discard these
 events.
 
+> **Correction (implementation):** the snippet above describes a trait that
+> was never built. The real one (`src/serve/mod.rs:1609-1614`) is
+>
+> ```rust
+> pub(crate) trait TurnProgress: Send + Sync {
+>     async fn tool_start(&self, id: &str, name: &str);
+>     async fn tool_end(&self, id: &str, name: &str);
+>     async fn turn_error(&self, message: &str);
+> }
+> ```
+>
+> Two differences, both load-bearing:
+>
+> - The `{name, input}` / `{name, output}` payloads this section invented
+>   never existed on the wire. The SSE events have always carried `{id,
+>   name}`, where `id` is the provider's own tool-call id — which is exactly
+>   what ACP's `toolCallId` needs (see `AcpProgress::tool_start` in
+>   `src/serve/acp.rs`), so the shape that was actually built serves ACP
+>   better than the one planned here.
+> - `turn_error` exists because `run_llm_turn` also emits a JSON-RPC error
+>   event on provider failure, which this design overlooked. Without it,
+>   `req_id` could not have left `run_llm_turn`'s signature and the refactor
+>   this section describes would not have achieved its purpose. ACP uses it
+>   to carry the provider's failure message into `session/prompt`'s JSON-RPC
+>   error (`AcpProgress::turn_error`, `src/serve/acp.rs`).
+>
+> "Three implementations" is still accurate — `SseProgress`, `NullProgress`,
+> `AcpProgress` — but there are now four call sites, not one: `/rpc` and the
+> voice pipeline use `SseProgress` (`src/serve/mod.rs`, two call sites),
+> heartbeat-injected turns use `NullProgress` (`src/serve/mod.rs`, near
+> line 1494 as of this writing — line numbers below have already drifted
+> once, from a mid-plan merge of `origin/main`, so treat them as
+> approximate), and `/a2a` also uses `NullProgress`
+> (`src/serve/a2a.rs`, `super::run_llm_turn` call), a fourth call site this
+> section did not anticipate because A2A support did not exist yet when it
+> was written.
+
 This is the only change to shared code in this phase, and it removes a coupling that was
 already awkward rather than adding one.
 
