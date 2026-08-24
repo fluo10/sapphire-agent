@@ -139,7 +139,7 @@ sapphire-framework = { version = "0.1", git = "https://github.com/fluo10/sapphir
 grain-id = { version = "0.14", features = ["serde"] }
 
 # HTTP server (control API + Matrix/Discord channels)
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
 
 # Stream utilities (axum SSE)
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -190,3 +190,4 @@ dirs = "6"
 
 [dev-dependencies]
 tempfile = "3"
+tokio-tungstenite = "0.30.0"

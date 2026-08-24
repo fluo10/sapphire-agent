@@ -10,6 +10,7 @@
 //! #79) and is intentionally not served here.
 
 pub mod a2a;
+pub mod acp;
 pub mod mcp;
 
 use crate::channel::RoomInfo;
@@ -319,6 +320,7 @@ pub async fn run(addr: String, state: Arc<ServeState>) -> anyhow::Result<()> {
         .route("/rpc", post(rpc_post).get(rpc_get))
         .route("/a2a", post(a2a::handle_a2a_post))
         .route("/mcp", post(mcp::handle_mcp_post))
+        .route("/acp", axum::routing::get(acp::handle_acp_ws))
         .route(
             "/.well-known/agent-card.json",
             axum::routing::get(a2a::handle_agent_card),
