@@ -34,6 +34,25 @@
 //! and sends the `Responder` along with it — see the `session/prompt`
 //! handler. The visible consequence is that prompts on one connection run
 //! concurrently rather than one after another.
+//!
+//! Two caveats come with that, both about history, and both worth knowing
+//! before building on this:
+//!
+//! - **Concurrent prompts on *one session* are not history-safe.**
+//!   [`super::run_llm_turn`] clones the session's history at the top and
+//!   writes the whole vector back at the end, so two overlapping turns on
+//!   the same session are last-writer-wins in memory — while both have
+//!   already appended their user messages to JSONL. The durable transcript
+//!   and the in-memory history diverge. The race is not ACP's: `/rpc` and
+//!   the voice heartbeat path can already reach it. What is new here is
+//!   that concurrency became *documented* rather than accidental, so this
+//!   says plainly that concurrent prompts on separate sessions are fine and
+//!   concurrent prompts on one session are not.
+//! - **A cancelled turn's future is dropped**, and `run_llm_turn` was not
+//!   written to be. Its user message is already on disk; its write-back to
+//!   `state.sessions` never runs. So a cancelled prompt is missing from the
+//!   next turn's model context but present in `list_sessions` and after a
+//!   restart. See the drop note on [`super::run_llm_turn`] itself.
 
 use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;

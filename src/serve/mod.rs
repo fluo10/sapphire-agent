@@ -1721,6 +1721,35 @@ pub(crate) struct LlmTurnOutcome {
 /// `progress`. Does NOT send the final JSON-RPC result event — the caller
 /// is responsible for shaping the final payload (text reply, voice audio,
 /// etc.) and emitting the appropriate result event.
+///
+/// # This future may be dropped mid-turn
+///
+/// `/rpc` and the voice/heartbeat paths run this inside a detached
+/// `tokio::spawn`, so it finishes whether or not the client is still there.
+/// Two callers can drop it instead: the ACP endpoint does so deliberately,
+/// on `session/cancel` and on a vanished client (`src/serve/acp.rs`, the
+/// `session/prompt` handler's `tokio::select!`), and `/a2a` awaits it
+/// directly in an axum handler, whose future hyper may drop when an HTTP
+/// client disconnects mid-request. Either way it is dropped at whatever
+/// await point it happens to be sitting on.
+///
+/// Nothing here unwinds, so a dropped turn leaves a *split*:
+///
+/// - The user message and any compaction summary are already on disk — they
+///   are appended to JSONL as they happen (steps 4 and 5). The `state.sessions`
+///   write-back at the end never runs. So a cancelled prompt is invisible to
+///   the next turn's in-memory model context, yet present in `list_sessions`
+///   and after a restart; a compaction summary can be persisted and then
+///   thrown away, and will be produced again next turn.
+/// - Tool futures in flight are dropped too. `ShellTool` therefore sets
+///   `kill_on_drop(true)` (`src/tools/builtin_tools.rs`) — without it a
+///   cancelled turn left a shell command running against the workspace.
+///   Any tool added later that owns an external process, a lock or a
+///   partially-written file must be drop-safe for the same reason.
+///
+/// Anything added to this function that must happen exactly once per turn
+/// needs to be written with that in mind: reaching the end of the body is
+/// not guaranteed.
 pub(crate) async fn run_llm_turn(
     state: Arc<ServeState>,
     session_id: String,
