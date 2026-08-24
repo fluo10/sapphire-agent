@@ -144,6 +144,13 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 # Stream utilities (axum SSE)
 tokio-stream = { version = "0.1", features = ["sync"] }
 
+# Cancellation tokens for in-flight ACP prompt turns. The parent/child
+# hierarchy is the whole reason for the dependency: one token per ACP
+# connection and a child per turn, so `session/cancel` stops one turn while a
+# client that goes away stops every turn it left running, with one call and
+# without a registry to keep in step.
+tokio-util = "0.7"
+
 # CORS middleware
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 

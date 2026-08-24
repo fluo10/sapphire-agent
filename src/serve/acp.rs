@@ -15,8 +15,8 @@
 //! transport expects, so [`lines_transport`] adapts the socket without
 //! reframing anything.
 //!
-//! `initialize`, `session/new` and `session/prompt` are answered here;
-//! cancellation lands in a later task.
+//! `initialize`, `session/new`, `session/prompt` and `session/cancel` are
+//! answered here.
 //!
 //! A prompt is not implemented here beyond its ACP shape: it extracts the
 //! text, hands the turn to [`super::run_llm_turn`] — the same executor
@@ -25,16 +25,27 @@
 //! tool loop, history handling or persistence on this path, so an editor's
 //! conversation lands in the same session store, under the same memory
 //! namespace and system prompt, as every other transport's.
+//!
+//! A turn does *not* run in the handler that received it. The SDK's request
+//! callbacks hold its dispatch loop, which parses no further frame on the
+//! connection until they return, so awaiting a turn there would make the
+//! `session/cancel` meant to stop it unreadable until the turn had already
+//! finished. Instead the handler spawns the turn with `ConnectionTo::spawn`
+//! and sends the `Responder` along with it — see the `session/prompt`
+//! handler. The visible consequence is that prompts on one connection run
+//! concurrently rather than one after another.
 
 use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ContentBlock, ContentChunk, Error, InitializeRequest, InitializeResponse,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
-    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall as AcpToolCall,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Error, InitializeRequest,
+    InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
+    ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, Lines, on_receive_request};
+use agent_client_protocol::{
+    Agent, Client, ConnectionTo, Lines, on_receive_notification, on_receive_request,
+};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
@@ -43,6 +54,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// One ACP session, mapped onto an agent session.
@@ -65,6 +77,14 @@ struct AcpSession {
     /// client-side terminals (`terminal/create`); until then it is inert.
     #[allow(dead_code)]
     cwd: PathBuf,
+    /// Cancellation for the turn this session is *currently* running.
+    ///
+    /// Replaced with a fresh token by every `session/prompt` rather than
+    /// created once with the session: a `CancellationToken` stays cancelled
+    /// for good, so reusing one would make every prompt after a cancel come
+    /// straight back as `cancelled`. Each is a child of the connection's
+    /// token, which is how one vanished client stops every turn at once.
+    turn_cancel: CancellationToken,
 }
 
 /// Sessions live for the lifetime of one ACP connection: a `HashMap` behind
@@ -157,6 +177,29 @@ impl super::TurnProgress for AcpProgress {
     }
 }
 
+/// How one prompt turn stopped.
+enum TurnEnd {
+    /// The client asked for it to stop, or its connection went away.
+    Cancelled,
+    /// The shared executor finished — successfully or not; the outcome says
+    /// which.
+    Ran(super::LlmTurnOutcome),
+}
+
+/// Log, rather than propagate, a failure to answer a `session/prompt`.
+///
+/// The turn that produced this answer runs in a task spawned on the
+/// connection, and the SDK shuts the whole connection down when one of those
+/// returns an error (`ConnectionTo::spawn`'s own documentation says so). A
+/// send that fails here only ever means the client already left — which the
+/// connection notices on its own — so it must not be reported that way.
+fn answered(session_id: &SessionId, sent: Result<(), Error>) -> Result<(), Error> {
+    if let Err(e) = sent {
+        warn!("ACP: could not answer session/prompt for session {session_id}: {e}");
+    }
+    Ok(())
+}
+
 /// The wire name of a prompt content block, for the log line that says one
 /// was dropped. `ContentBlock` is `#[non_exhaustive]`, so the catch-all arm
 /// is load-bearing rather than defensive.
@@ -206,8 +249,13 @@ pub async fn handle_acp_ws(
 /// frames carry no ACP meaning, axum answers ping/pong itself, and a close
 /// frame is followed by the end of the stream, which is what actually ends
 /// the connection.
+///
+/// `connection_cancel` is cancelled when this socket stops delivering frames.
+/// The socket going quiet is the only news a turn in flight ever gets that
+/// nobody is listening any more, and this is the earliest place it is known.
 fn lines_transport(
     socket: WebSocket,
+    connection_cancel: CancellationToken,
 ) -> Lines<
     impl futures_util::Sink<String, Error = std::io::Error> + Send + 'static,
     impl futures_util::Stream<Item = std::io::Result<String>> + Send + 'static,
@@ -218,7 +266,7 @@ fn lines_transport(
         .sink_map_err(std::io::Error::other)
         .with(|line: String| async move { Ok::<_, std::io::Error>(Message::Text(line.into())) });
 
-    let incoming = rx.filter_map(|frame| async move {
+    let frames = rx.filter_map(|frame| async move {
         match frame {
             Ok(Message::Text(text)) => Some(Ok(text.to_string())),
             // Not ACP: no reply, and the connection carries on.
@@ -229,12 +277,29 @@ fn lines_transport(
         }
     });
 
+    // The cancellation rides in the stream's own state as a drop guard, so it
+    // fires on every way out — clean EOF, a close frame, or a transport error
+    // — without a branch per case.
+    //
+    // It has to live here rather than after `connect_to` returns: that call
+    // cannot return while a spawned turn is still running, because the turn
+    // keeps the SDK's task actor alive. Cancelling there would be waiting on
+    // the very thing the cancellation exists to stop.
+    let incoming = futures_util::stream::unfold(
+        (Box::pin(frames), connection_cancel.drop_guard()),
+        |(mut frames, guard)| async move { frames.next().await.map(|item| (item, (frames, guard))) },
+    );
+
     Lines::new(outgoing, incoming)
 }
 
 /// Drive one ACP connection until the peer goes away.
 async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_name: String) {
     let sessions = Arc::new(AcpSessions::default());
+    // Cancelled when the socket goes away (see `lines_transport`). Every
+    // turn's token is a child of this one, so one client leaving stops every
+    // turn it left running — including turns on sessions created later.
+    let connection_cancel = CancellationToken::new();
 
     let result = Agent
         .builder()
@@ -284,6 +349,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                 let sessions = Arc::clone(&sessions);
                 let state = Arc::clone(&state);
                 let profile_name = profile_name.clone();
+                let connection_cancel = connection_cancel.clone();
                 async move |req: NewSessionRequest, responder, _connection| {
                     // Mint the agent-side session id the same way a
                     // brand-new `/rpc` session gets one in `handle_initialize`
@@ -307,6 +373,10 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         AcpSession {
                             agent_session_id,
                             cwd: req.cwd.clone(),
+                            // A placeholder until the first prompt replaces
+                            // it: nothing is running yet, so cancelling this
+                            // one fires at nothing.
+                            turn_cancel: connection_cancel.child_token(),
                         },
                     );
 
@@ -315,18 +385,48 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
             },
             on_receive_request!(),
         )
+        .on_receive_notification(
+            {
+                let sessions = Arc::clone(&sessions);
+                async move |notif: CancelNotification, _connection: ConnectionTo<Client>| {
+                    // Cancelling a session with no turn running is not an
+                    // error — the client may simply have raced the reply —
+                    // so the token is fired and nothing more is said. An
+                    // unknown session is a different thing, and a
+                    // notification has no way to report it but the log.
+                    match sessions.inner.lock().await.get(&notif.session_id) {
+                        Some(session) => session.turn_cancel.cancel(),
+                        None => warn!(
+                            "ACP: session/cancel named a session this connection never \
+                             minted: {}",
+                            notif.session_id
+                        ),
+                    }
+                    Ok(())
+                }
+            },
+            on_receive_notification!(),
+        )
         .on_receive_request(
             {
                 let sessions = Arc::clone(&sessions);
                 let state = Arc::clone(&state);
+                let connection_cancel = connection_cancel.clone();
                 async move |req: PromptRequest, responder, connection: ConnectionTo<Client>| {
-                    let Some(agent_session_id) = sessions
-                        .inner
-                        .lock()
-                        .await
-                        .get(&req.session_id)
-                        .map(|s| s.agent_session_id.clone())
-                    else {
+                    // Mint this turn's cancellation token in the same lock
+                    // that resolves the session, so `session/cancel` can only
+                    // ever see the token of a turn that has already started.
+                    let looked_up = {
+                        let mut sessions = sessions.inner.lock().await;
+                        sessions.get_mut(&req.session_id).map(|session| {
+                            session.turn_cancel = connection_cancel.child_token();
+                            (
+                                session.agent_session_id.clone(),
+                                session.turn_cancel.clone(),
+                            )
+                        })
+                    };
+                    let Some((agent_session_id, turn_cancel)) = looked_up else {
                         // Not created on the fly: a prompt naming a session
                         // this connection never minted is a client bug, and
                         // starting one here would quietly open a second
@@ -384,46 +484,124 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     // namespace all come from the shared executor, so an
                     // editor's conversation lands in the same session store,
                     // with the same system prompt, as `/rpc` and A2A.
-                    let progress = Arc::new(AcpProgress::new(req.session_id.clone(), connection));
-                    let outcome = super::run_llm_turn(
-                        Arc::clone(&state),
-                        agent_session_id,
-                        crate::provider::ChatMessage::user(&text),
-                        Arc::clone(&progress) as Arc<dyn super::TurnProgress>,
-                        None,
-                    )
-                    .await;
+                    let session_id = req.session_id.clone();
+                    let progress =
+                        Arc::new(AcpProgress::new(session_id.clone(), connection.clone()));
 
-                    let Some(reply) = outcome.text else {
-                        // A failed turn is a JSON-RPC error, not a stop
-                        // reason: none of ACP v1's stop reasons means "the
-                        // agent broke", and `Refusal` would tell the user the
-                        // agent *declined*, which is a materially different
-                        // thing to show them.
-                        return responder.respond_with_internal_error(
-                            progress
-                                .failure()
-                                .unwrap_or_else(|| "the turn produced no reply".to_string()),
-                        );
-                    };
+                    // The turn runs OUTSIDE the dispatch loop, and the
+                    // `Responder` travels with it.
+                    //
+                    // This is not a stylistic choice and must not be
+                    // "simplified" back into an `await` here. Handlers
+                    // registered with `on_receive_request` run *inside* the
+                    // SDK's dispatch loop, which parses no further frame on
+                    // this connection until the handler returns. Awaiting the
+                    // turn here would mean the `session/cancel` sent to stop
+                    // it could not be read until the turn had already
+                    // finished — the feature would be unimplementable rather
+                    // than merely slow. `ConnectionTo::spawn` is the SDK's own
+                    // escape hatch for exactly this, and `Responder` is
+                    // movable, so the spawned task answers the request
+                    // whenever the turn really ends.
+                    //
+                    // The consequence, accepted deliberately: prompts on one
+                    // connection now run concurrently instead of one after
+                    // another.
+                    connection.spawn({
+                        let state = Arc::clone(&state);
+                        async move {
+                            // Bound to a `let` on purpose: that drops the
+                            // losing branch's future here, before the answer
+                            // goes out, so a client told its turn was
+                            // cancelled knows the provider call is already
+                            // abandoned rather than merely disowned.
+                            let end = tokio::select! {
+                                // `biased`, so a cancellation that lands in
+                                // the same poll as a finished turn still wins:
+                                // the schema makes `Cancelled` a MUST "even if
+                                // the cancellation causes exceptions in
+                                // underlying operations", which means the
+                                // error path below must be unreachable once
+                                // the token has fired.
+                                biased;
+                                () = turn_cancel.cancelled() => TurnEnd::Cancelled,
+                                outcome = super::run_llm_turn(
+                                    state,
+                                    agent_session_id,
+                                    crate::provider::ChatMessage::user(&text),
+                                    Arc::clone(&progress) as Arc<dyn super::TurnProgress>,
+                                    None,
+                                ) => TurnEnd::Ran(outcome),
+                            };
 
-                    // One chunk, not a stream: `Provider::chat` returns the
-                    // whole response at once, so there is nothing to stream,
-                    // and splitting it here would invent chunk boundaries the
-                    // model never produced. An empty reply is no chunk at all
-                    // rather than an empty one.
-                    if !reply.is_empty() {
-                        progress.notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                            ContentBlock::Text(TextContent::new(reply)),
-                        )));
-                    }
-                    responder.respond(PromptResponse::new(StopReason::EndTurn))
+                            let TurnEnd::Ran(outcome) = end else {
+                                return answered(
+                                    &session_id,
+                                    responder.respond(PromptResponse::new(StopReason::Cancelled)),
+                                );
+                            };
+
+                            let Some(reply) = outcome.text else {
+                                if turn_cancel.is_cancelled() {
+                                    // The turn failed *because* it was being
+                                    // cancelled, or was cancelled in the
+                                    // moment it failed. Either way the client
+                                    // asked for this, and the schema says it
+                                    // hears `Cancelled`.
+                                    return answered(
+                                        &session_id,
+                                        responder
+                                            .respond(PromptResponse::new(StopReason::Cancelled)),
+                                    );
+                                }
+                                // A failed turn is a JSON-RPC error, not a
+                                // stop reason: none of ACP v1's stop reasons
+                                // means "the agent broke", and `Refusal` would
+                                // tell the user the agent *declined*, which is
+                                // a materially different thing to show them.
+                                return answered(
+                                    &session_id,
+                                    responder.respond_with_internal_error(
+                                        progress.failure().unwrap_or_else(|| {
+                                            "the turn produced no reply".to_string()
+                                        }),
+                                    ),
+                                );
+                            };
+
+                            // One chunk, not a stream: `Provider::chat`
+                            // returns the whole response at once, so there is
+                            // nothing to stream, and splitting it here would
+                            // invent chunk boundaries the model never
+                            // produced. An empty reply is no chunk at all
+                            // rather than an empty one.
+                            if !reply.is_empty() {
+                                progress.notify(SessionUpdate::AgentMessageChunk(
+                                    ContentChunk::new(ContentBlock::Text(TextContent::new(reply))),
+                                ));
+                            }
+                            answered(
+                                &session_id,
+                                responder.respond(PromptResponse::new(StopReason::EndTurn)),
+                            )
+                        }
+                    })?;
+
+                    Ok(())
                 }
             },
             on_receive_request!(),
         )
-        .connect_to(lines_transport(socket))
+        .connect_to(lines_transport(socket, connection_cancel.clone()))
         .await;
+
+    // A backstop, not the mechanism. The transport's drop guard has already
+    // fired by the time this line runs — `connect_to` cannot return while a
+    // turn is still in flight, because the turn's task keeps the SDK's task
+    // actor alive, so waiting until here to cancel would be waiting on the
+    // very thing being cancelled. This covers the connection ending for some
+    // reason other than the socket.
+    connection_cancel.cancel();
 
     // Name the profile on the way out as well as the way in: with several
     // editors connected under different profiles, a bare "connection closed"
@@ -438,11 +616,15 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::HangingChat;
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+    /// One end of an ACP socket, as the test client holds it.
+    type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
     /// Bind the router on an ephemeral port and return its `host:port`.
     async fn spawn(state: Arc<ServeState>) -> String {
@@ -490,9 +672,7 @@ mod tests {
     }
 
     /// Open an authenticated ACP socket.
-    pub(super) async fn connect(
-        addr: &str,
-    ) -> WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>> {
+    pub(super) async fn connect(addr: &str) -> TestSocket {
         let mut req = format!("ws://{addr}/acp").into_client_request().unwrap();
         req.headers_mut()
             .insert("authorization", "Bearer sa-acp-token".parse().unwrap());
@@ -539,9 +719,7 @@ mod tests {
 
     /// Read the next frame. A missing reply fails loudly instead of hanging
     /// the test run forever.
-    async fn next_frame(
-        ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    ) -> Message {
+    async fn next_frame(ws: &mut TestSocket) -> Message {
         tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
             .await
             .expect("timed out waiting for an ACP frame")
@@ -1083,5 +1261,135 @@ mod tests {
             data.contains("script exhausted"),
             "the error must carry the provider's cause, got {reply}"
         );
+    }
+
+    /// `session/cancel` carries no id: it is a notification, and gets no
+    /// reply of its own. The reply it produces is the one to the prompt.
+    fn cancel_notification(session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": session_id }
+        })
+    }
+
+    /// initialize → session/new → session/prompt on one connection, returning
+    /// as soon as the prompt (request id 2) is on the wire.
+    ///
+    /// Unlike [`drive`], the socket comes back open and undrained, so the
+    /// caller decides how the turn ends — by cancelling it or by vanishing.
+    /// Only usable with a provider that does not answer, which is what makes
+    /// "still in flight" true rather than merely likely.
+    async fn prompt_in_flight(addr: &str) -> (TestSocket, String) {
+        let mut ws = connect(addr).await;
+        for request in [initialize_request(0), new_session_request(1)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 1 {
+                let session_id = v["result"]["sessionId"]
+                    .as_str()
+                    .expect("sessionId present")
+                    .to_string();
+                ws.send(Message::Text(
+                    prompt_request(2, &session_id, text_prompt("hang"))
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+                return (ws, session_id);
+            }
+        }
+    }
+
+    /// The schema makes `cancelled` a MUST for a turn stopped by
+    /// `session/cancel`, "even if the cancellation causes exceptions in
+    /// underlying operations".
+    ///
+    /// The provider never returns, so the turn is unambiguously still running
+    /// when the cancel arrives — which also makes this a test of *where* the
+    /// turn runs. A turn awaited inside the dispatch loop would stop that loop
+    /// from ever parsing this notification, and the reply would never come.
+    #[tokio::test]
+    async fn session_cancel_ends_the_turn_with_cancelled() {
+        let (state, hanging) = ServeState::for_test_hanging(true);
+        let addr = spawn(state).await;
+        let (mut ws, session_id) = prompt_in_flight(&addr).await;
+
+        // Cancelling before the turn reaches the provider would prove
+        // nothing about tearing a live call down, so wait for it to get
+        // there first.
+        HangingChat::wait_for(&hanging.entered, "the turn to reach the provider").await;
+
+        ws.send(Message::Text(
+            cancel_notification(&session_id).to_string().into(),
+        ))
+        .await
+        .unwrap();
+
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 2 {
+                assert_eq!(v["result"]["stopReason"], "cancelled", "got {v}");
+                break;
+            }
+        }
+
+        // The stop reason alone would also be satisfied by a handler that
+        // answers `cancelled` and leaves the turn running.
+        assert!(
+            hanging.dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the provider call outlived the cancellation it reported"
+        );
+    }
+
+    /// A client that leaves mid-turn must stop the turn: a tool loop still
+    /// calling a provider with nobody listening spends money and can still
+    /// write to the workspace.
+    ///
+    /// The assertion is the hanging provider's drop flag, not the server's
+    /// liveness: a test that merely reconnects and finds the server healthy
+    /// passes whether or not any of this wiring exists.
+    async fn assert_a_disconnect_stops_the_turn(say_goodbye: bool) {
+        let (state, hanging) = ServeState::for_test_hanging(true);
+        let addr = spawn(state).await;
+        let (mut ws, _session_id) = prompt_in_flight(&addr).await;
+
+        HangingChat::wait_for(&hanging.entered, "the turn to reach the provider").await;
+        if say_goodbye {
+            ws.send(Message::Close(None)).await.unwrap();
+        }
+        drop(ws);
+
+        HangingChat::wait_for(&hanging.dropped, "the turn to stop after the client left").await;
+    }
+
+    /// The polite exit — the one an editor actually performs on quit — and
+    /// the one that needs this task's wiring. A close frame ends the incoming
+    /// stream *successfully*, so nothing in the SDK fails and nothing tears
+    /// the turn down; only the connection's own cancellation reaches it.
+    #[tokio::test]
+    async fn a_closing_client_stops_an_in_flight_turn() {
+        assert_a_disconnect_stops_the_turn(true).await;
+    }
+
+    /// The rude exit: a client whose process died. This one is torn down
+    /// twice over — the transport error fails the SDK's actors, which drops
+    /// everything they own — so it would pass without any cancellation at
+    /// all. It is here to keep that second belt from being the only one.
+    #[tokio::test]
+    async fn a_vanishing_client_stops_an_in_flight_turn() {
+        assert_a_disconnect_stops_the_turn(false).await;
     }
 }
