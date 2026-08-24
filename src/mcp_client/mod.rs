@@ -240,7 +240,10 @@ impl McpClient {
         });
         let transport = self.transport.read().await.clone();
         if let Err(e) = transport.notify(&notification).await {
-            warn!("MCP '{}': initialized notification failed: {e:#}", self.name);
+            warn!(
+                "MCP '{}': initialized notification failed: {e:#}",
+                self.name
+            );
         }
 
         Ok(())
