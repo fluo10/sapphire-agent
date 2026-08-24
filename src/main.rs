@@ -184,6 +184,14 @@ async fn main() -> Result<()> {
                 println!("  Channel           : NONE (add [discord] or [matrix] to config)");
             }
             println!(
+                "  ACP endpoint      : {}",
+                if config.acp.as_ref().is_some_and(|c| c.enabled) {
+                    "enabled (GET /acp)"
+                } else {
+                    "disabled"
+                }
+            );
+            println!(
                 "  Anthropic model   : {} [{}]",
                 config.anthropic.model,
                 layer_tag(&provenance, "anthropic.model")

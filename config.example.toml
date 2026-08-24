@@ -407,3 +407,11 @@ steps  = [
 #   { label = "Focus",      minutes = 50 },
 #   { label = "Break",      minutes = 10 },
 # ]
+
+# Agent Client Protocol endpoint (GET /acp, WebSocket).
+# Lets an ACP client such as Zed drive this agent. Authentication reuses the
+# bearer tokens in [room_profile.<name>].api_keys, and the token that connects
+# selects the room profile the ACP session runs under.
+# Host-local: the workspace config layer cannot set this.
+[acp]
+enabled = false

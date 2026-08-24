@@ -30,6 +30,11 @@ pub struct Config {
     /// the `/a2a` and `/.well-known/agent-card.json` routes off.
     #[serde(default)]
     pub a2a: Option<A2aConfig>,
+    /// ACP (Agent Client Protocol) endpoint configuration. Mounted on the
+    /// same axum app as `serve`; `enabled = false` (or absent) leaves the
+    /// `GET /acp` route off. Host-local — see [`AcpConfig`].
+    #[serde(default)]
+    pub acp: Option<AcpConfig>,
     /// Workspace-external image cache. Holds raw bytes for vision
     /// inputs by SHA-256 so in-memory `ChatMessage` history and JSONL
     /// session files only carry compact references. When unset, the
@@ -233,6 +238,17 @@ pub struct A2aConfig {
     /// a generic personal-assistant description.
     #[serde(default)]
     pub agent_description: Option<String>,
+}
+
+/// `[acp]` — the Agent Client Protocol endpoint at `GET /acp`.
+///
+/// Host-local by construction: `src/config_layer.rs` is default-deny, so the
+/// workspace layer cannot turn an endpoint on for every host that syncs it.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct AcpConfig {
+    /// Serve `/acp`. Off by default; the endpoint 404s while disabled.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Image cache settings. See [`Config::image_cache`] for an overview
@@ -2351,5 +2367,41 @@ model = "gemma-4-31b-it"
             rendered.contains("does-not-exist"),
             "error should carry the validation failure, got: {rendered}"
         );
+    }
+
+    #[test]
+    fn acp_absent_means_disabled() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+"#,
+        );
+        assert!(cfg.acp.is_none());
+        assert!(!cfg.acp.as_ref().is_some_and(|c| c.enabled));
+    }
+
+    #[test]
+    fn acp_block_parses_and_defaults_to_disabled() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[acp]
+"#,
+        );
+        assert!(!cfg.acp.as_ref().expect("[acp] parsed").enabled);
+
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[acp]
+enabled = true
+"#,
+        );
+        assert!(cfg.acp.as_ref().expect("[acp] parsed").enabled);
     }
 }
