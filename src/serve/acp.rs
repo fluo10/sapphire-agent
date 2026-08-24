@@ -361,8 +361,11 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
         .on_receive_request(
             async move |req: InitializeRequest, responder, _connection| {
                 // Answer with the version we will actually speak, which the
-                // schema defines as the client's version if we support it and
-                // otherwise the highest we do (`version.rs:26-32`). Handing
+                // ACP specification defines as the client's version if we
+                // support it and otherwise the latest version we do support
+                // (the prose spec's Initialization / "Protocol Version
+                // Negotiation" section; the SDK only carries the version
+                // constants themselves, in `schema/src/version.rs`). Handing
                 // the request back unchanged lies in both directions: a v2
                 // client told "2" sends v2-shaped traffic nothing here
                 // understands, and a v0 client told "0" is the same lie at the
@@ -409,6 +412,25 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     // (`src/serve/mod.rs`), rather than inventing a second
                     // convention.
                     let agent_session_id = uuid::Uuid::now_v7().to_string();
+
+                    // `mcp_servers` is not honoured, and silence about that
+                    // would be indistinguishable from a bug: the editor's
+                    // configured servers would simply be absent, with no
+                    // tools from them and nothing said. They are the
+                    // *client's* servers, mostly stdio commands to spawn on
+                    // the client's machine, which an agent reached over a
+                    // socket cannot launch and must not try to — this
+                    // process is not on that machine. MCP servers for this
+                    // agent are configured server-side, in its own config.
+                    if !req.mcp_servers.is_empty() {
+                        warn!(
+                            "ACP: ignoring {} MCP server(s) offered by the client for session {}: \
+                             they are the client's to launch, and this agent runs elsewhere. \
+                             Configure MCP servers in the agent's own config instead.",
+                            req.mcp_servers.len(),
+                            agent_session_id,
+                        );
+                    }
 
                     // Pin the session to the room profile the bearer token
                     // resolved to at connection time. That pin is what gives

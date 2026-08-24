@@ -78,6 +78,14 @@ rooms    = []                      # ACP-only; no chat rooms map here
 api_keys = ["sa-acp-<long random>"]
 ```
 
+Note that `[acp].enabled = true` opens `/acp` to **every** token in every
+`[room_profile.*].api_keys`, not only to one minted for the editor — each
+simply connects under its own profile. No privilege is gained by doing so
+(`/a2a` already runs the full tool set through the same executor for the same
+tokens), but if you want the editor confined to its own model, namespace or
+audit trail, that is what the dedicated profile above is for; giving it a
+token does not take `/acp` away from the others.
+
 **3. Install [`websocat`](https://github.com/vi/websocat).** Zed's
 `agent_servers` setting only takes a `command` to spawn, not a URL — and ACP
 itself still specifies only stdio transport, so *some* local process has to
@@ -112,6 +120,13 @@ being provided by the agent itself.
   they run.
 - **No session resumption.** A dropped connection ends the session. ACP v1
   has no resumption mechanism, and `session/load` is not implemented.
+- **Tool calls reach the editor as a bare name.** No arguments and no results
+  are sent — the shared turn executor reports only a tool's id and name — so
+  Zed shows "shell" rather than the command it ran or what came back.
+- **A failed tool is reported as completed.** The executor's `ToolOutput`
+  carries no success bit, so every tool that finishes is sent to the editor
+  as `completed`, whether it succeeded or errored. The model still sees the
+  error text and reacts to it; only the editor's status display is wrong.
 - **Not yet exercised against a real Zed.** The endpoint is covered by
   automated tests (framing, auth, `initialize`/`session/new`/`session/prompt`/
   `session/cancel`), but has not yet been driven end-to-end from an actual

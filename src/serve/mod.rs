@@ -1616,7 +1616,7 @@ pub(crate) trait TurnProgress: Send + Sync {
 /// Builds the `{id, name}` params shared by the `tool_start`/`tool_end`
 /// wire notifications. Pulled out so tests can pin the field names
 /// directly without inspecting an opaque SSE `Event`.
-pub(crate) fn tool_event_params(id: &str, name: &str) -> Value {
+fn tool_event_params(id: &str, name: &str) -> Value {
     json!({ "id": id, "name": name })
 }
 
