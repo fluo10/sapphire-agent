@@ -15,21 +15,57 @@
 //! transport expects, so [`lines_transport`] adapts the socket without
 //! reframing anything.
 //!
-//! Only `initialize` is answered here; `session/new` and `session/prompt`
-//! land in later tasks and currently come back as JSON-RPC
+//! `initialize` and `session/new` are answered here; `session/prompt` and
+//! cancellation land in later tasks and currently come back as JSON-RPC
 //! `method not found`.
 
 use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{AgentCapabilities, InitializeRequest, InitializeResponse};
+use agent_client_protocol::schema::v1::{
+    AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
+    NewSessionResponse, SessionId,
+};
 use agent_client_protocol::{Agent, Lines, on_receive_request};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
+
+/// One ACP session, mapped onto an agent session.
+struct AcpSession {
+    /// The agent-side session id, minted the same way `handle_initialize`
+    /// (`src/serve/mod.rs`) mints one for a brand-new `/rpc` session:
+    /// `uuid::Uuid::now_v7().to_string()`. This is also the key under which
+    /// `state.session_room_profiles` pins the session to a room profile, so
+    /// it is what routes this ACP session through the same namespace chain
+    /// and provider selection every other transport uses. It duplicates the
+    /// map key (a `SessionId` wrapping this same string) because Task 8's
+    /// `session/prompt` handler needs the plain `String` to call
+    /// `run_llm_turn`, which does not know about ACP's `SessionId` type.
+    #[allow(dead_code)]
+    agent_session_id: String,
+    /// The client's workspace root, as reported in `session/new`'s `cwd`
+    /// field. This is an absolute path on the *client's* machine, not this
+    /// server's — nothing in this phase may canonicalise it, check it
+    /// exists, or otherwise treat it as a local path. It is recorded now
+    /// because a later phase needs it as the default working directory for
+    /// client-side terminals (`terminal/create`); until then it is inert.
+    #[allow(dead_code)]
+    cwd: PathBuf,
+}
+
+/// Sessions live for the lifetime of one ACP connection: a `HashMap` behind
+/// a `tokio::sync::Mutex`, shared across this connection's request handlers
+/// via `Arc`.
+#[derive(Default)]
+struct AcpSessions {
+    inner: tokio::sync::Mutex<HashMap<SessionId, AcpSession>>,
+}
 
 pub async fn handle_acp_ws(
     State(state): State<Arc<ServeState>>,
@@ -94,9 +130,7 @@ fn lines_transport(
 
 /// Drive one ACP connection until the peer goes away.
 async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_name: String) {
-    // `initialize` does not need it, but the session methods added by the
-    // next tasks do, so it stays plumbed through.
-    let _ = &state;
+    let sessions = Arc::new(AcpSessions::default());
 
     let result = Agent
         .builder()
@@ -138,6 +172,42 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     InitializeResponse::new(version)
                         .agent_capabilities(AgentCapabilities::new().load_session(false)),
                 )
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let sessions = Arc::clone(&sessions);
+                let state = Arc::clone(&state);
+                let profile_name = profile_name.clone();
+                async move |req: NewSessionRequest, responder, _connection| {
+                    // Mint the agent-side session id the same way a
+                    // brand-new `/rpc` session gets one in `handle_initialize`
+                    // (`src/serve/mod.rs`), rather than inventing a second
+                    // convention.
+                    let agent_session_id = uuid::Uuid::now_v7().to_string();
+
+                    // Pin the session to the room profile the bearer token
+                    // resolved to at connection time. That pin is what gives
+                    // the ACP session its namespace chain and provider
+                    // through the paths that already exist for `/rpc`.
+                    state
+                        .session_room_profiles
+                        .lock()
+                        .await
+                        .insert(agent_session_id.clone(), profile_name.clone());
+
+                    let session_id = SessionId::new(agent_session_id.clone());
+                    sessions.inner.lock().await.insert(
+                        session_id.clone(),
+                        AcpSession {
+                            agent_session_id,
+                            cwd: req.cwd.clone(),
+                        },
+                    );
+
+                    responder.respond(NewSessionResponse::new(session_id))
+                }
             },
             on_receive_request!(),
         )
@@ -239,12 +309,20 @@ mod tests {
         })
     }
 
+    fn test_cwd() -> &'static str {
+        if cfg!(windows) {
+            "C:\\work\\proj"
+        } else {
+            "/work/proj"
+        }
+    }
+
     fn new_session_request(id: i64) -> serde_json::Value {
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "session/new",
-            "params": { "cwd": "/tmp", "mcpServers": [] }
+            "params": { "cwd": test_cwd(), "mcpServers": [] }
         })
     }
 
@@ -376,32 +454,52 @@ mod tests {
         }
     }
 
-    /// DEVIATION from the plan's expectation. The plan predicted the RFD's
-    /// rule — `initialize` must come first — would be enforced, so that
-    /// `session/new` on a fresh connection is rejected *because* it is out of
-    /// order. The SDK enforces no ordering at all: it has no notion of an
-    /// initialized connection. What actually rejects `session/new` is that no
-    /// handler is registered for it, so the dispatch loop falls through to
-    /// `method not found` — and, as the second half of this test shows, the
-    /// answer is identical once `initialize` has been done.
+    /// A method nothing here registers a handler for, and whose params carry
+    /// no `sessionId` field (so the SDK's session-scoped retry —
+    /// `role/acp.rs:293-311`, keyed on `Dispatch::has_session_id` — never
+    /// applies), falls straight through to JSON-RPC `method not found`.
     ///
-    /// Task 7 registers a `session/new` handler, at which point this test
-    /// must be replaced: either by dropping the ordering claim, or by
-    /// implementing the ordering check inside the handler.
+    /// DEVIATION from the plan's expectation. The plan predicted the RFD's
+    /// rule — `initialize` must come first — would be enforced, so that an
+    /// unhandled method on a fresh connection is rejected *because* it is out
+    /// of order. The SDK enforces no ordering at all: it has no notion of an
+    /// initialized connection. What actually rejects it is that no handler is
+    /// registered, so the dispatch loop falls through to `method not found` —
+    /// and, as the second half of this test shows, the answer is identical
+    /// once `initialize` has been done.
+    ///
+    /// This test originally used `session/new` as its unhandled example.
+    /// Task 7 registered a `session/new` handler, so it was replaced with a
+    /// fabricated method name: any real ACP method scoped to a session (e.g.
+    /// `session/load`) carries `sessionId` in its own params and would hang
+    /// on the retry instead of demonstrating this behaviour.
     #[tokio::test]
     async fn an_unimplemented_method_is_answered_with_method_not_found() {
+        fn unknown_method_request(id: i64) -> serde_json::Value {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "totally/unknown",
+                "params": {}
+            })
+        }
+
         let addr = spawn(ServeState::for_test(true)).await;
 
-        let before = roundtrip(&addr, new_session_request(0)).await;
+        let before = roundtrip(&addr, unknown_method_request(0)).await;
         assert_eq!(before["id"], 0);
         assert_eq!(
             before["error"]["code"], -32601,
-            "no handler is registered yet, got {before}"
+            "no handler is registered for it, got {before}"
         );
 
         // Initializing first changes nothing: the rejection is about the
         // missing handler, not about the connection's state.
-        let after = conversation(&addr, vec![initialize_request(0), new_session_request(1)]).await;
+        let after = conversation(
+            &addr,
+            vec![initialize_request(0), unknown_method_request(1)],
+        )
+        .await;
         assert!(after[0]["result"].is_object(), "got {}", after[0]);
         assert_eq!(
             after[1]["error"]["code"], -32601,
@@ -462,5 +560,17 @@ mod tests {
                 Some(Ok(other)) => panic!("unexpected frame after close: {other:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn session_new_returns_a_session_id() {
+        let addr = spawn(ServeState::for_test(true)).await;
+        let responses =
+            conversation(&addr, vec![initialize_request(0), new_session_request(1)]).await;
+
+        let session_id = responses[1]["result"]["sessionId"]
+            .as_str()
+            .expect("sessionId present");
+        assert!(!session_id.is_empty());
     }
 }
