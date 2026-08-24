@@ -188,6 +188,12 @@ a2a = { package = "a2a-lf", version = "0.3" }
 # (or the platform equivalent) when no explicit dir is configured.
 dirs = "6"
 
+# Agent Client Protocol SDK (Zed's official Rust SDK). Backs `GET /acp`: the
+# JSON-RPC dispatch loop, the v1 schema types, and the `Lines` transport the
+# WebSocket is wrapped in. Default features only — `unstable_protocol_v2`
+# stays off, which is what pins this build to ACP v1.
+agent-client-protocol = "2.0.0"
+
 [dev-dependencies]
 tempfile = "3"
 tokio-tungstenite = "0.30.0"
