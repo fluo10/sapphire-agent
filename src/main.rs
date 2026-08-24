@@ -6,6 +6,7 @@
 mod agent;
 mod channel;
 mod config;
+mod config_layer;
 mod context_compression;
 mod frontmatter;
 mod heartbeat;
@@ -27,7 +28,7 @@ use anyhow::{Context, Result};
 use channel::discord::DiscordChannel;
 use channel::matrix::MatrixChannel;
 use clap::{Parser, Subcommand};
-use config::Config;
+use config::{Config, LoadedConfig};
 use heartbeat::Heartbeat;
 use periodic_log::{
     build_all_today_digests, catchup_missing_daily_digests, catchup_pending_daily_logs,
@@ -86,6 +87,18 @@ enum Command {
     Verify,
 }
 
+/// One-word tag naming where a setting's effective value came from, for `verify`.
+fn layer_tag(
+    provenance: &std::collections::BTreeMap<String, config_layer::Layer>,
+    path: &str,
+) -> &'static str {
+    match provenance.get(path) {
+        Some(config_layer::Layer::Workspace) => "workspace",
+        Some(config_layer::Layer::Host) => "host",
+        None => "default",
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     fmt()
@@ -99,8 +112,28 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let config_path = cli.config.unwrap_or_else(Config::default_path);
-    let config = Config::load(&config_path)
+    let LoadedConfig {
+        config,
+        rejected,
+        provenance,
+        workspace_path,
+    } = Config::load_layered(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+
+    if !rejected.is_empty() {
+        tracing::warn!(
+            "Ignoring {} key(s) in the workspace config at {} that the workspace layer may not \
+             set: {}. Credentials, MCP servers, bind addresses and machine paths are host-local \
+             by design; set them in {} instead.",
+            rejected.len(),
+            workspace_path
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            rejected.join(", "),
+            config_path.display()
+        );
+    }
 
     if config.standby_mode == Some(true) {
         anyhow::bail!(
@@ -119,7 +152,25 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Verify) => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
-            println!("Config OK");
+            let profile_errors = config.validate_profiles();
+            if profile_errors.is_empty() {
+                println!("Config OK");
+            } else {
+                println!("Config INVALID:");
+                for err in &profile_errors {
+                    println!("  - {err}");
+                }
+            }
+            match &workspace_path {
+                Some(p) => println!("  Workspace config  : {}", p.display()),
+                None => {
+                    let ws_config = config::workspace_config_path(&workspace_dir);
+                    println!(
+                        "  Workspace config  : none ({} absent)",
+                        ws_config.display()
+                    );
+                }
+            }
             if let Some(m) = &config.matrix {
                 println!("  Channel           : matrix");
                 println!("  Matrix homeserver : {}", m.homeserver);
@@ -132,14 +183,41 @@ async fn main() -> Result<()> {
             } else {
                 println!("  Channel           : NONE (add [discord] or [matrix] to config)");
             }
-            println!("  Anthropic model   : {}", config.anthropic.model);
-            println!("  Anthropic max_tok : {}", config.anthropic.max_tokens);
+            println!(
+                "  Anthropic model   : {} [{}]",
+                config.anthropic.model,
+                layer_tag(&provenance, "anthropic.model")
+            );
+            println!(
+                "  Anthropic max_tok : {} [{}]",
+                config.anthropic.max_tokens,
+                layer_tag(&provenance, "anthropic.max_tokens")
+            );
             println!("  Workspace dir     : {}", workspace_dir.display());
             println!(
-                "  Day boundary hour : {}:00 local",
-                config.day_boundary_hour
+                "  Day boundary hour : {}:00 local [{}]",
+                config.day_boundary_hour,
+                layer_tag(&provenance, "day_boundary_hour")
             );
-            println!("  Heartbeat enabled : {}", config.heartbeat_enabled);
+            println!(
+                "  Heartbeat enabled : {} [{}]",
+                config.heartbeat_enabled,
+                layer_tag(&provenance, "heartbeat_enabled")
+            );
+            println!();
+            println!("Workspace-supplied settings:");
+            let ws_settings: Vec<&String> = provenance
+                .iter()
+                .filter(|(_, layer)| **layer == config_layer::Layer::Workspace)
+                .map(|(path, _)| path)
+                .collect();
+            if ws_settings.is_empty() {
+                println!("  (none)");
+            } else {
+                for path in ws_settings {
+                    println!("  {path}");
+                }
+            }
             println!();
             let workspace_files = [
                 ("AGENTS.md / AGENT.md", vec!["AGENTS.md", "AGENT.md"]),

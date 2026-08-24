@@ -1,6 +1,7 @@
+use crate::config_layer::{self, Layer};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -893,24 +894,9 @@ fn default_digest_yearly_items() -> usize {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let config: Config =
-            toml::from_str(&content).with_context(|| "Failed to parse config file")?;
-        Ok(config)
-    }
-
     /// Resolve the workspace directory: explicit config > config file's parent directory.
     pub fn resolved_workspace_dir(&self, config_path: &Path) -> PathBuf {
-        if let Some(dir) = &self.workspace_dir {
-            PathBuf::from(shellexpand::tilde(dir).as_ref())
-        } else {
-            config_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        }
+        resolve_workspace_dir(self.workspace_dir.as_deref(), config_path)
     }
 
     /// Resolve the sessions directory for JSONL persistence.
@@ -1283,6 +1269,184 @@ impl Config {
     }
 }
 
+/// Resolve the workspace directory from an explicit setting, falling back to the
+/// config file's own directory.
+///
+/// Free-standing because the layered loader needs it before a `Config` exists:
+/// the workspace directory has to be known to find the workspace config, so it
+/// can only ever come from the host layer.
+pub fn resolve_workspace_dir(explicit: Option<&str>, config_path: &Path) -> PathBuf {
+    match explicit {
+        Some(dir) => PathBuf::from(shellexpand::tilde(dir).as_ref()),
+        None => config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+    }
+}
+
+/// Path of the workspace-level config: `{workspace_dir}/.sapphire-agent/config.toml`.
+///
+/// This mirrors the framework's `Workspace::config_path()` convention. It is not
+/// called through the framework because reaching a `Workspace` value goes via
+/// `from_root`, which fails when the marker directory is absent — and the agent
+/// resolves its workspace through the marker-free path.
+pub fn workspace_config_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(".sapphire-agent").join("config.toml")
+}
+
+/// A `Config` plus what the layering did to produce it.
+#[derive(Debug)]
+pub struct LoadedConfig {
+    pub config: Config,
+    /// Workspace-layer keys refused by the allowlist. Reported at startup.
+    pub rejected: Vec<String>,
+    /// Which layer supplied each setting, for `verify`.
+    pub provenance: BTreeMap<String, Layer>,
+    /// Path of the workspace-level config, when one was actually read (the file
+    /// existed and was readable). `None` when no workspace layer was loaded, so
+    /// callers can name the file in diagnostics without recomputing the path.
+    pub workspace_path: Option<PathBuf>,
+}
+
+impl Config {
+    /// Load the host config, then layer the workspace config under it.
+    ///
+    /// The workspace layer is opt-in by existence: with no
+    /// `{workspace_dir}/.sapphire-agent/config.toml` this behaves exactly like
+    /// a single-file load of the host config.
+    ///
+    /// A malformed **host** config is an error, as it always was. The workspace
+    /// layer must never be able to stop the agent starting: from the point the
+    /// workspace syncs from a server it is remote input, and one bad file must
+    /// not take down every host. That covers three distinct ways the workspace
+    /// file can be bad:
+    ///
+    /// - **TOML syntax** the parser rejects — demoted to a warning, workspace
+    ///   treated as absent.
+    /// - **The merged document fails to deserialize** into `Config` (a wrong
+    ///   type, a required field missing from a table the workspace introduced)
+    ///   — even though every key involved was allowlisted.
+    /// - **The merged config fails semantic validation**
+    ///   (`Config::validate_profiles`) — deserializes fine, references
+    ///   something that does not exist.
+    ///
+    /// The latter two fall back to the host layer alone: the merged document is
+    /// discarded, the host `toml::Value` is deserialized on its own, and
+    /// `rejected`/`provenance` are reset to reflect a host-only load. A host
+    /// layer that fails on its own (with or without a workspace layer present)
+    /// is still a hard error — it is local, hand-written, and belongs to the
+    /// person reading the message.
+    pub fn load_layered(host_path: &Path) -> Result<LoadedConfig> {
+        let host_text = std::fs::read_to_string(host_path)
+            .with_context(|| format!("Failed to read config file: {}", host_path.display()))?;
+        let host: toml::Value = toml::from_str(&host_text)
+            .with_context(|| format!("Failed to parse config file: {}", host_path.display()))?;
+
+        let workspace_dir = resolve_workspace_dir(
+            host.get("workspace_dir").and_then(toml::Value::as_str),
+            host_path,
+        );
+        let ws_path = workspace_config_path(&workspace_dir);
+
+        let mut workspace_path = None;
+        let mut workspace_present = false;
+        let workspace = match std::fs::read_to_string(&ws_path) {
+            Ok(text) => {
+                workspace_path = Some(ws_path.clone());
+                match toml::from_str::<toml::Value>(&text) {
+                    Ok(value) => {
+                        workspace_present = true;
+                        value
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Ignoring malformed workspace config at {}: {e}",
+                            ws_path.display()
+                        );
+                        toml::Value::Table(toml::map::Map::new())
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                toml::Value::Table(toml::map::Map::new())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Ignoring unreadable workspace config at {}: {e}",
+                    ws_path.display()
+                );
+                toml::Value::Table(toml::map::Map::new())
+            }
+        };
+
+        let outcome = config_layer::merge_layers(workspace, host.clone());
+        let deserialized: std::result::Result<Config, toml::de::Error> =
+            outcome.merged.clone().try_into();
+
+        // Drop the workspace layer and continue on the host config alone — but
+        // only once the host config is known to be good on its own. Blaming the
+        // workspace file before checking that would misattribute a host-side
+        // bug to it: a host with its own broken profile reference fails the
+        // merged check too, and the mere existence of an unrelated workspace
+        // file would otherwise put its name in the message.
+        let fall_back_to_host_only = |reason: String| -> Result<LoadedConfig> {
+            let host_config: Config = host.clone().try_into().with_context(|| {
+                format!(
+                    "Failed to parse config file: {} (the workspace layer had already been \
+                     dropped because it {reason})",
+                    host_path.display()
+                )
+            })?;
+            let host_errors = host_config.validate_profiles();
+            if !host_errors.is_empty() {
+                anyhow::bail!(
+                    "invalid configuration in {}: {}",
+                    host_path.display(),
+                    host_errors.join("; ")
+                );
+            }
+            tracing::warn!(
+                "Workspace config at {} produces an invalid merged configuration ({reason}); \
+                 falling back to the host config alone at {}.",
+                ws_path.display(),
+                host_path.display()
+            );
+            let empty = toml::Value::Table(toml::map::Map::new());
+            let provenance = config_layer::provenance_of(&empty, &host);
+            Ok(LoadedConfig {
+                config: host_config,
+                rejected: Vec::new(),
+                provenance,
+                workspace_path: workspace_path.clone(),
+            })
+        };
+
+        match deserialized {
+            Ok(config) => {
+                let profile_errors = config.validate_profiles();
+                if workspace_present && !profile_errors.is_empty() {
+                    fall_back_to_host_only(format!(
+                        "fails validation: {}",
+                        profile_errors.join("; ")
+                    ))
+                } else {
+                    Ok(LoadedConfig {
+                        config,
+                        rejected: outcome.rejected,
+                        provenance: outcome.provenance,
+                        workspace_path,
+                    })
+                }
+            }
+            Err(e) if workspace_present => {
+                fall_back_to_host_only(format!("fails to deserialize: {e}"))
+            }
+            Err(e) => Err(e).with_context(|| "Failed to parse config file"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1551,11 +1715,19 @@ api_keys = ["sa-a2a-dev"]
 
     #[test]
     fn shipped_example_parses() {
-        // Sanity check: the example file we ship in the repo must parse
-        // and validate without errors so first-time users aren't greeted
-        // with a confusing TOML error.
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
-        let cfg = Config::load(&path).expect("config.example.toml should parse");
+        // Sanity check: the example file we ship in the repo must parse and
+        // validate without errors so first-time users aren't greeted with a
+        // confusing TOML error. Loaded through `load_layered` from a tempdir,
+        // which also exercises the no-workspace-layer path — the case that has
+        // to behave exactly as a single-file load always did.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::copy(&src, &path).expect("copy the shipped example");
+
+        let cfg = Config::load_layered(&path)
+            .expect("config.example.toml should parse")
+            .config;
         assert!(
             cfg.validate_profiles().is_empty(),
             "validation errors: {:?}",
@@ -2017,5 +2189,167 @@ model = "gemma-4-31b-it"
                 assert!(c.api_key.is_none());
             }
         }
+    }
+
+    #[test]
+    fn load_layered_without_a_workspace_config_matches_plain_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            "day_boundary_hour = 5\n\n[anthropic]\napi_key = \"sk-test\"\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        assert_eq!(loaded.config.day_boundary_hour, 5);
+        assert!(loaded.rejected.is_empty());
+        // With no workspace file every value can only have come from the host.
+        assert!(
+            loaded
+                .provenance
+                .values()
+                .all(|l| *l == crate::config_layer::Layer::Host)
+        );
+    }
+
+    #[test]
+    fn load_layered_merges_the_workspace_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            "day_boundary_hour = 6\n\n[anthropic]\napi_key = \"sk-host\"\n",
+        )
+        .unwrap();
+        let marker = dir.path().join(".sapphire-agent");
+        std::fs::create_dir_all(&marker).unwrap();
+        std::fs::write(
+            marker.join("config.toml"),
+            "day_boundary_hour = 4\n\n[anthropic]\nsystem_prompt = \"shared\"\napi_key = \"sk-should-not-travel\"\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        // Host wins where both set a key.
+        assert_eq!(loaded.config.day_boundary_hour, 6);
+        // Workspace supplies what the host omits.
+        assert_eq!(
+            loaded.config.anthropic.system_prompt.as_deref(),
+            Some("shared")
+        );
+        // The host's secret is untouched and the workspace's is refused.
+        assert_eq!(loaded.config.anthropic.api_key.as_deref(), Some("sk-host"));
+        assert_eq!(loaded.rejected, vec!["anthropic.api_key".to_string()]);
+        assert_eq!(
+            loaded.provenance.get("anthropic.system_prompt"),
+            Some(&crate::config_layer::Layer::Workspace)
+        );
+    }
+
+    #[test]
+    fn workspace_dir_from_the_host_layer_locates_the_workspace_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("elsewhere");
+        std::fs::create_dir_all(ws.join(".sapphire-agent")).unwrap();
+        std::fs::write(
+            ws.join(".sapphire-agent").join("config.toml"),
+            "session_policy = \"none\"\n",
+        )
+        .unwrap();
+
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            format!(
+                "workspace_dir = \"{}\"\n\n[anthropic]\napi_key = \"sk-test\"\n",
+                ws.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        assert_eq!(loaded.config.session_policy, SessionPolicy::None);
+    }
+
+    #[test]
+    fn a_workspace_config_that_fails_to_deserialize_falls_back_to_the_host_layer() {
+        // The workspace's bad value for `day_boundary_hour` is fully allowlisted,
+        // and the host sets the same key, so `host wins` on the merge already
+        // neutralises it before deserialization ever runs. This pins that the
+        // fallback decision is made against the *merged* document, not the raw
+        // workspace document — a naive implementation that validated the
+        // workspace layer standalone would wrongly fall back here even though
+        // the merged config is perfectly fine.
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            "day_boundary_hour = 5\n\n[anthropic]\napi_key = \"sk-test\"\n",
+        )
+        .unwrap();
+        let marker = dir.path().join(".sapphire-agent");
+        std::fs::create_dir_all(&marker).unwrap();
+        std::fs::write(marker.join("config.toml"), "day_boundary_hour = \"nine\"\n").unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        assert_eq!(loaded.config.day_boundary_hour, 5);
+    }
+
+    #[test]
+    fn a_workspace_config_that_fails_validation_falls_back_to_the_host_layer() {
+        // `room_profile.*.profile` is allowlisted, but the workspace's chosen
+        // profile does not exist. The merged document deserializes fine — it's
+        // `Config::validate_profiles` that catches this, one layer past
+        // `try_into()`, and it must fall back exactly as a deserialize failure
+        // does.
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(&host_path, "[anthropic]\napi_key = \"sk-test\"\n").unwrap();
+        let marker = dir.path().join(".sapphire-agent");
+        std::fs::create_dir_all(&marker).unwrap();
+        std::fs::write(
+            marker.join("config.toml"),
+            "[room_profile.x]\nprofile = \"does-not-exist\"\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        assert!(
+            loaded.config.validate_profiles().is_empty(),
+            "{:?}",
+            loaded.config.validate_profiles()
+        );
+    }
+
+    #[test]
+    fn a_host_config_that_fails_validation_is_fatal_and_blames_the_host_file() {
+        // The bad profile reference is the *host's*, and the workspace file is
+        // innocent — it only sets an unrelated key. Falling back would return a
+        // config that is still invalid while naming the workspace file as the
+        // culprit, so the fallback has to re-validate and let a host-side
+        // failure stay fatal.
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            "[anthropic]\napi_key = \"sk-test\"\n\n[room_profile.x]\nprofile = \"does-not-exist\"\n",
+        )
+        .unwrap();
+        let marker = dir.path().join(".sapphire-agent");
+        std::fs::create_dir_all(&marker).unwrap();
+        std::fs::write(marker.join("config.toml"), "day_boundary_hour = 4\n").unwrap();
+
+        let err = Config::load_layered(&host_path)
+            .expect_err("a host config that fails validation must not load");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&host_path.display().to_string()),
+            "error should name the host config, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("does-not-exist"),
+            "error should carry the validation failure, got: {rendered}"
+        );
     }
 }
