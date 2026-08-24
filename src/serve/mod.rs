@@ -1599,10 +1599,10 @@ fn apply_input_kind_label(mut msg: ChatMessage) -> ChatMessage {
 /// Where a turn reports its per-tool progress.
 ///
 /// `run_llm_turn` is the shared executor behind `/rpc`, the voice pipeline,
-/// A2A, and (from Task 8) the ACP endpoint — but each caller wants its
+/// A2A and the ACP endpoint — but each caller wants its
 /// `tool_start`/`tool_end`/error notifications shaped differently: `/rpc`
-/// and voice relay them as JSON-RPC notifications over SSE, ACP will need
-/// them as `session/update` notifications instead, and some callers (voice
+/// and voice relay them as JSON-RPC notifications over SSE, ACP sends them
+/// as `session/update` notifications instead, and some callers (voice
 /// heartbeats, A2A) don't surface intermediate progress at all. Putting
 /// reporting behind this trait keeps the turn executor itself agnostic to
 /// which of those shapes (if any) is listening.

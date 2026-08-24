@@ -157,6 +157,20 @@ impl super::TurnProgress for AcpProgress {
     }
 }
 
+/// The wire name of a prompt content block, for the log line that says one
+/// was dropped. `ContentBlock` is `#[non_exhaustive]`, so the catch-all arm
+/// is load-bearing rather than defensive.
+fn prompt_block_kind(block: &ContentBlock) -> &'static str {
+    match block {
+        ContentBlock::Text(_) => "text",
+        ContentBlock::Image(_) => "image",
+        ContentBlock::Audio(_) => "audio",
+        ContentBlock::ResourceLink(_) => "resource_link",
+        ContentBlock::Resource(_) => "resource",
+        _ => "unknown",
+    }
+}
+
 pub async fn handle_acp_ws(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
@@ -327,16 +341,40 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         ));
                     };
 
-                    // Flatten the prompt's blocks into one user message. Only
-                    // Text is handled: `initialize` advertises no prompt
-                    // capabilities, so images, audio and embedded resources
-                    // are not ours to receive.
+                    // Flatten the prompt's blocks into one user message.
+                    //
+                    // Text and ResourceLink are both mandatory for every
+                    // agent — the schema's words are "All agents MUST support
+                    // resource links in prompts" — and a resource link is how
+                    // Zed sends an `@file` mention. Dropping one would leave
+                    // the model reading "explain" with no idea what it refers
+                    // to. The link is folded in by name and uri: this build
+                    // cannot open the file (client-side filesystem access is
+                    // a later phase), but naming the reference keeps the
+                    // mention in the conversation until it can.
+                    //
+                    // Image, Audio and Resource are capability-gated and
+                    // `initialize` advertises no prompt capabilities, so they
+                    // should never arrive — if one does, it is dropped
+                    // loudly rather than silently.
                     let text = req
                         .prompt
                         .iter()
                         .filter_map(|block| match block {
-                            ContentBlock::Text(t) => Some(t.text.as_str()),
-                            _ => None,
+                            ContentBlock::Text(t) => Some(t.text.clone()),
+                            ContentBlock::ResourceLink(link) => Some(format!(
+                                "[referenced resource: {} ({})]",
+                                link.name, link.uri
+                            )),
+                            other => {
+                                warn!(
+                                    "ACP: dropped an unsupported prompt block ({}) from a \
+                                     session/prompt for session {}",
+                                    prompt_block_kind(other),
+                                    req.session_id
+                                );
+                                None
+                            }
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
@@ -761,28 +799,38 @@ mod tests {
         );
     }
 
-    fn prompt_request(id: i64, session_id: &str, text: &str) -> serde_json::Value {
+    /// The `prompt` array of a text-only message.
+    fn text_prompt(text: &str) -> serde_json::Value {
+        serde_json::json!([{ "type": "text", "text": text }])
+    }
+
+    fn prompt_request(id: i64, session_id: &str, prompt: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "session/prompt",
-            "params": {
-                "sessionId": session_id,
-                "prompt": [{ "type": "text", "text": text }]
-            }
+            "params": { "sessionId": session_id, "prompt": prompt }
         })
     }
 
     /// initialize → session/new → session/prompt on ONE connection.
     ///
-    /// Returns every `session/update` notification the turn emitted, in
-    /// arrival order, plus the whole JSON-RPC reply to the prompt (so a
-    /// caller can inspect either `result.stopReason` or `error`).
+    /// Returns the session id the agent minted, every `session/update`
+    /// notification the turn emitted in arrival order, and the whole
+    /// JSON-RPC reply to the prompt (so a caller can inspect either
+    /// `result.stopReason` or `error`).
+    ///
+    /// The session id is returned rather than discarded so callers can
+    /// assert against *that* session in the shared store, instead of
+    /// against whatever session happens to be the only one there.
     ///
     /// `conversation` cannot be used here: it filters frames down to one
     /// request id and would drop exactly the notifications under test,
     /// turning a wrong ordering into a slow hang instead of a failure.
-    async fn drive(addr: &str, prompt: &str) -> (Vec<serde_json::Value>, serde_json::Value) {
+    async fn drive(
+        addr: &str,
+        prompt: serde_json::Value,
+    ) -> (String, Vec<serde_json::Value>, serde_json::Value) {
         let mut ws = connect(addr).await;
         for request in [initialize_request(0), new_session_request(1)] {
             ws.send(Message::Text(request.to_string().into()))
@@ -805,7 +853,7 @@ mod tests {
                     .to_string();
                 session_id = Some(id.clone());
                 ws.send(Message::Text(
-                    prompt_request(2, &id, prompt).to_string().into(),
+                    prompt_request(2, &id, prompt.clone()).to_string().into(),
                 ))
                 .await
                 .unwrap();
@@ -817,7 +865,11 @@ mod tests {
                 );
                 updates.push(v["params"]["update"].clone());
             } else if v["id"] == 2 {
-                return (updates, v);
+                return (
+                    session_id.expect("the prompt was sent, so a session exists"),
+                    updates,
+                    v,
+                );
             }
         }
     }
@@ -836,7 +888,7 @@ mod tests {
             }],
         );
         let addr = spawn(state).await;
-        let (updates, reply) = drive(&addr, "hi").await;
+        let (_session_id, updates, reply) = drive(&addr, text_prompt("hi")).await;
 
         let chunks: Vec<&str> = updates
             .iter()
@@ -861,13 +913,16 @@ mod tests {
             }],
         );
         let addr = spawn(Arc::clone(&state)).await;
-        drive(&addr, "hi").await;
+        let (session_id, _updates, _reply) = drive(&addr, text_prompt("hi")).await;
 
+        // Keyed on the session id the agent handed the client, not on
+        // "whatever single entry exists": a handler that minted a session
+        // id of its own — quietly starting a second conversation — would
+        // still leave exactly one entry here and pass a looser assertion.
         let sessions = state.sessions.lock().await;
-        let (_id, history) = sessions
-            .iter()
-            .next()
-            .expect("the prompt turn created a session in the shared store");
+        let history = sessions
+            .get(&session_id)
+            .unwrap_or_else(|| panic!("no history under {session_id}, got {:?}", sessions.keys()));
         let texts: Vec<&str> = history
             .iter()
             .filter_map(|m| match m.parts.first() {
@@ -876,6 +931,52 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["hi", "hello from the agent"], "got {texts:?}");
+    }
+
+    /// Zed sends every `@file` mention as a `resource_link` block, which
+    /// the schema makes mandatory for all agents ("All agents MUST support
+    /// resource links in prompts"). It is not capability-gated, so it will
+    /// arrive, and it must reach the model rather than being dropped on the
+    /// way — otherwise "explain @main.rs" reaches the provider as "explain".
+    #[tokio::test]
+    async fn a_resource_link_reaches_the_model() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![crate::provider::ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let addr = spawn(Arc::clone(&state)).await;
+        let (session_id, _updates, reply) = drive(
+            &addr,
+            serde_json::json!([
+                { "type": "text", "text": "explain" },
+                {
+                    "type": "resource_link",
+                    "name": "main.rs",
+                    "uri": "file:///work/proj/src/main.rs"
+                }
+            ]),
+        )
+        .await;
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
+
+        let sessions = state.sessions.lock().await;
+        let history = sessions.get(&session_id).expect("history for the session");
+        let Some(crate::provider::ContentPart::Text(user)) = history[0].parts.first() else {
+            panic!("expected a text user message, got {:?}", history[0].parts);
+        };
+        assert!(user.contains("explain"), "got {user:?}");
+        assert!(
+            user.contains("main.rs"),
+            "the reference is lost, got {user:?}"
+        );
+        assert!(
+            user.contains("file:///work/proj/src/main.rs"),
+            "the reference is lost, got {user:?}"
+        );
     }
 
     /// Tool progress is reported as it happens, so a tool call must reach
@@ -905,7 +1006,7 @@ mod tests {
             ],
         );
         let addr = spawn(state).await;
-        let (updates, reply) = drive(&addr, "use the tool").await;
+        let (_session_id, updates, reply) = drive(&addr, text_prompt("use the tool")).await;
 
         let kinds: Vec<&str> = updates
             .iter()
@@ -947,7 +1048,7 @@ mod tests {
             &addr,
             vec![
                 initialize_request(0),
-                prompt_request(1, "no-such-session", "hi"),
+                prompt_request(1, "no-such-session", text_prompt("hi")),
             ],
         )
         .await;
@@ -967,7 +1068,7 @@ mod tests {
         // An empty script makes the stub provider fail the chat call.
         let state = ServeState::for_test_scripted(true, Vec::new());
         let addr = spawn(state).await;
-        let (updates, reply) = drive(&addr, "hi").await;
+        let (_session_id, updates, reply) = drive(&addr, text_prompt("hi")).await;
 
         assert!(
             !updates
