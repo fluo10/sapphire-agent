@@ -15,20 +15,26 @@
 //! transport expects, so [`lines_transport`] adapts the socket without
 //! reframing anything.
 //!
-//! `initialize` and `session/new` are answered here. `session/prompt` and
-//! cancellation land in later tasks; until then, any request carrying a
-//! `sessionId` field (which both do) hits the SDK's session-scoped retry
-//! instead of a definitive answer — it is queued, waiting for a dynamic
-//! per-session handler that never arrives on this connection, rather than
-//! being rejected with JSON-RPC `method not found`.
+//! `initialize`, `session/new` and `session/prompt` are answered here;
+//! cancellation lands in a later task.
+//!
+//! A prompt is not implemented here beyond its ACP shape: it extracts the
+//! text, hands the turn to [`super::run_llm_turn`] — the same executor
+//! behind `/rpc`, voice and A2A — and translates that turn's progress back
+//! into `session/update` notifications. There is deliberately no second
+//! tool loop, history handling or persistence on this path, so an editor's
+//! conversation lands in the same session store, under the same memory
+//! namespace and system prompt, as every other transport's.
 
 use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
-    NewSessionResponse, SessionId,
+    AgentCapabilities, ContentBlock, ContentChunk, Error, InitializeRequest, InitializeResponse,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
+    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall as AcpToolCall,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
-use agent_client_protocol::{Agent, Lines, on_receive_request};
+use agent_client_protocol::{Agent, Client, ConnectionTo, Lines, on_receive_request};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
@@ -47,10 +53,9 @@ struct AcpSession {
     /// `state.session_room_profiles` pins the session to a room profile, so
     /// it is what routes this ACP session through the same namespace chain
     /// and provider selection every other transport uses. It duplicates the
-    /// map key (a `SessionId` wrapping this same string) because Task 8's
+    /// map key (a `SessionId` wrapping this same string) because the
     /// `session/prompt` handler needs the plain `String` to call
     /// `run_llm_turn`, which does not know about ACP's `SessionId` type.
-    #[allow(dead_code)]
     agent_session_id: String,
     /// The client's workspace root, as reported in `session/new`'s `cwd`
     /// field. This is an absolute path on the *client's* machine, not this
@@ -68,6 +73,88 @@ struct AcpSession {
 #[derive(Default)]
 struct AcpSessions {
     inner: tokio::sync::Mutex<HashMap<SessionId, AcpSession>>,
+}
+
+/// Reports one prompt turn's progress to an ACP client as `session/update`
+/// notifications, and remembers why a turn failed.
+///
+/// The remembering is not incidental: [`super::LlmTurnOutcome`] carries only
+/// the final text, so a failed turn reaches the prompt handler as `None` with
+/// no cause attached, and `turn_error` is the only place the provider's
+/// message is ever offered. Stashing it here is what lets the JSON-RPC error
+/// say *what* went wrong rather than merely *that* something did.
+struct AcpProgress {
+    session_id: SessionId,
+    /// The connection this turn is running on. `ConnectionTo<Client>` is the
+    /// handle the SDK passes to every request handler; it is `Clone`, so the
+    /// turn keeps its own to push notifications through while it runs.
+    connection: ConnectionTo<Client>,
+    /// The message from the most recent `turn_error`. A blocking mutex is
+    /// enough: it is never held across an await.
+    error: std::sync::Mutex<Option<String>>,
+}
+
+impl AcpProgress {
+    fn new(session_id: SessionId, connection: ConnectionTo<Client>) -> Self {
+        Self {
+            session_id,
+            connection,
+            error: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Push one `session/update` for this turn's session.
+    ///
+    /// A send failure means the client is already gone, which the connection
+    /// task notices on its own; there is nothing useful for a turn in flight
+    /// to do about it beyond saying so.
+    fn notify(&self, update: SessionUpdate) {
+        if let Err(e) = self
+            .connection
+            .send_notification(SessionNotification::new(self.session_id.clone(), update))
+        {
+            warn!(
+                "ACP: dropped a session/update for session {}: {e}",
+                self.session_id
+            );
+        }
+    }
+
+    /// The reason the turn failed, if it reported one.
+    fn failure(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl super::TurnProgress for AcpProgress {
+    /// The provider's own tool-call id becomes ACP's `toolCallId`, so the
+    /// completion below can name the call it completes. There is no input to
+    /// report — `TurnProgress` does not carry one — so the tool's name serves
+    /// as the title. `InProgress` rather than the default `Pending`: the
+    /// executor has already started the call, whereas `Pending` tells a
+    /// client the call is still waiting on input or approval.
+    async fn tool_start(&self, id: &str, name: &str) {
+        self.notify(SessionUpdate::ToolCall(
+            AcpToolCall::new(ToolCallId::new(id), name).status(ToolCallStatus::InProgress),
+        ));
+    }
+
+    /// Only the status changes: everything else the client already has from
+    /// `tool_start`, and `ToolCallUpdate` carries just what moved.
+    async fn tool_end(&self, id: &str, _name: &str) {
+        self.notify(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            ToolCallId::new(id),
+            ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+        )));
+    }
+
+    /// Recorded rather than sent: ACP reports a failed turn by answering the
+    /// `session/prompt` request with a JSON-RPC error, and this is the only
+    /// place the cause is offered to put in it.
+    async fn turn_error(&self, message: &str) {
+        *self.error.lock().unwrap() = Some(message.to_string());
+    }
 }
 
 pub async fn handle_acp_ws(
@@ -210,6 +297,89 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     );
 
                     responder.respond(NewSessionResponse::new(session_id))
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let sessions = Arc::clone(&sessions);
+                let state = Arc::clone(&state);
+                async move |req: PromptRequest, responder, connection: ConnectionTo<Client>| {
+                    let Some(agent_session_id) = sessions
+                        .inner
+                        .lock()
+                        .await
+                        .get(&req.session_id)
+                        .map(|s| s.agent_session_id.clone())
+                    else {
+                        // Not created on the fly: a prompt naming a session
+                        // this connection never minted is a client bug, and
+                        // starting one here would quietly open a second
+                        // conversation the client believes it is continuing.
+                        // `invalid_params`, because the offending thing is a
+                        // parameter of this request.
+                        return responder.respond_with_error(Error::invalid_params().data(
+                            format!(
+                                "unknown session '{}'; call session/new first",
+                                req.session_id
+                            ),
+                        ));
+                    };
+
+                    // Flatten the prompt's blocks into one user message. Only
+                    // Text is handled: `initialize` advertises no prompt
+                    // capabilities, so images, audio and embedded resources
+                    // are not ours to receive.
+                    let text = req
+                        .prompt
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    // Everything past this point belongs to `run_llm_turn`:
+                    // history, the tool loop, persistence and the memory
+                    // namespace all come from the shared executor, so an
+                    // editor's conversation lands in the same session store,
+                    // with the same system prompt, as `/rpc` and A2A.
+                    let progress = Arc::new(AcpProgress::new(req.session_id.clone(), connection));
+                    let outcome = super::run_llm_turn(
+                        Arc::clone(&state),
+                        agent_session_id,
+                        crate::provider::ChatMessage::user(&text),
+                        Arc::clone(&progress) as Arc<dyn super::TurnProgress>,
+                        None,
+                    )
+                    .await;
+
+                    let Some(reply) = outcome.text else {
+                        // A failed turn is a JSON-RPC error, not a stop
+                        // reason: none of ACP v1's stop reasons means "the
+                        // agent broke", and `Refusal` would tell the user the
+                        // agent *declined*, which is a materially different
+                        // thing to show them.
+                        return responder.respond_with_internal_error(
+                            progress
+                                .failure()
+                                .unwrap_or_else(|| "the turn produced no reply".to_string()),
+                        );
+                    };
+
+                    // One chunk, not a stream: `Provider::chat` returns the
+                    // whole response at once, so there is nothing to stream,
+                    // and splitting it here would invent chunk boundaries the
+                    // model never produced. An empty reply is no chunk at all
+                    // rather than an empty one.
+                    if !reply.is_empty() {
+                        progress.notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                            ContentBlock::Text(TextContent::new(reply)),
+                        )));
+                    }
+                    responder.respond(PromptResponse::new(StopReason::EndTurn))
                 }
             },
             on_receive_request!(),
@@ -588,6 +758,229 @@ mod tests {
             profiles.get(session_id).map(String::as_str),
             Some("developer"),
             "session/new must pin the session to the token's room profile, got {profiles:?}"
+        );
+    }
+
+    fn prompt_request(id: i64, session_id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": text }]
+            }
+        })
+    }
+
+    /// initialize → session/new → session/prompt on ONE connection.
+    ///
+    /// Returns every `session/update` notification the turn emitted, in
+    /// arrival order, plus the whole JSON-RPC reply to the prompt (so a
+    /// caller can inspect either `result.stopReason` or `error`).
+    ///
+    /// `conversation` cannot be used here: it filters frames down to one
+    /// request id and would drop exactly the notifications under test,
+    /// turning a wrong ordering into a slow hang instead of a failure.
+    async fn drive(addr: &str, prompt: &str) -> (Vec<serde_json::Value>, serde_json::Value) {
+        let mut ws = connect(addr).await;
+        for request in [initialize_request(0), new_session_request(1)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        let mut session_id: Option<String> = None;
+        let mut updates = Vec::new();
+
+        loop {
+            let frame = next_frame(&mut ws).await;
+            let Message::Text(t) = frame else { continue };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+
+            if v["id"] == 1 {
+                let id = v["result"]["sessionId"]
+                    .as_str()
+                    .expect("sessionId present")
+                    .to_string();
+                session_id = Some(id.clone());
+                ws.send(Message::Text(
+                    prompt_request(2, &id, prompt).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            } else if v["method"] == "session/update" {
+                assert_eq!(
+                    v["params"]["sessionId"],
+                    *session_id.as_ref().expect("a session exists by now"),
+                    "an update must name the session it belongs to, got {v}"
+                );
+                updates.push(v["params"]["update"].clone());
+            } else if v["id"] == 2 {
+                return (updates, v);
+            }
+        }
+    }
+
+    /// `Provider::chat` returns a whole response, so the reply arrives as
+    /// exactly one `agent_message_chunk` — one, not zero, and not a faked
+    /// token stream.
+    #[tokio::test]
+    async fn prompt_answers_with_one_chunk_and_ends_the_turn() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![crate::provider::ChatResponse {
+                text: Some("hello from the agent".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let addr = spawn(state).await;
+        let (updates, reply) = drive(&addr, "hi").await;
+
+        let chunks: Vec<&str> = updates
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+            .map(|u| u["content"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(chunks, vec!["hello from the agent"], "got {updates:?}");
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
+    }
+
+    /// A prompt turn must land in the same session store as every other
+    /// transport: `session/prompt` delegates to `run_llm_turn`, so the
+    /// user message and the reply are in the session's history afterwards.
+    #[tokio::test]
+    async fn prompt_history_lands_in_the_shared_session_store() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![crate::provider::ChatResponse {
+                text: Some("hello from the agent".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let addr = spawn(Arc::clone(&state)).await;
+        drive(&addr, "hi").await;
+
+        let sessions = state.sessions.lock().await;
+        let (_id, history) = sessions
+            .iter()
+            .next()
+            .expect("the prompt turn created a session in the shared store");
+        let texts: Vec<&str> = history
+            .iter()
+            .filter_map(|m| match m.parts.first() {
+                Some(crate::provider::ContentPart::Text(t)) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["hi", "hello from the agent"], "got {texts:?}");
+    }
+
+    /// Tool progress is reported as it happens, so a tool call must reach
+    /// the client BEFORE the reply that depended on it — presence alone
+    /// would also pass if everything were flushed at the end of the turn.
+    #[tokio::test]
+    async fn tool_calls_are_reported_before_the_reply() {
+        // The fixture registers one tool named "echo"; script a turn that
+        // calls it and then answers.
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo".to_string(),
+                        input: serde_json::json!({ "text": "ping" }),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        let addr = spawn(state).await;
+        let (updates, reply) = drive(&addr, "use the tool").await;
+
+        let kinds: Vec<&str> = updates
+            .iter()
+            .map(|u| u["sessionUpdate"].as_str().unwrap())
+            .collect();
+        let started = kinds
+            .iter()
+            .position(|k| *k == "tool_call")
+            .unwrap_or_else(|| panic!("no tool_call update, got {kinds:?}"));
+        let completed = kinds
+            .iter()
+            .position(|k| *k == "tool_call_update")
+            .unwrap_or_else(|| panic!("no tool_call_update, got {kinds:?}"));
+        let first_chunk = kinds
+            .iter()
+            .position(|k| *k == "agent_message_chunk")
+            .unwrap_or_else(|| panic!("no agent_message_chunk, got {kinds:?}"));
+        assert!(
+            started < completed && completed < first_chunk,
+            "start then end then reply, got {kinds:?}"
+        );
+
+        // The provider's own tool-call id is what ACP's toolCallId carries,
+        // so a client can correlate the completion with the start.
+        assert_eq!(updates[started]["toolCallId"], "call-1");
+        assert_eq!(updates[started]["title"], "echo");
+        assert_eq!(updates[completed]["toolCallId"], "call-1");
+        assert_eq!(updates[completed]["status"], "completed");
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
+    }
+
+    /// A session id this connection never minted is answered — not queued
+    /// on the SDK's session-scoped retry, and not treated as a fresh
+    /// session.
+    #[tokio::test]
+    async fn prompt_for_an_unknown_session_is_an_error() {
+        let addr = spawn(ServeState::for_test(true)).await;
+        let responses = conversation(
+            &addr,
+            vec![
+                initialize_request(0),
+                prompt_request(1, "no-such-session", "hi"),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            responses[1]["error"]["code"], -32602,
+            "an unknown sessionId is a bad parameter, got {}",
+            responses[1]
+        );
+    }
+
+    /// A provider failure is a JSON-RPC error carrying the cause, not a
+    /// stop reason: none of ACP's stop reasons means "the agent broke",
+    /// and `refusal` would tell the user the agent declined.
+    #[tokio::test]
+    async fn a_provider_failure_answers_with_an_error_carrying_the_cause() {
+        // An empty script makes the stub provider fail the chat call.
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let addr = spawn(state).await;
+        let (updates, reply) = drive(&addr, "hi").await;
+
+        assert!(
+            !updates
+                .iter()
+                .any(|u| u["sessionUpdate"] == "agent_message_chunk"),
+            "a failed turn has no reply to send, got {updates:?}"
+        );
+        assert!(reply["result"].is_null(), "got {reply}");
+        assert_eq!(reply["error"]["code"], -32603, "got {reply}");
+        let data = reply["error"]["data"].as_str().unwrap_or_default();
+        assert!(
+            data.contains("script exhausted"),
+            "the error must carry the provider's cause, got {reply}"
         );
     }
 }

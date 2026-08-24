@@ -2146,6 +2146,43 @@ async fn generate_session_title(
 // place that knows how to build one without a real Anthropic API key.
 // ---------------------------------------------------------------------------
 
+/// The one tool the fixture advertises, so a scripted turn has something
+/// real to call: a turn whose tool call names a tool nobody registered
+/// would exercise `ToolSet`'s "Unknown tool" path instead of an execution.
+#[cfg(test)]
+pub(crate) struct EchoTool {
+    spec: crate::provider::ToolSpec,
+}
+
+#[cfg(test)]
+impl EchoTool {
+    pub(crate) fn new() -> Self {
+        Self {
+            spec: crate::provider::ToolSpec {
+                name: "echo".into(),
+                description: "Echo the given text back.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"]
+                }),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::tools::Tool for EchoTool {
+    fn spec(&self) -> &crate::provider::ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &Value) -> anyhow::Result<String> {
+        Ok(input["text"].as_str().unwrap_or_default().to_string())
+    }
+}
+
 /// Provider double for tests. In "scripted" mode it pops one
 /// [`crate::provider::ChatResponse`] off a queue per `chat()` call. In
 /// "hanging" mode `chat()` never resolves — used to keep a turn in
@@ -2288,7 +2325,7 @@ api_keys = ["sa-acp-token"]
                 base.join("workspace"),
                 crate::config::DigestConfig::default(),
             )),
-            tools: Arc::new(ToolSet::new(Vec::new(), Vec::new())),
+            tools: Arc::new(ToolSet::new(vec![Box::new(EchoTool::new())], Vec::new())),
             cross_device_session_store: Arc::new(SessionStore::new(base.join("sessions"), "rpc")),
             device_default_session_store: Arc::new(SessionStore::new(
                 base.join("device-default"),
