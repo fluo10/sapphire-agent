@@ -40,7 +40,7 @@ use axum::{Json, response::Response};
 use serde_json::{Value, json};
 use tracing::warn;
 
-use super::ServeState;
+use super::{ServeState, extract_bearer};
 use crate::provider::ChatMessage;
 use crate::session::ReportMeta;
 
@@ -586,20 +586,6 @@ fn optional_string_array(args: &Value, field: &str) -> Option<Vec<String>> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn extract_bearer(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(axum::http::header::AUTHORIZATION)?;
-    let s = value.to_str().ok()?;
-    let token = s
-        .strip_prefix("Bearer ")
-        .or_else(|| s.strip_prefix("bearer "))?;
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
 
 fn jsonrpc_result(id: Value, result: Value) -> Response {
     let body = json!({

@@ -35,7 +35,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use super::ServeState;
+use super::{ServeState, extract_bearer};
 use crate::provider::ChatMessage;
 
 /// Method name for the only A2A method we implement. The A2A v1 spec
@@ -365,20 +365,6 @@ async fn handle_send_message(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn extract_bearer(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(axum::http::header::AUTHORIZATION)?;
-    let s = value.to_str().ok()?;
-    let token = s
-        .strip_prefix("Bearer ")
-        .or_else(|| s.strip_prefix("bearer "))?;
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
 
 /// Extract text and inline images from `parts`. Returns
 /// `(joined_text, Vec<(media_type, base64)>)` on success.

@@ -436,13 +436,13 @@ async fn rpc_post(
     }
 }
 
-/// Extract a `Bearer <token>` from the `Authorization` header, trimming
-/// whitespace. Empty / malformed → `None`. Shared shape with
-/// `serve::a2a::extract_bearer` — same Authorization parsing rules so
-/// the three protocol endpoints stay symmetrical.
-fn extract_bearer(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(axum::http::header::AUTHORIZATION)?;
-    let s = value.to_str().ok()?;
+/// Extract a bearer token from an `Authorization` header.
+///
+/// Returns `None` when the header is absent, uses another scheme, or
+/// carries an empty token — every one of which the endpoints treat as
+/// "unauthenticated" rather than "malformed".
+pub(crate) fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+    let s = headers.get("authorization")?.to_str().ok()?;
     let token = s
         .strip_prefix("Bearer ")
         .or_else(|| s.strip_prefix("bearer "))?;
@@ -2142,5 +2142,29 @@ mod tests {
             _ => panic!("expected inserted Text part"),
         }
         assert!(matches!(labeled.parts[1], ContentPart::Image { .. }));
+    }
+
+    #[test]
+    fn extract_bearer_accepts_both_cases_and_trims() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("Bearer  tok-1 "));
+        assert_eq!(extract_bearer(&h), Some("tok-1".to_string()));
+
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("bearer tok-2"));
+        assert_eq!(extract_bearer(&h), Some("tok-2".to_string()));
+    }
+
+    #[test]
+    fn extract_bearer_rejects_missing_wrong_scheme_and_empty() {
+        assert_eq!(extract_bearer(&HeaderMap::new()), None);
+
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("Basic tok"));
+        assert_eq!(extract_bearer(&h), None);
+
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("Bearer   "));
+        assert_eq!(extract_bearer(&h), None);
     }
 }
