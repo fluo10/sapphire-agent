@@ -2190,47 +2190,59 @@ impl crate::tools::Tool for EchoTool {
 #[cfg(test)]
 pub(crate) struct StubProvider {
     script: Option<std::sync::Mutex<std::collections::VecDeque<crate::provider::ChatResponse>>>,
-    /// Only set in hanging mode. Flips to `true` once `chat()` has been
-    /// entered and is parked forever — see [`HangingChat::entered`].
-    hang_entered: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// Only set in hanging mode. Flips to `true` when an in-flight
-    /// `chat()` future is dropped (e.g. its task is aborted), so a
-    /// cancellation test can assert the turn was actually torn down
-    /// rather than merely observing that it never completed on its own.
-    hang_dropped: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Only set in hanging mode. Counts entries into the parked `chat()` —
+    /// see [`HangingChat::entered`].
+    hang_entered: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Only set in hanging mode. Counts in-flight `chat()` futures that were
+    /// dropped (e.g. their task was aborted), so a cancellation test can
+    /// assert the turn was actually torn down rather than merely observing
+    /// that it never completed on its own.
+    hang_dropped: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 /// The two observations a test can make about a hanging provider's
-/// `chat()` call.
+/// `chat()` calls.
 ///
 /// `entered` exists so a test never has to *guess* that a turn has reached
 /// the provider. Cancelling a turn that has not got that far yet drops a
-/// future that never built the guard, so `dropped` would stay false and the
+/// future that never built the guard, so `dropped` would stay behind and the
 /// assertion would be a coin toss; waiting for `entered` first makes it a
 /// fact.
+///
+/// Both are counters rather than flags because prompts on one ACP connection
+/// run concurrently: a test that opens two turns needs to wait for *both* to
+/// reach the provider, and to see both of them torn down.
 #[cfg(test)]
 pub(crate) struct HangingChat {
-    /// Set just before `chat()` parks forever, so a test can wait until a
-    /// turn is genuinely inside the provider before taking its connection
-    /// away.
-    pub(crate) entered: Arc<std::sync::atomic::AtomicBool>,
-    /// Set when that parked future is dropped: the proof that an abandoned
-    /// turn actually stopped calling the provider.
-    pub(crate) dropped: Arc<std::sync::atomic::AtomicBool>,
+    /// Incremented just before `chat()` parks forever, so a test can wait
+    /// until N turns are genuinely inside the provider before taking their
+    /// connection away.
+    pub(crate) entered: Arc<std::sync::atomic::AtomicUsize>,
+    /// Incremented when one of those parked futures is dropped: the proof
+    /// that an abandoned turn actually stopped calling the provider.
+    pub(crate) dropped: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(test)]
 impl HangingChat {
-    /// Wait for one of the flags, or fail with `what` naming the thing that
-    /// never happened.
-    pub(crate) async fn wait_for(flag: &std::sync::atomic::AtomicBool, what: &str) {
+    /// Wait until one of the counters reaches `at_least`, or fail with
+    /// `what` naming the thing that never happened.
+    pub(crate) async fn wait_for(
+        counter: &std::sync::atomic::AtomicUsize,
+        at_least: usize,
+        what: &str,
+    ) {
         let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            while counter.load(std::sync::atomic::Ordering::SeqCst) < at_least {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await;
-        assert!(waited.is_ok(), "timed out waiting for {what}");
+        assert!(
+            waited.is_ok(),
+            "timed out waiting for {what} (reached {}, wanted {at_least})",
+            counter.load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 }
 
@@ -2247,8 +2259,8 @@ impl StubProvider {
     /// A provider whose `chat()` never resolves. Returns the provider plus
     /// the flags described on [`HangingChat`].
     pub(crate) fn new_hanging() -> (Self, HangingChat) {
-        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         (
             Self {
                 script: None,
@@ -2277,10 +2289,10 @@ impl Provider for StubProvider {
             // Hold a guard whose Drop flips `hang_dropped` before awaiting
             // forever, so a caller that aborts this future (rather than
             // waiting for it) leaves proof behind.
-            struct DroppedFlag(Arc<std::sync::atomic::AtomicBool>);
+            struct DroppedFlag(Arc<std::sync::atomic::AtomicUsize>);
             impl Drop for DroppedFlag {
                 fn drop(&mut self) {
-                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }
             let flag = self
@@ -2293,8 +2305,8 @@ impl Provider for StubProvider {
             // fire.
             self.hang_entered
                 .as_ref()
-                .expect("hanging StubProvider always carries an entry flag")
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+                .expect("hanging StubProvider always carries an entry counter")
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::future::pending::<()>().await;
             unreachable!()
         };
@@ -2518,12 +2530,14 @@ mod tests {
         tokio::task::yield_now().await;
         handle.abort();
         let _ = handle.await;
-        assert!(
+        assert_eq!(
             hanging.entered.load(std::sync::atomic::Ordering::SeqCst),
+            1,
             "expected the chat() call to have parked before it was aborted"
         );
-        assert!(
+        assert_eq!(
             hanging.dropped.load(std::sync::atomic::Ordering::SeqCst),
+            1,
             "expected the in-flight chat() future's drop guard to fire on abort"
         );
     }

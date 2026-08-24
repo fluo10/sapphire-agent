@@ -77,14 +77,26 @@ struct AcpSession {
     /// client-side terminals (`terminal/create`); until then it is inert.
     #[allow(dead_code)]
     cwd: PathBuf,
-    /// Cancellation for the turn this session is *currently* running.
+    /// Cancellation tokens for the turns *currently in flight* on this
+    /// session, keyed by their connection-wide turn number.
     ///
-    /// Replaced with a fresh token by every `session/prompt` rather than
-    /// created once with the session: a `CancellationToken` stays cancelled
-    /// for good, so reusing one would make every prompt after a cancel come
-    /// straight back as `cancelled`. Each is a child of the connection's
+    /// Every live turn, not just the newest. Prompts on one connection run
+    /// concurrently (see the `session/prompt` handler), so a client can have
+    /// two turns open on one session, and `session/cancel` is scoped to the
+    /// session rather than to a request — the schema calls it "ongoing
+    /// operations for a session". Keeping only the latest token would leave
+    /// an older turn calling the provider until the connection died and then
+    /// answering `EndTurn`, and `Cancelled` is a MUST.
+    ///
+    /// A fresh token per turn rather than one per session, because a
+    /// `CancellationToken` stays cancelled for good: reusing one would make
+    /// every prompt after a cancel come straight back as `cancelled` without
+    /// the provider ever being called. Each is a child of the connection's
     /// token, which is how one vanished client stops every turn at once.
-    turn_cancel: CancellationToken,
+    ///
+    /// Entries are removed by the turn that owns them, so this holds only
+    /// turns that are still running.
+    turns: HashMap<u64, CancellationToken>,
 }
 
 /// Sessions live for the lifetime of one ACP connection: a `HashMap` behind
@@ -93,6 +105,10 @@ struct AcpSession {
 #[derive(Default)]
 struct AcpSessions {
     inner: tokio::sync::Mutex<HashMap<SessionId, AcpSession>>,
+    /// Hands every turn on this connection a number, so a turn that finishes
+    /// can remove exactly its own token — `CancellationToken` has no identity
+    /// to match on, and "the newest" is not the answer once turns overlap.
+    next_turn: std::sync::atomic::AtomicU64,
 }
 
 /// Reports one prompt turn's progress to an ACP client as `session/update`
@@ -250,9 +266,8 @@ pub async fn handle_acp_ws(
 /// frame is followed by the end of the stream, which is what actually ends
 /// the connection.
 ///
-/// `connection_cancel` is cancelled when this socket stops delivering frames.
-/// The socket going quiet is the only news a turn in flight ever gets that
-/// nobody is listening any more, and this is the earliest place it is known.
+/// `connection_cancel` is cancelled when this socket stops delivering
+/// frames — see [`cancel_when_exhausted`].
 fn lines_transport(
     socket: WebSocket,
     connection_cancel: CancellationToken,
@@ -277,20 +292,40 @@ fn lines_transport(
         }
     });
 
-    // The cancellation rides in the stream's own state as a drop guard, so it
-    // fires on every way out — clean EOF, a close frame, or a transport error
-    // — without a branch per case.
-    //
-    // It has to live here rather than after `connect_to` returns: that call
-    // cannot return while a spawned turn is still running, because the turn
-    // keeps the SDK's task actor alive. Cancelling there would be waiting on
-    // the very thing the cancellation exists to stop.
-    let incoming = futures_util::stream::unfold(
-        (Box::pin(frames), connection_cancel.drop_guard()),
-        |(mut frames, guard)| async move { frames.next().await.map(|item| (item, (frames, guard))) },
-    );
+    Lines::new(outgoing, cancel_when_exhausted(frames, connection_cancel))
+}
 
-    Lines::new(outgoing, incoming)
+/// Cancel `token` as soon as `frames` stops producing items.
+///
+/// This is *not* what keeps a turn from outliving its connection — the SDK
+/// already does that. `Builder::connect_to` runs `incoming_closed()` then
+/// `drain_outgoing()` as the foreground of the connection future
+/// (`jsonrpc.rs:1602-1611`), with the task actor as the background; when the
+/// foreground finishes the background is dropped, taking every spawned turn
+/// with it. Cancelling after `connect_to` returns would be redundant, not too
+/// late.
+///
+/// What this adds is *timing*. The guard fires at EOF, which is before the
+/// drain — and a client that has gone away without reading can hold the drain
+/// up indefinitely by backpressuring the outgoing sink. Until the drain
+/// finishes, a turn would otherwise still be calling the provider.
+///
+/// The token rides in the stream's own state as a `DropGuard`: `Unfold` drops
+/// the completed step future, and with it the guard, at the poll that observes
+/// `None`. On the error path the item is `Some(Err(_))` and the state is
+/// retained, so there the guard fires only when the SDK drops the stream while
+/// failing its actors — same outcome, different mechanism.
+fn cancel_when_exhausted<S>(
+    frames: S,
+    token: CancellationToken,
+) -> impl futures_util::Stream<Item = S::Item> + Send + 'static
+where
+    S: futures_util::Stream + Send + 'static,
+{
+    futures_util::stream::unfold(
+        (Box::pin(frames), token.drop_guard()),
+        |(mut frames, guard)| async move { frames.next().await.map(|item| (item, (frames, guard))) },
+    )
 }
 
 /// Drive one ACP connection until the peer goes away.
@@ -349,7 +384,6 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                 let sessions = Arc::clone(&sessions);
                 let state = Arc::clone(&state);
                 let profile_name = profile_name.clone();
-                let connection_cancel = connection_cancel.clone();
                 async move |req: NewSessionRequest, responder, _connection| {
                     // Mint the agent-side session id the same way a
                     // brand-new `/rpc` session gets one in `handle_initialize`
@@ -373,10 +407,9 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         AcpSession {
                             agent_session_id,
                             cwd: req.cwd.clone(),
-                            // A placeholder until the first prompt replaces
-                            // it: nothing is running yet, so cancelling this
-                            // one fires at nothing.
-                            turn_cancel: connection_cancel.child_token(),
+                            // No turn is running yet, so there is nothing for
+                            // a `session/cancel` to reach.
+                            turns: HashMap::new(),
                         },
                     );
 
@@ -389,13 +422,22 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
             {
                 let sessions = Arc::clone(&sessions);
                 async move |notif: CancelNotification, _connection: ConnectionTo<Client>| {
-                    // Cancelling a session with no turn running is not an
-                    // error — the client may simply have raced the reply —
-                    // so the token is fired and nothing more is said. An
-                    // unknown session is a different thing, and a
-                    // notification has no way to report it but the log.
+                    // *Every* turn on the session, not the newest one: the
+                    // notification names a session, and the schema scopes it
+                    // to that session's "ongoing operations" — plural, which
+                    // concurrent prompts make reachable.
+                    //
+                    // A session with nothing running is not an error; the
+                    // client may simply have raced the reply, and the empty
+                    // map makes that a no-op. An unknown session is a
+                    // different thing, and a notification has no way to
+                    // report it but the log.
                     match sessions.inner.lock().await.get(&notif.session_id) {
-                        Some(session) => session.turn_cancel.cancel(),
+                        Some(session) => {
+                            for turn in session.turns.values() {
+                                turn.cancel();
+                            }
+                        }
                         None => warn!(
                             "ACP: session/cancel named a session this connection never \
                              minted: {}",
@@ -413,17 +455,18 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                 let state = Arc::clone(&state);
                 let connection_cancel = connection_cancel.clone();
                 async move |req: PromptRequest, responder, connection: ConnectionTo<Client>| {
-                    // Mint this turn's cancellation token in the same lock
-                    // that resolves the session, so `session/cancel` can only
-                    // ever see the token of a turn that has already started.
+                    // Register this turn's cancellation token in the same
+                    // lock that resolves the session, so a `session/cancel`
+                    // arriving after this point cannot miss it.
+                    let turn = sessions
+                        .next_turn
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let looked_up = {
-                        let mut sessions = sessions.inner.lock().await;
-                        sessions.get_mut(&req.session_id).map(|session| {
-                            session.turn_cancel = connection_cancel.child_token();
-                            (
-                                session.agent_session_id.clone(),
-                                session.turn_cancel.clone(),
-                            )
+                        let mut guard = sessions.inner.lock().await;
+                        guard.get_mut(&req.session_id).map(|session| {
+                            let turn_cancel = connection_cancel.child_token();
+                            session.turns.insert(turn, turn_cancel.clone());
+                            (session.agent_session_id.clone(), turn_cancel)
                         })
                     };
                     let Some((agent_session_id, turn_cancel)) = looked_up else {
@@ -509,6 +552,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     // another.
                     connection.spawn({
                         let state = Arc::clone(&state);
+                        let sessions = Arc::clone(&sessions);
                         async move {
                             // Bound to a `let` on purpose: that drops the
                             // losing branch's future here, before the answer
@@ -533,6 +577,18 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                                     None,
                                 ) => TurnEnd::Ran(outcome),
                             };
+
+                            // This turn is no longer an "ongoing operation",
+                            // so drop its token: a later `session/cancel`
+                            // should not have to fire at turns that have
+                            // already answered, and a long-lived session must
+                            // not accumulate one token per prompt it ever
+                            // received. The local clone above still works, so
+                            // the reply paths below are unaffected.
+                            if let Some(session) = sessions.inner.lock().await.get_mut(&session_id)
+                            {
+                                session.turns.remove(&turn);
+                            }
 
                             let TurnEnd::Ran(outcome) = end else {
                                 return answered(
@@ -595,12 +651,12 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
         .connect_to(lines_transport(socket, connection_cancel.clone()))
         .await;
 
-    // A backstop, not the mechanism. The transport's drop guard has already
-    // fired by the time this line runs — `connect_to` cannot return while a
-    // turn is still in flight, because the turn's task keeps the SDK's task
-    // actor alive, so waiting until here to cancel would be waiting on the
-    // very thing being cancelled. This covers the connection ending for some
-    // reason other than the socket.
+    // Belt and braces, and known to be so. By the time this runs the socket
+    // has gone, so `cancel_when_exhausted` has already fired the token, and
+    // the SDK has dropped the task actor holding any turn along with it. It
+    // is kept because it states the connection's contract where a reader
+    // looks for it, and costs one atomic on a path that runs once per
+    // connection.
     connection_cancel.cancel();
 
     // Name the profile on the way out as well as the way in: with several
@@ -1327,7 +1383,7 @@ mod tests {
         // Cancelling before the turn reaches the provider would prove
         // nothing about tearing a live call down, so wait for it to get
         // there first.
-        HangingChat::wait_for(&hanging.entered, "the turn to reach the provider").await;
+        HangingChat::wait_for(&hanging.entered, 1, "the turn to reach the provider").await;
 
         ws.send(Message::Text(
             cancel_notification(&session_id).to_string().into(),
@@ -1348,8 +1404,9 @@ mod tests {
 
         // The stop reason alone would also be satisfied by a handler that
         // answers `cancelled` and leaves the turn running.
-        assert!(
+        assert_eq!(
             hanging.dropped.load(std::sync::atomic::Ordering::SeqCst),
+            1,
             "the provider call outlived the cancellation it reported"
         );
     }
@@ -1358,38 +1415,135 @@ mod tests {
     /// calling a provider with nobody listening spends money and can still
     /// write to the workspace.
     ///
-    /// The assertion is the hanging provider's drop flag, not the server's
+    /// The assertion is the hanging provider's drop counter, not the server's
     /// liveness: a test that merely reconnects and finds the server healthy
-    /// passes whether or not any of this wiring exists.
+    /// passes whether or not the turn is still burning tokens.
     async fn assert_a_disconnect_stops_the_turn(say_goodbye: bool) {
         let (state, hanging) = ServeState::for_test_hanging(true);
         let addr = spawn(state).await;
         let (mut ws, _session_id) = prompt_in_flight(&addr).await;
 
-        HangingChat::wait_for(&hanging.entered, "the turn to reach the provider").await;
+        HangingChat::wait_for(&hanging.entered, 1, "the turn to reach the provider").await;
         if say_goodbye {
             ws.send(Message::Close(None)).await.unwrap();
         }
         drop(ws);
 
-        HangingChat::wait_for(&hanging.dropped, "the turn to stop after the client left").await;
+        HangingChat::wait_for(
+            &hanging.dropped,
+            1,
+            "the turn to stop after the client left",
+        )
+        .await;
     }
 
-    /// The polite exit — the one an editor actually performs on quit — and
-    /// the one that needs this task's wiring. A close frame ends the incoming
-    /// stream *successfully*, so nothing in the SDK fails and nothing tears
-    /// the turn down; only the connection's own cancellation reaches it.
+    /// The polite exit — the one an editor performs on quit.
+    ///
+    /// Neither this nor its rude sibling isolates *our* cancellation: both
+    /// were measured passing with `cancel_when_exhausted`'s guard removed,
+    /// because the SDK tears the turn down on its own either way (a clean EOF
+    /// finishes `connect_to`'s foreground and drops the task actor; an
+    /// abrupt one fails the actors outright). They pin the observable
+    /// contract — a client that leaves stops paying for a turn — and
+    /// `the_transport_cancels_when_the_frame_stream_ends` pins the mechanism
+    /// this module adds on top.
     #[tokio::test]
     async fn a_closing_client_stops_an_in_flight_turn() {
         assert_a_disconnect_stops_the_turn(true).await;
     }
 
-    /// The rude exit: a client whose process died. This one is torn down
-    /// twice over — the transport error fails the SDK's actors, which drops
-    /// everything they own — so it would pass without any cancellation at
-    /// all. It is here to keep that second belt from being the only one.
+    /// The rude exit: a client whose process died.
     #[tokio::test]
     async fn a_vanishing_client_stops_an_in_flight_turn() {
         assert_a_disconnect_stops_the_turn(false).await;
+    }
+
+    /// The connection's cancellation must fire the moment the socket stops
+    /// producing frames.
+    ///
+    /// Tested directly on [`cancel_when_exhausted`] rather than through a
+    /// live connection, because an end-to-end test cannot tell this guard
+    /// apart from the SDK's own teardown: at EOF `connect_to`'s foreground
+    /// (`incoming_closed` then `drain_outgoing`) finishes and the task actor
+    /// holding the turn is dropped with it, so a turn stops either way. What
+    /// only the guard gives is the *timing* — before the drain, which a
+    /// client that has stopped reading can hold up indefinitely.
+    #[tokio::test]
+    async fn the_transport_cancels_when_the_frame_stream_ends() {
+        let cancel = CancellationToken::new();
+        let mut frames = Box::pin(cancel_when_exhausted(
+            futures_util::stream::iter(vec!["{}".to_string()]),
+            cancel.clone(),
+        ));
+
+        assert_eq!(frames.next().await.as_deref(), Some("{}"));
+        assert!(
+            !cancel.is_cancelled(),
+            "a connection still delivering frames must not be cancelled"
+        );
+
+        assert!(frames.next().await.is_none(), "the stream ends here");
+        assert!(
+            cancel.is_cancelled(),
+            "the end of the frame stream must cancel the connection's turns"
+        );
+    }
+
+    /// `session/cancel` names a *session*, not a request — the schema scopes
+    /// it to "ongoing operations for a session" — and prompts on one
+    /// connection now run concurrently, so a session can have two turns open
+    /// at once. Both must answer `cancelled`.
+    ///
+    /// Keeping only the newest turn's token would leave the older one calling
+    /// the provider until the connection died, and then answering `end_turn`:
+    /// the one path in this design where a cancelled turn does not report
+    /// `Cancelled`, which the schema makes a MUST.
+    #[tokio::test]
+    async fn session_cancel_ends_every_turn_on_the_session() {
+        let (state, hanging) = ServeState::for_test_hanging(true);
+        let addr = spawn(state).await;
+        // Leaves prompt id 2 in flight.
+        let (mut ws, session_id) = prompt_in_flight(&addr).await;
+        HangingChat::wait_for(&hanging.entered, 1, "the first turn to reach the provider").await;
+
+        // A second prompt on the SAME session while the first still runs.
+        ws.send(Message::Text(
+            prompt_request(3, &session_id, text_prompt("hang as well"))
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        HangingChat::wait_for(&hanging.entered, 2, "the second turn to reach the provider").await;
+
+        // One cancel, naming the session both turns belong to.
+        ws.send(Message::Text(
+            cancel_notification(&session_id).to_string().into(),
+        ))
+        .await
+        .unwrap();
+
+        let mut cancelled = Vec::new();
+        while cancelled.len() < 2 {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 2 || v["id"] == 3 {
+                assert_eq!(
+                    v["result"]["stopReason"], "cancelled",
+                    "every turn on a cancelled session answers cancelled, got {v}"
+                );
+                cancelled.push(v["id"].clone());
+            }
+        }
+        cancelled.sort_by_key(|id| id.as_i64().unwrap_or_default());
+        assert_eq!(cancelled, vec![serde_json::json!(2), serde_json::json!(3)]);
+
+        assert_eq!(
+            hanging.dropped.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both provider calls must be abandoned, not just the newest"
+        );
     }
 }
