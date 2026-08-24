@@ -20,6 +20,7 @@
 //! `method not found`.
 
 use super::{ServeState, extract_bearer};
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{AgentCapabilities, InitializeRequest, InitializeResponse};
 use agent_client_protocol::{Agent, Lines, on_receive_request};
 use axum::extract::State;
@@ -102,20 +103,24 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
         .name("sapphire-agent")
         .on_receive_request(
             async move |req: InitializeRequest, responder, _connection| {
-                // Echo the version the client asked for. Note this does NOT
-                // clamp: this build only implements v1, so a client asking
-                // for anything else is told it got what it asked for. Echoing
-                // is what the plan specifies. What Zed actually negotiates is
-                // still unobserved here — the smoke test against a real Zed
-                // is outstanding. If it sends anything but 1, this needs to
-                // clamp to `min(requested, V1)` instead.
+                // Answer with the version we will actually speak: the lower of
+                // what the client asked for and the highest this build
+                // implements. Echoing the request back unclamped would tell a
+                // v2 client it got v2, after which it sends v2-shaped traffic
+                // nothing here understands. `ProtocolVersion` derives `Ord`
+                // over its `u16`, so this is the schema's own ordering.
                 //
+                // `V1`, not `LATEST`: this is a claim about what *this* code
+                // implements, and `LATEST` would silently start claiming v2
+                // the day the SDK promotes it.
+                let version = req.protocol_version.min(ProtocolVersion::V1);
+
                 // `loadSession` is false because `session/load` is not
                 // implemented. `authMethods` is empty because the bearer token
                 // checked above already authenticated the peer, so ACP never
                 // sees an unauthenticated client.
                 responder.respond(
-                    InitializeResponse::new(req.protocol_version)
+                    InitializeResponse::new(version)
                         .agent_capabilities(AgentCapabilities::new().load_session(false)),
                 )
             },
@@ -196,12 +201,17 @@ mod tests {
     }
 
     pub(super) fn initialize_request(id: i64) -> serde_json::Value {
+        initialize_request_asking_for(id, 1)
+    }
+
+    /// An `initialize` that asks for a specific protocol version.
+    fn initialize_request_asking_for(id: i64, protocol_version: u16) -> serde_json::Value {
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "initialize",
             "params": {
-                "protocolVersion": 1,
+                "protocolVersion": protocol_version,
                 "clientCapabilities": {
                     "fs": { "readTextFile": true, "writeTextFile": true },
                     "terminal": true
@@ -283,6 +293,23 @@ mod tests {
             serde_json::json!([]),
             "auth already happened at the HTTP layer"
         );
+    }
+
+    /// A client offering a version this build does not implement must be told
+    /// v1 — the version we will actually speak — not handed its own request
+    /// back. Answering "2" to a v2 client makes it send v2-shaped traffic that
+    /// nothing here understands, and the failure surfaces far from its cause.
+    #[tokio::test]
+    async fn a_newer_client_is_negotiated_down_to_v1() {
+        let addr = spawn(ServeState::for_test(true)).await;
+
+        for asked in [2u16, 99] {
+            let resp = roundtrip(&addr, initialize_request_asking_for(0, asked)).await;
+            assert_eq!(
+                resp["result"]["protocolVersion"], 1,
+                "asked for {asked}, must be negotiated down to v1, got {resp}"
+            );
+        }
     }
 
     #[tokio::test]
