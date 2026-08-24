@@ -2,6 +2,13 @@
 
 Date: 2026-08-24
 
+> **Implemented.** Four places below stated a design that implementation
+> replaced with something else, once the code was actually written; each is
+> corrected in place, marked **Correction (implementation):**, rather than
+> silently rewritten. `src/serve/acp.rs`'s module doc is the authoritative
+> record of what was actually built; this spec is the record of what was
+> planned.
+
 ## Context
 
 Phase 5a of `docs/superpowers/specs/2026-08-20-zed-acp-remote-workspace-roadmap.md`.
@@ -75,6 +82,31 @@ as everything else, with the same memory and the same system prompt.
 
 This is the whole reason the endpoint is worth building: getting a *different* agent in Zed
 would have been easy and useless.
+
+> **Correction (implementation):** the prompt is not `ContentBlock::Text`
+> alone. `ResourceLink` is ungated by the ACP schema — "All agents MUST
+> support resource links in prompts" — and Zed sends one for every `@file`
+> mention, so dropping it would silently lose part of every such prompt.
+> The implementation folds each `ResourceLink` into the prompt text by name
+> and URI (this build cannot open the client-side file yet — that is phase
+> 5b) rather than discarding it. `Image`, `Audio` and plain `Resource`
+> blocks are still dropped, logged, because `initialize` advertises no
+> prompt capabilities for them and they should not arrive.
+
+### Prompt concurrency, as a consequence of cancellation
+
+Not anticipated here, and worth recording because it changes what "one session" means:
+prompts on one ACP connection run **concurrently**, not one after another.
+
+This falls out of the cancellation design, not a deliberate choice to allow concurrent
+prompts. Handlers registered against the SDK's dispatch loop run *inside* it, which parses no
+further frame on the connection until a handler returns; awaiting a turn to completion inside
+the `session/prompt` handler would make the `session/cancel` meant to stop that very turn
+unreadable until after the turn had already finished. So the handler spawns the turn
+(`ConnectionTo::spawn`) and returns immediately, freeing the dispatch loop to read the next
+frame — including a second `session/prompt` before the first has answered. A session therefore
+tracks *every* in-flight turn's cancellation token, not just the newest, and `session/cancel`
+fires all of them.
 
 ### Turn progress is decoupled from SSE
 
@@ -197,6 +229,14 @@ stream feeds it directly. Which protocol version is negotiated depends on the Ze
 use, and `initialize` negotiates it — the implementation plan's first task is an end-to-end
 smoke test against the installed Zed to pin that down before anything else is built on it.
 
+> **Correction (implementation):** `initialize` does not echo the client's
+> requested version, and no smoke test gated this. It answers with the
+> client's version only when that version is in an explicit supported set
+> (today just `V1`), and otherwise with the highest version this build
+> implements (also `V1` today). Echoing would tell a v2 client it got v2
+> service when only v1 exists; the explicit set keeps that claim honest as
+> versions accumulate, without needing a live Zed to settle it.
+
 ## Error handling
 
 | Case | Behaviour |
@@ -210,6 +250,15 @@ smoke test against the installed Zed to pin that down before anything else is bu
 | Client disconnects mid-turn | Cancel the in-flight turn. A tool loop that keeps calling a provider with nobody listening spends money and can still write to the workspace |
 | `MAX_TOOL_ROUNDS` exhausted | End the turn with the corresponding ACP stop reason rather than a protocol error |
 | Provider error | Same — a failed turn is a turn outcome, not a transport failure |
+
+> **Correction (implementation):** there is no "method before `initialize`"
+> row in practice, because there is no ordering gate to violate it. The SDK
+> models no connection state, and nothing in this agent conditions a
+> capability on `initialize` having happened first. A request naming an
+> unimplemented or unknown method gets JSON-RPC `-32601` (method not found)
+> whether it arrives before or after `initialize` — the same answer either
+> way, for the same reason (the method simply isn't registered), not because
+> ordering was checked and rejected.
 
 ## Testing
 
@@ -226,6 +275,15 @@ smoke test against the installed Zed to pin that down before anything else is bu
   `tool_end` sequence for the same script. This is what protects the `TurnProgress` refactor.
 - **Manual smoke test** — real Zed, real `websocat`, against a dev instance. This is the only
   way to learn what Zed actually advertises and negotiates, and it gates the phase.
+
+> **Correction (implementation):** this did not gate the phase. The manual
+> smoke test was descoped from the implementation plan's final task — driving
+> a real Zed UI is outside what an agent running the plan can do — so the
+> phase shipped on the automated tests alone, and version negotiation was
+> settled by the explicit-supported-set design above instead of by observing
+> a real client. The roadmap
+> (`docs/superpowers/specs/2026-08-20-zed-acp-remote-workspace-roadmap.md`,
+> phase 5a) records the smoke test as still outstanding.
 
 ## Out of scope
 

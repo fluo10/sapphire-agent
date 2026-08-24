@@ -148,15 +148,23 @@ is no second host to share settings with — but the work is nearly complete, it
 allowlist is the trust boundary phase 4 would need, and phase 5a reuses the
 same host-local-by-default reasoning for the ACP endpoint's own settings.
 
-### 5a. ACP WebSocket transport and adapter — next
+### 5a. ACP WebSocket transport and adapter — done
 
 A `/acp` WebSocket endpoint on the existing axum listener, bearer-authenticated
 through `Config::resolve_a2a_token` as `/a2a` and `/mcp` already are, driving an
 ACP adapter over the agent's **existing** tools.
 
-Done, Zed can hold a conversation with the production agent against the
-production memory and session store. Independently valuable and independently
-testable.
+Zed can hold a conversation with the production agent against the production
+memory and session store. Independently valuable and independently testable.
+
+**The real-Zed smoke test remains outstanding.** The endpoint is covered by
+automated tests (framing, auth, `initialize` / `session/new` /
+`session/prompt` / `session/cancel`), but has not been driven end-to-end from
+an actual Zed install — nobody has confirmed what Zed actually sends for
+`protocolVersion` and `clientCapabilities`, or watched a real multi-turn
+conversation, a real cancellation, or a real dropped connection. Treat that as
+unverified until someone runs it; do not assume phase 5b's foundations were
+exercised against a real client just because the phase is marked done.
 
 Spec: `docs/superpowers/specs/2026-08-24-acp-websocket-transport-design.md`.
 

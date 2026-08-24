@@ -4,10 +4,10 @@
 //!           GET  /rpc  (Phase 2: server→client SSE push, currently 405)
 //!           POST /a2a  (Agent2Agent Protocol; gated by [a2a].enabled)
 //!           GET  /.well-known/agent-card.json
+//!           POST /mcp  (MCP server; write_report / recall_memory tools)
+//!           GET  /acp  (Agent Client Protocol over WebSocket; gated by [acp].enabled)
 //!
-//! Session management uses a `Session-Id` request/response header. The
-//! `/mcp` endpoint is reserved for the future MCP server (issue #80,
-//! #79) and is intentionally not served here.
+//! Session management uses a `Session-Id` request/response header.
 
 pub mod a2a;
 pub mod acp;
