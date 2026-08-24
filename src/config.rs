@@ -1463,12 +1463,23 @@ impl Config {
     }
 }
 
+/// Parse a TOML string into a [`Config`]. Test-only; shared by `mod
+/// tests` below and by fixtures elsewhere in the crate (e.g.
+/// `ServeState::build_for_test` in `src/serve/mod.rs`) that need a
+/// minimal, hand-written config without going through a file on disk.
+#[cfg(test)]
+impl Config {
+    pub(crate) fn parse_for_test(s: &str) -> Config {
+        toml::from_str(s).expect("config should parse")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parse(s: &str) -> Config {
-        toml::from_str(s).expect("config should parse")
+        Config::parse_for_test(s)
     }
 
     const MINIMAL: &str = r#"

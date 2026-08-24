@@ -144,6 +144,24 @@ impl ProviderRegistry {
     }
 }
 
+/// Registry holding exactly one provider, registered under every name in
+/// `names`. Test-only: `from_config` always builds a real Anthropic
+/// provider, so fixtures that want to script replies need a way to install
+/// a stub in its place — including under the built-in `"anthropic"` key,
+/// since `ServeState::provider_for_session` falls back to the background
+/// provider (which resolves `"anthropic"` when no `[profiles.background]`
+/// is configured).
+#[cfg(test)]
+impl ProviderRegistry {
+    pub(crate) fn for_test(names: &[&str], provider: Arc<dyn Provider>) -> Self {
+        let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        for name in names {
+            providers.insert(name.to_string(), Arc::clone(&provider));
+        }
+        Self { providers }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

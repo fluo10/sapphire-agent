@@ -2080,6 +2080,173 @@ async fn generate_session_title(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Test fixtures — ServeState backed by a scripted / hanging stub provider.
+// Every endpoint/turn test elsewhere needs a ServeState; this is the one
+// place that knows how to build one without a real Anthropic API key.
+// ---------------------------------------------------------------------------
+
+/// Provider double for tests. In "scripted" mode it pops one
+/// [`crate::provider::ChatResponse`] off a queue per `chat()` call. In
+/// "hanging" mode `chat()` never resolves — used to keep a turn in
+/// flight while a cancellation test races it.
+#[cfg(test)]
+pub(crate) struct StubProvider {
+    script: Option<std::sync::Mutex<std::collections::VecDeque<crate::provider::ChatResponse>>>,
+    /// Only set in hanging mode. Flips to `true` when an in-flight
+    /// `chat()` future is dropped (e.g. its task is aborted), so a
+    /// cancellation test can assert the turn was actually torn down
+    /// rather than merely observing that it never completed on its own.
+    hang_dropped: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+#[cfg(test)]
+impl StubProvider {
+    pub(crate) fn new(responses: Vec<crate::provider::ChatResponse>) -> Self {
+        Self {
+            script: Some(std::sync::Mutex::new(responses.into())),
+            hang_dropped: None,
+        }
+    }
+
+    /// A provider whose `chat()` never resolves. Returns the provider
+    /// plus the flag described on [`StubProvider::hang_dropped`].
+    pub(crate) fn new_hanging() -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            Self {
+                script: None,
+                hang_dropped: Some(Arc::clone(&flag)),
+            },
+            flag,
+        )
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Provider for StubProvider {
+    fn name(&self) -> &str {
+        "stub"
+    }
+
+    async fn chat(
+        &self,
+        _system: Option<&str>,
+        _messages: &[ChatMessage],
+        _tools: Option<&[crate::provider::ToolSpec]>,
+    ) -> anyhow::Result<crate::provider::ChatResponse> {
+        let Some(script) = &self.script else {
+            // Hold a guard whose Drop flips `hang_dropped` before awaiting
+            // forever, so a caller that aborts this future (rather than
+            // waiting for it) leaves proof behind.
+            struct DroppedFlag(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for DroppedFlag {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let flag = self
+                .hang_dropped
+                .clone()
+                .expect("hanging StubProvider always carries a drop flag");
+            let _guard = DroppedFlag(flag);
+            std::future::pending::<()>().await;
+            unreachable!()
+        };
+        let next = script.lock().unwrap().pop_front();
+        next.ok_or_else(|| anyhow::anyhow!("StubProvider script exhausted"))
+    }
+}
+
+#[cfg(test)]
+impl ServeState {
+    /// State backed by temp directories and a stub provider that answers "ok".
+    pub(crate) fn for_test(acp_enabled: bool) -> Arc<Self> {
+        Self::for_test_scripted(
+            acp_enabled,
+            vec![crate::provider::ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        )
+    }
+
+    pub(crate) fn for_test_scripted(
+        acp_enabled: bool,
+        responses: Vec<crate::provider::ChatResponse>,
+    ) -> Arc<Self> {
+        Self::build_for_test(acp_enabled, StubProvider::new(responses))
+    }
+
+    /// State whose provider never returns, so a turn stays in flight.
+    /// The returned flag flips to `true` once the in-flight `chat()`
+    /// future is dropped — see [`StubProvider::new_hanging`].
+    pub(crate) fn for_test_hanging(
+        acp_enabled: bool,
+    ) -> (Arc<Self>, Arc<std::sync::atomic::AtomicBool>) {
+        let (provider, dropped) = StubProvider::new_hanging();
+        (Self::build_for_test(acp_enabled, provider), dropped)
+    }
+
+    fn build_for_test(acp_enabled: bool, provider: StubProvider) -> Arc<Self> {
+        // Leak the TempDir guard on purpose: this is a test binary and the
+        // OS reclaims the directory when it exits.
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let base = dir.path().to_path_buf();
+
+        let mut config = Config::parse_for_test(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.dev]
+provider = "stub"
+
+[room_profile.developer]
+profile  = "dev"
+rooms    = []
+api_keys = ["sa-acp-token"]
+"#,
+        );
+        config.acp = Some(crate::config::AcpConfig {
+            enabled: acp_enabled,
+        });
+
+        // Registered under both names: `provider_for_session` falls
+        // through to the background provider when no room_profile is
+        // pinned (as in the fixture_state_serves_the_scripted_provider
+        // test above, which looks up an unpinned session), and the
+        // background provider resolves the built-in "anthropic" key.
+        let registry = ProviderRegistry::for_test(&["anthropic", "stub"], Arc::new(provider));
+
+        Arc::new(Self {
+            config,
+            registry: Arc::new(registry),
+            workspace: Arc::new(Workspace::new(
+                base.join("workspace"),
+                crate::config::DigestConfig::default(),
+            )),
+            tools: Arc::new(ToolSet::new(Vec::new(), Vec::new())),
+            cross_device_session_store: Arc::new(SessionStore::new(base.join("sessions"), "rpc")),
+            device_default_session_store: Arc::new(SessionStore::new(
+                base.join("device-default"),
+                "device-default",
+            )),
+            mcp_session_store: Arc::new(SessionStore::new(base.join("mcp"), "mcp")),
+            mcp_project_index: Default::default(),
+            sessions: Default::default(),
+            pending_sessions: Default::default(),
+            session_room_profiles: Default::default(),
+            session_room_metadata: Default::default(),
+            voice: None,
+            image_cache: None,
+            voice_subscribers: Default::default(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2166,5 +2333,52 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("authorization", HeaderValue::from_static("Bearer   "));
         assert_eq!(extract_bearer(&h), None);
+    }
+
+    #[tokio::test]
+    async fn fixture_state_serves_the_scripted_provider() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![crate::provider::ChatResponse {
+                text: Some("scripted reply".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let provider = state.provider_for_session("no-such-session").await;
+        let resp = provider
+            .chat(None, &[ChatMessage::user("hi")], None)
+            .await
+            .unwrap();
+        assert_eq!(resp.text.as_deref(), Some("scripted reply"));
+    }
+
+    #[tokio::test]
+    async fn fixture_state_resolves_the_test_token() {
+        let state = ServeState::for_test(true);
+        assert_eq!(
+            state.config.resolve_a2a_token("sa-acp-token"),
+            Some("developer")
+        );
+        assert_eq!(state.config.resolve_a2a_token("sa-wrong"), None);
+    }
+
+    #[tokio::test]
+    async fn hanging_provider_sets_the_drop_flag_when_its_chat_future_is_aborted() {
+        let (state, dropped) = ServeState::for_test_hanging(true);
+        let handle = tokio::spawn(async move {
+            let provider = state.provider_for_session("no-such-session").await;
+            let _ = provider.chat(None, &[ChatMessage::user("hi")], None).await;
+        });
+        // Give the spawned task a chance to actually enter `chat()` and
+        // start awaiting `pending::<()>()` before we abort it — otherwise
+        // we might cancel it before the guard is ever constructed.
+        tokio::task::yield_now().await;
+        handle.abort();
+        let _ = handle.await;
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "expected the in-flight chat() future's drop guard to fire on abort"
+        );
     }
 }
