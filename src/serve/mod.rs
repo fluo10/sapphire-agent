@@ -1263,8 +1263,7 @@ async fn run_voice_turn_from_text_sse(
         Arc::clone(&state),
         session_id.clone(),
         ChatMessage::user_voice(&user_text),
-        req_id.clone(),
-        tx.clone(),
+        Arc::new(SseProgress::new(tx.clone(), req_id.clone())),
         device_id
             .clone()
             .map(|d| crate::timer::TimerOrigin::Voice { device_id: d }),
@@ -1482,10 +1481,8 @@ pub(crate) async fn push_voice_text_to_subscriber(
         })
         .await;
 
-    // LLM turn (no SSE response channel — discard tool_start/tool_end
-    // notifications by draining the sink in a background task).
-    let (sink_tx, mut sink_rx) = mpsc::channel::<Result<Event, Infallible>>(32);
-    let drain_handle = tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+    // LLM turn (no SSE response channel — nobody watches this
+    // heartbeat-injected turn's tool_start/tool_end progress).
     // Heartbeat-injected user line — synthesised by the timer pipeline,
     // not authored by a human, so no input modality applies.
     let injected_msg = ChatMessage {
@@ -1498,14 +1495,12 @@ pub(crate) async fn push_voice_text_to_subscriber(
         Arc::clone(&state),
         session_id.clone(),
         injected_msg,
-        Value::Null,
-        sink_tx,
+        Arc::new(NullProgress),
         Some(crate::timer::TimerOrigin::Voice {
             device_id: device_id.clone(),
         }),
     )
     .await;
-    drain_handle.abort();
     let reply_text = match outcome.text {
         Some(t) => t,
         None => {
@@ -1601,8 +1596,88 @@ fn apply_input_kind_label(mut msg: ChatMessage) -> ChatMessage {
     msg
 }
 
+/// Where a turn reports its per-tool progress.
+///
+/// `run_llm_turn` is the shared executor behind `/rpc`, the voice pipeline,
+/// A2A, and (from Task 8) the ACP endpoint — but each caller wants its
+/// `tool_start`/`tool_end`/error notifications shaped differently: `/rpc`
+/// and voice relay them as JSON-RPC notifications over SSE, ACP will need
+/// them as `session/update` notifications instead, and some callers (voice
+/// heartbeats, A2A) don't surface intermediate progress at all. Putting
+/// reporting behind this trait keeps the turn executor itself agnostic to
+/// which of those shapes (if any) is listening.
+#[async_trait::async_trait]
+pub(crate) trait TurnProgress: Send + Sync {
+    async fn tool_start(&self, id: &str, name: &str);
+    async fn tool_end(&self, id: &str, name: &str);
+    async fn turn_error(&self, message: &str);
+}
+
+/// Builds the `{id, name}` params shared by the `tool_start`/`tool_end`
+/// wire notifications. Pulled out so tests can pin the field names
+/// directly without inspecting an opaque SSE `Event`.
+pub(crate) fn tool_event_params(id: &str, name: &str) -> Value {
+    json!({ "id": id, "name": name })
+}
+
+/// The `/rpc` and voice shape: JSON-RPC notifications (and, on provider
+/// failure, a JSON-RPC error) delivered over the SSE channel — exactly
+/// what `run_llm_turn` used to emit inline before progress reporting moved
+/// behind [`TurnProgress`].
+pub(crate) struct SseProgress {
+    tx: mpsc::Sender<Result<Event, Infallible>>,
+    req_id: Value,
+}
+
+impl SseProgress {
+    pub(crate) fn new(tx: mpsc::Sender<Result<Event, Infallible>>, req_id: Value) -> Self {
+        Self { tx, req_id }
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnProgress for SseProgress {
+    async fn tool_start(&self, id: &str, name: &str) {
+        let _ = self
+            .tx
+            .send(Ok(notification_event(
+                "tool_start",
+                tool_event_params(id, name),
+            )))
+            .await;
+    }
+
+    async fn tool_end(&self, id: &str, name: &str) {
+        let _ = self
+            .tx
+            .send(Ok(notification_event(
+                "tool_end",
+                tool_event_params(id, name),
+            )))
+            .await;
+    }
+
+    async fn turn_error(&self, message: &str) {
+        let _ = self
+            .tx
+            .send(Ok(error_event(&self.req_id, -32603, message)))
+            .await;
+    }
+}
+
+/// Discard progress. Used by callers that drive a turn to completion with
+/// nobody watching intermediate events (voice heartbeats, A2A v1).
+pub(crate) struct NullProgress;
+
+#[async_trait::async_trait]
+impl TurnProgress for NullProgress {
+    async fn tool_start(&self, _id: &str, _name: &str) {}
+    async fn tool_end(&self, _id: &str, _name: &str) {}
+    async fn turn_error(&self, _message: &str) {}
+}
+
 /// Outcome of [`run_llm_turn`].
-struct LlmTurnOutcome {
+pub(crate) struct LlmTurnOutcome {
     /// Final assistant text, when the turn completed successfully. `None`
     /// on provider error or when MAX_TOOL_ROUNDS was hit without resolving.
     text: Option<String>,
@@ -1613,25 +1688,17 @@ struct LlmTurnOutcome {
 
 /// Execute one full LLM turn for an established session: hydrate history,
 /// run the tool-calling loop, persist user + assistant messages to JSONL,
-/// and emit per-tool `tool_start` / `tool_end` SSE notifications. Does NOT
-/// send the final JSON-RPC result event — the caller is responsible for
-/// shaping the final payload (text reply, voice audio, etc.) and emitting
-/// the appropriate result event.
-async fn run_llm_turn(
+/// and report per-tool `tool_start` / `tool_end` progress through
+/// `progress`. Does NOT send the final JSON-RPC result event — the caller
+/// is responsible for shaping the final payload (text reply, voice audio,
+/// etc.) and emitting the appropriate result event.
+pub(crate) async fn run_llm_turn(
     state: Arc<ServeState>,
     session_id: String,
     user_msg: ChatMessage,
-    req_id: Value,
-    tx: mpsc::Sender<Result<Event, Infallible>>,
+    progress: Arc<dyn TurnProgress>,
     timer_origin: Option<crate::timer::TimerOrigin>,
 ) -> LlmTurnOutcome {
-    let send = |evt: Event| {
-        let tx = tx.clone();
-        async move {
-            let _ = tx.send(Ok(evt)).await;
-        }
-    };
-
     // Pick the right store up front so every persistence call in this
     // turn lands in the same place (device-default vs cross-device).
     let store = Arc::clone(state.store_for_session(&session_id));
@@ -1762,7 +1829,7 @@ async fn run_llm_turn(
         match response {
             Err(e) => {
                 error!("Provider error: {e:#}");
-                send(error_event(&req_id, -32603, &e.to_string())).await;
+                progress.turn_error(&e.to_string()).await;
                 break None;
             }
             Ok(resp) if !resp.has_tool_calls() => {
@@ -1791,11 +1858,7 @@ async fn run_llm_turn(
 
                 // Notify client of each tool starting
                 for call in &tool_calls {
-                    send(notification_event(
-                        "tool_start",
-                        json!({ "id": call.id, "name": call.name }),
-                    ))
-                    .await;
+                    progress.tool_start(&call.id, &call.name).await;
                 }
 
                 // Execute all tools concurrently — each call wrapped in
@@ -1830,11 +1893,7 @@ async fn run_llm_turn(
 
                 // Notify client of each tool completing
                 for call in &tool_calls {
-                    send(notification_event(
-                        "tool_end",
-                        json!({ "id": call.id, "name": call.name }),
-                    ))
-                    .await;
+                    progress.tool_end(&call.id, &call.name).await;
                 }
 
                 let mut text_results = Vec::with_capacity(results.len());
@@ -1889,8 +1948,7 @@ async fn run_turn(
         Arc::clone(&state),
         session_id.clone(),
         ChatMessage::user(&user_message),
-        req_id.clone(),
-        tx.clone(),
+        Arc::new(SseProgress::new(tx.clone(), req_id.clone())),
         None,
     )
     .await;
@@ -2382,5 +2440,57 @@ mod tests {
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "expected the in-flight chat() future's drop guard to fire on abort"
         );
+    }
+
+    #[test]
+    fn tool_event_params_pins_the_wire_field_names() {
+        assert_eq!(
+            tool_event_params("call-1", "recall"),
+            json!({ "id": "call-1", "name": "recall" })
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_progress_emits_one_event_per_call() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let progress = SseProgress::new(tx, json!(7));
+
+        progress.tool_start("call-1", "recall").await;
+        progress.tool_end("call-1", "recall").await;
+        drop(progress);
+
+        let mut seen = Vec::new();
+        while let Some(item) = rx.recv().await {
+            seen.push(item);
+        }
+        assert_eq!(seen.len(), 2, "one event per call");
+        assert!(seen[0].is_ok());
+        assert!(seen[1].is_ok());
+    }
+
+    #[tokio::test]
+    async fn sse_progress_turn_error_emits_one_event() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let progress = SseProgress::new(tx, json!(7));
+
+        progress.turn_error("provider exploded").await;
+        drop(progress);
+
+        let mut seen = Vec::new();
+        while let Some(item) = rx.recv().await {
+            seen.push(item);
+        }
+        assert_eq!(seen.len(), 1, "one event for the error");
+        assert!(seen[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn null_progress_discards_without_panicking_and_sends_nothing() {
+        // NullProgress holds no channel to observe directly, so the
+        // absence of a panic across all three methods is the assertion.
+        let progress = NullProgress;
+        progress.tool_start("recall", "call-1").await;
+        progress.tool_end("recall", "call-1").await;
+        progress.turn_error("ignored").await;
     }
 }
