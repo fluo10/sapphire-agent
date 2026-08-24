@@ -94,26 +94,41 @@ fn lines_transport(
 
 /// Drive one ACP connection until the peer goes away.
 async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_name: String) {
-    // `initialize` needs neither, but the session methods added by the next
-    // tasks need both, so they stay plumbed through.
-    let _ = (&state, &profile_name);
+    // `initialize` does not need it, but the session methods added by the
+    // next tasks do, so it stays plumbed through.
+    let _ = &state;
 
     let result = Agent
         .builder()
         .name("sapphire-agent")
         .on_receive_request(
             async move |req: InitializeRequest, responder, _connection| {
-                // Answer with the version we will actually speak: the lower of
-                // what the client asked for and the highest this build
-                // implements. Echoing the request back unclamped would tell a
-                // v2 client it got v2, after which it sends v2-shaped traffic
-                // nothing here understands. `ProtocolVersion` derives `Ord`
-                // over its `u16`, so this is the schema's own ordering.
+                // Answer with the version we will actually speak, which the
+                // schema defines as the client's version if we support it and
+                // otherwise the highest we do (`version.rs:26-32`). Handing
+                // the request back unchanged lies in both directions: a v2
+                // client told "2" sends v2-shaped traffic nothing here
+                // understands, and a v0 client told "0" is the same lie at the
+                // other end — v0 being a pre-release the schema documents as
+                // one to treat as unsupported.
+                //
+                // An explicit supported set rather than a clamp: with one
+                // version implemented the correct answer is `V1` for every
+                // input, and this keeps saying what we actually support as
+                // versions accumulate, instead of silently claiming each new
+                // gap in the range.
                 //
                 // `V1`, not `LATEST`: this is a claim about what *this* code
-                // implements, and `LATEST` would silently start claiming v2
-                // the day the SDK promotes it.
-                let version = req.protocol_version.min(ProtocolVersion::V1);
+                // implements. `LATEST` means "newest stable the SDK knows of"
+                // and would resume telling exactly this lie the day the SDK
+                // promotes v2 (it is cfg-gated off when `unstable_protocol_v2`
+                // is enabled, precisely so that choice stays explicit).
+                const SUPPORTED: [ProtocolVersion; 1] = [ProtocolVersion::V1];
+                let version = if SUPPORTED.contains(&req.protocol_version) {
+                    req.protocol_version
+                } else {
+                    ProtocolVersion::V1
+                };
 
                 // `loadSession` is false because `session/load` is not
                 // implemented. `authMethods` is empty because the bearer token
@@ -129,10 +144,13 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
         .connect_to(lines_transport(socket))
         .await;
 
+    // Name the profile on the way out as well as the way in: with several
+    // editors connected under different profiles, a bare "connection closed"
+    // cannot be matched to the connection it belongs to.
     if let Err(e) = result {
-        warn!("ACP: connection ended with an error: {e}");
+        warn!("ACP: connection for room profile '{profile_name}' ended with an error: {e}");
     } else {
-        info!("ACP: connection closed");
+        info!("ACP: connection for room profile '{profile_name}' closed");
     }
 }
 
@@ -297,17 +315,20 @@ mod tests {
 
     /// A client offering a version this build does not implement must be told
     /// v1 — the version we will actually speak — not handed its own request
-    /// back. Answering "2" to a v2 client makes it send v2-shaped traffic that
-    /// nothing here understands, and the failure surfaces far from its cause.
+    /// back. That holds in both directions: answering "2" to a v2 client makes
+    /// it send v2-shaped traffic nothing here understands, and answering "0"
+    /// to a v0 client is the same lie at the other end of the range. v0 is a
+    /// pre-release the schema documents as unsupported, and this build does
+    /// not implement it either.
     #[tokio::test]
-    async fn a_newer_client_is_negotiated_down_to_v1() {
+    async fn unsupported_versions_are_negotiated_to_v1() {
         let addr = spawn(ServeState::for_test(true)).await;
 
-        for asked in [2u16, 99] {
+        for asked in [0u16, 2, 99] {
             let resp = roundtrip(&addr, initialize_request_asking_for(0, asked)).await;
             assert_eq!(
                 resp["result"]["protocolVersion"], 1,
-                "asked for {asked}, must be negotiated down to v1, got {resp}"
+                "asked for {asked}, must be negotiated to v1, got {resp}"
             );
         }
     }
@@ -409,6 +430,36 @@ mod tests {
                 }
                 Message::Ping(_) | Message::Pong(_) => continue,
                 other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+    }
+
+    /// The close arm of the frame filter, which every later task's connection
+    /// lifetime rests on. A close frame must let the incoming stream end so
+    /// the ACP connection finishes and the server drops its half — rather than
+    /// the filter swallowing it and leaving the connection task parked forever.
+    /// The 10s timeout is the real assertion here: a leak shows up as a hang.
+    #[tokio::test]
+    async fn a_close_frame_ends_the_connection() {
+        let addr = spawn(ServeState::for_test(true)).await;
+        let mut ws = connect(&addr).await;
+
+        ws.send(Message::Close(None)).await.unwrap();
+
+        loop {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+                .await
+                .expect("server still holding the connection open after a close frame");
+            match next {
+                // The server closed its side: what this test is for.
+                None => return,
+                // axum echoes the close frame back before closing.
+                Some(Ok(Message::Close(_))) => continue,
+                // A transport error also means the connection is gone. What
+                // this rules out is the server hanging on to it, not the
+                // niceties of the closing handshake.
+                Some(Err(_)) => return,
+                Some(Ok(other)) => panic!("unexpected frame after close: {other:?}"),
             }
         }
     }
