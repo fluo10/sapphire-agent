@@ -384,12 +384,9 @@ async fn main() -> Result<()> {
             // that starts but cannot authenticate, transcribe, or store
             // looks exactly like a broken device from the outside, and the
             // device has no way to tell you.
-            let ambient_runtime = ambient::startup::build(
-                &config,
-                &workspace_dir,
-                voice_providers.as_deref(),
-            )
-            .context("ambient audio ingest failed to start")?;
+            let ambient_runtime =
+                ambient::startup::build(&config, &workspace_dir, voice_providers.as_deref())
+                    .context("ambient audio ingest failed to start")?;
 
             // ── Image cache (workspace-external) ──────────────────────────
             // Resolves once at startup. A missing platform cache dir

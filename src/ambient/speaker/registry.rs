@@ -66,7 +66,11 @@ impl SpeakerRegistry {
             }
             let id = entry.file_name().to_string_lossy().into_owned();
             let mut vectors = Vec::new();
-            for file in std::fs::read_dir(entry.path()).into_iter().flatten().flatten() {
+            for file in std::fs::read_dir(entry.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
                 let path = file.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("wav") {
                     continue;
@@ -236,13 +240,9 @@ mod tests {
     #[test]
     fn matches_a_registered_speaker_above_the_threshold() {
         let (tmp, voices) = voices_with(&["me"]);
-        let mut reg = SpeakerRegistry::open(
-            voices,
-            tmp.path().join("emb"),
-            "test-model".into(),
-            0.55,
-        )
-        .unwrap();
+        let mut reg =
+            SpeakerRegistry::open(voices, tmp.path().join("emb"), "test-model".into(), 0.55)
+                .unwrap();
         reg.load_reference_audio(&FixedEmbedder::new(vec![1.0, 0.0, 0.0]))
             .unwrap();
 
@@ -254,13 +254,9 @@ mod tests {
     #[test]
     fn returns_none_below_the_threshold() {
         let (tmp, voices) = voices_with(&["me"]);
-        let mut reg = SpeakerRegistry::open(
-            voices,
-            tmp.path().join("emb"),
-            "test-model".into(),
-            0.55,
-        )
-        .unwrap();
+        let mut reg =
+            SpeakerRegistry::open(voices, tmp.path().join("emb"), "test-model".into(), 0.55)
+                .unwrap();
         reg.load_reference_audio(&FixedEmbedder::new(vec![1.0, 0.0, 0.0]))
             .unwrap();
         assert!(reg.match_speaker(&[0.0, 1.0, 0.0]).is_none());
@@ -269,13 +265,9 @@ mod tests {
     #[test]
     fn the_directory_name_is_the_speaker_id() {
         let (tmp, voices) = voices_with(&["blithe-otter-42"]);
-        let mut reg = SpeakerRegistry::open(
-            voices,
-            tmp.path().join("emb"),
-            "test-model".into(),
-            0.55,
-        )
-        .unwrap();
+        let mut reg =
+            SpeakerRegistry::open(voices, tmp.path().join("emb"), "test-model".into(), 0.55)
+                .unwrap();
         reg.load_reference_audio(&FixedEmbedder::new(vec![1.0, 0.0, 0.0]))
             .unwrap();
         assert_eq!(
@@ -313,13 +305,9 @@ mod tests {
         std::fs::create_dir_all(&broken).unwrap();
         std::fs::write(broken.join("sample.wav"), b"not a wav at all").unwrap();
 
-        let mut reg = SpeakerRegistry::open(
-            voices,
-            tmp.path().join("emb"),
-            "test-model".into(),
-            0.55,
-        )
-        .unwrap();
+        let mut reg =
+            SpeakerRegistry::open(voices, tmp.path().join("emb"), "test-model".into(), 0.55)
+                .unwrap();
         reg.load_reference_audio(&FixedEmbedder::new(vec![1.0, 0.0, 0.0]))
             .expect("load succeeds despite the broken speaker");
         assert_eq!(reg.match_speaker(&[1.0, 0.0, 0.0]).unwrap().id, "me");

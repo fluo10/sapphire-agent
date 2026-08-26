@@ -118,8 +118,9 @@ pub fn build(
     let cache =
         AudioCache::open(cache_root.join("audio")).context("opening ambient audio cache")?;
     let transcripts_dir = cache_root.join("transcripts");
-    let worker_transcripts = TranscriptStore::open(transcripts_dir.clone(), config.day_boundary_hour)
-        .context("opening ambient transcript store")?;
+    let worker_transcripts =
+        TranscriptStore::open(transcripts_dir.clone(), config.day_boundary_hour)
+            .context("opening ambient transcript store")?;
     let tool_transcripts = TranscriptStore::open(transcripts_dir, config.day_boundary_hour)
         .context("opening ambient transcript store (tools)")?;
 
@@ -235,7 +236,9 @@ mod tests {
         let missing = tmp.path().join("keys.toml");
         cfg.keys.file = Some(missing.clone());
 
-        let err = build(&cfg, tmp.path(), None).err().expect("expected an error");
+        let err = build(&cfg, tmp.path(), None)
+            .err()
+            .expect("expected an error");
         let msg = format!("{err:#}");
         assert!(
             msg.contains(&missing.display().to_string()),
@@ -260,7 +263,9 @@ mod tests {
         // No `voice` registry at all — indistinguishable, from `build`'s
         // point of view, from one that exists but never configured a
         // `[stt_provider.nonexistent]` block.
-        let err = build(&cfg, tmp.path(), None).err().expect("expected an error");
+        let err = build(&cfg, tmp.path(), None)
+            .err()
+            .expect("expected an error");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("nonexistent"),
@@ -294,7 +299,9 @@ mod tests {
         cfg.keys.file = Some(key_path);
 
         let voice = crate::voice::VoiceProviders::from_config(&cfg).unwrap();
-        let err = build(&cfg, tmp.path(), Some(&voice)).err().expect("expected an error");
+        let err = build(&cfg, tmp.path(), Some(&voice))
+            .err()
+            .expect("expected an error");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("voice-sherpa"),

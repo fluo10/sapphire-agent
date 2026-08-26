@@ -158,7 +158,11 @@ mod tests {
         store.append(&r).unwrap();
 
         let got = store
-            .read(at - chrono::Duration::hours(1), at + chrono::Duration::hours(1), None)
+            .read(
+                at - chrono::Duration::hours(1),
+                at + chrono::Duration::hours(1),
+                None,
+            )
             .unwrap();
         assert_eq!(got, vec![r]);
     }
@@ -171,7 +175,9 @@ mod tests {
         let local = chrono::Local
             .with_ymd_and_hms(2026, 8, 27, 2, 0, 0)
             .unwrap();
-        store.append(&rec(local.with_timezone(&Utc), None, "late night")).unwrap();
+        store
+            .append(&rec(local.with_timezone(&Utc), None, "late night"))
+            .unwrap();
 
         let files: Vec<String> = std::fs::read_dir(tmp.path())
             .unwrap()
@@ -187,14 +193,22 @@ mod tests {
         let base = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
         store.append(&rec(base, Some("me"), "mine")).unwrap();
         store
-            .append(&rec(base + chrono::Duration::minutes(1), Some("tanaka-san"), "theirs"))
+            .append(&rec(
+                base + chrono::Duration::minutes(1),
+                Some("tanaka-san"),
+                "theirs",
+            ))
             .unwrap();
         store
             .append(&rec(base + chrono::Duration::hours(5), Some("me"), "later"))
             .unwrap();
 
         let mine = store
-            .read(base - chrono::Duration::hours(1), base + chrono::Duration::hours(1), Some("me"))
+            .read(
+                base - chrono::Duration::hours(1),
+                base + chrono::Duration::hours(1),
+                Some("me"),
+            )
             .unwrap();
         assert_eq!(mine.len(), 1, "speaker filter and range both applied");
         assert_eq!(mine[0].text, "mine");
@@ -210,7 +224,11 @@ mod tests {
         store.append(&rec(day1, Some("me"), "first")).unwrap();
 
         let all = store
-            .read(day1 - chrono::Duration::days(1), day2 + chrono::Duration::days(1), None)
+            .read(
+                day1 - chrono::Duration::days(1),
+                day2 + chrono::Duration::days(1),
+                None,
+            )
             .unwrap();
         let texts: Vec<&str> = all.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(texts, vec!["first", "second"], "sorted by started_at");
@@ -228,10 +246,18 @@ mod tests {
         store.append(&rec(earlier, Some("me"), "earlier")).unwrap();
 
         let got = store
-            .read(base - chrono::Duration::hours(1), base + chrono::Duration::hours(1), None)
+            .read(
+                base - chrono::Duration::hours(1),
+                base + chrono::Duration::hours(1),
+                None,
+            )
             .unwrap();
         let texts: Vec<&str> = got.iter().map(|r| r.text.as_str()).collect();
-        assert_eq!(texts, vec!["earlier", "later"], "sorted by started_at within one file");
+        assert_eq!(
+            texts,
+            vec!["earlier", "later"],
+            "sorted by started_at within one file"
+        );
     }
 
     #[test]
@@ -246,7 +272,11 @@ mod tests {
         std::fs::write(&day_file, body).unwrap();
 
         let got = store
-            .read(at - chrono::Duration::hours(1), at + chrono::Duration::hours(1), None)
+            .read(
+                at - chrono::Duration::hours(1),
+                at + chrono::Duration::hours(1),
+                None,
+            )
             .unwrap();
         assert_eq!(got.len(), 1);
     }

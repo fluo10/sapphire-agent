@@ -196,7 +196,11 @@ mod tests {
 
         let ida = model_id_for(&a).unwrap();
         assert_eq!(ida, model_id_for(&b).unwrap(), "same bytes, same id");
-        assert_ne!(ida, model_id_for(&c).unwrap(), "different bytes, different id");
+        assert_ne!(
+            ida,
+            model_id_for(&c).unwrap(),
+            "different bytes, different id"
+        );
         assert_eq!(ida.len(), 16, "short enough to read in a filename");
         assert!(ida.chars().all(|c| c.is_ascii_hexdigit()));
     }

@@ -66,10 +66,8 @@ impl Worker {
             .transcribe(&gated.pcm, self.language.as_deref())
             .await?;
 
-        let day = local_date_for_timestamp(
-            seg.started_at.with_timezone(&Local),
-            self.day_boundary_hour,
-        );
+        let day =
+            local_date_for_timestamp(seg.started_at.with_timezone(&Local), self.day_boundary_hour);
 
         let (speaker, speaker_score) = if gated.speech_ms < self.min_embed_ms {
             // Embeddings from very short utterances are unreliable, and
@@ -257,7 +255,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_silence_only_segment_produces_no_transcript() {
-        let mut h = harness(Box::new(SilentGate), Box::new(FixedEmbedder::new(vec![1.0, 0.0])), &[]);
+        let mut h = harness(
+            Box::new(SilentGate),
+            Box::new(FixedEmbedder::new(vec![1.0, 0.0])),
+            &[],
+        );
         let out = h.worker.process(seg(16_000, false)).await.unwrap();
         assert!(out.is_none(), "re-gate found no speech");
     }
@@ -302,7 +304,11 @@ mod tests {
         // `<`, so this boundary must still be attributed, not excluded.
         let rec = h.worker.process(seg(24_000, true)).await.unwrap().unwrap();
         assert_eq!(rec.speech_ms, 1500);
-        assert_eq!(rec.speaker.as_deref(), Some("me"), "at the boundary, not below it");
+        assert_eq!(
+            rec.speaker.as_deref(),
+            Some("me"),
+            "at the boundary, not below it"
+        );
     }
 
     #[tokio::test]
@@ -366,7 +372,11 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert_eq!(promoted.len(), 1, "80s over two days clears both thresholds");
+        assert_eq!(
+            promoted.len(),
+            1,
+            "80s over two days clears both thresholds"
+        );
         assert!(promoted[0].path().join("clip.wav").exists());
     }
 }

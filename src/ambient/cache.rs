@@ -118,7 +118,8 @@ mod tests {
         let stale = cache.put(b"stale").unwrap();
 
         // Backdate one blob by ten days.
-        let ten_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86400);
+        let ten_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86400);
         filetime::set_file_mtime(
             tmp.path().join(&stale),
             filetime::FileTime::from_system_time(ten_days_ago),

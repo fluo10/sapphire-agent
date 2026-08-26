@@ -2589,7 +2589,10 @@ embedding_num_threads = 4
 "#,
         )
         .unwrap();
-        assert_eq!(cfg.embedding_model_dir.as_deref(), Some("/models/3dspeaker"));
+        assert_eq!(
+            cfg.embedding_model_dir.as_deref(),
+            Some("/models/3dspeaker")
+        );
         assert_eq!(cfg.vad_model_dir.as_deref(), Some("/models/silero"));
         assert_eq!(cfg.vad_threshold, 0.6);
         assert_eq!(cfg.embedding_num_threads, 4);

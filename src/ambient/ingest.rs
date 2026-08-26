@@ -341,7 +341,10 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let seg = rx.try_recv().expect("segment enqueued");
         assert_eq!(seg.segment, "seg-1");
-        assert_eq!(seg.device, "pendant", "identity comes from the key, not the URL");
+        assert_eq!(
+            seg.device, "pendant",
+            "identity comes from the key, not the URL"
+        );
         assert!(seg.live);
         assert_eq!(seg.pcm.len(), 16_000);
         assert_eq!(
@@ -366,7 +369,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(res.status(), StatusCode::OK, "replay is normal, not an error");
+            assert_eq!(
+                res.status(),
+                StatusCode::OK,
+                "replay is normal, not an error"
+            );
         }
         assert!(rx.try_recv().is_ok(), "first delivery enqueued");
         assert!(rx.try_recv().is_err(), "duplicate not enqueued twice");
@@ -536,11 +543,13 @@ mod tests {
         let body = wav_bytes(16, &[0i16; 1_600]);
         let res = app
             .oneshot(
-                Request::post("/audio/ingest?segment=seg-wav&started_at=1787000000000&rate=16000&live=0")
-                    .header("authorization", "Bearer sa-dev-good")
-                    .header("content-type", "audio/wav")
-                    .body(Body::from(body))
-                    .unwrap(),
+                Request::post(
+                    "/audio/ingest?segment=seg-wav&started_at=1787000000000&rate=16000&live=0",
+                )
+                .header("authorization", "Bearer sa-dev-good")
+                .header("content-type", "audio/wav")
+                .body(Body::from(body))
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -560,11 +569,13 @@ mod tests {
         let body = wav_bytes(8, &[0i16; 1_600]);
         let res = app
             .oneshot(
-                Request::post("/audio/ingest?segment=seg-wav8&started_at=1787000000000&rate=16000&live=0")
-                    .header("authorization", "Bearer sa-dev-good")
-                    .header("content-type", "audio/wav")
-                    .body(Body::from(body))
-                    .unwrap(),
+                Request::post(
+                    "/audio/ingest?segment=seg-wav8&started_at=1787000000000&rate=16000&live=0",
+                )
+                .header("authorization", "Bearer sa-dev-good")
+                .header("content-type", "audio/wav")
+                .body(Body::from(body))
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -588,7 +599,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["device"], "pendant");
         assert_eq!(v["sample_rate"], 16000);

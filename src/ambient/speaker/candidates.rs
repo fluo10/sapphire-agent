@@ -56,8 +56,7 @@ pub struct CandidateStore {
 impl CandidateStore {
     /// Open the store, loading every candidate already on disk.
     pub fn open(dir: PathBuf) -> Result<Self> {
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating candidate dir {dir:?}"))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating candidate dir {dir:?}"))?;
         let mut candidates = HashMap::new();
         for entry in std::fs::read_dir(&dir)?.flatten() {
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -160,8 +159,7 @@ impl CandidateStore {
     /// a passing greeting heard twice.
     pub fn is_promotable(&self, id: &str, after_seconds: u32, after_days: u32) -> bool {
         self.candidates.get(id).is_some_and(|c| {
-            c.stats.speech_seconds >= after_seconds
-                && c.stats.days_seen.len() as u32 >= after_days
+            c.stats.speech_seconds >= after_seconds && c.stats.days_seen.len() as u32 >= after_days
         })
     }
 
@@ -182,8 +180,7 @@ impl CandidateStore {
         // `voices_dir` is ours to create; canonicalise it once so the
         // eventual write always lands on a fully resolved, symlink-free
         // root rather than whatever relative form the caller passed in.
-        std::fs::create_dir_all(voices_dir)
-            .with_context(|| format!("creating {voices_dir:?}"))?;
+        std::fs::create_dir_all(voices_dir).with_context(|| format!("creating {voices_dir:?}"))?;
         let voices_root = voices_dir
             .canonicalize()
             .with_context(|| format!("resolving {voices_dir:?}"))?;
@@ -214,10 +211,8 @@ impl CandidateStore {
         let target = voices_root.join(&dir_name);
 
         let target_existed = target.exists();
-        std::fs::create_dir_all(&target)
-            .with_context(|| format!("creating {target:?}"))?;
-        if let Err(e) = std::fs::copy(self.dir.join(id).join("clip.wav"), target.join("clip.wav"))
-        {
+        std::fs::create_dir_all(&target).with_context(|| format!("creating {target:?}"))?;
+        if let Err(e) = std::fs::copy(self.dir.join(id).join("clip.wav"), target.join("clip.wav")) {
             // Don't leave a stray, empty directory ahead of a promotion
             // that did not actually happen -- but only if this call is
             // the one that just created it; a pre-existing target (an
@@ -302,8 +297,20 @@ mod tests {
             .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 1_000, "hello")
             .unwrap();
         assert!(!id.is_empty());
-        assert!(tmp.path().join("candidates").join(&id).join("clip.wav").exists());
-        assert!(tmp.path().join("candidates").join(&id).join("stats.json").exists());
+        assert!(
+            tmp.path()
+                .join("candidates")
+                .join(&id)
+                .join("clip.wav")
+                .exists()
+        );
+        assert!(
+            tmp.path()
+                .join("candidates")
+                .join(&id)
+                .join("stats.json")
+                .exists()
+        );
 
         // Reload from disk: candidates survive a restart.
         let reloaded = CandidateStore::open(tmp.path().join("candidates")).unwrap();
@@ -327,7 +334,9 @@ mod tests {
         let id = store
             .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 30_000, "a")
             .unwrap();
-        store.observe(&id, &[1.0, 0.0], day(27), 30_000, "b").unwrap();
+        store
+            .observe(&id, &[1.0, 0.0], day(27), 30_000, "b")
+            .unwrap();
         assert!(store.is_promotable(&id, 60, 2));
     }
 
@@ -349,7 +358,9 @@ mod tests {
         let id = store
             .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 40_000, "a")
             .unwrap();
-        store.observe(&id, &[1.0, 0.0], day(26), 40_000, "b").unwrap();
+        store
+            .observe(&id, &[1.0, 0.0], day(26), 40_000, "b")
+            .unwrap();
         assert!(!store.is_promotable(&id, 60, 2), "still only one day seen");
     }
 
@@ -363,7 +374,10 @@ mod tests {
         let name = store.promote(&id, None, &voices).unwrap();
         assert_eq!(name, id, "no name given, so the grain-id is the directory");
         assert!(voices.join(&id).join("clip.wav").exists());
-        assert!(store.list().iter().all(|c| c.id != id), "promoted, so no longer a candidate");
+        assert!(
+            store.list().iter().all(|c| c.id != id),
+            "promoted, so no longer a candidate"
+        );
     }
 
     #[test]
@@ -385,7 +399,11 @@ mod tests {
         let id = store
             .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 60_000, "a")
             .unwrap();
-        assert!(store.promote(&id, Some("../../etc/passwd"), &voices).is_err());
+        assert!(
+            store
+                .promote(&id, Some("../../etc/passwd"), &voices)
+                .is_err()
+        );
         assert!(store.promote(&id, Some("has/slash"), &voices).is_err());
     }
 
@@ -399,8 +417,12 @@ mod tests {
         let id = store
             .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 10_000, "a")
             .unwrap();
-        store.observe(&id, &[1.0, 0.0], day(26), 10_000, "b").unwrap();
-        store.observe(&id, &[1.0, 0.0], day(26), 10_000, "c").unwrap();
+        store
+            .observe(&id, &[1.0, 0.0], day(26), 10_000, "b")
+            .unwrap();
+        store
+            .observe(&id, &[1.0, 0.0], day(26), 10_000, "c")
+            .unwrap();
 
         let reloaded = CandidateStore::open(tmp.path().join("candidates")).unwrap();
         let reloaded_candidate = reloaded.list().into_iter().find(|c| c.id == id).unwrap();
@@ -420,7 +442,11 @@ mod tests {
         let id = store
             .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 60_000, "a")
             .unwrap();
-        assert!(store.promote(&id, Some("..\\..\\etc\\passwd"), &voices).is_err());
+        assert!(
+            store
+                .promote(&id, Some("..\\..\\etc\\passwd"), &voices)
+                .is_err()
+        );
         assert!(store.promote(&id, Some("has\\backslash"), &voices).is_err());
     }
 
