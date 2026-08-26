@@ -302,7 +302,8 @@ ambient/
     candidates/<grain-id>/
       centroid.emb                  # running mean embedding
       clip.wav                      # representative clip, exported on promotion
-      stats.json                    # cumulative speech seconds, days seen, first seen
+      stats.json                    # cumulative speech_ms, days seen, first seen,
+                                    # observation count, embedding model id
 ```
 
 A transcript line:
@@ -343,15 +344,45 @@ workspace", because it is input I curate, not derived data:
 ```text
 voices/
   me/                *.wav
-  agent/             *.wav    # samples of the agent's own TTS
+  agent/             *.wav          # samples of the agent's own TTS
   tanaka-san/        *.wav
-  blithe-otter-42/   clip.wav # auto-promoted; rename to finish registering
+  blithe-otter-42/   <grain-id>.wav # auto-promoted; rename to finish registering
+                     id             # the speaker id, so the rename is safe
 ```
 
-The directory name is both the speaker id and the display name. Embeddings are keyed
-by (reference file sha256 × model id) in the cache, so renaming triggers no
-recomputation, and **changing the embedding model recomputes automatically** — no
-model-dependent data lives in the workspace.
+The directory name is the **display name**. The speaker **id** — the value
+transcripts record — comes from the one-line `id` marker file when there is one, and
+otherwise from the directory name.
+
+That separation is what makes the rename transparency above actually hold, and the
+first draft of this spec got it wrong: it claimed the property was covered
+structurally *because* the directory name is the id and transcripts store ids. Those
+two facts give the opposite result. If the directory name **is** the id, renaming the
+directory **changes** the id: `transcript_read(speaker="tanaka-san")` returns nothing
+recorded before the rename, and nothing links the two ids.
+`speaker_promote(id, Some("tanaka-san"))` is worse — it forks the identity mid-run,
+because the live registry and every past transcript still say `blithe-otter-42` while
+`voices/tanaka-san/` now exists.
+
+So promotion writes the candidate's grain-id into the marker, and names it copies the
+clip `<grain-id>.wav` rather than `clip.wav`: a fixed filename made
+`speaker_promote(id, name="me")` — which is exactly what the model does when the user
+says "that was me" — a destructive overwrite of curated reference audio. Since the
+registry averages every `*.wav` in the directory, a unique name turns promoting into
+an existing speaker into a **merge**. When the target directory already existed, its
+own name is written as the first (canonical) marker line, because transcripts may
+already say `me`; the promoted grain-id joins as an alias and both resolve to the
+same display name.
+
+A directory created by hand (`me/`, `agent/`) has no marker and keeps using its
+directory name as its id — correct, since nothing referred to it before.
+
+Embeddings are keyed by (reference file sha256 × model id) in the cache, so renaming
+triggers no recomputation, and **changing the embedding model recomputes
+automatically** — no model-dependent data lives in the workspace. Candidate
+centroids have no such key, so their `stats.json` carries the `model_id` it was
+computed under; after a model swap those candidates are ignored (and left on disk,
+not deleted) rather than matched against from a different embedding space.
 
 ### Why candidates are not written straight to the workspace
 

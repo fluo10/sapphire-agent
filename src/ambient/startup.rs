@@ -140,8 +140,15 @@ pub fn build(
     // 7. Candidate store, seeding the registry so a candidate that was
     // already enrolled before a restart still matches on its next
     // segment instead of being enrolled a second time under a new id.
-    let candidate_store = CandidateStore::open(cache_root.join("speakers").join("candidates"))
-        .context("opening candidate store")?;
+    // It is given the active model id: candidate centroids carry no
+    // (sha256 x model) cache key of their own, so this is the only thing
+    // stopping a model swap from seeding the matcher with vectors from a
+    // different embedding space.
+    let candidate_store = CandidateStore::open(
+        cache_root.join("speakers").join("candidates"),
+        resolved.model_id.clone(),
+    )
+    .context("opening candidate store")?;
     for c in candidate_store.list() {
         registry.add_runtime(c.id.clone(), c.centroid.clone());
     }

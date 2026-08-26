@@ -116,11 +116,11 @@ impl Worker {
             // (a later task), and releasing the lock between "is this a
             // candidate" and "observe it" would let a promotion land in
             // the gap, so `observe` would find the id already gone.
-            let observed = {
+            let updated = {
                 let mut candidates = self.candidates.lock().expect("candidate store poisoned");
                 if candidates.get(&m.id).is_some() {
                     match candidates.observe(&m.id, embedding, day, speech_ms, text) {
-                        Ok(()) => true,
+                        Ok(()) => candidates.get(&m.id).map(|c| c.centroid.clone()),
                         Err(e) => {
                             // The transcript is already committed to being
                             // written (audio is cached, STT has run); losing
@@ -128,14 +128,20 @@ impl Worker {
                             // that losing the transcript is not, so this
                             // degrades rather than propagating with `?`.
                             warn!("ambient: could not update candidate {}: {e}", m.id);
-                            false
+                            None
                         }
                     }
                 } else {
-                    false
+                    None
                 }
             };
-            if observed {
+            if let Some(centroid) = updated {
+                // `observe` moved the running mean on disk and in the
+                // candidate store. The matcher holds its own copy, so
+                // without this it would keep attributing against the
+                // first-sighting vector for the life of the process — and
+                // this is a daemon, so that may be weeks.
+                self.registry.add_runtime(m.id.clone(), centroid);
                 self.maybe_promote(&m.id)?;
             }
             return Ok((Some(m.id), Some(m.score)));
@@ -157,8 +163,13 @@ impl Worker {
             return Ok(());
         }
         match candidates.promote(id, None, &self.voices_dir) {
+            // The rename really is safe: `promote` writes the grain-id into
+            // the directory's `id` marker, so the directory name is only a
+            // display name from here on and every transcript already
+            // written keeps resolving to it.
             Ok(name) => info!(
-                "ambient: promoted candidate {id} to voices/{name}; rename it to finish registering"
+                "ambient: promoted candidate {id} to voices/{name}; rename that directory to \
+                 finish registering — the id is recorded inside it, so past transcripts follow"
             ),
             Err(e) => warn!("ambient: could not promote {id}: {e}"),
         }
@@ -228,8 +239,11 @@ mod tests {
             registry.add_runtime(id.to_string(), v.clone());
         }
         let candidates = Arc::new(Mutex::new(
-            crate::ambient::speaker::candidates::CandidateStore::open(root.join("candidates"))
-                .unwrap(),
+            crate::ambient::speaker::candidates::CandidateStore::open(
+                root.join("candidates"),
+                "test-model".into(),
+            )
+            .unwrap(),
         ));
         let stt = std::sync::Arc::new(crate::voice::MockStt::new(
             "mock".into(),
@@ -338,6 +352,77 @@ mod tests {
         );
     }
 
+    /// Returns a different vector per call, so a candidate's running-mean
+    /// centroid actually moves between observations. `FixedEmbedder`
+    /// cannot show this: with a constant vector the mean never changes.
+    struct SequenceEmbedder {
+        vectors: Vec<Vec<f32>>,
+        next: Mutex<usize>,
+    }
+
+    impl SequenceEmbedder {
+        fn new(vectors: Vec<Vec<f32>>) -> Self {
+            Self {
+                vectors,
+                next: Mutex::new(0),
+            }
+        }
+    }
+
+    impl crate::ambient::audio::SpeakerEmbedder for SequenceEmbedder {
+        fn embed(&self, _pcm: &[i16]) -> Result<Vec<f32>> {
+            let mut n = self.next.lock().unwrap();
+            let i = (*n).min(self.vectors.len() - 1);
+            *n += 1;
+            Ok(self.vectors[i].clone())
+        }
+    }
+
+    /// `observe` updates the candidate store, on disk and in memory. It
+    /// must also update the *matcher*, or the process keeps attributing
+    /// against the first-sighting vector for its whole lifetime — which,
+    /// for a daemon, can be weeks.
+    #[tokio::test]
+    async fn an_observation_updates_the_matcher_not_just_the_candidate_store() {
+        let mut h = harness(
+            Box::new(PassthroughGate::new()),
+            Box::new(SequenceEmbedder::new(vec![vec![1.0, 0.0], vec![1.0, 1.0]])),
+            &[],
+        );
+        let first = h.worker.process(seg(32_000, true)).await.unwrap().unwrap();
+        let id = first.speaker.expect("enrolled on first sight");
+
+        let mut next = seg(32_000, true);
+        next.segment = "seg-second".into();
+        let second = h.worker.process(next).await.unwrap().unwrap();
+        assert_eq!(second.speaker.as_deref(), Some(id.as_str()));
+
+        // The store now holds the mean of [1,0] and [1,1], i.e. [1,0.5].
+        let stored = h
+            .worker
+            .candidates
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .centroid
+            .clone();
+        assert_eq!(stored, vec![1.0, 0.5]);
+
+        // The matcher must agree. Against the stale [1,0] this scores
+        // ~0.894; against the updated centroid it scores 1.0.
+        let m = h
+            .worker
+            .registry
+            .match_speaker(&[1.0, 0.5])
+            .expect("still matches");
+        assert!(
+            m.score > 0.999,
+            "matcher is still using the first-sighting vector (score {})",
+            m.score
+        );
+    }
+
     #[tokio::test]
     async fn the_audio_blob_is_cached_and_referenced_by_the_transcript() {
         let mut h = harness(
@@ -377,6 +462,19 @@ mod tests {
             1,
             "80s over two days clears both thresholds"
         );
-        assert!(promoted[0].path().join("clip.wav").exists());
+        // The clip is named after the grain-id (so merging into an
+        // existing speaker never overwrites curated audio), and the
+        // grain-id is also written into the directory's `id` marker so the
+        // user can rename the directory freely.
+        let dir = promoted[0].path();
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(dir.join(format!("{name}.wav")).exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("id"))
+                .unwrap()
+                .trim()
+                .to_string(),
+            name
+        );
     }
 }

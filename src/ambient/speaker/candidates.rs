@@ -14,7 +14,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use super::registry::{decode_embedding, encode_embedding};
+use super::registry::{ID_MARKER, decode_embedding, encode_embedding, speaker_ids_in};
 use crate::voice::PIPELINE_SAMPLE_RATE;
 
 /// How many sample utterances to keep per candidate, so a human deciding
@@ -23,8 +23,18 @@ const MAX_SAMPLES: usize = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateStats {
-    /// Cumulative gated speech, in whole seconds.
-    pub speech_seconds: u32,
+    /// Cumulative gated speech, in **milliseconds**.
+    ///
+    /// Milliseconds, not seconds, because the spec makes `speech_ms` one
+    /// measure used in three places — the transcript field, the
+    /// `min_embed_ms` comparison, and this promotion total. Truncating
+    /// each observation to whole seconds broke that third use: a voice
+    /// made of 1.9 s utterances accumulated 1 s per observation, so it
+    /// took nearly twice as long to reach `promote_after_seconds` as the
+    /// configuration says. The division now happens once, at the
+    /// [`CandidateStore::is_promotable`] comparison.
+    #[serde(default)]
+    pub speech_ms: u64,
     /// Distinct logical days this voice was heard on.
     pub days_seen: Vec<NaiveDate>,
     pub first_seen: DateTime<Utc>,
@@ -35,10 +45,31 @@ pub struct CandidateStats {
     /// mean. Persisted so a restart does not corrupt the weighting: this
     /// is deliberately distinct from `days_seen.len()`, which counts only
     /// distinct days and undercounts a voice heard several times in one
-    /// afternoon. `#[serde(default)]` keeps this tolerant of any file
-    /// that predates the field, though nothing on disk does yet.
-    #[serde(default)]
+    /// afternoon.
+    ///
+    /// The default is **1**, not 0: a candidate always exists because at
+    /// least one segment was folded into its centroid, and a 0 would make
+    /// the next running-mean update `(centroid * 0 + x) / 1` — discarding
+    /// the entire accumulated centroid in favour of a single observation.
+    #[serde(default = "default_observations")]
     pub observations: u32,
+    /// Embedding model the centroid was computed with.
+    ///
+    /// Registered speakers get this for free: their cache key is (file
+    /// sha256 x model id), so a model swap recomputes. A candidate's
+    /// centroid has no such key — it is derived from audio that is long
+    /// gone — so the model id has to travel with it. Without this, swapping
+    /// `[ambient].embedding_model_dir` either leaves candidates permanently
+    /// unmatchable (different dimension) or, far worse, keeps matching
+    /// against them and attributes speech to the wrong id when the new
+    /// model happens to share a dimension — and 192 dimensions is shared
+    /// across several common checkpoints.
+    #[serde(default)]
+    pub model_id: String,
+}
+
+fn default_observations() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone)]
@@ -50,27 +81,54 @@ pub struct Candidate {
 
 pub struct CandidateStore {
     dir: PathBuf,
+    /// Embedding model the *live* pipeline is using. Candidates recorded
+    /// under any other model are left on disk but never loaded.
+    model_id: String,
     candidates: HashMap<String, Candidate>,
 }
 
 impl CandidateStore {
-    /// Open the store, loading every candidate already on disk.
-    pub fn open(dir: PathBuf) -> Result<Self> {
+    /// Open the store, loading every candidate recorded under `model_id`.
+    ///
+    /// Candidates from a different embedding model are **skipped, not
+    /// deleted**. Skipping is enough for correctness — they are never
+    /// matched against, never promoted, never counted — and deleting would
+    /// be a silent, unattended `remove_dir_all` over the only surviving
+    /// artefact of audio that is otherwise gone: the representative clip a
+    /// user might still want to promote by hand. It would also make trying
+    /// a different checkpoint and switching back a destructive operation,
+    /// which it should not be. They cost a few kilobytes each; a future
+    /// prune can be an explicit, asked-for action.
+    pub fn open(dir: PathBuf, model_id: String) -> Result<Self> {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating candidate dir {dir:?}"))?;
         let mut candidates = HashMap::new();
+        let mut foreign = 0usize;
         for entry in std::fs::read_dir(&dir)?.flatten() {
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().into_owned();
             match load_candidate(&entry.path(), &id) {
+                Ok(c) if c.stats.model_id != model_id => {
+                    foreign += 1;
+                }
                 Ok(c) => {
                     candidates.insert(id, c);
                 }
                 Err(e) => warn!("skipping unreadable candidate {id}: {e}"),
             }
         }
-        Ok(Self { dir, candidates })
+        if foreign > 0 {
+            warn!(
+                "ambient: {foreign} candidate(s) were enrolled with a different embedding model \
+                 and are ignored under {model_id}; they are left on disk, not deleted"
+            );
+        }
+        Ok(Self {
+            dir,
+            model_id,
+            candidates,
+        })
     }
 
     /// Register a newly seen voice. Returns the minted id.
@@ -89,11 +147,12 @@ impl CandidateStore {
         std::fs::write(dir.join("centroid.emb"), encode_embedding(&embedding))?;
 
         let stats = CandidateStats {
-            speech_seconds: speech_ms / 1000,
+            speech_ms: speech_ms as u64,
             days_seen: vec![day],
             first_seen: Utc::now(),
             samples: sample_vec(sample_text),
             observations: 1,
+            model_id: self.model_id.clone(),
         };
         std::fs::write(dir.join("stats.json"), serde_json::to_vec_pretty(&stats)?)?;
 
@@ -120,16 +179,28 @@ impl CandidateStore {
         let Some(c) = self.candidates.get_mut(id) else {
             bail!("no such candidate: {id}");
         };
+        // An explicit error rather than a truncating `take(centroid.len())`:
+        // folding a shorter or longer vector into the mean quietly produces
+        // a centroid that is partly one model's geometry and partly
+        // another's, and the caller degrades gracefully on an error here
+        // (the transcript is still written) but cannot notice a silent one.
+        if embedding.len() != c.centroid.len() {
+            bail!(
+                "candidate {id}: embedding has {} dimensions, centroid has {}",
+                embedding.len(),
+                c.centroid.len()
+            );
+        }
         // Running mean, so a candidate's centroid tracks the voice rather
         // than being pinned to whatever the first segment sounded like.
         // `observations` is persisted (see `CandidateStats`) precisely so
         // this weight survives a restart intact.
         let n = c.stats.observations as f32;
-        for (i, x) in embedding.iter().enumerate().take(c.centroid.len()) {
+        for (i, x) in embedding.iter().enumerate() {
             c.centroid[i] = (c.centroid[i] * n + x) / (n + 1.0);
         }
         c.stats.observations += 1;
-        c.stats.speech_seconds += speech_ms / 1000;
+        c.stats.speech_ms += speech_ms as u64;
         if !c.stats.days_seen.contains(&day) {
             c.stats.days_seen.push(day);
         }
@@ -145,7 +216,7 @@ impl CandidateStore {
 
     pub fn list(&self) -> Vec<&Candidate> {
         let mut out: Vec<&Candidate> = self.candidates.values().collect();
-        out.sort_by(|a, b| b.stats.speech_seconds.cmp(&a.stats.speech_seconds));
+        out.sort_by(|a, b| b.stats.speech_ms.cmp(&a.stats.speech_ms));
         out
     }
 
@@ -157,14 +228,34 @@ impl CandidateStore {
     /// Both thresholds must be cleared. Cumulative time alone would promote
     /// a television left on all afternoon; distinct days alone would promote
     /// a passing greeting heard twice.
+    ///
+    /// The seconds/milliseconds conversion happens **here**, once, rather
+    /// than per observation — see [`CandidateStats::speech_ms`].
     pub fn is_promotable(&self, id: &str, after_seconds: u32, after_days: u32) -> bool {
         self.candidates.get(id).is_some_and(|c| {
-            c.stats.speech_seconds >= after_seconds && c.stats.days_seen.len() as u32 >= after_days
+            c.stats.speech_ms >= after_seconds as u64 * 1000
+                && c.stats.days_seen.len() as u32 >= after_days
         })
     }
 
     /// Export a candidate into `voices/<name>/` and stop tracking it.
     /// Returns the directory name used.
+    ///
+    /// Two properties this has to get right, both of them about not
+    /// destroying things the user curated:
+    ///
+    /// - **The clip is named `<grain-id>.wav`, not `clip.wav`.**
+    ///   `speaker_promote(id, name = "me")` is exactly what the model does
+    ///   when the user says "that was me", and a fixed filename made that a
+    ///   model-invoked overwrite of whatever `voices/me/clip.wav` held. The
+    ///   registry averages every `*.wav` in the directory, so a unique name
+    ///   turns merging into an existing speaker into correct behaviour.
+    /// - **The grain-id is recorded in an [`ID_MARKER`] file**, so the
+    ///   directory can be renamed afterwards without changing the id every
+    ///   past transcript refers to. When the directory already existed, its
+    ///   own name is written as the *first* (canonical) id, because
+    ///   transcripts may already say `me`; the promoted grain-id joins as
+    ///   an alias, and both resolve to the same display name.
     pub fn promote(&mut self, id: &str, name: Option<&str>, voices_dir: &Path) -> Result<String> {
         let Some(c) = self.candidates.get(id) else {
             bail!("no such candidate: {id}");
@@ -212,21 +303,64 @@ impl CandidateStore {
 
         let target_existed = target.exists();
         std::fs::create_dir_all(&target).with_context(|| format!("creating {target:?}"))?;
-        if let Err(e) = std::fs::copy(self.dir.join(id).join("clip.wav"), target.join("clip.wav")) {
+        // Named after the candidate, so promoting a second voice into the
+        // same speaker adds a reference file instead of replacing one.
+        let clip_name = format!("{id}.wav");
+        if let Err(e) = std::fs::copy(self.dir.join(id).join("clip.wav"), target.join(&clip_name)) {
             // Don't leave a stray, empty directory ahead of a promotion
             // that did not actually happen -- but only if this call is
-            // the one that just created it; a pre-existing target (an
-            // overwrite) is not ours to delete.
+            // the one that just created it; a pre-existing target (a
+            // merge) is not ours to delete.
             if !target_existed {
                 std::fs::remove_dir_all(&target).ok();
             }
             return Err(e).with_context(|| format!("copying candidate clip into {target:?}"));
         }
 
+        if let Err(e) = write_id_marker(&target, id, &dir_name, target_existed) {
+            // Same rule as the copy above: undo only what this call made.
+            // A directory carrying the clip but no marker would attribute
+            // this voice under its *directory name* instead of the id the
+            // transcripts already use, which is the exact identity fork
+            // the marker exists to prevent.
+            std::fs::remove_file(target.join(&clip_name)).ok();
+            if !target_existed {
+                std::fs::remove_dir_all(&target).ok();
+            }
+            return Err(e);
+        }
+
         std::fs::remove_dir_all(self.dir.join(id)).ok();
         self.candidates.remove(id);
         Ok(dir_name)
     }
+}
+
+/// Record `grain_id` in the speaker directory's [`ID_MARKER`], preserving
+/// whatever was already there.
+///
+/// When the directory pre-dates this promotion and carries no marker, its
+/// own name goes in first and stays canonical: `voices/me/` had id `me`
+/// before the merge, and every transcript already written says `me`.
+/// Promoting a candidate into it must add an alias, not silently rename
+/// that speaker's identity to a grain-id nothing else refers to.
+fn write_id_marker(
+    target: &Path,
+    grain_id: &str,
+    dir_name: &str,
+    target_existed: bool,
+) -> Result<()> {
+    let mut ids = speaker_ids_in(target);
+    if ids.is_empty() && target_existed {
+        ids.push(dir_name.to_string());
+    }
+    if !ids.iter().any(|i| i == grain_id) {
+        ids.push(grain_id.to_string());
+    }
+    let mut body = ids.join("\n");
+    body.push('\n');
+    let path = target.join(ID_MARKER);
+    std::fs::write(&path, body).with_context(|| format!("writing speaker id marker {path:?}"))
 }
 
 /// A speaker name becomes a directory name under the workspace, so it must
@@ -286,7 +420,8 @@ mod tests {
 
     fn store() -> (tempfile::TempDir, CandidateStore) {
         let tmp = tempfile::tempdir().unwrap();
-        let store = CandidateStore::open(tmp.path().join("candidates")).unwrap();
+        let store =
+            CandidateStore::open(tmp.path().join("candidates"), "test-model".into()).unwrap();
         (tmp, store)
     }
 
@@ -313,9 +448,42 @@ mod tests {
         );
 
         // Reload from disk: candidates survive a restart.
-        let reloaded = CandidateStore::open(tmp.path().join("candidates")).unwrap();
+        let reloaded =
+            CandidateStore::open(tmp.path().join("candidates"), "test-model".into()).unwrap();
         assert_eq!(reloaded.list().len(), 1);
         assert_eq!(reloaded.list()[0].id, id);
+    }
+
+    /// A candidate centroid is model-specific and has no cache key that a
+    /// model swap invalidates, so the model id travels in its stats. After
+    /// a swap the old candidates must not be matched against: a different
+    /// dimension makes them dead weight, and — much worse — the *same*
+    /// dimension under a different model attributes speech to the wrong id.
+    #[test]
+    fn candidates_enrolled_under_another_model_are_ignored_but_left_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("candidates");
+        let id = {
+            let mut store = CandidateStore::open(dir.clone(), "model-a".into()).unwrap();
+            store
+                .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 60_000, "a")
+                .unwrap()
+        };
+
+        let swapped = CandidateStore::open(dir.clone(), "model-b".into()).unwrap();
+        assert!(
+            swapped.get(&id).is_none(),
+            "a centroid from another model must not be matched against"
+        );
+        assert!(swapped.list().is_empty());
+        assert!(
+            dir.join(&id).join("clip.wav").exists(),
+            "skipped, not deleted: the clip is the only surviving artefact of that audio"
+        );
+
+        // Switching back must find them again — this is why they are kept.
+        let back = CandidateStore::open(dir, "model-a".into()).unwrap();
+        assert!(back.get(&id).is_some());
     }
 
     #[test]
@@ -373,7 +541,7 @@ mod tests {
             .unwrap();
         let name = store.promote(&id, None, &voices).unwrap();
         assert_eq!(name, id, "no name given, so the grain-id is the directory");
-        assert!(voices.join(&id).join("clip.wav").exists());
+        assert!(voices.join(&id).join(format!("{id}.wav")).exists());
         assert!(
             store.list().iter().all(|c| c.id != id),
             "promoted, so no longer a candidate"
@@ -389,7 +557,7 @@ mod tests {
             .unwrap();
         let name = store.promote(&id, Some("tanaka-san"), &voices).unwrap();
         assert_eq!(name, "tanaka-san");
-        assert!(voices.join("tanaka-san").join("clip.wav").exists());
+        assert!(voices.join("tanaka-san").join(format!("{id}.wav")).exists());
     }
 
     #[test]
@@ -424,7 +592,8 @@ mod tests {
             .observe(&id, &[1.0, 0.0], day(26), 10_000, "c")
             .unwrap();
 
-        let reloaded = CandidateStore::open(tmp.path().join("candidates")).unwrap();
+        let reloaded =
+            CandidateStore::open(tmp.path().join("candidates"), "test-model".into()).unwrap();
         let reloaded_candidate = reloaded.list().into_iter().find(|c| c.id == id).unwrap();
         assert_eq!(
             reloaded_candidate.stats.observations, 3,
@@ -487,6 +656,130 @@ mod tests {
             .unwrap();
         assert!(store.promote(&id, Some("."), &voices).is_err());
         assert!(store.promote(&id, Some(".."), &voices).is_err());
+    }
+
+    /// `speech_ms` is documented as the same measure everywhere: the
+    /// transcript field, the `min_embed_ms` comparison and the promotion
+    /// total. Truncating each observation to whole seconds broke that —
+    /// two 1.9 s utterances counted as 2 s of speech, not 3.8 s, so a
+    /// voice made of short utterances could never reach the threshold.
+    #[test]
+    fn sub_second_observations_accumulate_rather_than_truncating() {
+        let (_tmp, mut store) = store();
+        let id = store
+            .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 1_900, "a")
+            .unwrap();
+        store
+            .observe(&id, &[1.0, 0.0], day(27), 1_900, "b")
+            .unwrap();
+        assert!(
+            store.is_promotable(&id, 3, 2),
+            "1.9s + 1.9s is 3.8s of speech, not 2s"
+        );
+    }
+
+    /// `observations` defaulting to 0 makes the very next running-mean
+    /// update `(centroid * 0 + x) / 1` — the whole accumulated centroid is
+    /// discarded and replaced by one observation.
+    #[test]
+    fn a_stats_file_with_no_observation_count_still_weights_the_existing_centroid() {
+        let (tmp, mut store) = store();
+        let id = store
+            .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 10_000, "a")
+            .unwrap();
+        // Simulate a stats file written before `observations` existed.
+        let stats_path = tmp.path().join("candidates").join(&id).join("stats.json");
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&stats_path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("observations");
+        std::fs::write(&stats_path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+
+        let mut reloaded =
+            CandidateStore::open(tmp.path().join("candidates"), "test-model".into()).unwrap();
+        reloaded
+            .observe(&id, &[0.0, 1.0], day(26), 10_000, "b")
+            .unwrap();
+        let c = reloaded.get(&id).unwrap();
+        assert_eq!(
+            c.centroid,
+            vec![0.5, 0.5],
+            "an absent count must mean one prior observation, not zero"
+        );
+    }
+
+    /// `speaker_promote(id, name="me")` is exactly what the model does
+    /// when the user says "that was me". A fixed `clip.wav` filename made
+    /// that a destructive, model-invoked overwrite of curated reference
+    /// audio in the user's workspace. Naming the copy after the grain-id
+    /// turns merging into an existing speaker into correct behaviour: the
+    /// registry averages every `*.wav` in the directory.
+    #[test]
+    fn promotion_into_an_existing_speaker_keeps_its_curated_audio() {
+        let (tmp, mut store) = store();
+        let voices = tmp.path().join("voices");
+        let curated = voices.join("me");
+        std::fs::create_dir_all(&curated).unwrap();
+        write_wav(&curated.join("clip.wav"), &vec![1234i16; 16_000]).unwrap();
+        let before = std::fs::read(curated.join("clip.wav")).unwrap();
+
+        let id = store
+            .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 60_000, "a")
+            .unwrap();
+        store.promote(&id, Some("me"), &voices).unwrap();
+
+        // `assert!` rather than `assert_eq!` on purpose: a failure here
+        // would otherwise dump both 32 kB WAV bodies into the test log.
+        assert!(
+            std::fs::read(curated.join("clip.wav")).unwrap() == before,
+            "curated reference audio must survive a promotion into the same speaker"
+        );
+        assert!(
+            curated.join(format!("{id}.wav")).exists(),
+            "the promoted clip lands under its own grain-id"
+        );
+    }
+
+    /// The workspace directory name is the *display* name; the id must be
+    /// stable across a rename, so promotion records it in a marker file.
+    #[test]
+    fn promotion_writes_an_id_marker_holding_the_grain_id() {
+        let (tmp, mut store) = store();
+        let voices = tmp.path().join("voices");
+        let id = store
+            .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 60_000, "a")
+            .unwrap();
+        store.promote(&id, Some("tanaka-san"), &voices).unwrap();
+        let marker = std::fs::read_to_string(voices.join("tanaka-san").join("id")).unwrap();
+        assert_eq!(marker.lines().next(), Some(id.as_str()));
+    }
+
+    /// Merging into a hand-made speaker directory must not silently change
+    /// that speaker's id: `voices/me/` had no marker, so its id was "me",
+    /// and every transcript already written says "me".
+    #[test]
+    fn merging_into_a_hand_made_speaker_keeps_its_directory_name_as_the_canonical_id() {
+        let (tmp, mut store) = store();
+        let voices = tmp.path().join("voices");
+        let curated = voices.join("me");
+        std::fs::create_dir_all(&curated).unwrap();
+        write_wav(&curated.join("clip.wav"), &vec![7i16; 16_000]).unwrap();
+
+        let id = store
+            .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 60_000, "a")
+            .unwrap();
+        store.promote(&id, Some("me"), &voices).unwrap();
+
+        let marker = std::fs::read_to_string(curated.join("id")).unwrap();
+        let ids: Vec<&str> = marker.lines().collect();
+        assert_eq!(
+            ids.first(),
+            Some(&"me"),
+            "the pre-existing id stays canonical"
+        );
+        assert!(
+            ids.contains(&id.as_str()),
+            "the merged grain-id is an alias"
+        );
     }
 
     /// `promote` creates the target directory before copying the clip into

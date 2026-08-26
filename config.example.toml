@@ -463,6 +463,14 @@ system_prompt = "You are a helpful personal assistant."
 # just wait for auto-enrolment + `speaker_promote`, see below).
 # Auto-enrolled voices that have not been named live outside the
 # workspace, alongside the audio cache.
+#
+# The directory name is the speaker's *display* name, not their id.
+# A promoted voice also gets a one-line `voices/<name>/id` file holding
+# the id transcripts actually record, so the directory can be renamed
+# ("blithe-otter-42" -> "tanaka-san") and everything already recorded
+# reads back under the new name with no rewrite pass. A directory you
+# create by hand has no `id` file and simply uses its own name as the
+# id — which is what you want, since nothing referred to it before.
 
 # ── Device key file (host-local) ────────────────────────────────────
 # Ambient capture devices authenticate with a bearer token that lives

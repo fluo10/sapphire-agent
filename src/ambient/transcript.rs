@@ -81,7 +81,14 @@ impl TranscriptStore {
     }
 
     /// Every record with `from <= started_at <= to`, optionally restricted
-    /// to one speaker id, sorted by `started_at`.
+    /// to a set of speaker ids, sorted by `started_at`.
+    ///
+    /// A *set* rather than one id because one person can own several ids:
+    /// a speaker directory merged from a promoted candidate lists both in
+    /// its `id` marker (see
+    /// [`crate::ambient::speaker::registry::SpeakerNames`]), and a filter
+    /// given that person's name must return everything recorded under any
+    /// of them.
     ///
     /// Unparseable lines are skipped with a warning. A half-written line
     /// from a crash must not make the whole day unreadable.
@@ -89,7 +96,7 @@ impl TranscriptStore {
         &self,
         from: DateTime<Utc>,
         to: DateTime<Utc>,
-        speaker: Option<&str>,
+        speakers: Option<&[String]>,
     ) -> Result<Vec<TranscriptRecord>> {
         let mut out = Vec::new();
         // Widen by a day on each side: the boundary hour means a record's
@@ -124,7 +131,11 @@ impl TranscriptStore {
         out.retain(|r| {
             r.started_at >= from
                 && r.started_at <= to
-                && speaker.is_none_or(|s| r.speaker.as_deref() == Some(s))
+                && speakers.is_none_or(|ids| {
+                    r.speaker
+                        .as_deref()
+                        .is_some_and(|s| ids.iter().any(|id| id == s))
+                })
         });
         out.sort_by_key(|r| r.started_at);
         Ok(out)
@@ -207,11 +218,46 @@ mod tests {
             .read(
                 base - chrono::Duration::hours(1),
                 base + chrono::Duration::hours(1),
-                Some("me"),
+                Some(&["me".to_string()][..]),
             )
             .unwrap();
         assert_eq!(mine.len(), 1, "speaker filter and range both applied");
         assert_eq!(mine[0].text, "mine");
+    }
+
+    /// One person can own several ids once a promoted candidate is merged
+    /// into an existing speaker directory, so the filter takes a set.
+    #[test]
+    fn read_matches_any_of_several_speaker_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TranscriptStore::open(tmp.path().to_path_buf(), 4).unwrap();
+        let base = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        store.append(&rec(base, Some("me"), "before")).unwrap();
+        store
+            .append(&rec(
+                base + chrono::Duration::minutes(1),
+                Some("blithe-otter-42"),
+                "after",
+            ))
+            .unwrap();
+        store
+            .append(&rec(
+                base + chrono::Duration::minutes(2),
+                Some("someone-else"),
+                "not mine",
+            ))
+            .unwrap();
+
+        let ids = ["me".to_string(), "blithe-otter-42".to_string()];
+        let got = store
+            .read(
+                base - chrono::Duration::hours(1),
+                base + chrono::Duration::hours(1),
+                Some(&ids[..]),
+            )
+            .unwrap();
+        let texts: Vec<&str> = got.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["before", "after"]);
     }
 
     #[test]

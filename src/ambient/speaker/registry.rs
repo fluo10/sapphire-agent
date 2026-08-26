@@ -1,10 +1,28 @@
 //! Registered speakers, loaded from workspace reference audio.
 //!
-//! `voices/<id>/*.wav` — the directory name is **both** the speaker id and
-//! the display name. Embeddings are cached outside the workspace, keyed by
-//! (reference file sha256 x model id), so renaming a directory triggers no
-//! recomputation and swapping the embedding model recomputes automatically.
-//! No model-dependent data ever lands in the workspace, which was the
+//! `voices/<name>/*.wav`. The directory name is the speaker's **display
+//! name**. Its **id** — the value transcripts store — comes from the
+//! optional [`ID_MARKER`] file inside the directory, falling back to the
+//! directory name when there is none.
+//!
+//! That split is what makes the spec's rename transparency real. If the
+//! directory name *were* the id, renaming `voices/blithe-otter-42/` to
+//! `voices/tanaka-san/` would **change** the id: afterwards one person has
+//! two unrelated ids, nothing links them, and every transcript written
+//! before the rename is unreachable under the new name. `speaker_promote`
+//! with a name is worse still — it would fork the identity mid-run, with
+//! the live registry and every past transcript saying `blithe-otter-42`
+//! while `voices/tanaka-san/` exists alongside it.
+//!
+//! So promotion records the candidate's grain-id in the marker, and the
+//! directory name is free to change. A directory the user created by hand
+//! (`me/`, `agent/`) has no marker and keeps using its name as its id,
+//! which is correct: nothing else ever referred to it.
+//!
+//! Embeddings are cached outside the workspace, keyed by (reference file
+//! sha256 x model id), so renaming a directory triggers no recomputation
+//! and swapping the embedding model recomputes automatically. No
+//! model-dependent data ever lands in the workspace, which was the
 //! requirement that shaped this split.
 
 use std::collections::HashMap;
@@ -20,6 +38,96 @@ use crate::image_cache::sha256_hex;
 pub struct SpeakerMatch {
     pub id: String,
     pub score: f32,
+}
+
+/// Name of the id marker file inside a `voices/<name>/` directory.
+///
+/// Newline-separated speaker ids. The **first** line is canonical — the id
+/// new speech from this voice is attributed to. Any further lines are
+/// aliases: ids that used to be separate and were merged into this speaker
+/// (see [`super::candidates::CandidateStore::promote`]). All of them
+/// resolve to the directory's current name.
+pub const ID_MARKER: &str = "id";
+
+/// Ids recorded for one speaker directory, canonical first.
+///
+/// Empty when the directory has no marker — the caller then falls back to
+/// the directory name, which is what a hand-made `voices/me/` relies on.
+pub fn speaker_ids_in(dir: &Path) -> Vec<String> {
+    let Ok(body) = std::fs::read_to_string(dir.join(ID_MARKER)) else {
+        return Vec::new();
+    };
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Speaker id -> the directory name it currently lives under.
+///
+/// Deliberately a scan rather than a startup-time snapshot: the whole
+/// point of the marker file is that the user may rename a directory at any
+/// moment, and a transcript read must reflect the name as it is *now*. The
+/// scan is a handful of `read_dir` entries and one small file each.
+#[derive(Debug, Clone, Default)]
+pub struct SpeakerNames {
+    by_id: HashMap<String, String>,
+}
+
+impl SpeakerNames {
+    pub fn scan(voices_dir: &Path) -> Self {
+        let mut by_id = HashMap::new();
+        let Ok(entries) = std::fs::read_dir(voices_dir) else {
+            return Self { by_id };
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // A directory always answers to its own name, marker or not.
+            by_id.insert(name.clone(), name.clone());
+            for id in speaker_ids_in(&entry.path()) {
+                by_id.insert(id, name.clone());
+            }
+        }
+        Self { by_id }
+    }
+
+    /// Display name for `id`, or `id` itself when nothing claims it — an
+    /// unpromoted candidate has no directory and is shown by its grain-id.
+    pub fn display_name(&self, id: &str) -> String {
+        self.by_id
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// Every id belonging to the speaker `who` names — `who` being either a
+    /// display name or any one of that speaker's ids.
+    ///
+    /// Resolving through [`Self::display_name`] first is what makes both
+    /// spellings work, and what makes a filter given a *pre-rename* id
+    /// still return everything that person said: the id maps to the
+    /// directory, and the directory maps back to all of its ids.
+    ///
+    /// Falls back to `[who]` when nothing claims it, so filtering by the
+    /// grain-id of a candidate that was never promoted still works.
+    pub fn ids_for(&self, who: &str) -> Vec<String> {
+        let dir = self.display_name(who);
+        let matched: Vec<String> = self
+            .by_id
+            .iter()
+            .filter(|(_, name)| *name == &dir)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if matched.is_empty() {
+            vec![who.to_string()]
+        } else {
+            matched
+        }
+    }
 }
 
 pub struct SpeakerRegistry {
@@ -64,7 +172,14 @@ impl SpeakerRegistry {
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            let id = entry.file_name().to_string_lossy().into_owned();
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            // The id is the marker's first line when there is one; the
+            // directory name only ever supplies the *display* name, plus
+            // the id for a directory the user made by hand.
+            let id = speaker_ids_in(&entry.path())
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| dir_name.clone());
             let mut vectors = Vec::new();
             for file in std::fs::read_dir(entry.path())
                 .into_iter()
@@ -77,14 +192,25 @@ impl SpeakerRegistry {
                 }
                 match self.embedding_for(&path, embedder) {
                     Ok(v) => vectors.push(v),
-                    Err(e) => warn!("speaker {id}: skipping {path:?}: {e}"),
+                    Err(e) => warn!("speaker {dir_name}: skipping {path:?}: {e}"),
                 }
             }
             if vectors.is_empty() {
-                warn!("speaker {id}: no usable reference audio; speaker disabled");
+                warn!("speaker {dir_name}: no usable reference audio; speaker disabled");
                 continue;
             }
-            self.speakers.insert(id, centroid(&vectors));
+            match centroid(&vectors) {
+                Ok(c) => {
+                    self.speakers.insert(id, c);
+                }
+                // Averaging vectors of different lengths cannot produce a
+                // meaningful centroid; the old code took the first
+                // vector's length and truncated the rest, which skewed the
+                // result towards whichever file `read_dir` happened to
+                // return first. Disabling the speaker is the same
+                // treatment unreadable reference audio already gets.
+                Err(e) => warn!("speaker {dir_name}: {e}; speaker disabled"),
+            }
         }
         Ok(())
     }
@@ -129,17 +255,6 @@ impl SpeakerRegistry {
         }
         best
     }
-
-    /// Display name for a speaker id. Names live in the workspace as the
-    /// directory name itself, so a renamed directory is picked up here
-    /// without touching stored transcripts.
-    // Consumed by the later transcript-rendering task, which resolves a
-    // stored speaker id to a display name at read time. Delete this
-    // attribute once that task adds a caller.
-    #[allow(dead_code)]
-    pub fn display_name(&self, id: &str) -> String {
-        id.to_string()
-    }
 }
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -155,18 +270,31 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (na * nb)
 }
 
-fn centroid(vectors: &[Vec<f32>]) -> Vec<f32> {
+/// Mean of `vectors`, which must all share one dimension.
+///
+/// A mismatch is an explicit error rather than a truncation: silently
+/// averaging over the first vector's length produces a plausible-looking
+/// centroid that is wrong, and the only way it arises — reference vectors
+/// computed by two different embedding models — is exactly the case where
+/// a wrong centroid misattributes speech to the wrong person.
+fn centroid(vectors: &[Vec<f32>]) -> Result<Vec<f32>> {
     let dim = vectors[0].len();
+    if let Some(other) = vectors.iter().find(|v| v.len() != dim) {
+        anyhow::bail!(
+            "reference embeddings disagree on dimension ({dim} vs {})",
+            other.len()
+        );
+    }
     let mut out = vec![0.0; dim];
     for v in vectors {
-        for (i, x) in v.iter().take(dim).enumerate() {
+        for (i, x) in v.iter().enumerate() {
             out[i] += x;
         }
     }
     for x in &mut out {
         *x /= vectors.len() as f32;
     }
-    out
+    Ok(out)
 }
 
 /// Serialize an embedding to the little-endian f32 bytes stored in the
@@ -203,6 +331,12 @@ mod tests {
 
     /// Write a 1-second 16 kHz mono WAV of silence.
     fn write_wav(path: &std::path::Path) {
+        write_wav_of(path, 0);
+    }
+
+    /// Write a 1-second 16 kHz mono WAV of a constant sample value, so two
+    /// reference files can differ in content (and therefore in cache key).
+    fn write_wav_of(path: &std::path::Path, sample: i16) {
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: 16_000,
@@ -211,7 +345,7 @@ mod tests {
         };
         let mut w = hound::WavWriter::create(path, spec).unwrap();
         for _ in 0..16_000 {
-            w.write_sample(0i16).unwrap();
+            w.write_sample(sample).unwrap();
         }
         w.finalize().unwrap();
     }
@@ -273,6 +407,118 @@ mod tests {
         assert_eq!(
             reg.match_speaker(&[1.0, 0.0, 0.0]).unwrap().id,
             "blithe-otter-42"
+        );
+    }
+
+    /// The directory name is the *display* name; the id must be stable
+    /// across a rename, or `voices/blithe-otter-42/` -> `voices/tanaka-san/`
+    /// silently forks one person into two unrelated ids and every past
+    /// transcript stops resolving.
+    #[test]
+    fn an_id_marker_file_overrides_the_directory_name_as_the_speaker_id() {
+        let (tmp, voices) = voices_with(&["tanaka-san"]);
+        std::fs::write(voices.join("tanaka-san").join("id"), "blithe-otter-42\n").unwrap();
+        let mut reg = SpeakerRegistry::open(
+            voices.clone(),
+            tmp.path().join("emb"),
+            "test-model".into(),
+            0.55,
+        )
+        .unwrap();
+        reg.load_reference_audio(&FixedEmbedder::new(vec![1.0, 0.0, 0.0]))
+            .unwrap();
+        assert_eq!(
+            reg.match_speaker(&[1.0, 0.0, 0.0]).unwrap().id,
+            "blithe-otter-42",
+            "the marker is the id; the directory name is only the display name"
+        );
+        assert_eq!(
+            SpeakerNames::scan(&voices).display_name("blithe-otter-42"),
+            "tanaka-san",
+            "display name resolves from the current directory name"
+        );
+    }
+
+    /// A speaker directory the user created by hand (`me/`, `agent/`) has
+    /// no marker, and must keep working with its directory name as its id.
+    #[test]
+    fn a_directory_without_a_marker_keeps_using_its_name_as_the_id() {
+        let (tmp, voices) = voices_with(&["me"]);
+        let mut reg = SpeakerRegistry::open(
+            voices.clone(),
+            tmp.path().join("emb"),
+            "test-model".into(),
+            0.55,
+        )
+        .unwrap();
+        reg.load_reference_audio(&FixedEmbedder::new(vec![1.0, 0.0, 0.0]))
+            .unwrap();
+        assert_eq!(reg.match_speaker(&[1.0, 0.0, 0.0]).unwrap().id, "me");
+        assert_eq!(SpeakerNames::scan(&voices).display_name("me"), "me");
+    }
+
+    /// A merged speaker directory lists several ids; the first is the
+    /// canonical one used for new attributions, the rest are aliases that
+    /// must still resolve to the same display name.
+    #[test]
+    fn every_id_in_a_marker_resolves_to_the_directory_name() {
+        let (tmp, voices) = voices_with(&["me"]);
+        std::fs::write(voices.join("me").join("id"), "me\nblithe-otter-42\n").unwrap();
+        let mut reg = SpeakerRegistry::open(
+            voices.clone(),
+            tmp.path().join("emb"),
+            "test-model".into(),
+            0.55,
+        )
+        .unwrap();
+        reg.load_reference_audio(&FixedEmbedder::new(vec![1.0, 0.0, 0.0]))
+            .unwrap();
+        assert_eq!(
+            reg.match_speaker(&[1.0, 0.0, 0.0]).unwrap().id,
+            "me",
+            "the first marker line stays canonical"
+        );
+        let names = SpeakerNames::scan(&voices);
+        assert_eq!(names.display_name("blithe-otter-42"), "me");
+        let mut ids = names.ids_for("me");
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["blithe-otter-42".to_string(), "me".to_string()],
+            "both the canonical id and the merged alias resolve to this speaker"
+        );
+    }
+
+    /// Reference vectors of different lengths cannot be averaged. Taking
+    /// the first vector's length and truncating the rest produced a
+    /// centroid skewed towards whichever file happened to be read first.
+    #[test]
+    fn a_dimension_mismatch_disables_the_speaker_instead_of_skewing_its_centroid() {
+        let (tmp, voices) = voices_with(&["mixed"]);
+        // A second reference file with *different* content, so it hashes to
+        // its own cache key and the speaker has two vectors to average.
+        write_wav_of(&voices.join("mixed").join("second.wav"), 1234);
+        // Pre-seed one cached embedding at a different dimension than the
+        // embedder produces, which is what a half-swapped model looks like.
+        let emb_dir = tmp.path().join("emb");
+        std::fs::create_dir_all(&emb_dir).unwrap();
+        let bytes = std::fs::read(voices.join("mixed").join("second.wav")).unwrap();
+        std::fs::write(
+            emb_dir.join(format!(
+                "{}.{}.emb",
+                crate::image_cache::sha256_hex(&bytes),
+                "test-model"
+            )),
+            encode_embedding(&[1.0, 0.0]),
+        )
+        .unwrap();
+
+        let mut reg = SpeakerRegistry::open(voices, emb_dir, "test-model".into(), 0.55).unwrap();
+        reg.load_reference_audio(&FixedEmbedder::new(vec![1.0, 0.0, 0.0]))
+            .expect("one bad speaker must not fail the whole load");
+        assert!(
+            reg.match_speaker(&[1.0, 0.0, 0.0]).is_none(),
+            "a speaker whose references disagree on dimension is disabled, not averaged"
         );
     }
 
