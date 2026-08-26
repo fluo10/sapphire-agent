@@ -144,9 +144,18 @@ mod tests {
     #[test]
     fn rejects_an_expired_token_even_though_it_matches() {
         let tmp = tempfile::tempdir().unwrap();
+        // Carries a second, live key alongside the expired one: `open` bails
+        // when the *whole* key file has no usable key (by design, so a
+        // misconfiguration is loud), so a fixture with only an expired key
+        // would fail at `open` rather than exercising the expiry check in
+        // `resolve`. The live key keeps the store usable and lets this test
+        // actually reach `KeyStore::authenticate`'s expiry rejection.
         let path = key_file(
             tmp.path(),
-            &[("sa-dev-old", "pendant-key", Some("2020-01-01T00:00:00Z"))],
+            &[
+                ("sa-dev-live", "other-key", None),
+                ("sa-dev-old", "pendant-key", Some("2020-01-01T00:00:00Z")),
+            ],
         );
         let id = id_of(&path, "pendant-key");
         let reg = DeviceRegistry::open(&path, &devices(&[("pendant", id)])).unwrap();
