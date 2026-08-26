@@ -105,51 +105,60 @@ mod sherpa_impl {
     /// Silero VAD re-gate. Concatenates every detected speech run, so a
     /// segment with a pause in the middle yields one `GatedSpeech` with the
     /// silence removed.
+    ///
+    /// Holds the loaded model for the process lifetime — `gate` calls
+    /// `reset()` rather than reloading, since a reconnect burst can be
+    /// hundreds of segments and every one of `VoiceActivityDetector`'s
+    /// methods takes `&self` (the C library keeps its state behind the
+    /// pointer), so one instance can serve every call.
     // Constructed only by the later config-wiring task that reads
     // `[ambient]` and selects a `SpeechGate` implementation. Delete this
     // attribute once that task adds a caller.
     #[allow(dead_code)]
     pub struct SileroGate {
-        model_path: String,
-        threshold: f32,
+        vad: VoiceActivityDetector,
     }
 
     impl SileroGate {
+        // Constructed only by the later config-wiring task that reads
+        // `[ambient]` and selects a `SpeechGate` implementation. Delete
+        // this attribute once that task adds a caller.
         #[allow(dead_code)]
-        pub fn new(model_path: String, threshold: f32) -> Self {
-            Self {
-                model_path,
-                threshold,
-            }
-        }
-    }
-
-    impl SpeechGate for SileroGate {
-        fn gate(&self, pcm: &[i16]) -> Option<GatedSpeech> {
+        pub fn new(model_path: String, threshold: f32) -> anyhow::Result<Self> {
             let config = VadModelConfig {
                 silero_vad: SileroVadModelConfig {
-                    model: Some(self.model_path.clone()),
-                    threshold: self.threshold,
+                    model: Some(model_path),
+                    threshold,
                     ..Default::default()
                 },
                 sample_rate: PIPELINE_SAMPLE_RATE as i32,
                 ..Default::default()
             };
-            let vad = VoiceActivityDetector::create(&config, 30.0)?;
+            let vad = VoiceActivityDetector::create(&config, 30.0)
+                .ok_or_else(|| anyhow::anyhow!("failed to load Silero VAD model"))?;
+            Ok(Self { vad })
+        }
+    }
+
+    impl SpeechGate for SileroGate {
+        fn gate(&self, pcm: &[i16]) -> Option<GatedSpeech> {
+            // Clear state left over from the previous segment; the
+            // detector itself is reused, not rebuilt.
+            self.vad.reset();
 
             let samples: Vec<f32> = pcm.iter().map(|s| *s as f32 / 32768.0).collect();
             let mut kept: Vec<i16> = Vec::new();
             for window in samples.chunks(512) {
-                vad.accept_waveform(window);
-                while let Some(seg) = vad.front() {
-                    kept.extend(seg.samples().iter().map(|s| (s * 32768.0) as i16));
-                    vad.pop();
+                self.vad.accept_waveform(window);
+                while let Some(seg) = self.vad.front() {
+                    kept.extend(seg.samples().iter().map(|s| (s * 32768.0).round() as i16));
+                    self.vad.pop();
                 }
             }
-            vad.flush();
-            while let Some(seg) = vad.front() {
-                kept.extend(seg.samples().iter().map(|s| (s * 32768.0) as i16));
-                vad.pop();
+            self.vad.flush();
+            while let Some(seg) = self.vad.front() {
+                kept.extend(seg.samples().iter().map(|s| (s * 32768.0).round() as i16));
+                self.vad.pop();
             }
             if kept.is_empty() {
                 return None;
@@ -170,6 +179,9 @@ mod sherpa_impl {
     }
 
     impl SherpaEmbedder {
+        // Constructed only by the later config-wiring task that reads
+        // `[ambient]` and selects a `SpeakerEmbedder` implementation.
+        // Delete this attribute once that task adds a caller.
         #[allow(dead_code)]
         pub fn new(model_path: String, num_threads: i32) -> anyhow::Result<Self> {
             let config = SpeakerEmbeddingExtractorConfig {
