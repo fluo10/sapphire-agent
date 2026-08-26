@@ -191,8 +191,13 @@ Caveat: `KeyStore::generate` mints a fresh UUID per key, so **rotating a token
 without editing the agent config means hand-editing the key file** — appending a
 `[[key]]` with the new `token` and the *old* `id`. The file format permits this
 (`id` is an optional field filled in on load only when blank), but nothing automates
-it. Rotation is rare enough that this is acceptable; if it stops being rare, the
-framework needs a rotate-in-place operation.
+it. Rotation is rare enough that this is acceptable for S1, and a rotate-in-place
+operation is filed as
+[fluo10/sapphire-framework#104](https://github.com/fluo10/sapphire-framework/issues/104).
+The sharp edge worth remembering: the device here is a battery-powered thing on a
+lanyard, so a rotation that takes effect the instant it is written locks the device
+out until it is physically reachable. That is why the issue proposes a grace window
+rather than a straight swap.
 
 Both identity models coexist — the existing voice satellite path is unchanged.
 **One key per device is a requirement, not a suggestion:** a shared key would
@@ -205,18 +210,18 @@ The agent currently depends on `sapphire-framework` with `features = ["workspace
 `remote-server` also drags in `rpc`, `blob`, `retrieve`, `track`, redb and the whole
 axum sync server — a lot of crate to import one struct.
 
-Two acceptable routes, to be settled before implementation starts:
+**Decision: enable the `remote-server` feature for now.** It costs build time and
+dependency surface for one type, but it needs no new code and gets byte-identical key
+file semantics, and it does not block S1 on work in another repository.
 
-- **Enable `remote-server` in the agent.** Zero new code and byte-identical key file
-  semantics. Costs build time and dependency surface for one type.
-- **Split `keys.rs` into a slim crate** (or a feature that does not pull axum/redb),
-  re-exported by `remote-server` so its own use is unchanged. `keys.rs` only needs
-  `toml`, `uuid`, `chrono`, `base64` and `getrandom`. This is a `sapphire-framework`
-  change, so it is a separate piece of work in a separate repo.
+Splitting `keys.rs` into a slim crate is the cleaner end state and is filed as
+[fluo10/sapphire-framework#103](https://github.com/fluo10/sapphire-framework/issues/103).
+`keys.rs` only needs `toml`, `uuid`, `chrono`, `base64` and `getrandom`. When that
+lands, the agent switches its dependency and nothing else in this design changes —
+the import path is all that moves.
 
-The second is cleaner and is the recommendation. The first unblocks S1 immediately if
-the framework change is not wanted yet. **Reimplementing the key file format inside
-the agent is rejected** — see the rejected alternatives.
+**Reimplementing the key file format inside the agent is rejected** — see the
+rejected alternatives.
 
 ### `live` is explicit, not inferred
 
