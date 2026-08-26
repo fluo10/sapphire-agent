@@ -14,11 +14,24 @@ use crate::config::DeviceConfig;
 
 /// Resolves a presented bearer token to the name of the device it belongs
 /// to. Cheap to share behind an `Arc`; holds no mutable state.
-#[derive(Debug)]
 pub struct DeviceRegistry {
     keys: KeyStore,
     /// `KeyEntry::id` -> the `[device.<name>]` key.
     by_key_id: HashMap<uuid::Uuid, String>,
+}
+
+// Hand-written rather than `#[derive(Debug)]`: `sapphire-framework` stores
+// API tokens in `KeyStore` as plaintext by documented design, and currently
+// has no `Debug` impl of its own. A derive here would compile today but
+// silently start printing live bearer tokens the moment the framework ever
+// grows one. Naming only the key-file-derived index forecloses that for
+// good — this impl structurally cannot reach `keys`.
+impl std::fmt::Debug for DeviceRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceRegistry")
+            .field("by_key_id", &self.by_key_id)
+            .finish()
+    }
 }
 
 impl DeviceRegistry {
