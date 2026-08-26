@@ -69,6 +69,9 @@ impl DeviceRegistry {
     }
 
     /// Default key file location, used when `[keys].file` is unset.
+    // Consumed by the later startup-wiring task; delete this attribute
+    // once that task adds the caller.
+    #[allow(dead_code)]
     pub fn default_key_file() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("sapphire-agent").join("keys.toml"))
     }

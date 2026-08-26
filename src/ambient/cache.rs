@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
 use tracing::warn;
+
+use crate::image_cache::sha256_hex;
 
 pub struct AudioCache {
     dir: PathBuf,
@@ -29,6 +29,9 @@ impl AudioCache {
     }
 
     /// Platform-standard default, suitable as a config default.
+    // Consumed by the later startup-wiring task; delete this attribute
+    // once that task adds the caller.
+    #[allow(dead_code)]
     pub fn default_dir() -> Option<PathBuf> {
         dirs::cache_dir().map(|d| d.join("sapphire-agent").join("ambient").join("audio"))
     }
@@ -85,15 +88,6 @@ impl AudioCache {
         }
         Ok(removed)
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 #[cfg(test)]
