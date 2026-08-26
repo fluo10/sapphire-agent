@@ -41,10 +41,6 @@ pub enum BundleCategory {
     Tts,
     Kws,
     Vad,
-    /// Speaker embedding models. Upstream's tag name — `speaker-recongition`,
-    /// not `-recognition` — is their own typo, not ours; copy it verbatim or
-    /// the download 404s.
-    SpeakerEmbedding,
 }
 
 impl BundleCategory {
@@ -54,7 +50,6 @@ impl BundleCategory {
             BundleCategory::Tts => "tts-models",
             BundleCategory::Kws => "kws-models",
             BundleCategory::Vad => "vad-models",
-            BundleCategory::SpeakerEmbedding => "speaker-recongition-models",
         }
     }
 }
@@ -173,10 +168,6 @@ pub fn pick_file(dir: &Path, candidates: &[&str]) -> anyhow::Result<PathBuf> {
 }
 
 /// Return the path as a string suitable for sherpa-onnx config fields.
-// Only sherpa-onnx's own model configs need this exact stringification;
-// gated so a build without `voice-sherpa` (whose only caller, `ambient`,
-// stringifies paths itself) doesn't warn about a function with no callers.
-#[cfg(feature = "voice-sherpa")]
 pub fn path_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }

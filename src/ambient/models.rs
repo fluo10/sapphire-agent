@@ -7,13 +7,19 @@
 //! swapping the embedding model recomputes every cached vector rather than
 //! silently reusing vectors computed by a different model. See
 //! `docs/superpowers/specs/2026-08-26-ambient-audio-ingest-design.md`.
+//!
+//! Both models are configured as an explicit directory only, not a
+//! downloadable bundle name: unlike sherpa-onnx's ASR/TTS/KWS families
+//! (which ship as tar.bz2 bundles resolved by
+//! `voice::providers::sherpa_download::ensure_bundle`), Silero VAD and the
+//! speaker-embedding models have only ever shipped as bare `.onnx` files —
+//! there is nothing for a bundle-name field to auto-download.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::AmbientConfig;
 use crate::image_cache::sha256_hex;
-use crate::voice::providers::sherpa_download::{BundleCategory, ensure_bundle, pick_file};
 
 /// Everything the ambient worker needs to re-gate and attribute speech.
 // Constructed only by the later config-wiring task that reads `[ambient]`
@@ -26,22 +32,42 @@ pub struct ResolvedModels {
     pub model_id: String,
 }
 
-/// Resolve either an explicit `model_dir` or a bundle `model` name to one
-/// model file inside the resolved directory. Pure aside from filesystem
-/// reads — no sherpa-onnx involved, so this is testable without the
-/// `voice-sherpa` feature.
+/// Resolve a configured model directory to one model file inside it — the
+/// first of `candidates` that exists. Pure aside from filesystem reads — no
+/// sherpa-onnx involved, so this is testable without the `voice-sherpa`
+/// feature.
 // Outside tests, called only from `resolve` below, which the later
 // config-wiring task is what actually calls. Delete this attribute once
 // that task adds a caller.
 #[allow(dead_code)]
-pub fn resolve_model_file(
-    model: Option<&str>,
-    model_dir: Option<&str>,
-    category: BundleCategory,
-    candidates: &[&str],
-) -> anyhow::Result<PathBuf> {
-    let dir = ensure_bundle(model_dir, model, category)?;
-    pick_file(&dir, candidates)
+pub fn resolve_model_file(model_dir: Option<&str>, candidates: &[&str]) -> anyhow::Result<PathBuf> {
+    let dir = model_dir.ok_or_else(|| anyhow::anyhow!("model_dir must be set"))?;
+    let path = PathBuf::from(shellexpand::tilde(dir).into_owned());
+    if !path.exists() {
+        anyhow::bail!("model_dir does not exist: {}", path.display());
+    }
+    first_existing(&path, candidates)
+}
+
+/// Find the first of `candidates` that exists in `dir`.
+///
+/// Deliberately local rather than reused from
+/// `voice::providers::sherpa_download::pick_file`, which does the same
+/// thing: reaching that function would cost `sherpa_download` a permanent
+/// feature-gate and visibility change (it currently lives behind
+/// `voice-sherpa` and private to `voice`), whereas this is five lines.
+fn first_existing(dir: &Path, candidates: &[&str]) -> anyhow::Result<PathBuf> {
+    for c in candidates {
+        let p = dir.join(c);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    anyhow::bail!(
+        "no expected file found in {} (looked for: {})",
+        dir.display(),
+        candidates.join(", ")
+    )
 }
 
 /// A stable short id for a model file, for use as (part of) an embedding
@@ -66,15 +92,11 @@ pub fn resolve(cfg: &AmbientConfig) -> anyhow::Result<ResolvedModels> {
     use crate::ambient::audio::{SherpaEmbedder, SileroGate};
 
     let vad_path = resolve_model_file(
-        cfg.vad_model.as_deref(),
         cfg.vad_model_dir.as_deref(),
-        BundleCategory::Vad,
         &["silero_vad.onnx", "model.onnx"],
     )?;
     let embedding_path = resolve_model_file(
-        cfg.embedding_model.as_deref(),
         cfg.embedding_model_dir.as_deref(),
-        BundleCategory::SpeakerEmbedding,
         &["model.onnx", "model.int8.onnx"],
     )?;
 
@@ -82,10 +104,7 @@ pub fn resolve(cfg: &AmbientConfig) -> anyhow::Result<ResolvedModels> {
     // cached vector, so it must never perturb the cache key.
     let model_id = model_id_for(&embedding_path)?;
 
-    let gate = SileroGate::new(
-        vad_path.to_string_lossy().into_owned(),
-        cfg.vad_threshold,
-    )?;
+    let gate = SileroGate::new(vad_path.to_string_lossy().into_owned(), cfg.vad_threshold)?;
     let embedder = SherpaEmbedder::new(
         embedding_path.to_string_lossy().into_owned(),
         cfg.embedding_num_threads,
@@ -121,16 +140,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_model_file_prefers_an_explicit_dir_over_a_bundle_name() {
+    fn resolve_model_file_finds_the_only_candidate_present() {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "model.onnx", b"weights");
-        let got = resolve_model_file(
-            Some("some-bundle-that-would-be-downloaded"),
-            Some(tmp.path().to_str().unwrap()),
-            BundleCategory::SpeakerEmbedding,
-            &["model.onnx"],
-        )
-        .unwrap();
+        let got = resolve_model_file(Some(tmp.path().to_str().unwrap()), &["model.onnx"]).unwrap();
         assert_eq!(got, tmp.path().join("model.onnx"));
     }
 
@@ -139,9 +152,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "model.int8.onnx", b"quantised");
         let got = resolve_model_file(
-            None,
             Some(tmp.path().to_str().unwrap()),
-            BundleCategory::SpeakerEmbedding,
             &["model.onnx", "model.int8.onnx"],
         )
         .unwrap();
@@ -152,14 +163,9 @@ mod tests {
     fn resolve_model_file_errors_naming_the_directory_when_nothing_matches() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
-        let err = resolve_model_file(
-            None,
-            Some(tmp.path().to_str().unwrap()),
-            BundleCategory::SpeakerEmbedding,
-            &["model.onnx"],
-        )
-        .unwrap_err()
-        .to_string();
+        let err = resolve_model_file(Some(tmp.path().to_str().unwrap()), &["model.onnx"])
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains(&tmp.path().display().to_string()),
             "error should name the directory searched: {err}"
@@ -167,10 +173,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_model_file_errors_when_neither_model_nor_dir_is_set() {
+    fn resolve_model_file_errors_when_dir_is_not_set() {
+        assert!(resolve_model_file(None, &["model.onnx"]).is_err());
+    }
+
+    #[test]
+    fn resolve_model_file_errors_naming_the_directory_when_it_does_not_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let err = resolve_model_file(Some(missing.to_str().unwrap()), &["model.onnx"])
+            .unwrap_err()
+            .to_string();
         assert!(
-            resolve_model_file(None, None, BundleCategory::SpeakerEmbedding, &["model.onnx"])
-                .is_err()
+            err.contains(&missing.display().to_string()),
+            "error should name the missing directory: {err}"
         );
     }
 

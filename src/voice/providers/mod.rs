@@ -9,10 +9,7 @@
 
 mod mock;
 mod openai_tts;
-// Not gated behind `voice-sherpa`: this is a pure bundle-download/extract
-// helper (tar + bzip2 only, no sherpa-onnx-sys), and `ambient::models`
-// needs `ensure_bundle`/`pick_file`/`BundleCategory` to resolve its model
-// paths in builds that don't enable `voice-sherpa` at all.
+#[cfg(feature = "voice-sherpa")]
 pub(crate) mod sherpa_download;
 #[cfg(feature = "voice-sherpa")]
 mod sherpa_stt;

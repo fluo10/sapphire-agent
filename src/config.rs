@@ -311,17 +311,17 @@ pub struct AmbientConfig {
     /// handles exactly like being offline.
     #[serde(default = "default_max_queue")]
     pub max_queue: usize,
-    /// Silero VAD model: bundle name, auto-downloaded to the cache dir.
-    #[serde(default)]
-    pub vad_model: Option<String>,
-    /// Explicit directory holding the Silero VAD model. Wins over `vad_model`.
+    /// Directory holding the Silero VAD model. sherpa-onnx publishes it only
+    /// as a bare `.onnx` file (e.g. `silero_vad.onnx`), not a downloadable
+    /// bundle — get it from the sherpa-onnx GitHub releases page
+    /// (`asr-models` tag) and point this at the directory you saved it in.
     #[serde(default)]
     pub vad_model_dir: Option<String>,
-    /// Speaker embedding model: bundle name, auto-downloaded to the cache dir.
-    #[serde(default)]
-    pub embedding_model: Option<String>,
-    /// Explicit directory holding the speaker embedding model. Wins over
-    /// `embedding_model`.
+    /// Directory holding the speaker embedding model. Like the VAD model,
+    /// sherpa-onnx publishes these only as bare `.onnx` files — get one from
+    /// the sherpa-onnx GitHub releases page (`speaker-recongition-models`
+    /// tag, upstream's own spelling) and point this at the directory you
+    /// saved it in.
     #[serde(default)]
     pub embedding_model_dir: Option<String>,
     /// VAD speech probability threshold.
@@ -369,9 +369,7 @@ impl Default for AmbientConfig {
             promote_after_seconds: default_promote_after_seconds(),
             promote_after_days: default_promote_after_days(),
             max_queue: default_max_queue(),
-            vad_model: None,
             vad_model_dir: None,
-            embedding_model: None,
             embedding_model_dir: None,
             vad_threshold: default_vad_threshold(),
             embedding_num_threads: default_embedding_num_threads(),
@@ -2557,9 +2555,7 @@ api_key = "sa-dev-oops"
     #[test]
     fn ambient_model_fields_default_to_unset() {
         let cfg: crate::config::AmbientConfig = toml::from_str("").unwrap();
-        assert!(cfg.vad_model.is_none());
         assert!(cfg.vad_model_dir.is_none());
-        assert!(cfg.embedding_model.is_none());
         assert!(cfg.embedding_model_dir.is_none());
         assert_eq!(cfg.vad_threshold, 0.5);
         assert_eq!(cfg.embedding_num_threads, 2);
@@ -2570,14 +2566,14 @@ api_key = "sa-dev-oops"
         let cfg: crate::config::AmbientConfig = toml::from_str(
             r#"
 embedding_model_dir = "/models/3dspeaker"
-vad_model = "silero_vad"
+vad_model_dir = "/models/silero"
 vad_threshold = 0.6
 embedding_num_threads = 4
 "#,
         )
         .unwrap();
         assert_eq!(cfg.embedding_model_dir.as_deref(), Some("/models/3dspeaker"));
-        assert_eq!(cfg.vad_model.as_deref(), Some("silero_vad"));
+        assert_eq!(cfg.vad_model_dir.as_deref(), Some("/models/silero"));
         assert_eq!(cfg.vad_threshold, 0.6);
         assert_eq!(cfg.embedding_num_threads, 4);
     }
