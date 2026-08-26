@@ -151,10 +151,6 @@ impl CandidateStore {
     }
 
     /// Look up a single candidate by id.
-    // Consumed by the later worker/tool wiring task, which matches
-    // segments against candidates as well as registered speakers. Delete
-    // this attribute once that task adds a caller.
-    #[allow(dead_code)]
     pub fn get(&self, id: &str) -> Option<&Candidate> {
         self.candidates.get(id)
     }

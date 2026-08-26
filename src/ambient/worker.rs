@@ -112,16 +112,32 @@ impl Worker {
     ) -> Result<(Option<String>, Option<f32>)> {
         if let Some(m) = self.registry.match_speaker(embedding) {
             // A match may be a candidate rather than a registered speaker;
-            // observing keeps its statistics and centroid current.
-            let is_candidate = {
-                let candidates = self.candidates.lock().expect("candidate store poisoned");
-                candidates.get(&m.id).is_some()
-            };
-            if is_candidate {
-                {
-                    let mut candidates = self.candidates.lock().expect("candidate store poisoned");
-                    candidates.observe(&m.id, embedding, day, speech_ms, text)?;
+            // observing keeps its statistics and centroid current. The
+            // existence check and the observe must share one lock
+            // acquisition: this store is also held by the promotion tool
+            // (a later task), and releasing the lock between "is this a
+            // candidate" and "observe it" would let a promotion land in
+            // the gap, so `observe` would find the id already gone.
+            let observed = {
+                let mut candidates = self.candidates.lock().expect("candidate store poisoned");
+                if candidates.get(&m.id).is_some() {
+                    match candidates.observe(&m.id, embedding, day, speech_ms, text) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            // The transcript is already committed to being
+                            // written (audio is cached, STT has run); losing
+                            // the attribution update is recoverable in a way
+                            // that losing the transcript is not, so this
+                            // degrades rather than propagating with `?`.
+                            warn!("ambient: could not update candidate {}: {e}", m.id);
+                            false
+                        }
+                    }
+                } else {
+                    false
                 }
+            };
+            if observed {
                 self.maybe_promote(&m.id)?;
             }
             return Ok((Some(m.id), Some(m.score)));
@@ -277,6 +293,20 @@ mod tests {
         assert_eq!(rec.speaker, None, "too short to attribute reliably");
         assert_eq!(rec.speaker_score, None);
         assert_eq!(rec.text, "transcribed text");
+    }
+
+    #[tokio::test]
+    async fn a_segment_exactly_at_min_embed_ms_gets_a_speaker() {
+        let mut h = harness(
+            Box::new(PassthroughGate::new()),
+            Box::new(FixedEmbedder::new(vec![1.0, 0.0])),
+            &[("me", vec![1.0, 0.0])],
+        );
+        // 24000 samples = 1500 ms, exactly min_embed_ms: the comparison is
+        // `<`, so this boundary must still be attributed, not excluded.
+        let rec = h.worker.process(seg(24_000, true)).await.unwrap().unwrap();
+        assert_eq!(rec.speech_ms, 1500);
+        assert_eq!(rec.speaker.as_deref(), Some("me"), "at the boundary, not below it");
     }
 
     #[tokio::test]

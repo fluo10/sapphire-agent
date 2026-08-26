@@ -104,10 +104,6 @@ impl SpeakerRegistry {
 
     /// Register an embedding at runtime — used for auto-enrolled candidates,
     /// so a newly seen voice matches on its next segment.
-    // Consumed by the later promotion task, which enrolls a candidate once
-    // it crosses the promotion threshold. Delete this attribute once that
-    // task adds a caller.
-    #[allow(dead_code)]
     pub fn add_runtime(&mut self, id: String, embedding: Vec<f32>) {
         self.speakers.insert(id, embedding);
     }
