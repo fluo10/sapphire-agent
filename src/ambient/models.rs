@@ -22,9 +22,6 @@ use crate::config::AmbientConfig;
 use crate::image_cache::sha256_hex;
 
 /// Everything the ambient worker needs to re-gate and attribute speech.
-// Constructed only by the later config-wiring task that reads `[ambient]`
-// and starts the worker. Delete this attribute once that task adds a caller.
-#[allow(dead_code)]
 pub struct ResolvedModels {
     pub gate: Box<dyn crate::ambient::audio::SpeechGate>,
     pub embedder: Box<dyn crate::ambient::audio::SpeakerEmbedder>,
@@ -36,9 +33,14 @@ pub struct ResolvedModels {
 /// first of `candidates` that exists. Pure aside from filesystem reads — no
 /// sherpa-onnx involved, so this is testable without the `voice-sherpa`
 /// feature.
-// Outside tests, called only from `resolve` below, which the later
-// config-wiring task is what actually calls. Delete this attribute once
-// that task adds a caller.
+///
+/// Outside tests, called only from `resolve`'s `voice-sherpa` branch below.
+/// This function itself is *not* `#[cfg]`-gated, so a
+/// `--no-default-features` build that omits `voice-sherpa` still compiles
+/// it — with no caller, since that branch of `resolve` doesn't exist in
+/// that build. Hence the `#[allow(dead_code)]`: still genuinely needed for
+/// that one build configuration, not for a task that hasn't wired a
+/// caller yet.
 #[allow(dead_code)]
 pub fn resolve_model_file(model_dir: Option<&str>, candidates: &[&str]) -> anyhow::Result<PathBuf> {
     let dir = model_dir.ok_or_else(|| anyhow::anyhow!("model_dir must be set"))?;
@@ -73,9 +75,10 @@ fn first_existing(dir: &Path, candidates: &[&str]) -> anyhow::Result<PathBuf> {
 /// A stable short id for a model file, for use as (part of) an embedding
 /// cache key. Depends only on the file's contents, not its name or path,
 /// so relocating a model directory never invalidates cached vectors.
-// Outside tests, called only from `resolve` below, which the later
-// config-wiring task is what actually calls. Delete this attribute once
-// that task adds a caller.
+///
+/// Outside tests, called only from `resolve`'s `voice-sherpa` branch below;
+/// see [`resolve_model_file`] for why `--no-default-features` (without
+/// `voice-sherpa`) still needs the `#[allow(dead_code)]` here.
 #[allow(dead_code)]
 pub fn model_id_for(path: &Path) -> anyhow::Result<String> {
     let bytes = fs::read(path)
@@ -84,9 +87,10 @@ pub fn model_id_for(path: &Path) -> anyhow::Result<String> {
     Ok(full[..16].to_string())
 }
 
-// Constructed only by the later config-wiring task that reads `[ambient]`
-// and starts the worker. Delete this attribute once that task adds a caller.
-#[allow(dead_code)]
+/// Called from `ambient::startup::build`, which is unreachable in this
+/// exact form under `--no-default-features` (see the sibling `resolve`
+/// below): only one of the two definitions compiles for a given feature
+/// set, and `startup::build` calls whichever one is present.
 #[cfg(feature = "voice-sherpa")]
 pub fn resolve(cfg: &AmbientConfig) -> anyhow::Result<ResolvedModels> {
     use crate::ambient::audio::{SherpaEmbedder, SileroGate};

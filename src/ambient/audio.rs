@@ -7,6 +7,11 @@
 
 use anyhow::Result;
 
+// Every consumer of this constant in this file — `samples_to_ms` and the
+// `sherpa_impl` module — is itself gated `#[cfg(any(test, feature =
+// "voice-sherpa"))]` or narrower, so the import needs the same gate: a
+// `--no-default-features` non-test build has no user for it at all.
+#[cfg(any(test, feature = "voice-sherpa"))]
 use crate::voice::PIPELINE_SAMPLE_RATE;
 
 /// Speech surviving the re-gate.
@@ -33,26 +38,42 @@ pub trait SpeakerEmbedder: Send + Sync {
 }
 
 /// Convert a sample count at [`PIPELINE_SAMPLE_RATE`] into milliseconds.
+///
+/// Two independent callers, neither of which exists in a
+/// `--no-default-features` non-test build: [`PassthroughGate::gate`] below
+/// (`#[cfg(test)]` — see its doc comment for why it is test-only, not a
+/// production fallback) and `SileroGate::gate` under
+/// `#[cfg(feature = "voice-sherpa")]`. The gate here has to cover both.
+#[cfg(any(test, feature = "voice-sherpa"))]
 pub fn samples_to_ms(samples: usize) -> u32 {
     ((samples as u64 * 1000) / PIPELINE_SAMPLE_RATE as u64) as u32
 }
 
-/// Keeps everything it is given. Used in tests and as the fallback when no
-/// VAD model is configured — over-keeping costs STT time, never data.
+/// Keeps everything it is given. Test double only — despite the name, this
+/// is **not** wired as a production fallback for a missing VAD model:
+/// `ambient::models::resolve` treats an unset `vad_model_dir` as a hard
+/// startup error, on purpose (a silently-degraded gate that keeps silence
+/// and noise would corrupt speaker attribution quietly instead of failing
+/// loudly). `#[cfg(test)]` reflects that this type has no production
+/// caller, only `ambient::worker`'s tests.
+#[cfg(test)]
 pub struct PassthroughGate;
 
+#[cfg(test)]
 impl PassthroughGate {
     pub fn new() -> Self {
         Self
     }
 }
 
+#[cfg(test)]
 impl Default for PassthroughGate {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl SpeechGate for PassthroughGate {
     fn gate(&self, pcm: &[i16]) -> Option<GatedSpeech> {
         if pcm.is_empty() {
@@ -66,8 +87,10 @@ impl SpeechGate for PassthroughGate {
 }
 
 /// Drops everything. Test double for "the re-gate found no speech".
+#[cfg(test)]
 pub struct SilentGate;
 
+#[cfg(test)]
 impl SpeechGate for SilentGate {
     fn gate(&self, _pcm: &[i16]) -> Option<GatedSpeech> {
         None
@@ -75,16 +98,19 @@ impl SpeechGate for SilentGate {
 }
 
 /// Returns one fixed vector regardless of input. Test double.
+#[cfg(test)]
 pub struct FixedEmbedder {
     vector: Vec<f32>,
 }
 
+#[cfg(test)]
 impl FixedEmbedder {
     pub fn new(vector: Vec<f32>) -> Self {
         Self { vector }
     }
 }
 
+#[cfg(test)]
 impl SpeakerEmbedder for FixedEmbedder {
     fn dim(&self) -> usize {
         self.vector.len()
@@ -111,19 +137,11 @@ mod sherpa_impl {
     /// hundreds of segments and every one of `VoiceActivityDetector`'s
     /// methods takes `&self` (the C library keeps its state behind the
     /// pointer), so one instance can serve every call.
-    // Constructed only by the later config-wiring task that reads
-    // `[ambient]` and selects a `SpeechGate` implementation. Delete this
-    // attribute once that task adds a caller.
-    #[allow(dead_code)]
     pub struct SileroGate {
         vad: VoiceActivityDetector,
     }
 
     impl SileroGate {
-        // Constructed only by the later config-wiring task that reads
-        // `[ambient]` and selects a `SpeechGate` implementation. Delete
-        // this attribute once that task adds a caller.
-        #[allow(dead_code)]
         pub fn new(model_path: String, threshold: f32) -> anyhow::Result<Self> {
             let config = VadModelConfig {
                 silero_vad: SileroVadModelConfig {
@@ -170,19 +188,11 @@ mod sherpa_impl {
         }
     }
 
-    // Constructed only by the later config-wiring task that reads
-    // `[ambient]` and selects a `SpeakerEmbedder` implementation. Delete
-    // this attribute once that task adds a caller.
-    #[allow(dead_code)]
     pub struct SherpaEmbedder {
         extractor: SpeakerEmbeddingExtractor,
     }
 
     impl SherpaEmbedder {
-        // Constructed only by the later config-wiring task that reads
-        // `[ambient]` and selects a `SpeakerEmbedder` implementation.
-        // Delete this attribute once that task adds a caller.
-        #[allow(dead_code)]
         pub fn new(model_path: String, num_threads: i32) -> anyhow::Result<Self> {
             let config = SpeakerEmbeddingExtractorConfig {
                 model: Some(model_path),
@@ -218,10 +228,10 @@ mod sherpa_impl {
     }
 }
 
-// Re-exported for the later config-wiring task; nothing constructs these
-// yet. Delete this attribute once that task adds a caller.
+// `sherpa_impl` is a private module (no `pub` above); this re-export is
+// what lets `ambient::models::resolve`'s `voice-sherpa` branch name
+// `crate::ambient::audio::{SherpaEmbedder, SileroGate}` from outside it.
 #[cfg(feature = "voice-sherpa")]
-#[allow(unused_imports)]
 pub use sherpa_impl::{SherpaEmbedder, SileroGate};
 
 #[cfg(test)]

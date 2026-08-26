@@ -383,11 +383,13 @@ system_prompt = "You are a helpful personal assistant."
 # Ambient audio ingest (optional)
 # ─────────────────────────────────────────────────────────────────────
 # A wearable/pendant device POSTs short audio segments to
-# `POST /audio/ingest`, mounted on the same HTTP server as `/rpc`.
-# Disabled by default; the route exists either way but answers 404
-# while `[ambient].enabled` is false, the same "off means 404, not a
-# bad-auth 401" convention `/a2a` and `/mcp` use, so a device probing
-# for the feature isn't told its key is wrong.
+# `POST /audio/ingest`, mounted on the same HTTP server as `/rpc` only
+# once this subsystem actually starts. Disabled by default: with
+# `[ambient].enabled = false` the route is not mounted at all, so it
+# answers 404 like any other unmatched path — a device probing for the
+# feature isn't told its key is wrong (401), the same distinction `/a2a`
+# and `/mcp` preserve, just reached by router omission here rather than
+# by a handler that refuses while still being mounted.
 #
 # This is a **recording** pipeline, not a conversational one: segments
 # are re-gated, transcribed, attributed to a speaker, and stored — no
