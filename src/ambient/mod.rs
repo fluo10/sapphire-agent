@@ -11,4 +11,5 @@ pub mod auth;
 pub mod cache;
 pub mod ingest;
 pub mod router;
+pub mod speaker;
 pub mod transcript;
