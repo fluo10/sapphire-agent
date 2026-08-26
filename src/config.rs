@@ -277,9 +277,12 @@ fn default_image_cache_enabled() -> bool {
     true
 }
 
-/// Ambient (always-on) audio capture ingest. Opt-in: the endpoint is
-/// mounted unconditionally but refuses requests when `enabled` is false,
-/// matching how `[a2a]` and `[acp]` behave.
+/// Ambient (always-on) audio capture ingest. Opt-in: with `enabled =
+/// false`, `ambient::startup::build` returns `None` and `/audio/ingest` is
+/// never mounted, so it 404s like any other unmatched path rather than
+/// answering 401 and telling a probing device its key is wrong. The
+/// handler's own `enabled` check survives as defence in depth for a caller
+/// that mounts the routes anyway.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AmbientConfig {
