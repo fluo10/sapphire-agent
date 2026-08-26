@@ -914,6 +914,7 @@ checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
  "bytes",
+ "form_urlencoded",
  "futures-util",
  "http",
  "http-body",
@@ -929,11 +930,13 @@ dependencies = [
  "serde_core",
  "serde_json",
  "serde_path_to_error",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -952,6 +955,7 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -10230,6 +10234,9 @@ version = "0.1.0"
 source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
 dependencies = [
  "sapphire-framework-backend",
+ "sapphire-framework-blob",
+ "sapphire-framework-remote-server",
+ "sapphire-framework-rpc",
  "sapphire-framework-workspace",
 ]
 
@@ -10251,6 +10258,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sapphire-framework-blob"
+version = "0.1.0"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
+dependencies = [
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sapphire-framework-remote-client"
 version = "0.1.0"
 source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
@@ -10262,6 +10278,25 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "sapphire-framework-remote-server"
+version = "0.1.0"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "redb",
+ "sapphire-framework-blob",
+ "sapphire-framework-retrieve",
+ "sapphire-framework-rpc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -11865,6 +11900,7 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
