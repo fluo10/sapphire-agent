@@ -17,7 +17,15 @@ mod sherpa_stt;
 mod sherpa_tts;
 mod wav_stream;
 
-pub(super) use mock::{MockStt, MockTts};
+// `MockStt` is re-exported at `pub(crate)` (not `pub(super)` like the
+// rest of this module) because `crate::voice::mod.rs` re-exports it a
+// second hop out for `ambient::worker`'s tests. A `pub(super) use` here
+// caps MockStt's effective visibility at "visible in `voice`"; a
+// `pub(crate) use` one level up cannot widen that after the fact — it
+// can only forward visibility the item already has. `MockTts` has no
+// such second-hop caller, so it keeps the tighter `pub(super)`.
+pub(crate) use mock::MockStt;
+pub(super) use mock::MockTts;
 pub(super) use openai_tts::OpenAiTts;
 #[cfg(feature = "voice-sherpa")]
 pub(super) use sherpa_stt::SherpaOnnxStt;

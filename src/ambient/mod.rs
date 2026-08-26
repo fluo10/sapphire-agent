@@ -13,3 +13,4 @@ pub mod ingest;
 pub mod router;
 pub mod speaker;
 pub mod transcript;
+pub mod worker;

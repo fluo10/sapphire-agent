@@ -26,6 +26,15 @@ use std::sync::Arc;
 
 use crate::config::{Config, SttProviderConfig, TtsProviderConfig};
 
+// `providers` is a private module, so nothing outside `voice/` can name
+// `providers::MockStt` directly. Re-exported here, one hop out, so
+// `ambient::worker`'s tests can build a deterministic STT double without
+// a real model. This only compiles because `providers/mod.rs` re-exports
+// `MockStt` itself at `pub(crate)` rather than `pub(super)` — a `pub(X)
+// use` can forward an item's existing visibility outward but never
+// widen it, so the inner re-export has to already be crate-visible.
+pub(crate) use providers::MockStt;
+
 pub use stt::SttProvider;
 pub use tts::TtsProvider;
 
