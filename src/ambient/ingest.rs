@@ -228,7 +228,7 @@ async fn handle_hello(
 /// rejected rather than silently dropping the trailing byte, the same
 /// failure class as accepting the wrong WAV bit depth in [`decode_wav`].
 fn decode_l16(bytes: &[u8]) -> anyhow::Result<Vec<i16>> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         anyhow::bail!(
             "audio/L16 body has odd length {} bytes; s16le must be a whole number of samples",
             bytes.len()
@@ -308,8 +308,10 @@ mod tests {
         );
         let registry = DeviceRegistry::open(&key_path, &devices).unwrap();
         let (tx, rx) = mpsc::channel(depth);
-        let mut cfg = AmbientConfig::default();
-        cfg.enabled = enabled;
+        let cfg = AmbientConfig {
+            enabled,
+            ..Default::default()
+        };
         let state = Arc::new(AmbientState::new(cfg, registry, tx));
         (routes(state), rx)
     }
