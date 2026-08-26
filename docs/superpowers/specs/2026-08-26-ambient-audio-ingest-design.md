@@ -59,7 +59,12 @@ input; S3 replaces the manual input with automation; S4 layers realtime on top.
   enrolment needs no new dependency.
 - `src/voice/providers/sherpa_download.rs` — model bundle fetch/extract, reused for
   the speaker embedding model.
-- The bearer scheme behind `/a2a`, `/mcp` and `/acp` — device auth reuses it.
+- `sapphire-framework`'s `remote_server::KeyStore` — labelled API keys in a
+  plaintext key file, each with a stable UUID `id`, constant-time `authenticate`
+  and `expires_at` enforcement. Device auth uses it rather than inventing a scheme
+  or holding tokens in `config.toml`.
+- The bearer *transport* convention from `/a2a`, `/mcp` and `/acp`
+  (`Authorization: Bearer <token>`); the token *resolution* differs, see below.
 - `src/mcp_client/` — how S2 will reach `sapphire-journal-mcp`. Not touched here.
 
 The new subsystem lives in `src/ambient/` and uses the `(ambient)` commit scope.
@@ -129,14 +134,28 @@ both the bytes and the CPU matter, and neither buys anything.
 
 ### Device identity comes from the API key
 
-There is no `device` parameter. One API key per device, bound server-side:
+There is no `device` parameter. One API key per device, bound server-side.
+
+**The token itself never appears in the agent's config.** Keys live in
+`sapphire-framework`'s key file (`remote_server::KeyStore`), and the agent's config
+references a key by its stable `id`:
 
 ```toml
+[keys]
+file = "~/.config/sapphire-agent/keys.toml"   # framework KeyStore
+
 [device.pendant]
-api_key      = "sa-dev-<long random>"
+key_id       = "6c8f4a2e-1d33-4b90-9a71-0e5b2f8c4d17"
 label        = "the one on the lanyard"
 room_profile = "default"   # which profile a conversation runs under (S4)
 ```
+
+Resolution on each request:
+
+1. `KeyStore::authenticate(token)` → `Option<&KeyEntry>`. This does the
+   constant-time comparison and the `expires_at` check. `None` → `401`.
+2. Find the device whose `key_id` equals `entry.id`. No match → `401` (a valid key
+   that is not bound to any device is not a device).
 
 The config key (`pendant`) is the stable device id recorded in transcripts.
 
@@ -147,9 +166,57 @@ Rationale over the existing `sapphire-call` model (client-generated UUID v7 in
 - Firmware needs one constant, with no UUID generation and no NVS persistence.
 - Transcripts carry `"device":"pendant"` instead of a UUID.
 
-Both models coexist — the existing voice satellite path is unchanged. **One key per
-device is a requirement, not a suggestion:** a shared key would collide in the
-`segment` idempotency namespace.
+Rationale for `key_id` over an inline `api_key`:
+
+- **No secret in `config.toml`.** This is concrete, not hygienic: `config_layer.rs`
+  carries an allowlist bounding what the *workspace* config layer may set, and it
+  names `providers`' leaves one by one specifically because a bare `providers.*`
+  "would drag `api_key` in with it". With `key_id`, `[device.*]` holds nothing
+  secret, so it can join that allowlist and device definitions become shareable
+  across hosts through the workspace — alongside the voice-identity sharing already
+  noted there as issue #173, which this design also needs.
+- **Revocation and expiry stop being the agent's problem.** Deleting or expiring the
+  key in the key file disables the device on the next request, with no agent config
+  edit and no restart-order question. `KeyEntry::is_expired` is already enforced
+  inside `authenticate`.
+- **The id survives a label change**, which is what the framework mints it for.
+
+Enrolling a device is therefore two steps, and the id flows key-file → config, never
+the other way: mint the key (`KeyStore::generate`, or append a `[[key]]` with just a
+`token` and let the next load fill the rest in), then copy the resulting `id` into a
+`[device.*]` block. The token goes to the device; the id goes to the config; the two
+never meet in one file.
+
+Caveat: `KeyStore::generate` mints a fresh UUID per key, so **rotating a token
+without editing the agent config means hand-editing the key file** — appending a
+`[[key]]` with the new `token` and the *old* `id`. The file format permits this
+(`id` is an optional field filled in on load only when blank), but nothing automates
+it. Rotation is rare enough that this is acceptable; if it stops being rare, the
+framework needs a rotate-in-place operation.
+
+Both identity models coexist — the existing voice satellite path is unchanged.
+**One key per device is a requirement, not a suggestion:** a shared key would
+collide in the `segment` idempotency namespace.
+
+### Reaching `KeyStore` from the agent
+
+The agent currently depends on `sapphire-framework` with `features = ["workspace"]`.
+`KeyStore` lives in `sapphire-framework-remote-server`, whose facade feature
+`remote-server` also drags in `rpc`, `blob`, `retrieve`, `track`, redb and the whole
+axum sync server — a lot of crate to import one struct.
+
+Two acceptable routes, to be settled before implementation starts:
+
+- **Enable `remote-server` in the agent.** Zero new code and byte-identical key file
+  semantics. Costs build time and dependency surface for one type.
+- **Split `keys.rs` into a slim crate** (or a feature that does not pull axum/redb),
+  re-exported by `remote-server` so its own use is unchanged. `keys.rs` only needs
+  `toml`, `uuid`, `chrono`, `base64` and `getrandom`. This is a `sapphire-framework`
+  change, so it is a separate piece of work in a separate repo.
+
+The second is cleaner and is the recommendation. The first unblocks S1 immediately if
+the framework change is not wanted yet. **Reimplementing the key file format inside
+the agent is rejected** — see the rejected alternatives.
 
 ### `live` is explicit, not inferred
 
@@ -328,11 +395,23 @@ promote_after_seconds = 60
 promote_after_days    = 2
 max_queue             = 1000
 
+[keys]
+file = "~/.config/sapphire-agent/keys.toml"
+
 [device.pendant]
-api_key      = "sa-dev-<long random>"
+key_id       = "6c8f4a2e-1d33-4b90-9a71-0e5b2f8c4d17"
 label        = "the one on the lanyard"
 room_profile = "default"
 ```
+
+`label` here is display metadata (it reaches the system prompt, the way
+`DeviceMetadata` does today). The key file has its own `label`, which the framework
+documents as a note for humans that nothing in the system reads. They are different
+fields with different owners; neither is derived from the other.
+
+`[device.*]` and `[keys].file` are host-local for now. Once `[device.*]` is added to
+`WORKSPACE_ALLOWLIST`, device definitions can come from the workspace layer while
+`[keys].file` stays host-only — which is the point of moving the token out.
 
 ## Error handling
 
@@ -342,14 +421,26 @@ room_profile = "default"
   pipeline does not stop.
 - **Unreadable reference audio** logs a warning and disables that speaker. Ingest
   continues.
-- **Unknown or unbound bearer** returns `401`.
+- **Authentication** returns `401` for all three failure modes, with no detail in the
+  response body distinguishing them: token not in the key file, token expired, and
+  token valid but bound to no device. The distinction is logged, not returned.
+- **A missing or unreadable key file** fails startup rather than accepting requests.
+  `KeyStore::load` treats a missing file as an empty store, which would otherwise
+  mean "every device is rejected" silently; ambient ingest with `enabled = true` and
+  no usable key is a misconfiguration, not a running state.
 
 ## Testing
 
 TDD. `MockStt` already exists, so most of this runs without models.
 
-- Endpoint: auth, idempotent double-POST of one `segment`, bad `Content-Type`,
+- Endpoint: idempotent double-POST of one `segment`, bad `Content-Type`,
   non-16 kHz rejection, `429` on a full queue.
+- Auth, one case per failure mode: unknown token, **expired** token (an
+  `expires_at` in the past must be rejected even though the token matches), token
+  valid but bound to no `[device.*]`, and the happy path resolving to the right
+  device id.
+- Startup fails, rather than rejecting every request at runtime, when `[ambient]` is
+  enabled and the key file is missing or holds no usable key.
 - Promotion policy boundaries: 59 s vs 60 s, 1 day vs 2 days.
 - Rename transparency: promote a candidate, rename the directory, confirm past
   transcripts read back under the new name.
@@ -402,3 +493,20 @@ radio is already awake for the uplink, and offline means no reply is wanted anyw
   television and passers-by.
 - **Client-declared device id.** Self-declared identity is spoofable and costs the
   firmware UUID generation and persistence.
+- **An inline `api_key` in `[device.*]`.** Puts a secret in the file the workspace
+  config layer merges into, and makes revocation an agent-config edit.
+- **Reimplementing the key file format in the agent.** It is a shared on-disk format
+  with defaulting behaviour (`id` and `created_at` filled on load, then written
+  back), so a second parser would have to stay bug-for-bug consistent with the
+  framework's through every change. That failure mode is already on record in this
+  workspace with the frontmatter parsers.
+
+## Follow-up, deliberately not in S1
+
+`[room_profile.*].api_keys` — the inline-token scheme behind `/a2a`, `/mcp` and
+`/acp` — has the same problems this section solves, and should migrate to the same
+`KeyStore` (a `key_ids` list resolving the same way). It is left alone here because
+it changes the authentication path of three shipped endpoints, which is its own
+change with its own migration for existing configs, and bundling it would make S1's
+diff mostly about something else. Nothing in this design blocks it: both schemes read
+the same `[keys].file`.
