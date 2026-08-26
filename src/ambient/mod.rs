@@ -10,6 +10,7 @@ pub mod audio;
 pub mod auth;
 pub mod cache;
 pub mod ingest;
+pub mod models;
 pub mod router;
 pub mod speaker;
 pub mod transcript;

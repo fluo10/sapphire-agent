@@ -311,6 +311,25 @@ pub struct AmbientConfig {
     /// handles exactly like being offline.
     #[serde(default = "default_max_queue")]
     pub max_queue: usize,
+    /// Silero VAD model: bundle name, auto-downloaded to the cache dir.
+    #[serde(default)]
+    pub vad_model: Option<String>,
+    /// Explicit directory holding the Silero VAD model. Wins over `vad_model`.
+    #[serde(default)]
+    pub vad_model_dir: Option<String>,
+    /// Speaker embedding model: bundle name, auto-downloaded to the cache dir.
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    /// Explicit directory holding the speaker embedding model. Wins over
+    /// `embedding_model`.
+    #[serde(default)]
+    pub embedding_model_dir: Option<String>,
+    /// VAD speech probability threshold.
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
+    /// Inference threads for the embedding model.
+    #[serde(default = "default_embedding_num_threads")]
+    pub embedding_num_threads: i32,
 }
 
 fn default_audio_retention_days() -> u32 {
@@ -331,6 +350,12 @@ fn default_promote_after_days() -> u32 {
 fn default_max_queue() -> usize {
     1000
 }
+fn default_vad_threshold() -> f32 {
+    0.5
+}
+fn default_embedding_num_threads() -> i32 {
+    2
+}
 
 impl Default for AmbientConfig {
     fn default() -> Self {
@@ -344,6 +369,12 @@ impl Default for AmbientConfig {
             promote_after_seconds: default_promote_after_seconds(),
             promote_after_days: default_promote_after_days(),
             max_queue: default_max_queue(),
+            vad_model: None,
+            vad_model_dir: None,
+            embedding_model: None,
+            embedding_model_dir: None,
+            vad_threshold: default_vad_threshold(),
+            embedding_num_threads: default_embedding_num_threads(),
         }
     }
 }
@@ -2521,5 +2552,33 @@ api_key = "sa-dev-oops"
             err.to_string().contains("api_key"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn ambient_model_fields_default_to_unset() {
+        let cfg: crate::config::AmbientConfig = toml::from_str("").unwrap();
+        assert!(cfg.vad_model.is_none());
+        assert!(cfg.vad_model_dir.is_none());
+        assert!(cfg.embedding_model.is_none());
+        assert!(cfg.embedding_model_dir.is_none());
+        assert_eq!(cfg.vad_threshold, 0.5);
+        assert_eq!(cfg.embedding_num_threads, 2);
+    }
+
+    #[test]
+    fn ambient_model_fields_parse_from_toml() {
+        let cfg: crate::config::AmbientConfig = toml::from_str(
+            r#"
+embedding_model_dir = "/models/3dspeaker"
+vad_model = "silero_vad"
+vad_threshold = 0.6
+embedding_num_threads = 4
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.embedding_model_dir.as_deref(), Some("/models/3dspeaker"));
+        assert_eq!(cfg.vad_model.as_deref(), Some("silero_vad"));
+        assert_eq!(cfg.vad_threshold, 0.6);
+        assert_eq!(cfg.embedding_num_threads, 4);
     }
 }

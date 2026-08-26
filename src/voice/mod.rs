@@ -19,7 +19,10 @@
 pub mod stt;
 pub mod tts;
 
-mod providers;
+// `pub(crate)` (not private) so `ambient::models` can reach
+// `sherpa_download`'s bundle-or-dir resolution to find its two ONNX
+// models, without needing anything else this module exposes.
+pub(crate) mod providers;
 
 use std::collections::HashMap;
 use std::sync::Arc;

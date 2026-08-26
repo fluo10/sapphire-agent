@@ -62,7 +62,7 @@ fastembed-embed = ["sapphire-framework/fastembed-embed"]
 # (sherpa-onnx + ONNX runtime, ~5–10 minutes on a cold cache). Users
 # who only run the Gradio TTS path or who don't need voice at all can
 # opt out with `--no-default-features` plus the other defaults.
-voice-sherpa = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2"]
+voice-sherpa = ["dep:sherpa-onnx"]
 
 [dependencies]
 # Async runtime
@@ -174,10 +174,13 @@ serenity = { version = "0.12", default-features = false, features = [
 sherpa-onnx = { version = "1.13", optional = true }
 
 # Model bundle extraction. sherpa-onnx ships pre-trained models as
-# tar.bz2 archives on GitHub releases; both crates are gated alongside
-# sherpa-onnx itself.
-tar = { version = "0.4", optional = true }
-bzip2 = { version = "0.6", optional = true }
+# tar.bz2 archives on GitHub releases. Unconditional (not gated behind
+# `voice-sherpa`): `ambient::models` resolves bundle-or-dir model paths
+# without needing sherpa-onnx itself, and both crates are pure Rust here
+# (bzip2 0.6 uses the libbz2-rs-sys backend, no C toolchain), so they add
+# no meaningful build cost to the default-features-off build.
+tar = "0.4"
+bzip2 = "0.6"
 
 # WAV decoding for TTS providers that return audio files (e.g. Gradio Web UI).
 hound = "3.5"
