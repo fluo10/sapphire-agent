@@ -41,6 +41,14 @@ impl DeviceRegistry {
     /// `KeyStore::load` treats absence as "no keys", which would leave
     /// ambient ingest running and rejecting every device forever — a
     /// misconfiguration that looks exactly like a broken device.
+    ///
+    /// Two `[device.*]` blocks naming the same `key_id` is fatal for the
+    /// same reason. One key per device is a stated requirement of the
+    /// design — a shared key collides in the `segment` idempotency
+    /// namespace — and indexing by key id silently resolves such a pair to
+    /// whichever name a randomly-seeded `HashMap` iteration reached last,
+    /// so the device name recorded in transcripts would change at every
+    /// restart.
     pub fn open(keys_file: &Path, devices: &HashMap<String, DeviceConfig>) -> Result<Self> {
         let keys = KeyStore::load(keys_file)
             .with_context(|| format!("loading key file {}", keys_file.display()))?;
@@ -50,10 +58,23 @@ impl DeviceRegistry {
                 keys_file.display()
             );
         }
-        let by_key_id = devices
-            .iter()
-            .map(|(name, cfg)| (cfg.key_id, name.clone()))
-            .collect();
+        // Sorted, so the pair named in the error is the same one on every
+        // run rather than whichever collision `HashMap` order surfaced.
+        let mut ordered: Vec<(&String, &DeviceConfig)> = devices.iter().collect();
+        ordered.sort_by(|a, b| a.0.cmp(b.0));
+        let mut by_key_id: HashMap<uuid::Uuid, String> = HashMap::new();
+        for (name, cfg) in ordered {
+            if let Some(existing) = by_key_id.get(&cfg.key_id) {
+                bail!(
+                    "devices [device.{existing}] and [device.{name}] share key_id {}; \
+                     one API key per device is required — a shared key collides in the \
+                     segment idempotency namespace and makes the recorded device name \
+                     depend on process start-up order",
+                    cfg.key_id
+                );
+            }
+            by_key_id.insert(cfg.key_id, name.clone());
+        }
         Ok(Self { keys, by_key_id })
     }
 
@@ -169,6 +190,25 @@ mod tests {
         // No [device.*] references this key at all.
         let reg = DeviceRegistry::open(&path, &HashMap::new()).unwrap();
         assert_eq!(reg.resolve("sa-dev-loose"), None);
+    }
+
+    /// One key per device is a requirement, not a suggestion: a shared key
+    /// collides in the `segment` idempotency namespace. Two `[device.*]`
+    /// blocks naming the same `key_id` used to collapse into a `HashMap`
+    /// whose iteration order is randomised per process, so *which* device
+    /// name a segment was recorded under changed at every restart.
+    #[test]
+    fn open_rejects_two_devices_sharing_one_key_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = key_file(tmp.path(), &[("sa-dev-good", "shared-key", None)]);
+        let id = id_of(&path, "shared-key");
+        let err = DeviceRegistry::open(&path, &devices(&[("pendant", id), ("desk-mic", id)]))
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("pendant") && msg.contains("desk-mic"),
+            "the error must name both devices so the config can be fixed, got: {msg}"
+        );
     }
 
     #[test]
