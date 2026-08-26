@@ -340,4 +340,18 @@ mod tests {
         assert!(store.promote(&id, Some("../../etc/passwd"), &voices).is_err());
         assert!(store.promote(&id, Some("has/slash"), &voices).is_err());
     }
+
+    /// Windows accepts backslash as a path separator too, so a check that
+    /// only rejects `/` would still let `..\..\` escape the voices
+    /// directory on this OS.
+    #[test]
+    fn promotion_refuses_a_name_with_backslash_traversal() {
+        let (tmp, mut store) = store();
+        let voices = tmp.path().join("voices");
+        let id = store
+            .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 60_000, "a")
+            .unwrap();
+        assert!(store.promote(&id, Some("..\\..\\etc\\passwd"), &voices).is_err());
+        assert!(store.promote(&id, Some("has\\backslash"), &voices).is_err());
+    }
 }
