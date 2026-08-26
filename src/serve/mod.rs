@@ -439,8 +439,10 @@ async fn rpc_post(
 /// Extract a `Bearer <token>` from the `Authorization` header, trimming
 /// whitespace. Empty / malformed → `None`. Shared shape with
 /// `serve::a2a::extract_bearer` — same Authorization parsing rules so
-/// the three protocol endpoints stay symmetrical.
-fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+/// the three protocol endpoints stay symmetrical. `pub(crate)` so
+/// `crate::ambient::ingest` can reuse the same parsing rules rather than
+/// duplicating them.
+pub(crate) fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(axum::http::header::AUTHORIZATION)?;
     let s = value.to_str().ok()?;
     let token = s

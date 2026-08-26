@@ -8,4 +8,5 @@
 
 pub mod auth;
 pub mod cache;
+pub mod ingest;
 pub mod transcript;
