@@ -33,7 +33,6 @@ pub trait SpeechGate: Send + Sync {
 }
 
 pub trait SpeakerEmbedder: Send + Sync {
-    fn dim(&self) -> usize;
     fn embed(&self, pcm: &[i16]) -> Result<Vec<f32>>;
 }
 
@@ -112,9 +111,6 @@ impl FixedEmbedder {
 
 #[cfg(test)]
 impl SpeakerEmbedder for FixedEmbedder {
-    fn dim(&self) -> usize {
-        self.vector.len()
-    }
     fn embed(&self, _pcm: &[i16]) -> Result<Vec<f32>> {
         Ok(self.vector.clone())
     }
@@ -206,10 +202,6 @@ mod sherpa_impl {
     }
 
     impl SpeakerEmbedder for SherpaEmbedder {
-        fn dim(&self) -> usize {
-            self.extractor.dim() as usize
-        }
-
         fn embed(&self, pcm: &[i16]) -> anyhow::Result<Vec<f32>> {
             let stream = self
                 .extractor
@@ -261,7 +253,6 @@ mod tests {
     #[test]
     fn fixed_embedder_returns_the_configured_vector() {
         let e = FixedEmbedder::new(vec![1.0, 0.0, 0.0]);
-        assert_eq!(e.dim(), 3);
         assert_eq!(e.embed(&[0; 100]).unwrap(), vec![1.0, 0.0, 0.0]);
     }
 }

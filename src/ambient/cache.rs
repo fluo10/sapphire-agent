@@ -47,6 +47,15 @@ impl AudioCache {
     }
 
     /// Raw bytes for `sha256`, or `None` on any miss.
+    ///
+    /// No caller yet: nothing in this plan reads a cached blob back. Kept
+    /// deliberately, not speculatively — the seven-day retention default
+    /// is justified as "enough to re-listen or re-run STT", and a
+    /// retention window with no way to read what it retains would make
+    /// that justification meaningless. The natural caller is a future
+    /// playback or re-transcribe tool, paired with `put` the way a get
+    /// belongs with a put.
+    #[allow(dead_code)]
     pub fn get(&self, sha256: &str) -> Option<Vec<u8>> {
         std::fs::read(self.dir.join(sha256)).ok()
     }
