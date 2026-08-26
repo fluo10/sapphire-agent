@@ -322,9 +322,12 @@ A transcript line:
 - **`speaker_score`** is the `SpeakerEmbeddingManager` match score, not an STT
   confidence. It is absent when `speaker` is `null`.
 
-**`speaker` holds an id, never a display name.** Names resolve from the workspace at
-read time, so renaming `voices/blithe-otter-42/` to `voices/tanaka-san/` makes every
-past transcript read back under the new name with no rewrite pass.
+**`speaker` holds an id, never a display name.** For promoted directories that carry an
+`id` marker file, names resolve from the workspace at read time, so renaming
+`voices/blithe-otter-42/` to `voices/tanaka-san/` makes every past transcript read back
+under the new name with no rewrite pass. Hand-made directories with no marker use the
+directory name as the id, so renaming after they have been used in a transcript orphans
+that identity.
 
 **Day boundaries follow the existing `day_boundary_hour` config**, not UTC midnight
 and not local midnight. The `YYYY-MM-DD.jsonl` filename and the "days seen" count
@@ -374,8 +377,10 @@ own name is written as the first (canonical) marker line, because transcripts ma
 already say `me`; the promoted grain-id joins as an alias and both resolve to the
 same display name.
 
-A directory created by hand (`me/`, `agent/`) has no marker and keeps using its
-directory name as its id — correct, since nothing referred to it before.
+A directory created by hand (`me/`, `agent/`) has no marker and uses its directory
+name as the id — safe to rename only before any transcript records from it. Once a
+promoted candidate's grain-id is written into the marker, that directory gains an id
+and becomes rename-safe like any promoted directory.
 
 Embeddings are keyed by (reference file sha256 × model id) in the cache, so renaming
 triggers no recomputation, and **changing the embedding model recomputes
