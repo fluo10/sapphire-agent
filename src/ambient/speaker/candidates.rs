@@ -31,6 +31,14 @@ pub struct CandidateStats {
     /// A few transcribed utterances, for recognition.
     #[serde(default)]
     pub samples: Vec<String>,
+    /// Number of observations folded into the centroid, for the running
+    /// mean. Persisted so a restart does not corrupt the weighting: this
+    /// is deliberately distinct from `days_seen.len()`, which counts only
+    /// distinct days and undercounts a voice heard several times in one
+    /// afternoon. `#[serde(default)]` keeps this tolerant of any file
+    /// that predates the field, though nothing on disk does yet.
+    #[serde(default)]
+    pub observations: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -38,8 +46,6 @@ pub struct Candidate {
     pub id: String,
     pub centroid: Vec<f32>,
     pub stats: CandidateStats,
-    /// Number of observations folded into `centroid`, for the running mean.
-    observations: u32,
 }
 
 pub struct CandidateStore {
@@ -88,6 +94,7 @@ impl CandidateStore {
             days_seen: vec![day],
             first_seen: Utc::now(),
             samples: sample_vec(sample_text),
+            observations: 1,
         };
         std::fs::write(dir.join("stats.json"), serde_json::to_vec_pretty(&stats)?)?;
 
@@ -97,7 +104,6 @@ impl CandidateStore {
                 id: id.clone(),
                 centroid: embedding,
                 stats,
-                observations: 1,
             },
         );
         Ok(id)
@@ -117,11 +123,13 @@ impl CandidateStore {
         };
         // Running mean, so a candidate's centroid tracks the voice rather
         // than being pinned to whatever the first segment sounded like.
-        let n = c.observations as f32;
+        // `observations` is persisted (see `CandidateStats`) precisely so
+        // this weight survives a restart intact.
+        let n = c.stats.observations as f32;
         for (i, x) in embedding.iter().enumerate().take(c.centroid.len()) {
             c.centroid[i] = (c.centroid[i] * n + x) / (n + 1.0);
         }
-        c.observations += 1;
+        c.stats.observations += 1;
         c.stats.speech_seconds += speech_ms / 1000;
         if !c.stats.days_seen.contains(&day) {
             c.stats.days_seen.push(day);
@@ -174,11 +182,55 @@ impl CandidateStore {
             }
             None => c.id.clone(),
         };
+
+        // `voices_dir` is ours to create; canonicalise it once so the
+        // eventual write always lands on a fully resolved, symlink-free
+        // root rather than whatever relative form the caller passed in.
+        std::fs::create_dir_all(voices_dir)
+            .with_context(|| format!("creating {voices_dir:?}"))?;
+        let voices_root = voices_dir
+            .canonicalize()
+            .with_context(|| format!("resolving {voices_dir:?}"))?;
+
+        // The character blocklist in `validate_speaker_name` is a guess
+        // about this OS's path grammar, and it has already been wrong
+        // twice on this same function: first backslash, then a bare
+        // Windows drive prefix. Assert the actual invariant instead of
+        // guessing again: join `dir_name` onto the un-canonicalised
+        // `voices_dir`, exactly as this function would, and require the
+        // join's parent to still be `voices_dir`. A component that
+        // hijacks `Path::join` (a drive prefix, a UNC prefix, and so on)
+        // replaces the whole path rather than appending to it, so the
+        // parent comes out completely different; this catches that
+        // regardless of which character caused it. It is also
+        // side-effect free, since comparing `Path` values touches no
+        // disk, so a rejected name never causes anything to be created
+        // that would need cleaning up afterwards. Canonicalising the
+        // target here instead would both require it to exist first,
+        // which it does not yet, and risk creating -- and then having to
+        // destroy -- whatever real location a hijacked join resolved to,
+        // which for a bare drive prefix could be nowhere near
+        // `voices_dir` at all.
         let target = voices_dir.join(&dir_name);
+        if target.parent() != Some(voices_dir) {
+            bail!("speaker name would escape the voices directory: {dir_name:?}");
+        }
+        let target = voices_root.join(&dir_name);
+
+        let target_existed = target.exists();
         std::fs::create_dir_all(&target)
             .with_context(|| format!("creating {target:?}"))?;
-        std::fs::copy(self.dir.join(id).join("clip.wav"), target.join("clip.wav"))
-            .with_context(|| format!("copying candidate clip into {target:?}"))?;
+        if let Err(e) = std::fs::copy(self.dir.join(id).join("clip.wav"), target.join("clip.wav"))
+        {
+            // Don't leave a stray, empty directory ahead of a promotion
+            // that did not actually happen -- but only if this call is
+            // the one that just created it; a pre-existing target (an
+            // overwrite) is not ours to delete.
+            if !target_existed {
+                std::fs::remove_dir_all(&target).ok();
+            }
+            return Err(e).with_context(|| format!("copying candidate clip into {target:?}"));
+        }
 
         std::fs::remove_dir_all(self.dir.join(id)).ok();
         self.candidates.remove(id);
@@ -189,10 +241,11 @@ impl CandidateStore {
 /// A speaker name becomes a directory name under the workspace, so it must
 /// be a single harmless path segment.
 fn validate_speaker_name(name: &str) -> Result<()> {
-    if name.trim().is_empty() {
-        bail!("speaker name must not be empty");
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        bail!("speaker name must not be empty or a directory reference: {name:?}");
     }
-    if name.contains('/') || name.contains('\\') || name.contains("..") {
+    if name.contains('/') || name.contains('\\') || name.contains(':') || name.contains("..") {
         bail!("speaker name must be a single path segment: {name:?}");
     }
     Ok(())
@@ -212,7 +265,6 @@ fn load_candidate(dir: &Path, id: &str) -> Result<Candidate> {
     Ok(Candidate {
         id: id.to_string(),
         centroid,
-        observations: stats.days_seen.len().max(1) as u32,
         stats,
     })
 }
@@ -341,6 +393,27 @@ mod tests {
         assert!(store.promote(&id, Some("has/slash"), &voices).is_err());
     }
 
+    /// A voice heard four times in one afternoon should weight its fourth
+    /// observation as a fifth of the running mean, not half of it. That
+    /// requires the observation count to survive a restart, not just the
+    /// count of distinct days.
+    #[test]
+    fn reopening_preserves_the_observation_count_not_just_distinct_days() {
+        let (tmp, mut store) = store();
+        let id = store
+            .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 10_000, "a")
+            .unwrap();
+        store.observe(&id, &[1.0, 0.0], day(26), 10_000, "b").unwrap();
+        store.observe(&id, &[1.0, 0.0], day(26), 10_000, "c").unwrap();
+
+        let reloaded = CandidateStore::open(tmp.path().join("candidates")).unwrap();
+        let reloaded_candidate = reloaded.list().into_iter().find(|c| c.id == id).unwrap();
+        assert_eq!(
+            reloaded_candidate.stats.observations, 3,
+            "three observations were folded in, even though they all land on one day"
+        );
+    }
+
     /// Windows accepts backslash as a path separator too, so a check that
     /// only rejects `/` would still let `..\..\` escape the voices
     /// directory on this OS.
@@ -353,5 +426,66 @@ mod tests {
             .unwrap();
         assert!(store.promote(&id, Some("..\\..\\etc\\passwd"), &voices).is_err());
         assert!(store.promote(&id, Some("has\\backslash"), &voices).is_err());
+    }
+
+    /// On Windows, `PathBuf::join` treats a component with a drive prefix
+    /// as absolute and *replaces* the base path instead of appending to
+    /// it: `voices_dir.join("C:foo")` is `"C:foo"`, entirely outside
+    /// `voices_dir`. Neither `/` nor `\` nor `..` catches this; only a
+    /// dedicated rejection (and the join-parent containment check) does.
+    #[test]
+    fn promotion_refuses_a_drive_qualified_name() {
+        let (tmp, mut store) = store();
+        let voices = tmp.path().join("voices");
+        let id = store
+            .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 60_000, "a")
+            .unwrap();
+        assert!(store.promote(&id, Some("C:foo"), &voices).is_err());
+        assert!(store.promote(&id, Some("C:"), &voices).is_err());
+    }
+
+    /// `voices_dir.join(".")` is `voices_dir` itself, so a bare "." would
+    /// collapse every candidate promoted under that name into the voices
+    /// root rather than a subdirectory of it. The join-parent containment
+    /// check happens to reject this too -- Rust's `Path` normalises away
+    /// a non-leading "." component, so `target.parent()` strips
+    /// `voices_dir`'s own last component instead of the phantom ".", and
+    /// comes out one level too high -- but that is an accident of how
+    /// `Path::parent` is implemented, not a stated guarantee. A
+    /// `starts_with`-style containment check would *not* catch it, since
+    /// `voices_dir` trivially starts with itself. Keep this explicit
+    /// rejection regardless, so the behaviour does not depend on which
+    /// comparison the containment check happens to use.
+    #[test]
+    fn promotion_refuses_a_bare_dot_name() {
+        let (tmp, mut store) = store();
+        let voices = tmp.path().join("voices");
+        let id = store
+            .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 60_000, "a")
+            .unwrap();
+        assert!(store.promote(&id, Some("."), &voices).is_err());
+        assert!(store.promote(&id, Some(".."), &voices).is_err());
+    }
+
+    /// `promote` creates the target directory before copying the clip into
+    /// it. If the copy fails, that directory must not survive — a stray,
+    /// empty `voices/<name>/` would be a partial workspace write ahead of
+    /// a promotion that never actually happened.
+    #[test]
+    fn promotion_removes_a_freshly_created_directory_when_the_copy_fails() {
+        let (tmp, mut store) = store();
+        let voices = tmp.path().join("voices");
+        let id = store
+            .enrol(vec![1.0, 0.0], &vec![0i16; 16_000], day(26), 60_000, "a")
+            .unwrap();
+        // Knock out the candidate's own clip so the copy inside `promote`
+        // fails partway through.
+        std::fs::remove_file(store.dir.join(&id).join("clip.wav")).unwrap();
+
+        assert!(store.promote(&id, Some("ghost"), &voices).is_err());
+        assert!(
+            !voices.join("ghost").exists(),
+            "a failed promotion must not leave a stray directory behind"
+        );
     }
 }
