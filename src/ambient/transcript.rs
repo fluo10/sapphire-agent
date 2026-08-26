@@ -98,17 +98,26 @@ impl TranscriptStore {
         let last = self.day_of(to) + chrono::Duration::days(1);
         while day <= last {
             let path = self.path_for_day(day);
-            if let Ok(file) = std::fs::File::open(&path) {
-                for line in BufReader::new(file).lines() {
-                    let Ok(line) = line else { continue };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    match serde_json::from_str::<TranscriptRecord>(&line) {
-                        Ok(rec) => out.push(rec),
-                        Err(e) => warn!("skipping corrupt transcript line in {path:?}: {e}"),
+            match std::fs::File::open(&path) {
+                Ok(file) => {
+                    for line in BufReader::new(file).lines() {
+                        let Ok(line) = line else { continue };
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<TranscriptRecord>(&line) {
+                            Ok(rec) => out.push(rec),
+                            Err(e) => warn!("skipping corrupt transcript line in {path:?}: {e}"),
+                        }
                     }
                 }
+                // A missing day file is normal: most days in the queried
+                // range simply have no transcripts. Anything else (a
+                // permissions error, for instance) is worse than a corrupt
+                // line — it silently drops a whole day rather than one
+                // record — so it gets a warning rather than staying quiet.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("skipping unreadable transcript file {path:?}: {e}"),
             }
             day += chrono::Duration::days(1);
         }
@@ -205,6 +214,24 @@ mod tests {
             .unwrap();
         let texts: Vec<&str> = all.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(texts, vec!["first", "second"], "sorted by started_at");
+    }
+
+    #[test]
+    fn read_orders_records_within_a_single_day_file_by_started_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TranscriptStore::open(tmp.path().to_path_buf(), 4).unwrap();
+        let base = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        let earlier = base;
+        let later = base + chrono::Duration::minutes(30);
+        // Appended out of chronological order, into the same day file.
+        store.append(&rec(later, Some("me"), "later")).unwrap();
+        store.append(&rec(earlier, Some("me"), "earlier")).unwrap();
+
+        let got = store
+            .read(base - chrono::Duration::hours(1), base + chrono::Duration::hours(1), None)
+            .unwrap();
+        let texts: Vec<&str> = got.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["earlier", "later"], "sorted by started_at within one file");
     }
 
     #[test]
