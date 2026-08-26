@@ -76,11 +76,32 @@ impl AmbientState {
     }
 
     /// Record `id` as admitted. Returns false when it was already present.
+    ///
+    /// Claiming the id *before* the body is decoded and enqueued is what
+    /// serialises two concurrent POSTs of the same segment; the loser sees
+    /// the id already taken and discards its body. The cost is that every
+    /// path which then fails to enqueue must give the id back — see
+    /// [`AmbientState::forget`].
     fn admit_once(&self, id: &str) -> bool {
         self.seen
             .lock()
             .expect("ambient seen-set poisoned")
             .insert(id.to_string())
+    }
+
+    /// Release an id claimed by [`AmbientState::admit_once`] when the
+    /// request did not end up enqueuing anything.
+    ///
+    /// Without this, a segment refused with 429 (queue full) is answered
+    /// `200 OK` on the retry the spec tells the device to make, and its
+    /// body is discarded as a duplicate: the audio is lost and the device
+    /// believes it was delivered. That fires precisely during a reconnect
+    /// burst, which is the case the bounded queue exists to handle.
+    fn forget(&self, id: &str) {
+        self.seen
+            .lock()
+            .expect("ambient seen-set poisoned")
+            .remove(id);
     }
 }
 
@@ -108,11 +129,18 @@ pub fn routes(state: Arc<AmbientState>) -> Router {
 
 /// Resolve the bearer to a device name, or the error response to return.
 ///
-/// `[ambient].enabled = false` and a missing/invalid bearer both collapse
-/// to a response here rather than the route being conditionally mounted,
-/// because a later task decides whether to mount at all. All three auth
-/// failure modes (unknown token, expired token, token bound to no device)
-/// collapse to the same 401 — the distinction is logged, not returned.
+/// All three auth failure modes (unknown token, expired token, token bound
+/// to no device) collapse to the same 401 — the distinction is logged, not
+/// returned.
+///
+/// The `enabled` check here is **defence in depth, not the mechanism**:
+/// `ambient::startup::build` returns `None` when `[ambient].enabled` is
+/// false, and `main` then never mounts these routes at all, so a disabled
+/// subsystem 404s by router omission. This guard only matters if some
+/// future caller mounts the routes with a disabled config, and it answers
+/// 404 rather than 401 so that case stays indistinguishable from the
+/// unmounted one — a device probing for the feature must never be told its
+/// key is wrong.
 fn authenticate(state: &AmbientState, headers: &HeaderMap) -> Result<String, StatusCode> {
     if !state.config.enabled {
         return Err(StatusCode::NOT_FOUND);
@@ -170,23 +198,28 @@ async fn handle_ingest(
         return StatusCode::OK.into_response();
     }
 
-    let pcm = match content_type.as_str() {
-        "audio/wav" => match decode_wav(&body) {
-            Ok(pcm) => pcm,
-            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-        },
-        _ => match decode_l16(&body) {
-            Ok(pcm) => pcm,
-            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-        },
+    // From here on the id is claimed, so every exit that does not enqueue
+    // must release it again — otherwise the retry the device is told to
+    // make is answered as a duplicate and its audio is silently dropped.
+    let decoded = match content_type.as_str() {
+        "audio/wav" => decode_wav(&body),
+        _ => decode_l16(&body),
+    };
+    let pcm = match decoded {
+        Ok(pcm) => pcm,
+        Err(e) => {
+            state.forget(&params.segment);
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
     };
 
     let Some(started_at) = Utc.timestamp_millis_opt(params.started_at).single() else {
+        state.forget(&params.segment);
         return (StatusCode::BAD_REQUEST, "started_at out of range").into_response();
     };
 
     let seg = Segment {
-        segment: params.segment,
+        segment: params.segment.clone(),
         device,
         started_at,
         live: params.live != 0,
@@ -196,10 +229,12 @@ async fn handle_ingest(
     match state.tx.try_send(seg) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(mpsc::error::TrySendError::Full(_)) => {
+            state.forget(&params.segment);
             warn!("ambient: admission queue full; asking the device to retry");
             StatusCode::TOO_MANY_REQUESTS.into_response()
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
+            state.forget(&params.segment);
             warn!("ambient: worker gone; refusing ingest");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
@@ -467,6 +502,104 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The spec tells the device to spool and retry after a 429, so the
+    /// retry must actually deliver. `answers_429_when_the_queue_is_full`
+    /// uses three *distinct* ids and so cannot see this: the id of the
+    /// refused segment is what matters. If admission burns the id before
+    /// the enqueue succeeds, the retry is answered `200 OK` as a
+    /// "duplicate" and the audio is dropped while the device believes it
+    /// was delivered — silent data loss in exactly the reconnect burst
+    /// the bounded queue exists to absorb.
+    #[tokio::test]
+    async fn a_segment_refused_with_429_still_enqueues_on_retry() {
+        let (app, mut rx) = harness_with_queue_depth(1);
+
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::post(ingest_uri("seg-first", false))
+                    .header("authorization", "Bearer sa-dev-good")
+                    .header("content-type", "audio/L16")
+                    .body(pcm_body(1_600))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let full = app
+            .clone()
+            .oneshot(
+                Request::post(ingest_uri("seg-retried", false))
+                    .header("authorization", "Bearer sa-dev-good")
+                    .header("content-type", "audio/L16")
+                    .body(pcm_body(1_600))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The worker drains one; the device retries the segment it was
+        // told to retry.
+        assert_eq!(rx.try_recv().unwrap().segment, "seg-first");
+        let retry = app
+            .oneshot(
+                Request::post(ingest_uri("seg-retried", false))
+                    .header("authorization", "Bearer sa-dev-good")
+                    .header("content-type", "audio/L16")
+                    .body(pcm_body(1_600))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(
+            rx.try_recv()
+                .expect("the retried segment must be enqueued, not discarded as a duplicate")
+                .segment,
+            "seg-retried"
+        );
+    }
+
+    /// A body that fails to decode must not burn its id either: the
+    /// device gets a 400 and may legitimately re-send the same segment
+    /// once it has fixed its framing.
+    #[tokio::test]
+    async fn a_rejected_body_does_not_burn_its_segment_id() {
+        let (app, mut rx) = harness();
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::post(ingest_uri("seg-refix", false))
+                    .header("authorization", "Bearer sa-dev-good")
+                    .header("content-type", "audio/L16")
+                    .body(Body::from(vec![0u8; 1_601]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        let good = app
+            .oneshot(
+                Request::post(ingest_uri("seg-refix", false))
+                    .header("authorization", "Bearer sa-dev-good")
+                    .header("content-type", "audio/L16")
+                    .body(pcm_body(800))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(good.status(), StatusCode::OK);
+        assert_eq!(
+            rx.try_recv()
+                .expect("a re-sent segment must be admitted after a decode failure")
+                .segment,
+            "seg-refix"
+        );
     }
 
     #[tokio::test]
