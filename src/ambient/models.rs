@@ -117,9 +117,6 @@ pub fn resolve(cfg: &AmbientConfig) -> anyhow::Result<ResolvedModels> {
     })
 }
 
-// Constructed only by the later config-wiring task that reads `[ambient]`
-// and starts the worker. Delete this attribute once that task adds a caller.
-#[allow(dead_code)]
 #[cfg(not(feature = "voice-sherpa"))]
 pub fn resolve(_cfg: &AmbientConfig) -> anyhow::Result<ResolvedModels> {
     anyhow::bail!(

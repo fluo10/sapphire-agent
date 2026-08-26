@@ -307,7 +307,19 @@ fn error_event(id: &Value, code: i32, message: &str) -> Event {
 // Router entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run(addr: String, state: Arc<ServeState>) -> anyhow::Result<()> {
+/// `extra` mounts the ambient audio ingest router (`POST /audio/ingest`,
+/// `POST /audio/hello`) alongside `/rpc`, when the subsystem started.
+/// It is a plain `Router` — not a field on `ServeState` — because the
+/// ingest endpoint owns its own state deliberately: it never starts an
+/// LLM turn, so it has no use for the runtime `ServeState` exists to
+/// serve. Both routers are already resolved to `Router<()>` via their
+/// own `.with_state()` call, which is what makes `.merge` valid here
+/// despite the two states having nothing in common.
+pub async fn run(
+    addr: String,
+    state: Arc<ServeState>,
+    extra: Option<axum::Router>,
+) -> anyhow::Result<()> {
     // Routes are intentionally separated so future protocol endpoints
     // (`/mcp` for the MCP server in #79/#80) can be mounted alongside
     // `/rpc` without colliding with the methods (`chat`,
@@ -315,7 +327,7 @@ pub async fn run(addr: String, state: Arc<ServeState>) -> anyhow::Result<()> {
     // endpoints below are mounted unconditionally — the handler refuses
     // requests when `[a2a].enabled = false` so we don't pay a route
     // table conditional but still preserve the opt-in semantic.
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/rpc", post(rpc_post).get(rpc_get))
         .route("/a2a", post(a2a::handle_a2a_post))
         .route("/mcp", post(mcp::handle_mcp_post))
@@ -325,6 +337,9 @@ pub async fn run(addr: String, state: Arc<ServeState>) -> anyhow::Result<()> {
         )
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(Arc::clone(&state));
+    if let Some(extra) = extra {
+        app = app.merge(extra);
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("sapphire-agent: API server listening on http://{addr}");

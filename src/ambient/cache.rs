@@ -29,9 +29,6 @@ impl AudioCache {
     }
 
     /// Platform-standard default, suitable as a config default.
-    // Consumed by the later startup-wiring task; delete this attribute
-    // once that task adds the caller.
-    #[allow(dead_code)]
     pub fn default_dir() -> Option<PathBuf> {
         dirs::cache_dir().map(|d| d.join("sapphire-agent").join("ambient").join("audio"))
     }

@@ -171,10 +171,6 @@ impl Worker {
 /// Drain the admission queue forever. One segment at a time on purpose:
 /// enrolment mutates shared speaker state, and a day of spooled audio
 /// arriving at once is a throughput problem, not a latency one.
-// Spawned only by the later startup-wiring task, which builds a `Worker`
-// from `[ambient]` config and hands it the receiving end of the
-// admission queue. Delete this attribute once that task adds a caller.
-#[allow(dead_code)]
 pub async fn run(mut worker: Worker, mut rx: mpsc::Receiver<Segment>) {
     while let Some(seg) = rx.recv().await {
         let id = seg.segment.clone();

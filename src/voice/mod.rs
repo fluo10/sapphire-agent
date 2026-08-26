@@ -33,6 +33,10 @@ use crate::config::{Config, SttProviderConfig, TtsProviderConfig};
 // `MockStt` itself at `pub(crate)` rather than `pub(super)` — a `pub(X)
 // use` can forward an item's existing visibility outward but never
 // widen it, so the inner re-export has to already be crate-visible.
+// `#[cfg(test)]`: this re-export's only consumer is `ambient::worker`'s
+// test module, so a non-test build has no user for it at all — without
+// the gate, `cargo check` flags it as an unused import.
+#[cfg(test)]
 pub(crate) use providers::MockStt;
 
 pub use stt::SttProvider;

@@ -99,11 +99,6 @@ fn default_rate() -> u32 {
 }
 
 /// Build the ambient ingest routes, bound to their own state.
-///
-/// Not called outside tests yet: mounting into the main router is Task
-/// 12's startup wiring. Delete this attribute once that task adds the
-/// caller.
-#[allow(dead_code)]
 pub fn routes(state: Arc<AmbientState>) -> Router {
     Router::new()
         .route("/audio/ingest", post(handle_ingest))

@@ -219,10 +219,6 @@ impl Tool for SpeakerPromoteTool {
     }
 }
 
-/// Not called outside tests yet: wiring these into the running agent's
-/// tool set is Task 12b's startup wiring. Delete this attribute once that
-/// task adds the caller.
-#[allow(dead_code)]
 pub fn ambient_tools(state: Arc<Mutex<AmbientToolState>>) -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(TranscriptReadTool::new(Arc::clone(&state))),

@@ -1033,6 +1033,23 @@ fn default_digest_yearly_items() -> usize {
 }
 
 impl Config {
+    /// Minimal valid config for tests outside this module. `anthropic` is
+    /// the only field without a `#[serde(default)]`, so this is the
+    /// smallest TOML that parses; every other field falls back to its own
+    /// default. Kept in one place so a change to a currently-required
+    /// field doesn't have to be replicated across every test module that
+    /// needs a `Config`.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        toml::from_str(
+            r#"
+[anthropic]
+api_key = "test"
+"#,
+        )
+        .expect("minimal config should parse")
+    }
+
     /// Resolve the workspace directory: explicit config > config file's parent directory.
     pub fn resolved_workspace_dir(&self, config_path: &Path) -> PathBuf {
         resolve_workspace_dir(self.workspace_dir.as_deref(), config_path)

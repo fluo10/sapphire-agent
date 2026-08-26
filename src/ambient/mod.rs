@@ -13,5 +13,6 @@ pub mod ingest;
 pub mod models;
 pub mod router;
 pub mod speaker;
+pub mod startup;
 pub mod transcript;
 pub mod worker;
