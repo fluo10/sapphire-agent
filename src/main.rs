@@ -4,6 +4,7 @@
 #![recursion_limit = "256"]
 
 mod agent;
+mod ambient;
 mod channel;
 mod config;
 mod config_layer;
