@@ -379,6 +379,137 @@ system_prompt = "You are a helpful personal assistant."
 # [voice]
 # wake_word_model = "/srv/sapphire/wake-models/saphina-v1.onnx"
 
+# ─────────────────────────────────────────────────────────────────────
+# Ambient audio ingest (optional)
+# ─────────────────────────────────────────────────────────────────────
+# A wearable/pendant device POSTs short audio segments to
+# `POST /audio/ingest`, mounted on the same HTTP server as `/rpc` only
+# once this subsystem actually starts. Disabled by default: with
+# `[ambient].enabled = false` the route is not mounted at all, so it
+# answers 404 like any other unmatched path — a device probing for the
+# feature isn't told its key is wrong (401), the same distinction `/a2a`
+# and `/mcp` preserve, just reached by router omission here rather than
+# by a handler that refuses while still being mounted.
+#
+# This is a **recording** pipeline, not a conversational one: segments
+# are re-gated, transcribed, attributed to a speaker, and stored — no
+# LLM turn runs over them. `transcript_read`, `speaker_candidates` and
+# `speaker_promote` (registered as agent tools once this starts) are
+# how a normal chat turn reads back what was overheard.
+#
+# Requires the `voice-sherpa` cargo feature (on by default) for the
+# Silero VAD re-gate and the speaker-embedding model — same feature
+# the local STT/TTS providers above need.
+#
+# ── Wire format ──
+# `curl` or a microcontroller can speak this directly: raw audio in
+# the body, everything else in the query string, so there is no JSON
+# framing (and no base64 inflation) around a multi-kilobyte payload.
+#
+#   POST /audio/ingest?segment=<id>&started_at=<unix_ms>&rate=16000&live=1
+#   Authorization: Bearer <token from [keys].file, see [device.*] below>
+#   Content-Type: audio/L16   (raw s16le)  — or: audio/wav
+#   <raw audio bytes>
+#
+#   - `segment`    — device-chosen idempotency key; a replay is
+#                    accepted and silently discarded, not an error.
+#   - `started_at` — when the audio was *recorded*, Unix ms. Replayed
+#                    spool (after a device reconnects) keeps its
+#                    original timestamp here.
+#   - `rate`       — must be 16000; the server never resamples.
+#   - `live`       — 1 for realtime audio, 0 for replayed spool. Only
+#                    `live=1` can ever reach a future conversational
+#                    path (S4) — replayed audio is recorded, never
+#                    answered, no matter how it is marked otherwise.
+#   - `audio/wav`  — must already be 16 kHz mono 16-bit PCM; other
+#                    bit depths are rejected outright rather than
+#                    silently reinterpreted.
+#
+# `POST /audio/hello` (same bearer auth, no body) answers with the
+# resolved device name and accepted parameters — a device can probe
+# this once at boot to confirm its credentials and the expected format
+# before it starts spooling audio.
+#
+# [ambient]
+# enabled              = true
+# # Root of the workspace-external cache for raw audio + speaker data
+# # (transcripts, unlike audio, are kept forever — only the audio blobs
+# # get swept). Defaults to `dirs::cache_dir()/sapphire-agent/ambient`.
+# cache_dir            = "/var/cache/sapphire-agent/ambient"
+# audio_retention_days = 7          # raw audio swept after this many days
+# stt_provider         = "sense_voice"   # names a [stt_provider.<n>] block above
+# min_embed_ms         = 1500       # below this, a segment gets a transcript but no speaker
+# match_threshold      = 0.55       # cosine-similarity floor for a speaker match
+# promote_after_seconds = 60        # both thresholds must clear before an
+# promote_after_days    = 2         # auto-enrolled voice is promoted into voices/
+# max_queue            = 1000       # admission queue depth; full queue answers 429
+#
+# # Silero VAD re-gate and the speaker-embedding model: sherpa-onnx
+# # publishes both only as bare `.onnx` files, never as a downloadable
+# # bundle name, so — unlike the STT/TTS providers above — there is no
+# # auto-download for these two. Fetch them yourself from the
+# # sherpa-onnx GitHub releases page and point these at the directory
+# # you saved them in:
+# #   - vad_model_dir:       the `asr-models` release tag (silero_vad.onnx)
+# #   - embedding_model_dir: the `speaker-recongition-models` release tag
+# #     (upstream's own spelling) — pick a 3D-Speaker or CAM++ bundle
+# vad_model_dir         = "/srv/sapphire/ambient-models/silero-vad"
+# embedding_model_dir   = "/srv/sapphire/ambient-models/3dspeaker"
+# vad_threshold         = 0.5
+# embedding_num_threads = 2
+#
+# Reference audio for a *named* speaker lives inside the workspace at
+# `voices/<name>/*.wav` — drop a clean sample there and restart (or
+# just wait for auto-enrolment + `speaker_promote`, see below).
+# Auto-enrolled voices that have not been named live outside the
+# workspace, alongside the audio cache.
+#
+# The directory name is the speaker's *display* name, not their id.
+# A promoted voice gets a one-line `voices/<name>/id` file holding
+# the id transcripts actually record, so the directory can be renamed
+# ("blithe-otter-42" -> "tanaka-san") and everything already recorded
+# reads back under the new name with no rewrite pass. A directory you
+# create by hand has no `id` file and simply uses its own name as the
+# id — safe to rename only before any transcript records from it. Once
+# a promoted candidate's grain-id is written into the marker, that
+# directory gains an id and becomes rename-safe.
+
+# ── Device key file (host-local) ────────────────────────────────────
+# Ambient capture devices authenticate with a bearer token that lives
+# only in `sapphire-framework`'s key file — never in this config — so
+# a leaked config reveals no credential and revoking a device is a
+# key-file edit, not an agent restart. Defaults to
+# `dirs::config_dir()/sapphire-agent/keys.toml`.
+#
+# [keys]
+# file = "/etc/sapphire/keys.toml"
+#
+# The key file itself (`sapphire-framework` format, not this file):
+#
+#   [[key]]
+#   token       = "sa-dev-...."     # bearer token the device sends
+#   label       = "pendant, lanyard"  # a note; nothing reads this back
+#   expires_at  = "2027-01-01T00:00:00Z"  # optional
+#
+# `[[key]]` entries get an id assigned on load; `[device.<name>]`
+# below binds that id (not the token) to a device name, so this file
+# never has to hold a secret.
+
+# ── Capture devices ──────────────────────────────────────────────────
+# One block per physical device. `key_id` is the id the framework's
+# `KeyStore` assigns the matching `[[key]]` entry above at load time —
+# `sapphire-agent verify` does not currently print it; find it by
+# loading the key file yourself (e.g. a one-off script against
+# `sapphire_framework::remote_server::KeyStore::load`) after adding a
+# key. A device block carrying an `api_key` (or any other secret field) is
+# a hard parse error, not a silently-ignored key: this is what lets
+# `[device.*]` be safe to share through the workspace config layer.
+#
+# [device.pendant]
+# key_id       = "6c8f4a2e-1d33-4b90-9a71-0e5b2f8c4d17"
+# label        = "the one on the lanyard"   # reaches the system prompt
+# room_profile = "default"                  # reserved for S4 (server-side wake word)
+
 # ── Timer / Pomodoro presets ────────────────────────────────────────
 # Single-shot timers ("5分後に教えて") don't need configuration — the
 # `timer_set` tool takes minutes + label directly. Presets are for
