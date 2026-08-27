@@ -294,6 +294,15 @@ mod tests {
         assert!(!path_allowed(&["room_profile", "work"]));
     }
 
+    #[test]
+    fn acp_is_host_only() {
+        // The endpoint a host exposes is a property of the host, not of the
+        // shared workspace. The allowlist is default-deny, so this passes
+        // without an entry — the test exists to catch someone adding one.
+        assert!(!path_allowed(&["acp"]));
+        assert!(!path_allowed(&["acp", "enabled"]));
+    }
+
     fn parse(s: &str) -> toml::Value {
         toml::from_str::<toml::Value>(s.trim()).expect("fixture parses")
     }

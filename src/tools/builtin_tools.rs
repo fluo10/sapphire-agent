@@ -663,12 +663,29 @@ impl Tool for ShellTool {
             .arg(command)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .current_dir(&workdir);
+            .current_dir(&workdir)
+            // The turn running this tool can be cancelled: the ACP endpoint
+            // drops `run_llm_turn`'s future on `session/cancel` and on a
+            // vanished client, which drops the `wait_with_output` future and
+            // with it the `Child`. Without this, that drop merely *disowns*
+            // the process — it keeps running, keeps writing to the
+            // workspace, and never reaches the timeout branch below, because
+            // the timeout is gone too. `shell` is the only tool that can
+            // outlive its future this way; the file tools use blocking
+            // `std::fs` and so cannot be interrupted part-way.
+            //
+            // Nothing else changes shape: `/rpc` and the voice/heartbeat
+            // paths run their turn in a detached `tokio::spawn`, so it
+            // finishes whether or not anyone is still listening, and this
+            // never fires for them. `/a2a` awaits its turn inside the axum
+            // handler, whose future hyper can drop when the HTTP client
+            // vanishes mid-request — there this quietly stops leaking a
+            // process it was already leaking.
+            .kill_on_drop(true);
 
         let child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn shell '{shell}'"))?;
-        let pid = child.id();
 
         let result =
             tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
@@ -689,11 +706,18 @@ impl Tool for ShellTool {
             }
             Ok(Err(e)) => Err(e.into()),
             Err(_) => {
-                if let Some(pid) = pid {
-                    let _ = std::process::Command::new("kill")
-                        .args(["-9", &pid.to_string()])
-                        .output();
-                }
+                // Nothing to kill here any more. `timeout` drops the
+                // `wait_with_output` future at the end of the statement
+                // above, which drops the `Child`, which `kill_on_drop`
+                // turns into a SIGKILL (a `TerminateProcess` on Windows) —
+                // so by the time this branch runs the shell is already
+                // dead. What used to stand here, `kill -9 <pid>`, did
+                // exactly that and no more: a positive pid signals one
+                // process, not its group, so neither form reaches
+                // grandchildren the shell left behind. It was also a
+                // blocking `std::process::Command` on an async thread, and
+                // relied on a `kill` binary being on PATH, which is not the
+                // case on Windows.
                 Ok(format!(
                     "[exit: 124]\nCommand timed out after {timeout_secs}s"
                 ))

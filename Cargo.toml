@@ -143,10 +143,17 @@ sapphire-framework = { version = "0.1", git = "https://github.com/fluo10/sapphir
 grain-id = { version = "0.14", features = ["serde"] }
 
 # HTTP server (control API + Matrix/Discord channels)
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
 
 # Stream utilities (axum SSE)
 tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Cancellation tokens for in-flight ACP prompt turns. The parent/child
+# hierarchy is the whole reason for the dependency: one token per ACP
+# connection and a child per turn, so `session/cancel` stops one turn while a
+# client that goes away stops every turn it left running, with one call and
+# without a registry to keep in step.
+tokio-util = "0.7"
 
 # CORS middleware
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
@@ -192,9 +199,16 @@ a2a = { package = "a2a-lf", version = "0.3" }
 # (or the platform equivalent) when no explicit dir is configured.
 dirs = "6"
 
+# Agent Client Protocol SDK (Zed's official Rust SDK). Backs `GET /acp`: the
+# JSON-RPC dispatch loop, the v1 schema types, and the `Lines` transport the
+# WebSocket is wrapped in. Default features only — `unstable_protocol_v2`
+# stays off, which is what pins this build to ACP v1.
+agent-client-protocol = "2.0.0"
+
 [dev-dependencies]
 tempfile = "3"
 filetime = "0.2"
+tokio-tungstenite = "0.30.0"
 
 # `ServiceExt::oneshot` to drive an axum `Router` directly in tests,
 # without binding a real listener.

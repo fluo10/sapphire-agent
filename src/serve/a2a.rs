@@ -19,23 +19,21 @@
 //! from `a2a-lf`; the JSON-RPC dispatch is hand-rolled here to share
 //! `ServeState` with the existing `/rpc` endpoint.
 
-use std::convert::Infallible;
 use std::sync::Arc;
 
 use a2a::{
     Message, Part, PartContent, Role, SendMessageRequest, SendMessageResponse, Task, TaskState,
     TaskStatus, new_task_id,
 };
+use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::{Json, response::sse::Event};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 
-use super::ServeState;
+use super::{ServeState, extract_bearer};
 use crate::provider::ChatMessage;
 
 /// Method name for the only A2A method we implement. The A2A v1 spec
@@ -279,27 +277,17 @@ async fn handle_send_message(
         .await
         .insert(session_id.clone(), profile_name.clone());
 
-    // run_llm_turn streams notifications (tool_start/tool_end, errors)
-    // through this mpsc; we drain into oblivion since A2A v1 doesn't
-    // surface intermediate progress to the caller. A bounded buffer
-    // keeps the producer from blocking if we drain slowly.
-    let (tx, mut rx) = mpsc::channel::<Result<Event, Infallible>>(32);
-    let drain = tokio::spawn(async move {
-        while rx.recv().await.is_some() {
-            // discard — A2A v1 is synchronous, no SSE relay
-        }
-    });
-
+    // run_llm_turn's tool_start/tool_end/error progress is discarded here:
+    // A2A v1 is synchronous and doesn't surface intermediate progress to
+    // the caller.
     let outcome = super::run_llm_turn(
         Arc::clone(&state),
         session_id.clone(),
         user_msg,
-        req_id.clone(),
-        tx,
+        Arc::new(super::NullProgress),
         None,
     )
     .await;
-    drop(drain); // sender dropped at end of run_llm_turn, drain returns
 
     // Build the terminal Task. Failed turns surface as TASK_STATE_FAILED
     // with a diagnostic message part, matching what A2A clients expect.
@@ -365,20 +353,6 @@ async fn handle_send_message(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn extract_bearer(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(axum::http::header::AUTHORIZATION)?;
-    let s = value.to_str().ok()?;
-    let token = s
-        .strip_prefix("Bearer ")
-        .or_else(|| s.strip_prefix("bearer "))?;
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
 
 /// Extract text and inline images from `parts`. Returns
 /// `(joined_text, Vec<(media_type, base64)>)` on success.

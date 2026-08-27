@@ -4,12 +4,13 @@
 //!           GET  /rpc  (Phase 2: server→client SSE push, currently 405)
 //!           POST /a2a  (Agent2Agent Protocol; gated by [a2a].enabled)
 //!           GET  /.well-known/agent-card.json
+//!           POST /mcp  (MCP server; write_report / recall_memory tools)
+//!           GET  /acp  (Agent Client Protocol over WebSocket; gated by [acp].enabled)
 //!
-//! Session management uses a `Session-Id` request/response header. The
-//! `/mcp` endpoint is reserved for the future MCP server (issue #80,
-//! #79) and is intentionally not served here.
+//! Session management uses a `Session-Id` request/response header.
 
 pub mod a2a;
+pub mod acp;
 pub mod mcp;
 
 use crate::channel::RoomInfo;
@@ -331,6 +332,7 @@ pub async fn run(
         .route("/rpc", post(rpc_post).get(rpc_get))
         .route("/a2a", post(a2a::handle_a2a_post))
         .route("/mcp", post(mcp::handle_mcp_post))
+        .route("/acp", axum::routing::get(acp::handle_acp_ws))
         .route(
             "/.well-known/agent-card.json",
             axum::routing::get(a2a::handle_agent_card),
@@ -451,12 +453,16 @@ async fn rpc_post(
     }
 }
 
-/// Extract a `Bearer <token>` from the `Authorization` header, trimming
-/// whitespace. Empty / malformed → `None`. Shared shape with
-/// `serve::a2a::extract_bearer` — same Authorization parsing rules so
-/// the three protocol endpoints stay symmetrical. `pub(crate)` so
-/// `crate::ambient::ingest` can reuse the same parsing rules rather than
-/// duplicating them.
+/// Extract a `Bearer <token>` from an `Authorization` header, trimming
+/// whitespace.
+///
+/// Returns `None` when the header is absent, uses another scheme, or
+/// carries an empty token — every one of which the endpoints treat as
+/// "unauthenticated" rather than "malformed".
+///
+/// `pub(crate)` so `/rpc`, `/a2a`, `/mcp`, `/acp` and
+/// `crate::ambient::ingest` share one set of parsing rules rather than
+/// each duplicating them.
 pub(crate) fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(axum::http::header::AUTHORIZATION)?;
     let s = value.to_str().ok()?;
@@ -1278,8 +1284,7 @@ async fn run_voice_turn_from_text_sse(
         Arc::clone(&state),
         session_id.clone(),
         ChatMessage::user_voice(&user_text),
-        req_id.clone(),
-        tx.clone(),
+        Arc::new(SseProgress::new(tx.clone(), req_id.clone())),
         device_id
             .clone()
             .map(|d| crate::timer::TimerOrigin::Voice { device_id: d }),
@@ -1497,10 +1502,8 @@ pub(crate) async fn push_voice_text_to_subscriber(
         })
         .await;
 
-    // LLM turn (no SSE response channel — discard tool_start/tool_end
-    // notifications by draining the sink in a background task).
-    let (sink_tx, mut sink_rx) = mpsc::channel::<Result<Event, Infallible>>(32);
-    let drain_handle = tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+    // LLM turn (no SSE response channel — nobody watches this
+    // heartbeat-injected turn's tool_start/tool_end progress).
     // Heartbeat-injected user line — synthesised by the timer pipeline,
     // not authored by a human, so no input modality applies.
     let injected_msg = ChatMessage {
@@ -1513,14 +1516,12 @@ pub(crate) async fn push_voice_text_to_subscriber(
         Arc::clone(&state),
         session_id.clone(),
         injected_msg,
-        Value::Null,
-        sink_tx,
+        Arc::new(NullProgress),
         Some(crate::timer::TimerOrigin::Voice {
             device_id: device_id.clone(),
         }),
     )
     .await;
-    drain_handle.abort();
     let reply_text = match outcome.text {
         Some(t) => t,
         None => {
@@ -1616,37 +1617,167 @@ fn apply_input_kind_label(mut msg: ChatMessage) -> ChatMessage {
     msg
 }
 
+/// Where a turn reports its per-tool progress.
+///
+/// `run_llm_turn` is the shared executor behind `/rpc`, the voice pipeline,
+/// A2A and the ACP endpoint — but each caller wants its
+/// `tool_start`/`tool_end`/error notifications shaped differently: `/rpc`
+/// and voice relay them as JSON-RPC notifications over SSE, ACP sends them
+/// as `session/update` notifications instead, and some callers (voice
+/// heartbeats, A2A) don't surface intermediate progress at all. Putting
+/// reporting behind this trait keeps the turn executor itself agnostic to
+/// which of those shapes (if any) is listening.
+#[async_trait::async_trait]
+pub(crate) trait TurnProgress: Send + Sync {
+    async fn tool_start(&self, id: &str, name: &str);
+    async fn tool_end(&self, id: &str, name: &str);
+    async fn turn_error(&self, message: &str);
+}
+
+/// Builds the `{id, name}` params shared by the `tool_start`/`tool_end`
+/// wire notifications. Pulled out so tests can pin the field names
+/// directly without inspecting an opaque SSE `Event`.
+fn tool_event_params(id: &str, name: &str) -> Value {
+    json!({ "id": id, "name": name })
+}
+
+/// The `/rpc` and voice shape: JSON-RPC notifications (and, on provider
+/// failure, a JSON-RPC error) delivered over the SSE channel — exactly
+/// what `run_llm_turn` used to emit inline before progress reporting moved
+/// behind [`TurnProgress`].
+pub(crate) struct SseProgress {
+    tx: mpsc::Sender<Result<Event, Infallible>>,
+    req_id: Value,
+}
+
+impl SseProgress {
+    pub(crate) fn new(tx: mpsc::Sender<Result<Event, Infallible>>, req_id: Value) -> Self {
+        Self { tx, req_id }
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnProgress for SseProgress {
+    async fn tool_start(&self, id: &str, name: &str) {
+        let _ = self
+            .tx
+            .send(Ok(notification_event(
+                "tool_start",
+                tool_event_params(id, name),
+            )))
+            .await;
+    }
+
+    async fn tool_end(&self, id: &str, name: &str) {
+        let _ = self
+            .tx
+            .send(Ok(notification_event(
+                "tool_end",
+                tool_event_params(id, name),
+            )))
+            .await;
+    }
+
+    async fn turn_error(&self, message: &str) {
+        let _ = self
+            .tx
+            .send(Ok(error_event(&self.req_id, -32603, message)))
+            .await;
+    }
+}
+
+/// Discard progress. Used by callers that drive a turn to completion with
+/// nobody watching intermediate events (voice heartbeats, A2A v1).
+pub(crate) struct NullProgress;
+
+#[async_trait::async_trait]
+impl TurnProgress for NullProgress {
+    async fn tool_start(&self, _id: &str, _name: &str) {}
+    async fn tool_end(&self, _id: &str, _name: &str) {}
+    async fn turn_error(&self, _message: &str) {}
+}
+
+/// Why a turn stopped.
+///
+/// Exists because `text: None` conflates two materially different endings:
+/// the provider broke, and the model was still working when its tool-round
+/// budget ran out. A transport that has a way to say "budget" — ACP's
+/// `StopReason::MaxTurnRequests` — cannot tell them apart from the text
+/// alone, and answering "internal error" for a turn that was merely long is
+/// wrong in a way the user sees.
+///
+/// Callers that don't care may keep reading `text` alone: this is an extra
+/// field on the outcome, not a replacement, and every existing caller
+/// ignores it.
+pub(crate) enum TurnStop {
+    /// The model produced its final message; `text` is `Some`.
+    Replied,
+    /// A `Provider::chat` call failed. `TurnProgress::turn_error` has
+    /// already been handed the message, so the cause is available to
+    /// whoever is reporting; `text` is `None`.
+    ProviderError,
+    /// [`MAX_TOOL_ROUNDS`] was reached with the model still calling tools.
+    /// `text` is `None` — deliberately, because every caller that predates
+    /// ACP treats this as a failed turn and must keep doing so — but the
+    /// prose the model emitted alongside its tool calls is real work, and
+    /// is carried here rather than discarded. It may be empty.
+    BudgetExhausted { partial_text: String },
+}
+
 /// Outcome of [`run_llm_turn`].
-struct LlmTurnOutcome {
+pub(crate) struct LlmTurnOutcome {
     /// Final assistant text, when the turn completed successfully. `None`
     /// on provider error or when MAX_TOOL_ROUNDS was hit without resolving.
     text: Option<String>,
     /// True iff the session had no prior turns before this one. Used by
     /// callers to decide whether to spawn a title-generation task.
     was_first_turn: bool,
+    /// Which of those endings this was. See [`TurnStop`].
+    stop: TurnStop,
 }
 
 /// Execute one full LLM turn for an established session: hydrate history,
 /// run the tool-calling loop, persist user + assistant messages to JSONL,
-/// and emit per-tool `tool_start` / `tool_end` SSE notifications. Does NOT
-/// send the final JSON-RPC result event — the caller is responsible for
-/// shaping the final payload (text reply, voice audio, etc.) and emitting
-/// the appropriate result event.
-async fn run_llm_turn(
+/// and report per-tool `tool_start` / `tool_end` progress through
+/// `progress`. Does NOT send the final JSON-RPC result event — the caller
+/// is responsible for shaping the final payload (text reply, voice audio,
+/// etc.) and emitting the appropriate result event.
+///
+/// # This future may be dropped mid-turn
+///
+/// `/rpc` and the voice/heartbeat paths run this inside a detached
+/// `tokio::spawn`, so it finishes whether or not the client is still there.
+/// Two callers can drop it instead: the ACP endpoint does so deliberately,
+/// on `session/cancel` and on a vanished client (`src/serve/acp.rs`, the
+/// `session/prompt` handler's `tokio::select!`), and `/a2a` awaits it
+/// directly in an axum handler, whose future hyper may drop when an HTTP
+/// client disconnects mid-request. Either way it is dropped at whatever
+/// await point it happens to be sitting on.
+///
+/// Nothing here unwinds, so a dropped turn leaves a *split*:
+///
+/// - The user message and any compaction summary are already on disk — they
+///   are appended to JSONL as they happen (steps 4 and 5). The `state.sessions`
+///   write-back at the end never runs. So a cancelled prompt is invisible to
+///   the next turn's in-memory model context, yet present in `list_sessions`
+///   and after a restart; a compaction summary can be persisted and then
+///   thrown away, and will be produced again next turn.
+/// - Tool futures in flight are dropped too. `ShellTool` therefore sets
+///   `kill_on_drop(true)` (`src/tools/builtin_tools.rs`) — without it a
+///   cancelled turn left a shell command running against the workspace.
+///   Any tool added later that owns an external process, a lock or a
+///   partially-written file must be drop-safe for the same reason.
+///
+/// Anything added to this function that must happen exactly once per turn
+/// needs to be written with that in mind: reaching the end of the body is
+/// not guaranteed.
+pub(crate) async fn run_llm_turn(
     state: Arc<ServeState>,
     session_id: String,
     user_msg: ChatMessage,
-    req_id: Value,
-    tx: mpsc::Sender<Result<Event, Infallible>>,
+    progress: Arc<dyn TurnProgress>,
     timer_origin: Option<crate::timer::TimerOrigin>,
 ) -> LlmTurnOutcome {
-    let send = |evt: Event| {
-        let tx = tx.clone();
-        async move {
-            let _ = tx.send(Ok(evt)).await;
-        }
-    };
-
     // Pick the right store up front so every persistence call in this
     // turn lands in the same place (device-default vs cross-device).
     let store = Arc::clone(state.store_for_session(&session_id));
@@ -1728,7 +1859,7 @@ async fn run_llm_turn(
     let tool_specs = state.tools.specs().await;
     let compression_config = &state.config.compression;
     let mut accumulated_text: Vec<String> = Vec::new();
-    let final_text = loop {
+    let (final_text, stop) = loop {
         let round = history
             .iter()
             .filter(|m| {
@@ -1740,7 +1871,16 @@ async fn run_llm_turn(
 
         if round >= MAX_TOOL_ROUNDS {
             warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS})");
-            break None;
+            // `None` for the text, as before — callers that predate ACP
+            // report this as a failed turn and must keep doing so — but the
+            // prose accumulated so far rides along on the stop reason for
+            // transports that can show partial work.
+            break (
+                None,
+                TurnStop::BudgetExhausted {
+                    partial_text: accumulated_text.join("\n\n"),
+                },
+            );
         }
 
         // Check if context compression is needed
@@ -1777,8 +1917,8 @@ async fn run_llm_turn(
         match response {
             Err(e) => {
                 error!("Provider error: {e:#}");
-                send(error_event(&req_id, -32603, &e.to_string())).await;
-                break None;
+                progress.turn_error(&e.to_string()).await;
+                break (None, TurnStop::ProviderError);
             }
             Ok(resp) if !resp.has_tool_calls() => {
                 let text = resp.text.unwrap_or_default();
@@ -1790,7 +1930,7 @@ async fn run_llm_turn(
                 if !text.is_empty() {
                     accumulated_text.push(text);
                 }
-                break Some(accumulated_text.join("\n\n"));
+                break (Some(accumulated_text.join("\n\n")), TurnStop::Replied);
             }
             Ok(resp) => {
                 let tool_calls = resp.tool_calls.clone();
@@ -1806,11 +1946,7 @@ async fn run_llm_turn(
 
                 // Notify client of each tool starting
                 for call in &tool_calls {
-                    send(notification_event(
-                        "tool_start",
-                        json!({ "id": call.id, "name": call.name }),
-                    ))
-                    .await;
+                    progress.tool_start(&call.id, &call.name).await;
                 }
 
                 // Execute all tools concurrently — each call wrapped in
@@ -1845,11 +1981,7 @@ async fn run_llm_turn(
 
                 // Notify client of each tool completing
                 for call in &tool_calls {
-                    send(notification_event(
-                        "tool_end",
-                        json!({ "id": call.id, "name": call.name }),
-                    ))
-                    .await;
+                    progress.tool_end(&call.id, &call.name).await;
                 }
 
                 let mut text_results = Vec::with_capacity(results.len());
@@ -1882,6 +2014,7 @@ async fn run_llm_turn(
     LlmTurnOutcome {
         text: final_text,
         was_first_turn,
+        stop,
     }
 }
 
@@ -1904,8 +2037,7 @@ async fn run_turn(
         Arc::clone(&state),
         session_id.clone(),
         ChatMessage::user(&user_message),
-        req_id.clone(),
-        tx.clone(),
+        Arc::new(SseProgress::new(tx.clone(), req_id.clone())),
         None,
     )
     .await;
@@ -2097,6 +2229,267 @@ async fn generate_session_title(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Test fixtures — ServeState backed by a scripted / hanging stub provider.
+// Every endpoint/turn test elsewhere needs a ServeState; this is the one
+// place that knows how to build one without a real Anthropic API key.
+// ---------------------------------------------------------------------------
+
+/// The one tool the fixture advertises, so a scripted turn has something
+/// real to call: a turn whose tool call names a tool nobody registered
+/// would exercise `ToolSet`'s "Unknown tool" path instead of an execution.
+#[cfg(test)]
+pub(crate) struct EchoTool {
+    spec: crate::provider::ToolSpec,
+}
+
+#[cfg(test)]
+impl EchoTool {
+    pub(crate) fn new() -> Self {
+        Self {
+            spec: crate::provider::ToolSpec {
+                name: "echo".into(),
+                description: "Echo the given text back.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"]
+                }),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::tools::Tool for EchoTool {
+    fn spec(&self) -> &crate::provider::ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &Value) -> anyhow::Result<String> {
+        Ok(input["text"].as_str().unwrap_or_default().to_string())
+    }
+}
+
+/// Provider double for tests. In "scripted" mode it pops one
+/// [`crate::provider::ChatResponse`] off a queue per `chat()` call. In
+/// "hanging" mode `chat()` never resolves — used to keep a turn in
+/// flight while a cancellation test races it.
+#[cfg(test)]
+pub(crate) struct StubProvider {
+    script: Option<std::sync::Mutex<std::collections::VecDeque<crate::provider::ChatResponse>>>,
+    /// Only set in hanging mode. Counts entries into the parked `chat()` —
+    /// see [`HangingChat::entered`].
+    hang_entered: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Only set in hanging mode. Counts in-flight `chat()` futures that were
+    /// dropped (e.g. their task was aborted), so a cancellation test can
+    /// assert the turn was actually torn down rather than merely observing
+    /// that it never completed on its own.
+    hang_dropped: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+/// The two observations a test can make about a hanging provider's
+/// `chat()` calls.
+///
+/// `entered` exists so a test never has to *guess* that a turn has reached
+/// the provider. Cancelling a turn that has not got that far yet drops a
+/// future that never built the guard, so `dropped` would stay behind and the
+/// assertion would be a coin toss; waiting for `entered` first makes it a
+/// fact.
+///
+/// Both are counters rather than flags because prompts on one ACP connection
+/// run concurrently: a test that opens two turns needs to wait for *both* to
+/// reach the provider, and to see both of them torn down.
+#[cfg(test)]
+pub(crate) struct HangingChat {
+    /// Incremented just before `chat()` parks forever, so a test can wait
+    /// until N turns are genuinely inside the provider before taking their
+    /// connection away.
+    pub(crate) entered: Arc<std::sync::atomic::AtomicUsize>,
+    /// Incremented when one of those parked futures is dropped: the proof
+    /// that an abandoned turn actually stopped calling the provider.
+    pub(crate) dropped: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl HangingChat {
+    /// Wait until one of the counters reaches `at_least`, or fail with
+    /// `what` naming the thing that never happened.
+    pub(crate) async fn wait_for(
+        counter: &std::sync::atomic::AtomicUsize,
+        at_least: usize,
+        what: &str,
+    ) {
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while counter.load(std::sync::atomic::Ordering::SeqCst) < at_least {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "timed out waiting for {what} (reached {}, wanted {at_least})",
+            counter.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+}
+
+#[cfg(test)]
+impl StubProvider {
+    pub(crate) fn new(responses: Vec<crate::provider::ChatResponse>) -> Self {
+        Self {
+            script: Some(std::sync::Mutex::new(responses.into())),
+            hang_entered: None,
+            hang_dropped: None,
+        }
+    }
+
+    /// A provider whose `chat()` never resolves. Returns the provider plus
+    /// the flags described on [`HangingChat`].
+    pub(crate) fn new_hanging() -> (Self, HangingChat) {
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Self {
+                script: None,
+                hang_entered: Some(Arc::clone(&entered)),
+                hang_dropped: Some(Arc::clone(&dropped)),
+            },
+            HangingChat { entered, dropped },
+        )
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Provider for StubProvider {
+    fn name(&self) -> &str {
+        "stub"
+    }
+
+    async fn chat(
+        &self,
+        _system: Option<&str>,
+        _messages: &[ChatMessage],
+        _tools: Option<&[crate::provider::ToolSpec]>,
+    ) -> anyhow::Result<crate::provider::ChatResponse> {
+        let Some(script) = &self.script else {
+            // Hold a guard whose Drop flips `hang_dropped` before awaiting
+            // forever, so a caller that aborts this future (rather than
+            // waiting for it) leaves proof behind.
+            struct DroppedFlag(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for DroppedFlag {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let flag = self
+                .hang_dropped
+                .clone()
+                .expect("hanging StubProvider always carries a drop flag");
+            let _guard = DroppedFlag(flag);
+            // Announce the guard only once it exists: a test that waits for
+            // this before cancelling knows the drop flag has something to
+            // fire.
+            self.hang_entered
+                .as_ref()
+                .expect("hanging StubProvider always carries an entry counter")
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            unreachable!()
+        };
+        let next = script.lock().unwrap().pop_front();
+        next.ok_or_else(|| anyhow::anyhow!("StubProvider script exhausted"))
+    }
+}
+
+#[cfg(test)]
+impl ServeState {
+    /// State backed by temp directories and a stub provider that answers "ok".
+    pub(crate) fn for_test(acp_enabled: bool) -> Arc<Self> {
+        Self::for_test_scripted(
+            acp_enabled,
+            vec![crate::provider::ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        )
+    }
+
+    pub(crate) fn for_test_scripted(
+        acp_enabled: bool,
+        responses: Vec<crate::provider::ChatResponse>,
+    ) -> Arc<Self> {
+        Self::build_for_test(acp_enabled, StubProvider::new(responses))
+    }
+
+    /// State whose provider never returns, so a turn stays in flight.
+    /// The returned [`HangingChat`] reports when that `chat()` call was
+    /// entered and when it was dropped.
+    pub(crate) fn for_test_hanging(acp_enabled: bool) -> (Arc<Self>, HangingChat) {
+        let (provider, hanging) = StubProvider::new_hanging();
+        (Self::build_for_test(acp_enabled, provider), hanging)
+    }
+
+    fn build_for_test(acp_enabled: bool, provider: StubProvider) -> Arc<Self> {
+        // Leak the TempDir guard on purpose: this is a test binary and the
+        // OS reclaims the directory when it exits.
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let base = dir.path().to_path_buf();
+
+        let mut config = Config::parse_for_test(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.dev]
+provider = "stub"
+
+[room_profile.developer]
+profile  = "dev"
+rooms    = []
+api_keys = ["sa-acp-token"]
+"#,
+        );
+        config.acp = Some(crate::config::AcpConfig {
+            enabled: acp_enabled,
+        });
+
+        // Registered under both names: `provider_for_session` falls
+        // through to the background provider when no room_profile is
+        // pinned (as in the fixture_state_serves_the_scripted_provider
+        // test above, which looks up an unpinned session), and the
+        // background provider resolves the built-in "anthropic" key.
+        let registry = ProviderRegistry::for_test(&["anthropic", "stub"], Arc::new(provider));
+
+        Arc::new(Self {
+            config,
+            registry: Arc::new(registry),
+            workspace: Arc::new(Workspace::new(
+                base.join("workspace"),
+                crate::config::DigestConfig::default(),
+            )),
+            tools: Arc::new(ToolSet::new(vec![Box::new(EchoTool::new())], Vec::new())),
+            cross_device_session_store: Arc::new(SessionStore::new(base.join("sessions"), "rpc")),
+            device_default_session_store: Arc::new(SessionStore::new(
+                base.join("device-default"),
+                "device-default",
+            )),
+            mcp_session_store: Arc::new(SessionStore::new(base.join("mcp"), "mcp")),
+            mcp_project_index: Default::default(),
+            sessions: Default::default(),
+            pending_sessions: Default::default(),
+            session_room_profiles: Default::default(),
+            session_room_metadata: Default::default(),
+            voice: None,
+            image_cache: None,
+            voice_subscribers: Default::default(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2159,5 +2552,134 @@ mod tests {
             _ => panic!("expected inserted Text part"),
         }
         assert!(matches!(labeled.parts[1], ContentPart::Image { .. }));
+    }
+
+    #[test]
+    fn extract_bearer_accepts_both_cases_and_trims() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("Bearer  tok-1 "));
+        assert_eq!(extract_bearer(&h), Some("tok-1".to_string()));
+
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("bearer tok-2"));
+        assert_eq!(extract_bearer(&h), Some("tok-2".to_string()));
+    }
+
+    #[test]
+    fn extract_bearer_rejects_missing_wrong_scheme_and_empty() {
+        assert_eq!(extract_bearer(&HeaderMap::new()), None);
+
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("Basic tok"));
+        assert_eq!(extract_bearer(&h), None);
+
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("Bearer   "));
+        assert_eq!(extract_bearer(&h), None);
+    }
+
+    #[tokio::test]
+    async fn fixture_state_serves_the_scripted_provider() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![crate::provider::ChatResponse {
+                text: Some("scripted reply".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let provider = state.provider_for_session("no-such-session").await;
+        let resp = provider
+            .chat(None, &[ChatMessage::user("hi")], None)
+            .await
+            .unwrap();
+        assert_eq!(resp.text.as_deref(), Some("scripted reply"));
+    }
+
+    #[tokio::test]
+    async fn fixture_state_resolves_the_test_token() {
+        let state = ServeState::for_test(true);
+        assert_eq!(
+            state.config.resolve_a2a_token("sa-acp-token"),
+            Some("developer")
+        );
+        assert_eq!(state.config.resolve_a2a_token("sa-wrong"), None);
+    }
+
+    #[tokio::test]
+    async fn hanging_provider_sets_the_drop_flag_when_its_chat_future_is_aborted() {
+        let (state, hanging) = ServeState::for_test_hanging(true);
+        let handle = tokio::spawn(async move {
+            let provider = state.provider_for_session("no-such-session").await;
+            let _ = provider.chat(None, &[ChatMessage::user("hi")], None).await;
+        });
+        // Give the spawned task a chance to actually enter `chat()` and
+        // start awaiting `pending::<()>()` before we abort it — otherwise
+        // we might cancel it before the guard is ever constructed.
+        tokio::task::yield_now().await;
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(
+            hanging.entered.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "expected the chat() call to have parked before it was aborted"
+        );
+        assert_eq!(
+            hanging.dropped.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "expected the in-flight chat() future's drop guard to fire on abort"
+        );
+    }
+
+    #[test]
+    fn tool_event_params_pins_the_wire_field_names() {
+        assert_eq!(
+            tool_event_params("call-1", "recall"),
+            json!({ "id": "call-1", "name": "recall" })
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_progress_emits_one_event_per_call() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let progress = SseProgress::new(tx, json!(7));
+
+        progress.tool_start("call-1", "recall").await;
+        progress.tool_end("call-1", "recall").await;
+        drop(progress);
+
+        let mut seen = Vec::new();
+        while let Some(item) = rx.recv().await {
+            seen.push(item);
+        }
+        assert_eq!(seen.len(), 2, "one event per call");
+        assert!(seen[0].is_ok());
+        assert!(seen[1].is_ok());
+    }
+
+    #[tokio::test]
+    async fn sse_progress_turn_error_emits_one_event() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let progress = SseProgress::new(tx, json!(7));
+
+        progress.turn_error("provider exploded").await;
+        drop(progress);
+
+        let mut seen = Vec::new();
+        while let Some(item) = rx.recv().await {
+            seen.push(item);
+        }
+        assert_eq!(seen.len(), 1, "one event for the error");
+        assert!(seen[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn null_progress_discards_without_panicking_and_sends_nothing() {
+        // NullProgress holds no channel to observe directly, so the
+        // absence of a panic across all three methods is the assertion.
+        let progress = NullProgress;
+        progress.tool_start("recall", "call-1").await;
+        progress.tool_end("recall", "call-1").await;
+        progress.turn_error("ignored").await;
     }
 }
