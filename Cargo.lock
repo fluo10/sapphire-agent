@@ -1001,6 +1001,7 @@ dependencies = [
  "axum-core",
  "base64 0.22.1",
  "bytes",
+ "form_urlencoded",
  "futures-util",
  "http",
  "http-body",
@@ -1016,6 +1017,7 @@ dependencies = [
  "serde_core",
  "serde_json",
  "serde_path_to_error",
+ "serde_urlencoded",
  "sha1 0.10.6",
  "sync_wrapper",
  "tokio",
@@ -1023,6 +1025,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -1041,6 +1044,7 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -10230,6 +10234,7 @@ dependencies = [
  "cron",
  "directories",
  "dirs",
+ "filetime",
  "futures-util",
  "grain-id",
  "hound",
@@ -10250,6 +10255,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "toml 1.1.2+spec-1.1.0",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -10332,16 +10338,19 @@ dependencies = [
 [[package]]
 name = "sapphire-framework"
 version = "0.1.0"
-source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#34ba131c6caa16032d77ead03ea264546dd20ac0"
 dependencies = [
  "sapphire-framework-backend",
+ "sapphire-framework-blob",
+ "sapphire-framework-remote-server",
+ "sapphire-framework-rpc",
  "sapphire-framework-workspace",
 ]
 
 [[package]]
 name = "sapphire-framework-backend"
 version = "0.1.0"
-source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#34ba131c6caa16032d77ead03ea264546dd20ac0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -10356,9 +10365,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sapphire-framework-blob"
+version = "0.1.0"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#34ba131c6caa16032d77ead03ea264546dd20ac0"
+dependencies = [
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sapphire-framework-remote-client"
 version = "0.1.0"
-source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#34ba131c6caa16032d77ead03ea264546dd20ac0"
 dependencies = [
  "base64 0.22.1",
  "reqwest",
@@ -10367,12 +10385,36 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "sapphire-framework-remote-server"
+version = "0.1.0"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#34ba131c6caa16032d77ead03ea264546dd20ac0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "getrandom 0.2.17",
+ "redb",
+ "sapphire-framework-blob",
+ "sapphire-framework-retrieve",
+ "sapphire-framework-rpc",
+ "sapphire-framework-track",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
 name = "sapphire-framework-retrieve"
 version = "0.1.0"
-source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#34ba131c6caa16032d77ead03ea264546dd20ac0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -10391,7 +10433,7 @@ dependencies = [
 [[package]]
 name = "sapphire-framework-rpc"
 version = "0.1.0"
-source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#34ba131c6caa16032d77ead03ea264546dd20ac0"
 dependencies = [
  "chrono",
  "serde",
@@ -10402,7 +10444,7 @@ dependencies = [
 [[package]]
 name = "sapphire-framework-track"
 version = "0.1.0"
-source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#34ba131c6caa16032d77ead03ea264546dd20ac0"
 dependencies = [
  "redb",
  "thiserror 2.0.18",
@@ -10412,7 +10454,7 @@ dependencies = [
 [[package]]
 name = "sapphire-framework-workspace"
 version = "0.1.0"
-source = "git+https://github.com/fluo10/sapphire-framework?branch=main#432edb5d2faca6f63655f0eaedf1522ce45d9513"
+source = "git+https://github.com/fluo10/sapphire-framework?branch=main#34ba131c6caa16032d77ead03ea264546dd20ac0"
 dependencies = [
  "chrono",
  "indexmap 2.14.0",
@@ -12068,6 +12110,7 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

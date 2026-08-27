@@ -144,6 +144,17 @@ pub struct Config {
     /// "25分集中 + 5分休憩を3回" every time.
     #[serde(default)]
     pub timer: TimerConfig,
+    /// Ambient (always-on) audio capture ingest configuration.
+    #[serde(default)]
+    pub ambient: AmbientConfig,
+    /// Location of the `sapphire-framework` key file used to authenticate
+    /// ambient capture devices.
+    #[serde(default)]
+    pub keys: KeysConfig,
+    /// Capture devices, keyed by a stable human-readable name. The key is
+    /// the device id recorded in transcripts.
+    #[serde(default, rename = "device")]
+    pub devices: HashMap<String, DeviceConfig>,
 }
 
 fn default_true() -> bool {
@@ -280,6 +291,137 @@ impl Default for ImageCacheConfig {
 
 fn default_image_cache_enabled() -> bool {
     true
+}
+
+/// Ambient (always-on) audio capture ingest. Opt-in: with `enabled =
+/// false`, `ambient::startup::build` returns `None` and `/audio/ingest` is
+/// never mounted, so it 404s like any other unmatched path rather than
+/// answering 401 and telling a probing device its key is wrong. The
+/// handler's own `enabled` check survives as defence in depth for a caller
+/// that mounts the routes anyway.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmbientConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Override the cache root. `None` resolves to
+    /// `dirs::cache_dir() / "sapphire-agent" / "ambient"` at startup.
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    /// Days of raw audio to keep. Transcripts are never swept.
+    #[serde(default = "default_audio_retention_days")]
+    pub audio_retention_days: u32,
+    /// Name of the `[stt_provider.*]` block used for ambient transcription.
+    #[serde(default)]
+    pub stt_provider: String,
+    /// Segments with less gated speech than this get no speaker attribution.
+    /// Embeddings from very short utterances are unreliable and are the main
+    /// driver of speaker-id inflation.
+    #[serde(default = "default_min_embed_ms")]
+    pub min_embed_ms: u32,
+    /// `SpeakerEmbeddingManager::search` threshold.
+    #[serde(default = "default_match_threshold")]
+    pub match_threshold: f32,
+    #[serde(default = "default_promote_after_seconds")]
+    pub promote_after_seconds: u32,
+    #[serde(default = "default_promote_after_days")]
+    pub promote_after_days: u32,
+    /// Admission queue depth. A full queue answers 429, which a device
+    /// handles exactly like being offline.
+    #[serde(default = "default_max_queue")]
+    pub max_queue: usize,
+    /// Directory holding the Silero VAD model. sherpa-onnx publishes it only
+    /// as a bare `.onnx` file (e.g. `silero_vad.onnx`), not a downloadable
+    /// bundle — get it from the sherpa-onnx GitHub releases page
+    /// (`asr-models` tag) and point this at the directory you saved it in.
+    #[serde(default)]
+    pub vad_model_dir: Option<String>,
+    /// Directory holding the speaker embedding model. Like the VAD model,
+    /// sherpa-onnx publishes these only as bare `.onnx` files — get one from
+    /// the sherpa-onnx GitHub releases page (`speaker-recongition-models`
+    /// tag, upstream's own spelling) and point this at the directory you
+    /// saved it in.
+    #[serde(default)]
+    pub embedding_model_dir: Option<String>,
+    /// VAD speech probability threshold.
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
+    /// Inference threads for the embedding model.
+    #[serde(default = "default_embedding_num_threads")]
+    pub embedding_num_threads: i32,
+}
+
+fn default_audio_retention_days() -> u32 {
+    7
+}
+fn default_min_embed_ms() -> u32 {
+    1500
+}
+fn default_match_threshold() -> f32 {
+    0.55
+}
+fn default_promote_after_seconds() -> u32 {
+    60
+}
+fn default_promote_after_days() -> u32 {
+    2
+}
+fn default_max_queue() -> usize {
+    1000
+}
+fn default_vad_threshold() -> f32 {
+    0.5
+}
+fn default_embedding_num_threads() -> i32 {
+    2
+}
+
+impl Default for AmbientConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cache_dir: None,
+            audio_retention_days: default_audio_retention_days(),
+            stt_provider: String::new(),
+            min_embed_ms: default_min_embed_ms(),
+            match_threshold: default_match_threshold(),
+            promote_after_seconds: default_promote_after_seconds(),
+            promote_after_days: default_promote_after_days(),
+            max_queue: default_max_queue(),
+            vad_model_dir: None,
+            embedding_model_dir: None,
+            vad_threshold: default_vad_threshold(),
+            embedding_num_threads: default_embedding_num_threads(),
+        }
+    }
+}
+
+/// Location of the `sapphire-framework` key file. Host-local: it names
+/// the only place tokens are stored, so it must never be settable from
+/// the workspace config layer.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeysConfig {
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+}
+
+/// One capture device. Carries no secret: `key_id` names a `KeyEntry` in
+/// the key file, and the token itself never appears here. That is what
+/// lets this block be shared through the workspace config layer.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceConfig {
+    /// `KeyEntry::id` from the framework key file.
+    pub key_id: uuid::Uuid,
+    /// Display metadata; reaches the system prompt. Distinct from the key
+    /// file's own `label`, which the framework documents as a note nothing
+    /// in the system reads.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Which room profile a conversation from this device runs under (S4).
+    #[serde(default)]
+    pub room_profile: Option<String>,
 }
 
 /// Voice-mode global settings — everything that's the same for every
@@ -910,6 +1052,23 @@ fn default_digest_yearly_items() -> usize {
 }
 
 impl Config {
+    /// Minimal valid config for tests outside this module. `anthropic` is
+    /// the only field without a `#[serde(default)]`, so this is the
+    /// smallest TOML that parses; every other field falls back to its own
+    /// default. Kept in one place so a change to a currently-required
+    /// field doesn't have to be replicated across every test module that
+    /// needs a `Config`.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        toml::from_str(
+            r#"
+[anthropic]
+api_key = "test"
+"#,
+        )
+        .expect("minimal config should parse")
+    }
+
     /// Resolve the workspace directory: explicit config > config file's parent directory.
     pub fn resolved_workspace_dir(&self, config_path: &Path) -> PathBuf {
         resolve_workspace_dir(self.workspace_dir.as_deref(), config_path)
@@ -2414,5 +2573,94 @@ enabled = true
 "#,
         );
         assert!(cfg.acp.as_ref().expect("[acp] parsed").enabled);
+    }
+
+    #[test]
+    fn ambient_config_defaults_to_disabled_with_documented_values() {
+        let cfg: crate::config::AmbientConfig = toml::from_str("").unwrap();
+        assert!(!cfg.enabled, "ambient must be opt-in");
+        assert_eq!(cfg.audio_retention_days, 7);
+        assert_eq!(cfg.min_embed_ms, 1500);
+        assert_eq!(cfg.match_threshold, 0.55);
+        assert_eq!(cfg.promote_after_seconds, 60);
+        assert_eq!(cfg.promote_after_days, 2);
+        assert_eq!(cfg.max_queue, 1000);
+        assert!(cfg.cache_dir.is_none());
+    }
+
+    #[test]
+    fn device_blocks_parse_a_key_id_and_never_a_token() {
+        let toml_src = r#"
+[anthropic]
+api_key = "sk-test"
+
+[keys]
+file = "/etc/sapphire/keys.toml"
+
+[device.pendant]
+key_id = "6c8f4a2e-1d33-4b90-9a71-0e5b2f8c4d17"
+label = "the one on the lanyard"
+room_profile = "default"
+"#;
+        let cfg: crate::config::Config = toml::from_str(toml_src).unwrap();
+        let dev = cfg.devices.get("pendant").expect("device.pendant parsed");
+        assert_eq!(
+            dev.key_id.to_string(),
+            "6c8f4a2e-1d33-4b90-9a71-0e5b2f8c4d17"
+        );
+        assert_eq!(dev.label.as_deref(), Some("the one on the lanyard"));
+        assert_eq!(dev.room_profile.as_deref(), Some("default"));
+        assert_eq!(
+            cfg.keys.file.as_deref(),
+            Some(std::path::Path::new("/etc/sapphire/keys.toml"))
+        );
+    }
+
+    #[test]
+    fn a_device_block_carrying_a_token_is_a_parse_error() {
+        // The whole point of key_id is that a secret cannot live here. An
+        // `api_key` field must not silently parse and be ignored.
+        let toml_src = r#"
+[anthropic]
+api_key = "sk-test"
+
+[device.pendant]
+key_id = "6c8f4a2e-1d33-4b90-9a71-0e5b2f8c4d17"
+api_key = "sa-dev-oops"
+"#;
+        let err = toml::from_str::<crate::config::Config>(toml_src).unwrap_err();
+        assert!(
+            err.to_string().contains("api_key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ambient_model_fields_default_to_unset() {
+        let cfg: crate::config::AmbientConfig = toml::from_str("").unwrap();
+        assert!(cfg.vad_model_dir.is_none());
+        assert!(cfg.embedding_model_dir.is_none());
+        assert_eq!(cfg.vad_threshold, 0.5);
+        assert_eq!(cfg.embedding_num_threads, 2);
+    }
+
+    #[test]
+    fn ambient_model_fields_parse_from_toml() {
+        let cfg: crate::config::AmbientConfig = toml::from_str(
+            r#"
+embedding_model_dir = "/models/3dspeaker"
+vad_model_dir = "/models/silero"
+vad_threshold = 0.6
+embedding_num_threads = 4
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.embedding_model_dir.as_deref(),
+            Some("/models/3dspeaker")
+        );
+        assert_eq!(cfg.vad_model_dir.as_deref(), Some("/models/silero"));
+        assert_eq!(cfg.vad_threshold, 0.6);
+        assert_eq!(cfg.embedding_num_threads, 4);
     }
 }

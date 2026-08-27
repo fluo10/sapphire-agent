@@ -4,6 +4,7 @@
 #![recursion_limit = "256"]
 
 mod agent;
+mod ambient;
 mod channel;
 mod config;
 mod config_layer;
@@ -381,6 +382,20 @@ async fn main() -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("voice provider init panicked: {e}"))??;
                 Some(Arc::new(providers))
             };
+
+            // ── Ambient audio ingest (optional) ─────────────────────────────
+            // Built here — after `voice_providers` exists, before it is
+            // moved into `ServeState::new` below — so it can resolve
+            // `[ambient].stt_provider` against the same registry. A borrow
+            // is enough; `build` never needs to own the registry.
+            // Every failure here is fatal and loud: an ambient subsystem
+            // that starts but cannot authenticate, transcribe, or store
+            // looks exactly like a broken device from the outside, and the
+            // device has no way to tell you.
+            let ambient_runtime =
+                ambient::startup::build(&config, &workspace_dir, voice_providers.as_deref())
+                    .context("ambient audio ingest failed to start")?;
+
             // ── Image cache (workspace-external) ──────────────────────────
             // Resolves once at startup. A missing platform cache dir
             // (rare; effectively only headless edge cases) or a config
@@ -424,6 +439,22 @@ async fn main() -> Result<()> {
                 tool_set
                     .register_tool(Box::new(tools::builtin_tools::RecallImageTool::new(cache)))
                     .await;
+            }
+
+            // Register the ambient tools (`transcript_read`,
+            // `speaker_candidates`, `speaker_promote`) only once the
+            // subsystem actually started — same rule as `recall_image`
+            // above: the model never sees a tool that cannot work.
+            // `spawn` is what starts the subsystem's only background
+            // tasks (the worker loop and the daily audio sweep), and
+            // hands back the ingest router for `serve::run` to mount.
+            let mut ambient_routes: Option<axum::Router> = None;
+            if let Some(runtime) = ambient_runtime {
+                let (routes, tools) = ambient::startup::spawn(runtime);
+                for tool in tools {
+                    tool_set.register_tool(tool).await;
+                }
+                ambient_routes = Some(routes);
             }
 
             let serve_state = Arc::new(serve::ServeState::new(
@@ -670,7 +701,7 @@ async fn main() -> Result<()> {
                 })
                 .unwrap_or_else(|| "127.0.0.1:9000".to_string());
 
-            serve::run(addr, Arc::clone(&serve_state)).await?;
+            serve::run(addr, Arc::clone(&serve_state), ambient_routes).await?;
 
             // Wait for the agent task's graceful shutdown to finish so its
             // summarize_on_shutdown LLM call isn't aborted by runtime drop.

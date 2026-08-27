@@ -125,7 +125,7 @@ shellexpand = "3.1"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Time-ordered unique IDs for session files
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", features = ["v7", "serde"] }
 
 # Local-first workspace framework: file indexing, FTS, vector search.
 # The facade crate (bevy-style) fronts the internal sapphire-framework-*
@@ -133,7 +133,11 @@ uuid = { version = "1", features = ["v7"] }
 # plus an explicit `workspace` keeps the facade's own default (workspace +
 # redb-store) from bypassing the feature flags below.
 # lancedb-store is gated behind the "lancedb-store" feature (default on)
-sapphire-framework = { version = "0.1", git = "https://github.com/fluo10/sapphire-framework", branch = "main", default-features = false, features = ["workspace"] }
+# `remote-server` is enabled for one type: `remote_server::KeyStore`, which
+# authenticates ambient capture devices. It drags in the whole JSON-RPC sync
+# server (axum, redb, blob, retrieve, track) for that one struct; splitting it
+# out is fluo10/sapphire-framework#103, after which this becomes `keys`.
+sapphire-framework = { version = "0.1", git = "https://github.com/fluo10/sapphire-framework", branch = "main", default-features = false, features = ["workspace", "remote-server"] }
 
 # Human-readable session IDs for API sessions
 grain-id = { version = "0.14", features = ["serde"] }
@@ -203,4 +207,9 @@ agent-client-protocol = "2.0.0"
 
 [dev-dependencies]
 tempfile = "3"
+filetime = "0.2"
 tokio-tungstenite = "0.30.0"
+
+# `ServiceExt::oneshot` to drive an axum `Router` directly in tests,
+# without binding a real listener.
+tower = { version = "0.5", default-features = false, features = ["util"] }
