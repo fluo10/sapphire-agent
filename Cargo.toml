@@ -50,12 +50,11 @@ name = "sapphire-agent"
 path = "src/main.rs"
 
 [features]
-default = ["redb-store", "lancedb-store", "fastembed-embed", "voice-sherpa"]
-# Pure-Rust cache backend (redb + tantivy) for the FTS/record store. Without it
-# the workspace falls back to an ephemeral in-memory store; lancedb-store only
-# covers the vector index.
+default = ["redb-store", "fastembed-embed", "voice-sherpa"]
+# Pure-Rust cache backend (redb + tantivy) for the FTS/record store, and the
+# brute-force vector index alongside it. Without it the workspace falls back to
+# an ephemeral in-memory store.
 redb-store = ["sapphire-framework/redb-store"]
-lancedb-store = ["sapphire-framework/lancedb-store"]
 fastembed-embed = ["sapphire-framework/fastembed-embed"]
 # Compile in the local sherpa-onnx STT + TTS providers. Enabled by
 # default, but note that sherpa-onnx-sys pulls in a large C++ build
@@ -132,7 +131,6 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # crates; each feature re-exports one as a module. `default-features = false`
 # plus an explicit `workspace` keeps the facade's own default (workspace +
 # redb-store) from bypassing the feature flags below.
-# lancedb-store is gated behind the "lancedb-store" feature (default on)
 # `remote-server` is enabled for one type: `remote_server::KeyStore`, which
 # authenticates ambient capture devices. It drags in the whole JSON-RPC sync
 # server (axum, redb, blob, retrieve, track) for that one struct; splitting it

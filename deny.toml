@@ -21,8 +21,10 @@ yanked = "warn"
 # filed.
 ignore = [
     # --- unmaintained (no vulnerability) ---
-    { id = "RUSTSEC-2025-0141", reason = "bincode 2.x is unmaintained but used transitively via lindera → lance; no safe upgrade exists." },
-    { id = "RUSTSEC-2021-0153", reason = "encoding crate is unmaintained but pulled in via lindera → lance." },
+    # The bincode (RUSTSEC-2025-0141) and encoding (RUSTSEC-2021-0153) entries
+    # are gone: both reached us through lance, which left the graph when
+    # sapphire-framework dropped its LanceDB backend. `cargo tree -i` finds
+    # neither package now, even under --all-features.
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained but pulled in via many proc-macro consumers; no drop-in replacement." },
 
     # --- rustls-webpki 0.102.x advisories pinned by serenity → tokio-tungstenite 0.21 → tokio-rustls 0.25 → rustls 0.22 ---
