@@ -6,13 +6,13 @@
 
 **Architecture:** 認証は `DeviceAuth` 1 個に集約する — トークン → `KeyStore`（ホストローカル）→ `KeyEntry.device_id` → `Devices`（ワークスペース）→ デバイス、そこからホスト設定の `[room_profile.*].devices` を反転した索引で room_profile。起動時に 1 回組んで `Arc` で共有し、`ServeState` と ambient の `IngestState` が同じものを見る。ルーティングの決定（どのデバイスがどの room_profile か）は人間が所有する `config.toml` に残し、台帳はコマンドが全上書きする「名前・説明・user_id」だけの帳簿にする。
 
-**Tech Stack:** Rust 2024 edition, `clap` 4（derive）, `axum` 0.8, `sapphire-framework`（`workspace` + `remote-server` + `registry`）, `grain-id` 0.15, `chrono`, `anyhow`
+**Tech Stack:** Rust 2024 edition, `clap` 4（derive）, `axum` 0.8, `sapphire-framework`（`workspace` + `remote-server` + `registry`）, `grain-id` 0.16, `chrono`, `anyhow`
 
 **Spec:** `docs/superpowers/specs/2026-08-29-device-based-auth-design.md`
 
 ## Global Constraints
 
-- **`grain-id` を 0.14 から 0.15 へ上げる。** framework が 0.15 を使うので、上げないと `KeyEntry.device_id` の型（framework の `GrainId`）と agent の `GrainId` が**別の型**になり、コンパイルが通らない。
+- **`grain-id` を 0.14 から 0.16 へ上げる。** framework が 0.16 を使うので、上げないと `KeyEntry.device_id` の型（framework の `GrainId`）と agent の `GrainId` が**別の型**になり、コンパイルが通らない。
 - `sapphire-framework` のフィーチャに `"registry"` を足す。
 - トークンの接頭辞は **`"sat"`**。framework の `mint_token` は `<prefix>_<random>` を作る。
 - `KeyStore::generate` は **5 引数**（`prefix`, `id: Option<Uuid>`, `device_id: Option<GrainId>`, `label`, `expires_at`）。
@@ -39,7 +39,7 @@
 Run: `cargo test`
 Expected: PASS。落ちるものがあれば本数と名前を控えておく（本計画と無関係の既存の失敗）。
 
-- [ ] **Step 2: `grain-id` を 0.15 へ上げる**
+- [ ] **Step 2: `grain-id` を 0.16 へ上げる**
 
 `Cargo.toml`:
 
@@ -48,7 +48,7 @@ Expected: PASS。落ちるものがあれば本数と名前を控えておく（
 # registry. Must match the version sapphire-framework uses — `KeyEntry.device_id`
 # is a `GrainId`, and two semver-incompatible grain-id versions in one graph are
 # two different types.
-grain-id = { version = "0.15", features = ["serde"] }
+grain-id = { version = "0.16", features = ["serde"] }
 ```
 
 - [ ] **Step 3: framework に `registry` フィーチャを足す**
@@ -68,7 +68,7 @@ Run: `cargo update -p sapphire-framework -p grain-id`
 Run: `cargo build`
 Expected: 成功
 
-grain-id 0.15 で API が変わっていて壊れる箇所があれば直す。候補は
+grain-id 0.16 で API が変わっていて壊れる箇所があれば直す。候補は
 `src/ambient/speaker/candidates.rs`（`grain_id::GrainId::random()`）と
 `crates/sapphire-agent-rpc/src/lib.rs`。
 
@@ -79,7 +79,7 @@ Expected: PASS（Step 1 と同じ本数）
 
 ```bash
 git add Cargo.toml Cargo.lock
-git commit -m "chore: grain-id 0.15 and the framework's registry feature"
+git commit -m "chore: grain-id 0.16 and the framework's registry feature"
 ```
 
 ---
