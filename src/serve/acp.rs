@@ -1,9 +1,9 @@
 //! Agent Client Protocol over WebSocket, at `GET /acp`.
 //!
-//! Auth: `Authorization: Bearer <token>` on the upgrade request, matched
-//! against `[room_profile.<n>].api_keys` — the same mechanism as `/a2a` and
-//! `/mcp`. The match resolves the room profile the ACP session runs under,
-//! so a dedicated Zed token can pin the editor to its own profile, provider
+//! Auth: `Authorization: Bearer <token>` on the upgrade request, resolved
+//! through `DeviceAuth` — the same mechanism as `/a2a` and `/mcp`. The
+//! match resolves the room profile the ACP session runs under, so a
+//! dedicated Zed token can pin the editor to its own profile, provider
 //! and memory namespace.
 //!
 //! Rejection happens *before* the 101: an error delivered after a successful
@@ -264,7 +264,11 @@ pub async fn handle_acp_ws(
     let Some(bearer) = extract_bearer(&headers) else {
         return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
     };
-    let Some(profile_name) = state.config.resolve_a2a_token(&bearer).map(str::to_string) else {
+    let Some(profile_name) = state
+        .device_auth
+        .resolve(&bearer)
+        .map(|r| r.room_profile.to_string())
+    else {
         warn!("ACP: rejected an unknown or revoked bearer token");
         return (StatusCode::UNAUTHORIZED, "unknown or revoked bearer token").into_response();
     };

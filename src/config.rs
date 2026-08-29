@@ -1113,26 +1113,6 @@ api_key = "test"
         self.room_profiles.get(name)
     }
 
-    /// Reverse-lookup: which room profile owns this bearer token?
-    ///
-    /// Returns the profile name on a match, or `None` when the token is
-    /// not registered under any `[room_profile.<n>].api_keys`. The A2A
-    /// handler uses this to pin a profile (and therefore a provider /
-    /// memory namespace) to a request without the client having to name
-    /// it explicitly. Token uniqueness across profiles is enforced by
-    /// `validate_profiles`.
-    pub fn resolve_a2a_token(&self, token: &str) -> Option<&str> {
-        if token.is_empty() {
-            return None;
-        }
-        for (name, rp) in &self.room_profiles {
-            if rp.api_keys.iter().any(|k| k == token) {
-                return Some(name.as_str());
-            }
-        }
-        None
-    }
-
     /// Resolve the session policy for a given `room_id`, falling back to
     /// the global default when no room profile sets one.
     pub fn session_policy_for(&self, room_id: &str) -> SessionPolicy {
@@ -1881,44 +1861,6 @@ api_keys = [""]
             errors.iter().any(|e| e.contains("empty api_keys")),
             "expected empty-token error, got: {errors:?}"
         );
-    }
-
-    #[test]
-    fn resolve_a2a_token_finds_owning_profile() {
-        let cfg = parse(
-            r#"
-[anthropic]
-api_key = "test"
-
-[profiles.world]
-provider = "anthropic"
-
-[profiles.dev]
-provider = "anthropic"
-
-[room_profile.sapphire_world]
-profile  = "world"
-rooms    = []
-api_keys = ["sa-a2a-world-1", "sa-a2a-world-2"]
-
-[room_profile.developer]
-profile  = "dev"
-rooms    = []
-api_keys = ["sa-a2a-dev"]
-"#,
-        );
-        assert!(cfg.validate_profiles().is_empty());
-        assert_eq!(
-            cfg.resolve_a2a_token("sa-a2a-world-1"),
-            Some("sapphire_world")
-        );
-        assert_eq!(
-            cfg.resolve_a2a_token("sa-a2a-world-2"),
-            Some("sapphire_world")
-        );
-        assert_eq!(cfg.resolve_a2a_token("sa-a2a-dev"), Some("developer"));
-        assert_eq!(cfg.resolve_a2a_token("nope"), None);
-        assert_eq!(cfg.resolve_a2a_token(""), None);
     }
 
     #[test]

@@ -384,18 +384,47 @@ async fn main() -> Result<()> {
                 Some(Arc::new(providers))
             };
 
+            // ── Device auth (bearer token -> device -> room profile) ────────
+            // Built once, here, and shared as one `Arc` between ambient
+            // ingest and `ServeState` (`/rpc`, `/a2a`, `/acp`, `/mcp`) so
+            // there is exactly one answer to "who is this token" in the
+            // process. A missing or unusable key file is fatal — see
+            // `DeviceAuth::open`'s own doc.
+            let keys_file = config
+                .keys
+                .file
+                .clone()
+                .or_else(device_auth::DeviceAuth::default_key_file)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[keys].file is unset and no platform config directory is resolvable; \
+                         set [keys].file explicitly"
+                    )
+                })?;
+            let devices_file = config::workspace_devices_path(&workspace_dir);
+            let device_auth = Arc::new(device_auth::DeviceAuth::open(
+                &keys_file,
+                &devices_file,
+                &config.room_profiles,
+            )?);
+
             // ── Ambient audio ingest (optional) ─────────────────────────────
             // Built here — after `voice_providers` exists, before it is
             // moved into `ServeState::new` below — so it can resolve
             // `[ambient].stt_provider` against the same registry. A borrow
-            // is enough; `build` never needs to own the registry.
+            // is enough; `build` never needs to own the registry. Shares
+            // `device_auth` with `ServeState` rather than resolving its own.
             // Every failure here is fatal and loud: an ambient subsystem
             // that starts but cannot authenticate, transcribe, or store
             // looks exactly like a broken device from the outside, and the
             // device has no way to tell you.
-            let ambient_runtime =
-                ambient::startup::build(&config, &workspace_dir, voice_providers.as_deref())
-                    .context("ambient audio ingest failed to start")?;
+            let ambient_runtime = ambient::startup::build(
+                &config,
+                &workspace_dir,
+                voice_providers.as_deref(),
+                Arc::clone(&device_auth),
+            )
+            .context("ambient audio ingest failed to start")?;
 
             // ── Image cache (workspace-external) ──────────────────────────
             // Resolves once at startup. A missing platform cache dir
@@ -468,6 +497,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&mcp_session_store),
                 voice_providers,
                 image_cache.clone(),
+                Arc::clone(&device_auth),
             ));
             // Wire serve_state into the timer manager so voice-origin
             // timers can push fire messages back to their satellite.

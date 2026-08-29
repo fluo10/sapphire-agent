@@ -6,10 +6,10 @@
 //!     internal chat turn to completion, return a terminal `Task`).
 //!   - `GET /.well-known/agent-card.json` — A2A agent card discovery.
 //!
-//! Auth: `Authorization: Bearer <token>` matched against
-//! `[room_profile.<n>].api_keys`. The match resolves the request's
+//! Auth: `Authorization: Bearer <token>` resolved through `DeviceAuth` —
+//! token -> device -> room profile. The match resolves the request's
 //! `room_profile` implicitly — clients don't need to (and can't) name
-//! it. A token leak therefore exposes one profile, not all.
+//! it. A token leak therefore exposes one device's profile, not all.
 //!
 //! Out of scope (v1): `SendStreamingMessage` (SSE), `GetTask`,
 //! `CancelTask`, `SubscribeToTask`, push notifications, `FilePart` `url`
@@ -183,8 +183,8 @@ pub async fn handle_a2a_post(
             return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
         }
     };
-    let profile_name = match state.config.resolve_a2a_token(&bearer) {
-        Some(name) => name.to_string(),
+    let profile_name = match state.device_auth.resolve(&bearer) {
+        Some(r) => r.room_profile.to_string(),
         None => {
             return jsonrpc_error_response(
                 req_id,
