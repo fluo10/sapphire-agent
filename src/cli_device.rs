@@ -88,7 +88,9 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     if value.is_empty() {
         bail!("duration must start with digits before the unit: {s:?}");
     }
-    let n: i64 = value.parse().with_context(|| format!("bad duration: {s:?}"))?;
+    let n: i64 = value
+        .parse()
+        .with_context(|| format!("bad duration: {s:?}"))?;
     let d = match unit {
         "d" => Duration::try_days(n),
         "h" => Duration::try_hours(n),
@@ -137,9 +139,8 @@ pub fn run_device(
             let expires_at = absolute_expiry(expires_in.as_deref())?;
             let user_id = match user {
                 Some(selector) => {
-                    let users = Users::load(users_file).with_context(|| {
-                        format!("loading user table {}", users_file.display())
-                    })?;
+                    let users = Users::load(users_file)
+                        .with_context(|| format!("loading user table {}", users_file.display()))?;
                     Some(users.resolve(&selector)?.id)
                 }
                 None => None,
@@ -153,7 +154,11 @@ pub fn run_device(
                 // The row already exists. Either this is a resumed `add` whose
                 // key write did not happen, or the name is genuinely taken.
                 Some(existing) => {
-                    if keys.entries().iter().any(|k| k.device_id == Some(existing.id)) {
+                    if keys
+                        .entries()
+                        .iter()
+                        .any(|k| k.device_id == Some(existing.id))
+                    {
                         bail!(
                             "device {name:?} already exists and already holds a key on this \
                              host; use `sapphire-agent device rotate {name}` to re-issue its \
@@ -223,7 +228,11 @@ pub fn run_device(
             let device = devices.resolve(&selector)?.clone();
             // Revoke first: the point of retiring is to stop the device, and a
             // crash between the two writes must not leave a live key behind.
-            if keys.entries().iter().any(|k| k.device_id == Some(device.id)) {
+            if keys
+                .entries()
+                .iter()
+                .any(|k| k.device_id == Some(device.id))
+            {
                 keys.revoke(&device.name)?;
             }
             if purge {
@@ -309,7 +318,11 @@ mod tests {
         let keys = KeyStore::load(&f.keys).unwrap();
         assert_eq!(keys.entries().len(), 1);
         let key = &keys.entries()[0];
-        assert_eq!(key.device_id, Some(device.id), "the key must name the device");
+        assert_eq!(
+            key.device_id,
+            Some(device.id),
+            "the key must name the device"
+        );
         assert!(key.token.starts_with("sat_"));
         assert_eq!(key.label.as_deref(), Some("pendant"));
     }
@@ -331,7 +344,11 @@ mod tests {
 
         let keys = KeyStore::load(&f.keys).unwrap();
         assert_eq!(keys.entries().len(), 1);
-        assert_eq!(keys.entries()[0].device_id, Some(id), "reuses the existing row");
+        assert_eq!(
+            keys.entries()[0].device_id,
+            Some(id),
+            "reuses the existing row"
+        );
         assert_eq!(Devices::load(&f.devices).unwrap().entries().len(), 1);
     }
 
@@ -343,13 +360,23 @@ mod tests {
         let err = add(&f, "pendant").unwrap_err();
 
         let msg = format!("{err:#}");
-        assert!(msg.contains("rotate"), "must point at the way forward: {msg}");
+        assert!(
+            msg.contains("rotate"),
+            "must point at the way forward: {msg}"
+        );
     }
 
     #[test]
     fn add_binds_a_user_when_asked() {
         let f = files();
-        run_user(UserCommand::Add { name: "fluo10".into(), description: None }, &f.users).unwrap();
+        run_user(
+            UserCommand::Add {
+                name: "fluo10".into(),
+                description: None,
+            },
+            &f.users,
+        )
+        .unwrap();
 
         run_device(
             DeviceCommand::Add {
@@ -413,7 +440,9 @@ mod tests {
         .unwrap();
 
         let keys = KeyStore::load(&f.keys).unwrap();
-        let expires = keys.entries()[0].expires_at.expect("an expiry was asked for");
+        let expires = keys.entries()[0]
+            .expires_at
+            .expect("an expiry was asked for");
         let expected = chrono::Utc::now() + chrono::Duration::days(90);
         assert!((expires - expected).num_seconds().abs() < 5);
     }
@@ -444,7 +473,10 @@ mod tests {
         let before = KeyStore::load(&f.keys).unwrap().entries()[0].clone();
 
         run_device(
-            DeviceCommand::Rotate { selector: "pendant".into(), expires_in: None },
+            DeviceCommand::Rotate {
+                selector: "pendant".into(),
+                expires_in: None,
+            },
             &f.devices,
             &f.users,
             &f.keys,
@@ -462,7 +494,10 @@ mod tests {
         add(&f, "pendant").unwrap();
 
         run_device(
-            DeviceCommand::Retire { selector: "pendant".into(), purge: false },
+            DeviceCommand::Retire {
+                selector: "pendant".into(),
+                purge: false,
+            },
             &f.devices,
             &f.users,
             &f.keys,
@@ -482,7 +517,10 @@ mod tests {
         add(&f, "pendant").unwrap();
 
         run_device(
-            DeviceCommand::Retire { selector: "pendant".into(), purge: true },
+            DeviceCommand::Retire {
+                selector: "pendant".into(),
+                purge: true,
+            },
             &f.devices,
             &f.users,
             &f.keys,
@@ -495,10 +533,20 @@ mod tests {
     #[test]
     fn user_add_rejects_a_duplicate_name() {
         let f = files();
-        run_user(UserCommand::Add { name: "fluo10".into(), description: None }, &f.users).unwrap();
+        run_user(
+            UserCommand::Add {
+                name: "fluo10".into(),
+                description: None,
+            },
+            &f.users,
+        )
+        .unwrap();
 
         let err = run_user(
-            UserCommand::Add { name: "fluo10".into(), description: None },
+            UserCommand::Add {
+                name: "fluo10".into(),
+                description: None,
+            },
             &f.users,
         )
         .unwrap_err();
@@ -510,7 +558,10 @@ mod tests {
     fn parse_duration_accepts_days_hours_and_minutes() {
         assert_eq!(parse_duration("90d").unwrap(), chrono::Duration::days(90));
         assert_eq!(parse_duration("12h").unwrap(), chrono::Duration::hours(12));
-        assert_eq!(parse_duration("30m").unwrap(), chrono::Duration::minutes(30));
+        assert_eq!(
+            parse_duration("30m").unwrap(),
+            chrono::Duration::minutes(30)
+        );
     }
 
     #[test]

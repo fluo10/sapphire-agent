@@ -20,18 +20,25 @@ session.
 
 ## Setup
 
-### 1. Server side: declare a room_profile with an API key
+### 1. Server side: register a device and declare a room_profile
 
-`sapphire-agent` reuses the `[room_profile.<n>].api_keys` mechanism
-(originally added for A2A) to authenticate MCP clients. Add a
+`sapphire-agent` reuses the same device table every other endpoint
+authenticates through (originally added for A2A) to authenticate MCP
+clients: bearer token -> key file entry -> workspace device -> room
+profile. Register a device for the client, then bind it under a
 profile dedicated to MCP traffic in `config.toml`:
+
+```sh
+sapphire-agent device add --name claude-code
+# token on stdout; device id + a devices=[...] line to paste on stderr
+```
 
 ```toml
 [room_profile.claude_code]
 profile          = "default"     # any [profiles.*]; drives the ねぎらい reply
 memory_namespace = "default"     # share the user's everyday namespace
 rooms            = []            # MCP-only; no chat rooms
-api_keys         = ["sa-mcp-<long random>"]
+devices          = ["a3f9k2p"]   # id printed by `device add --name claude-code`
 ```
 
 A few notes:
@@ -44,8 +51,8 @@ A few notes:
   declare one under `[memory_namespace.*]` and point this profile
   at it. Recall is always project-scoped regardless of namespace,
   so this is a write-side preference.
-- Tokens must be unique across all profiles. Sharing one across two
-  profiles is a startup error.
+- A device id must be unique across all room profiles, and every live
+  device must appear in exactly one. Startup refuses to run otherwise.
 
 ### 2. Client side: register the MCP server
 
@@ -59,7 +66,7 @@ The exact format depends on the client. For Claude Code's
       "type": "http",
       "url": "http://localhost:3000/mcp",
       "headers": {
-        "Authorization": "Bearer sa-mcp-<long random>"
+        "Authorization": "Bearer sat_<token printed by `device add`>"
       }
     }
   }

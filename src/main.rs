@@ -118,6 +118,15 @@ async fn main() -> Result<()> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        // `tracing_subscriber::fmt` defaults to stdout. `device add` prints
+        // the minted token alone to stdout so it can be piped straight into
+        // a file or a device's provisioning step; a stray log line ahead of
+        // it (e.g. the framework's own "key file permissions are not
+        // restricted on this platform" warning on non-Unix hosts) would
+        // corrupt that. Every other command's output is also `println!`, so
+        // sending logs to stderr instead keeps the split intact everywhere,
+        // not just here.
+        .with_writer(std::io::stderr)
         .init();
 
     init_app_ctx();
@@ -183,6 +192,32 @@ async fn main() -> Result<()> {
                 for err in &profile_errors {
                     println!("  - {err}");
                 }
+            }
+            // The device -> room_profile binding is written by hand, so it
+            // needs somewhere to be checked.
+            let keys_file = config
+                .keys
+                .file
+                .clone()
+                .or_else(device_auth::DeviceAuth::default_key_file);
+            match keys_file {
+                Some(keys_file) => {
+                    let devices_file = config::workspace_devices_path(&workspace_dir);
+                    match device_auth::DeviceAuth::open(
+                        &keys_file,
+                        &devices_file,
+                        &config.room_profiles,
+                    ) {
+                        Ok(auth) => {
+                            println!("  Device table      : {}", devices_file.display());
+                            for (device, rp) in auth.bindings() {
+                                println!("    {device:<20} -> room_profile '{rp}'");
+                            }
+                        }
+                        Err(e) => println!("  Devices           : INVALID: {e:#}"),
+                    }
+                }
+                None => println!("  Devices           : [keys].file unset"),
             }
             match &workspace_path {
                 Some(p) => println!("  Workspace config  : {}", p.display()),
@@ -1236,8 +1271,7 @@ mod tests {
 
     #[test]
     fn device_retire_defaults_to_keeping_the_row() {
-        let cli =
-            Cli::try_parse_from(["sapphire-agent", "device", "retire", "pendant"]).unwrap();
+        let cli = Cli::try_parse_from(["sapphire-agent", "device", "retire", "pendant"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Device {

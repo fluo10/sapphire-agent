@@ -151,8 +151,11 @@ pub struct Config {
     /// ambient capture devices.
     #[serde(default)]
     pub keys: KeysConfig,
-    /// Capture devices, keyed by a stable human-readable name. The key is
-    /// the device id recorded in transcripts.
+    /// Removed in the device-registry migration; kept only so a config that
+    /// still has `[device.*]` blocks parses far enough for
+    /// `Config::migration_errors` to name each leftover block by its key and
+    /// fail loudly, rather than the loader rejecting the whole file with a
+    /// generic parse error. Never populated by anything else.
     #[serde(default, rename = "device")]
     pub devices: HashMap<String, DeviceConfig>,
 }
