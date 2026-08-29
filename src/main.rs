@@ -9,6 +9,7 @@ mod channel;
 mod config;
 mod config_layer;
 mod context_compression;
+mod device_auth;
 mod frontmatter;
 mod heartbeat;
 mod heartbeat_config;

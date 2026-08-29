@@ -218,6 +218,12 @@ pub struct RoomProfileConfig {
     /// field will gate the legacy `/rpc` API too.
     #[serde(default)]
     pub api_keys: Vec<String>,
+    /// Device ids (from the workspace `devices.toml`) that run under this room
+    /// profile. A device id appears in exactly one room profile; the binding is
+    /// what gives an authenticated device its LLM profile and memory namespace.
+    /// Replaces `api_keys`, which held raw tokens in this file.
+    #[serde(default)]
+    pub devices: Vec<String>,
 }
 
 /// A2A (Agent2Agent Protocol) server settings.
@@ -1468,6 +1474,22 @@ pub fn resolve_workspace_dir(explicit: Option<&str>, config_path: &Path) -> Path
 /// resolves its workspace through the marker-free path.
 pub fn workspace_config_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join(".sapphire-agent").join("config.toml")
+}
+
+/// Path to the workspace device table.
+///
+/// Mirrors `workspace_config_path`. The framework has `Workspace::devices_path`
+/// for the same convention, but the agent resolves its workspace as a plain
+/// `PathBuf` and never builds a framework `Workspace` for config purposes —
+/// that constructor canonicalizes and requires the marker directory to already
+/// exist, neither of which is true when `device add` runs on a fresh checkout.
+pub fn workspace_devices_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(".sapphire-agent").join("devices.toml")
+}
+
+/// Path to the workspace user table. See `workspace_devices_path`.
+pub fn workspace_users_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(".sapphire-agent").join("users.toml")
 }
 
 /// A `Config` plus what the layering did to produce it.
