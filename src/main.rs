@@ -6,6 +6,7 @@
 mod agent;
 mod ambient;
 mod channel;
+mod cli_device;
 mod config;
 mod config_layer;
 mod context_compression;
@@ -87,6 +88,16 @@ struct Cli {
 enum Command {
     /// Validate the config file and exit
     Verify,
+    /// Manage the devices that authenticate to this agent.
+    Device {
+        #[command(subcommand)]
+        command: cli_device::DeviceCommand,
+    },
+    /// Manage the users devices belong to.
+    User {
+        #[command(subcommand)]
+        command: cli_device::UserCommand,
+    },
 }
 
 /// One-word tag naming where a setting's effective value came from, for `verify`.
@@ -258,6 +269,30 @@ async fn main() -> Result<()> {
                     None => println!("  {label:<28} -"),
                 }
             }
+        }
+        Some(Command::Device { command }) => {
+            let workspace_dir = config.resolved_workspace_dir(&config_path);
+            let keys_file = config
+                .keys
+                .file
+                .clone()
+                .or_else(device_auth::DeviceAuth::default_key_file)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[keys].file is unset and no platform config directory is \
+                         resolvable; set [keys].file explicitly"
+                    )
+                })?;
+            return cli_device::run_device(
+                command,
+                &config::workspace_devices_path(&workspace_dir),
+                &config::workspace_users_path(&workspace_dir),
+                &keys_file,
+            );
+        }
+        Some(Command::User { command }) => {
+            let workspace_dir = config.resolved_workspace_dir(&config_path);
+            return cli_device::run_user(command, &config::workspace_users_path(&workspace_dir));
         }
         None => {
             let bind = cli.bind;
@@ -1173,6 +1208,43 @@ fn migrate_pre_namespace_layout(workspace_dir: &std::path::Path) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_add_requires_a_name() {
+        assert!(Cli::try_parse_from(["sapphire-agent", "device", "add"]).is_err());
+    }
+
+    #[test]
+    fn device_add_takes_a_name_and_a_description() {
+        let cli = Cli::try_parse_from([
+            "sapphire-agent",
+            "device",
+            "add",
+            "--name",
+            "pendant",
+            "--description",
+            "the one on the lanyard",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Device {
+                command: cli_device::DeviceCommand::Add { ref name, description: Some(_), .. }
+            }) if name == "pendant"
+        ));
+    }
+
+    #[test]
+    fn device_retire_defaults_to_keeping_the_row() {
+        let cli =
+            Cli::try_parse_from(["sapphire-agent", "device", "retire", "pendant"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Device {
+                command: cli_device::DeviceCommand::Retire { purge: false, .. }
+            })
+        ));
+    }
 
     fn write_stub(path: &std::path::Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
