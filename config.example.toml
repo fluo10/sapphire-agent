@@ -491,8 +491,10 @@ system_prompt = "You are a helpful personal assistant."
 # `/acp`, `/mcp` — resolves the same way: bearer token -> key file entry
 # -> workspace device -> room profile. The token lives only in
 # `sapphire-framework`'s key file — never in this config — so a leaked
-# config reveals no credential and revoking a device is a key-file
-# edit, not an agent restart. Defaults to
+# config reveals no credential. `DeviceAuth` holds a snapshot of the key
+# file and the device table taken at startup with no reload path, so a
+# revoke, rotate, retire, or `[room_profile.*].devices` edit takes effect
+# on this agent's next restart, not immediately. Defaults to
 # `dirs::config_dir()/sapphire-agent/keys.toml`.
 #
 # [keys]

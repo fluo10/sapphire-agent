@@ -7,9 +7,13 @@
 //! runs key -> device (`KeyEntry.device_id`) rather than device -> key, because
 //! one physical device talking to two hosts has two keys in two files.
 //!
-//! Which room profile a device runs under is host config, not table data:
-//! `[room_profile.<n>].devices`. The table is rewritten in full by
+//! Which room profile a device runs under is config data, not table data:
+//! `[room_profile.<n>].devices`. The device table is rewritten in full by
 //! `sapphire-agent device`, so it is no place for a decision a human makes.
+//! That routing array is one of the few settings the workspace layer may
+//! also set (`config_layer::WORKSPACE_ALLOWLIST` allowlists
+//! `room_profile.*.devices` deliberately) — it is not host-only, just never
+//! table data.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -67,7 +71,9 @@ impl DeviceAuth {
         if !keys.has_usable_key() {
             bail!(
                 "key file {} has no usable key; every authenticated endpoint would \
-                 reject every device",
+                 reject every device. Mint one with `sapphire-agent device add --name \
+                 <device>`, or `sapphire-agent device rotate <selector>` if a key exists \
+                 but every token in it has expired",
                 keys_file.display()
             );
         }
@@ -138,6 +144,14 @@ impl DeviceAuth {
     /// `KeyStore::authenticate` does the constant-time comparison and the
     /// `expires_at` check.
     pub fn resolve(&self, token: &str) -> Option<Resolved<'_>> {
+        // `extract_bearer` filters an empty token on all five callers today,
+        // so this is unreachable in practice — but `resolve` is a `pub` API
+        // used by two subsystems, and `KeyStore::authenticate`'s constant-time
+        // comparison would happily match a hand-written `token = ""` entry
+        // against an empty presented token.
+        if token.is_empty() {
+            return None;
+        }
         let entry = self.keys.authenticate(token)?;
         let device = self.devices.get(entry.device_id?)?;
         if device.is_retired() {
@@ -378,6 +392,20 @@ mod tests {
         let err = DeviceAuth::open(&missing, &devices, &HashMap::new()).unwrap_err();
 
         assert!(err.to_string().contains("no usable key"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_an_empty_token_even_if_one_was_hand_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys_file = tmp.path().join("keys.toml");
+        let devices_file = tmp.path().join("devices.toml");
+        // `constant_time_eq("", "")` is true, so a hand-written empty token
+        // in keys.toml would otherwise authenticate an empty presented token.
+        std::fs::write(&keys_file, "[[key]]\ntoken = \"\"\n").unwrap();
+
+        let auth = DeviceAuth::open(&keys_file, &devices_file, &HashMap::new()).unwrap();
+
+        assert!(auth.resolve("").is_none());
     }
 
     #[test]

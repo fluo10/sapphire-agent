@@ -1278,11 +1278,14 @@ api_key = "test"
         names.sort();
         for name in names {
             errors.push(format!(
-                "[device.{name}] no longer lives in this file. Devices moved to the workspace \
-                 table at <workspace>/.sapphire-agent/devices.toml. Run `sapphire-agent device \
-                 add --name {name}`, put the printed token on the device, and add the printed id \
-                 to a `[room_profile.<name>].devices` array. The old token cannot be carried \
-                 over: it was hand-written plaintext with no entry in the key file."
+                "[device.{name}] no longer lives in this file. Delete this block from \
+                 config.toml first — startup refuses to run any command, including \
+                 `sapphire-agent device add`, while it is still present. Devices moved to the \
+                 workspace table at <workspace>/.sapphire-agent/devices.toml. Once the block is \
+                 gone, run `sapphire-agent device add --name {name}`, put the printed token on \
+                 the device, and add the printed id to a `[room_profile.<name>].devices` array. \
+                 The old token cannot be carried over: it was hand-written plaintext with no \
+                 entry in the key file."
             ));
         }
 
@@ -1295,9 +1298,11 @@ api_key = "test"
         rp_names.sort();
         for name in rp_names {
             errors.push(format!(
-                "[room_profile.{name}].api_keys was replaced by `devices`. Raw tokens no longer \
-                 live in this file; run `sapphire-agent device add --name <device>` for each \
-                 client and list the printed ids in `[room_profile.{name}].devices`."
+                "[room_profile.{name}].api_keys was replaced by `devices`. Delete this \
+                 `api_keys` line from config.toml first — startup refuses to run any command, \
+                 including `sapphire-agent device add`, while it is still present. Raw tokens \
+                 no longer live in this file; run `sapphire-agent device add --name <device>` \
+                 for each client and list the printed ids in `[room_profile.{name}].devices`."
             ));
         }
 
@@ -1914,6 +1919,15 @@ devices = ["a3f9k2p"]
             cfg.validate_profiles().is_empty(),
             "validation errors: {:?}",
             cfg.validate_profiles()
+        );
+        // This is the one test guaranteeing the shipped example is clean;
+        // it must also check the device-registry migration gate, not just
+        // profile validation, or a `[device.*]` / `api_keys` leftover in the
+        // example would go unnoticed until a user's own config hit it.
+        assert!(
+            cfg.migration_errors().is_empty(),
+            "migration errors: {:?}",
+            cfg.migration_errors()
         );
     }
 
