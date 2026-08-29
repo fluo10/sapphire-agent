@@ -288,7 +288,9 @@ mod tests {
         let devices_file = tmp.path().join("devices.toml");
         let mut keys = KeyStore::load(&keys_file).unwrap();
         // A hand-written key with no device_id at all.
-        let entry = keys.generate("sat", None, None, Some("loose".into()), None).unwrap();
+        let entry = keys
+            .generate("sat", None, None, Some("loose".into()), None)
+            .unwrap();
 
         let auth = DeviceAuth::open(&keys_file, &devices_file, &HashMap::new()).unwrap();
 
@@ -302,7 +304,13 @@ mod tests {
         let devices_file = tmp.path().join("devices.toml");
         let mut keys = KeyStore::load(&keys_file).unwrap();
         let entry = keys
-            .generate("sat", None, Some(GrainId::random()), Some("ghost".into()), None)
+            .generate(
+                "sat",
+                None,
+                Some(GrainId::random()),
+                Some("ghost".into()),
+                None,
+            )
             .unwrap();
 
         let auth = DeviceAuth::open(&keys_file, &devices_file, &HashMap::new()).unwrap();
@@ -313,11 +321,16 @@ mod tests {
     #[test]
     fn rejects_a_retired_device() {
         let tmp = tempfile::tempdir().unwrap();
-        let (keys, devices_file, rps) =
-            fixture(tmp.path(), &[("pendant", None), ("desk", None)],
-                    &[("pendant", "home"), ("desk", "work")]);
+        let (keys, devices_file, rps) = fixture(
+            tmp.path(),
+            &[("pendant", None), ("desk", None)],
+            &[("pendant", "home"), ("desk", "work")],
+        );
         let token = token_for(&keys, "pendant");
-        Devices::load(&devices_file).unwrap().retire("pendant").unwrap();
+        Devices::load(&devices_file)
+            .unwrap()
+            .retire("pendant")
+            .unwrap();
 
         let auth = DeviceAuth::open(&keys, &devices_file, &rps).unwrap();
 
@@ -334,7 +347,10 @@ mod tests {
         let err = DeviceAuth::open(&keys, &devices, &HashMap::new()).unwrap_err();
 
         let msg = format!("{err:#}");
-        assert!(msg.contains("pendant"), "the error must name the device: {msg}");
+        assert!(
+            msg.contains("pendant"),
+            "the error must name the device: {msg}"
+        );
     }
 
     #[test]
@@ -342,16 +358,28 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (keys, devices, mut rps) =
             fixture(tmp.path(), &[("pendant", None)], &[("pendant", "home")]);
-        let id = Devices::load(&devices).unwrap().resolve("pendant").unwrap().id.to_string();
+        let id = Devices::load(&devices)
+            .unwrap()
+            .resolve("pendant")
+            .unwrap()
+            .id
+            .to_string();
         rps.insert(
             "work".into(),
-            RoomProfileConfig { profile: "sonnet".into(), devices: vec![id], ..Default::default() },
+            RoomProfileConfig {
+                profile: "sonnet".into(),
+                devices: vec![id],
+                ..Default::default()
+            },
         );
 
         let err = DeviceAuth::open(&keys, &devices, &rps).unwrap_err();
 
         let msg = format!("{err:#}");
-        assert!(msg.contains("home") && msg.contains("work"), "name both: {msg}");
+        assert!(
+            msg.contains("home") && msg.contains("work"),
+            "name both: {msg}"
+        );
     }
 
     #[test]
@@ -372,13 +400,23 @@ mod tests {
     #[test]
     fn open_does_not_require_a_retired_device_to_be_bound() {
         let tmp = tempfile::tempdir().unwrap();
-        let (keys, devices_file, rps) =
-            fixture(tmp.path(), &[("pendant", None), ("old", None)],
-                    &[("pendant", "home"), ("old", "home")]);
+        let (keys, devices_file, rps) = fixture(
+            tmp.path(),
+            &[("pendant", None), ("old", None)],
+            &[("pendant", "home"), ("old", "home")],
+        );
         Devices::load(&devices_file).unwrap().retire("old").unwrap();
         let mut rps = rps;
-        let old_id = Devices::load(&devices_file).unwrap().resolve("old").unwrap().id.to_string();
-        rps.get_mut("home").unwrap().devices.retain(|d| *d != old_id);
+        let old_id = Devices::load(&devices_file)
+            .unwrap()
+            .resolve("old")
+            .unwrap()
+            .id
+            .to_string();
+        rps.get_mut("home")
+            .unwrap()
+            .devices
+            .retain(|d| *d != old_id);
 
         assert!(DeviceAuth::open(&keys, &devices_file, &rps).is_ok());
     }
@@ -391,7 +429,10 @@ mod tests {
 
         let err = DeviceAuth::open(&missing, &devices, &HashMap::new()).unwrap_err();
 
-        assert!(err.to_string().contains("no usable key"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("no usable key"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]

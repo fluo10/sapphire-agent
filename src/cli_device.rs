@@ -744,7 +744,13 @@ mod tests {
         )
         .unwrap();
 
-        assert!(Devices::load(&f.devices).unwrap().resolve("lanyard").unwrap().is_retired());
+        assert!(
+            Devices::load(&f.devices)
+                .unwrap()
+                .resolve("lanyard")
+                .unwrap()
+                .is_retired()
+        );
         assert!(
             KeyStore::load(&f.keys).unwrap().entries().is_empty(),
             "the key must be revoked even though its label still says the old name"

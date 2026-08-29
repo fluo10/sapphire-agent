@@ -152,9 +152,7 @@ fn authenticate(state: &AmbientState, headers: &HeaderMap) -> Result<String, Sta
     match state.devices.resolve(&token) {
         Some(r) => Ok(r.device.name.clone()),
         None => {
-            debug!(
-                "ambient: rejected bearer (unknown, expired, retired, or bound to no device)"
-            );
+            debug!("ambient: rejected bearer (unknown, expired, retired, or bound to no device)");
             Err(StatusCode::UNAUTHORIZED)
         }
     }

@@ -240,8 +240,7 @@ mod tests {
         keys.generate("sat", None, None, Some("test".into()), None)
             .unwrap();
         Arc::new(
-            DeviceAuth::open(&keys_file, &devices_file, &std::collections::HashMap::new())
-                .unwrap(),
+            DeviceAuth::open(&keys_file, &devices_file, &std::collections::HashMap::new()).unwrap(),
         )
     }
 

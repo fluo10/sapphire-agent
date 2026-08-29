@@ -2501,8 +2501,7 @@ impl ServeState {
         let keys_file = base.join("keys.toml");
         let devices_file = crate::config::workspace_devices_path(&workspace_dir);
         std::fs::create_dir_all(devices_file.parent().unwrap()).unwrap();
-        let mut devices =
-            sapphire_framework::registry::Devices::load(&devices_file).unwrap();
+        let mut devices = sapphire_framework::registry::Devices::load(&devices_file).unwrap();
         let device = devices.add("developer-device", None, None).unwrap();
         std::fs::write(
             &keys_file,
@@ -2530,11 +2529,7 @@ rooms    = []
             enabled: acp_enabled,
         });
         config.keys.file = Some(keys_file.clone());
-        config
-            .room_profiles
-            .get_mut("developer")
-            .unwrap()
-            .devices = vec![device.id.to_string()];
+        config.room_profiles.get_mut("developer").unwrap().devices = vec![device.id.to_string()];
 
         let device_auth = Arc::new(
             crate::device_auth::DeviceAuth::open(&keys_file, &devices_file, &config.room_profiles)
