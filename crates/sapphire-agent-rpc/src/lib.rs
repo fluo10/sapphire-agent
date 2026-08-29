@@ -61,8 +61,9 @@ impl DeviceMetadata {
 /// voice satellite) can reuse the same session-setup flow as the REPL.
 ///
 /// `token` is sent as `Authorization: Bearer <token>` and selects the
-/// room_profile server-side (the token must match an `api_keys` entry
-/// on some `[room_profile.<n>]`). The RPC surface requires this on
+/// room_profile server-side (the token must be one minted by
+/// `sapphire-agent device add` for a device listed in some
+/// `[room_profile.<n>].devices`). The RPC surface requires this on
 /// every `/rpc` call — there is no anonymous mode.
 pub async fn initialize(
     client: &reqwest::Client,
@@ -115,8 +116,9 @@ fn next_id() -> u64 {
 ///
 /// This is the shared entry point used by both `sapphire-agent call` and
 /// the standalone `sapphire-call` binary. `token` is forwarded as
-/// `Authorization: Bearer <token>` on every `/rpc` call — its match
-/// against `[room_profile.<n>].api_keys` server-side is what pins the
+/// `Authorization: Bearer <token>` on every `/rpc` call — resolving it to
+/// the device it was minted for, and that device's
+/// `[room_profile.<n>].devices` binding server-side, is what pins the
 /// session to a profile (no more `--room-profile`).
 #[allow(clippy::too_many_arguments)]
 pub async fn run(

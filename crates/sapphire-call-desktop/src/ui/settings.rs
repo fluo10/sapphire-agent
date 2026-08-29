@@ -30,7 +30,7 @@ pub fn ui(mut contexts: EguiContexts, mut state: ResMut<AppState>, bridge: NonSe
         ui.add(
             egui::TextEdit::singleline(token)
                 .password(true)
-                .hint_text("must match a [room_profile.*].api_keys entry"),
+                .hint_text("minted by `sapphire-agent device add`, listed in [room_profile.*].devices"),
         );
 
         ui.add_space(8.0);

@@ -26,9 +26,10 @@ struct Cli {
     session: Option<String>,
 
     /// Bearer token sent as `Authorization: Bearer <token>` on every
-    /// `/rpc` request. Must match an `api_keys` entry on a server-side
-    /// `[room_profile.<name>]`; the room_profile resolved from this
-    /// token is the session's binding (mirrors how MCP and A2A
+    /// `/rpc` request. Must be a token minted by `sapphire-agent device
+    /// add` for a device listed in a server-side
+    /// `[room_profile.<name>].devices`; the room_profile resolved from
+    /// this token is the session's binding (mirrors how MCP and A2A
     /// authenticate). Overrides `[server].token` in the config file
     /// and the `SAPPHIRE_AGENT_TOKEN` environment variable.
     #[arg(long, global = true, env = "SAPPHIRE_AGENT_TOKEN")]
@@ -124,8 +125,9 @@ async fn main() -> Result<()> {
     let token = cli.token.clone().or(file_cfg.server.token).ok_or_else(|| {
         anyhow::anyhow!(
             "missing bearer token — set [server].token in the config, pass --token <TOKEN>, \
-                 or export SAPPHIRE_AGENT_TOKEN; the agent uses it to look up your room_profile \
-                 (api_keys on [room_profile.<n>])"
+                 or export SAPPHIRE_AGENT_TOKEN; the agent uses it to look up your device and \
+                 its room_profile (`sapphire-agent device add`, listed in \
+                 [room_profile.<n>].devices)"
         )
     })?;
     let device = file_cfg.device.to_api();
