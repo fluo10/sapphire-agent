@@ -69,10 +69,11 @@ pub struct SessionMeta {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub device_id: Option<String>,
     /// Resolved room_profile name for device-default sessions. Pinned
-    /// at creation time (from the bearer token's `api_keys` match) so
-    /// rotation and `find_or_create_for_device` don't accidentally
-    /// hand a session to a different profile after `[room_profile]`
-    /// reshuffles. Absent on every other kind.
+    /// at creation time (from the bearer token's `DeviceAuth` resolution:
+    /// token -> device -> room profile) so rotation and
+    /// `find_or_create_for_device` don't accidentally hand a session to a
+    /// different profile after `[room_profile]` reshuffles. Absent on
+    /// every other kind.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub room_profile: Option<String>,
     /// Short auto-generated title, populated from a later `session_title` line.

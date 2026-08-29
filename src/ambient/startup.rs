@@ -268,9 +268,10 @@ mod tests {
 
     #[test]
     fn build_reaches_model_resolution_once_stt_resolves() {
-        // Confirms step ordering: with a valid device_auth and a real STT
-        // entry, `build` gets past auth and STT and fails at model
-        // resolution instead — this crate is built without
+        // Confirms step ordering: `device_auth` is a pre-validated `Arc`
+        // passed straight through (no auth step happens in `build` itself),
+        // so with a real STT entry, `build` gets past STT and fails at
+        // model resolution instead — this crate is built without
         // `voice-sherpa` in this test run, so that failure names the
         // feature rather than a model path.
         let mut cfg = Config::for_test();

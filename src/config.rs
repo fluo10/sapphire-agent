@@ -209,13 +209,9 @@ pub struct RoomProfileConfig {
     /// Absent means voice is disabled for this room profile.
     #[serde(default)]
     pub voice_pipeline: Option<String>,
-    /// Bearer tokens that grant access to this room profile via the A2A
-    /// server. Each token is unique across all room profiles — at
-    /// startup the inverse map (token → profile name) is built so an
-    /// incoming `Authorization: Bearer <token>` resolves to a profile
-    /// without the client having to name it. Empty (the default) means
-    /// the profile is not reachable via A2A. Future scope (#73): same
-    /// field will gate the legacy `/rpc` API too.
+    /// Removed in the device-registry migration; replaced by `devices`.
+    /// Retained so a config that still sets it fails loudly — see
+    /// `Config::migration_errors`.
     #[serde(default)]
     pub api_keys: Vec<String>,
     /// Device ids (from the workspace `devices.toml`) that run under this room
@@ -231,10 +227,10 @@ pub struct RoomProfileConfig {
 /// The A2A endpoints (`/a2a` JSON-RPC and `/.well-known/agent-card.json`)
 /// are mounted on the same axum app as the legacy `/rpc` API server
 /// (driven by `[serve]`). Disabled by default — set `enabled = true` to
-/// turn the routes on. Per-profile bearer tokens live in
-/// `[room_profile.<n>].api_keys`; the A2A handler reverse-looks-up
-/// `Authorization: Bearer <token>` to determine which profile (and
-/// therefore which provider/memory_namespace) the request runs under.
+/// turn the routes on. `Authorization: Bearer <token>` is resolved through
+/// `DeviceAuth` — token -> device -> room profile — to determine which
+/// profile (and therefore which provider/memory_namespace) the request
+/// runs under.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct A2aConfig {
     /// Whether to mount the A2A routes on the axum app. Default: false.
@@ -412,21 +408,18 @@ pub struct KeysConfig {
     pub file: Option<PathBuf>,
 }
 
-/// One capture device. Carries no secret: `key_id` names a `KeyEntry` in
-/// the key file, and the token itself never appears here. That is what
-/// lets this block be shared through the workspace config layer.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+/// Removed in the device-registry migration. Retained only so an existing
+/// config that still has `[device.*]` blocks fails loudly with instructions
+/// instead of silently coming up with ambient ingest rejecting every segment.
+/// Every field is optional on purpose: this type only has to parse, never to
+/// carry a value. See `Config::migration_errors`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct DeviceConfig {
-    /// `KeyEntry::id` from the framework key file.
-    pub key_id: uuid::Uuid,
-    /// Display metadata; reaches the system prompt. Distinct from the key
-    /// file's own `label`, which the framework documents as a note nothing
-    /// in the system reads.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Which room profile a conversation from this device runs under (S4).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_profile: Option<String>,
 }
 
@@ -1181,7 +1174,6 @@ api_key = "test"
         }
         // Room profile references and uniqueness of room_ids across profiles.
         let mut seen_rooms: HashMap<String, String> = HashMap::new();
-        let mut seen_api_keys: HashMap<String, String> = HashMap::new();
         for (rp_name, rp) in &self.room_profiles {
             if !self.profiles.contains_key(&rp.profile) {
                 errors.push(format!(
@@ -1203,21 +1195,6 @@ api_key = "test"
                     ));
                 } else {
                     seen_rooms.insert(room.clone(), rp_name.clone());
-                }
-            }
-            for key in &rp.api_keys {
-                if key.is_empty() {
-                    errors.push(format!(
-                        "room_profile '{rp_name}' has an empty api_keys entry"
-                    ));
-                    continue;
-                }
-                if let Some(prev) = seen_api_keys.get(key) {
-                    errors.push(format!(
-                        "api_keys token reused across room_profiles '{prev}' and '{rp_name}'"
-                    ));
-                } else {
-                    seen_api_keys.insert(key.clone(), rp_name.clone());
                 }
             }
         }
@@ -1281,6 +1258,46 @@ api_key = "test"
                 ));
             }
         }
+        errors
+    }
+
+    /// Settings that were removed when device-based auth landed.
+    ///
+    /// Reported as a hard error at start-up rather than ignored, following the
+    /// `standby_mode` precedent in `main.rs`. Ignoring them would turn a broken
+    /// *config* into what looks like a broken *device*: dropping `api_keys`
+    /// makes `/acp` 401 every client, and dropping `[device.*]` makes ambient
+    /// refuse every segment. Neither symptom sends anyone to the config file.
+    pub fn migration_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        let mut names: Vec<&String> = self.devices.keys().collect();
+        names.sort();
+        for name in names {
+            errors.push(format!(
+                "[device.{name}] no longer lives in this file. Devices moved to the workspace \
+                 table at <workspace>/.sapphire-agent/devices.toml. Run `sapphire-agent device \
+                 add --name {name}`, put the printed token on the device, and add the printed id \
+                 to a `[room_profile.<name>].devices` array. The old token cannot be carried \
+                 over: it was hand-written plaintext with no entry in the key file."
+            ));
+        }
+
+        let mut rp_names: Vec<&String> = self
+            .room_profiles
+            .iter()
+            .filter(|(_, rp)| !rp.api_keys.is_empty())
+            .map(|(name, _)| name)
+            .collect();
+        rp_names.sort();
+        for name in rp_names {
+            errors.push(format!(
+                "[room_profile.{name}].api_keys was replaced by `devices`. Raw tokens no longer \
+                 live in this file; run `sapphire-agent device add --name <device>` for each \
+                 client and list the printed ids in `[room_profile.{name}].devices`."
+            ));
+        }
+
         errors
     }
 
@@ -1810,57 +1827,69 @@ rooms   = ["!x:srv"]
     }
 
     #[test]
-    fn validate_rejects_duplicate_api_keys_across_profiles() {
-        let cfg = parse(
+    fn migration_errors_name_a_leftover_device_block() {
+        let cfg: Config = toml::from_str(
             r#"
 [anthropic]
 api_key = "test"
 
-[profiles.a]
-provider = "anthropic"
-
-[profiles.b]
-provider = "anthropic"
-
-[room_profile.alpha]
-profile  = "a"
-rooms    = []
-api_keys = ["sa-a2a-shared"]
-
-[room_profile.beta]
-profile  = "b"
-rooms    = []
-api_keys = ["sa-a2a-shared"]
+[device.pendant]
+key_id = "550e8400-e29b-41d4-a716-446655440000"
 "#,
-        );
-        let errors = cfg.validate_profiles();
-        assert!(
-            errors.iter().any(|e| e.contains("token reused")),
-            "expected duplicate-api_keys error, got: {errors:?}"
-        );
+        )
+        .unwrap();
+
+        let errors = cfg.migration_errors();
+
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("pendant"), "{errors:?}");
+        // The message has to say what to run, not just what is wrong: the
+        // token cannot be carried over, so the operator must re-issue it.
+        assert!(errors[0].contains("device add"), "{errors:?}");
     }
 
     #[test]
-    fn validate_rejects_empty_api_key() {
-        let cfg = parse(
+    fn migration_errors_name_a_leftover_api_keys_array() {
+        let cfg: Config = toml::from_str(
             r#"
 [anthropic]
 api_key = "test"
 
-[profiles.a]
+[profiles.sonnet]
 provider = "anthropic"
 
-[room_profile.alpha]
-profile  = "a"
-rooms    = []
-api_keys = [""]
+[room_profile.work]
+profile = "sonnet"
+api_keys = ["sa-acp-token"]
 "#,
-        );
-        let errors = cfg.validate_profiles();
-        assert!(
-            errors.iter().any(|e| e.contains("empty api_keys")),
-            "expected empty-token error, got: {errors:?}"
-        );
+        )
+        .unwrap();
+
+        let errors = cfg.migration_errors();
+
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("work"), "{errors:?}");
+        assert!(errors[0].contains("devices"), "{errors:?}");
+    }
+
+    #[test]
+    fn a_migrated_config_has_no_migration_errors() {
+        let cfg: Config = toml::from_str(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.sonnet]
+provider = "anthropic"
+
+[room_profile.work]
+profile = "sonnet"
+devices = ["a3f9k2p"]
+"#,
+        )
+        .unwrap();
+
+        assert!(cfg.migration_errors().is_empty());
     }
 
     #[test]
@@ -2550,53 +2579,6 @@ enabled = true
         assert_eq!(cfg.promote_after_days, 2);
         assert_eq!(cfg.max_queue, 1000);
         assert!(cfg.cache_dir.is_none());
-    }
-
-    #[test]
-    fn device_blocks_parse_a_key_id_and_never_a_token() {
-        let toml_src = r#"
-[anthropic]
-api_key = "sk-test"
-
-[keys]
-file = "/etc/sapphire/keys.toml"
-
-[device.pendant]
-key_id = "6c8f4a2e-1d33-4b90-9a71-0e5b2f8c4d17"
-label = "the one on the lanyard"
-room_profile = "default"
-"#;
-        let cfg: crate::config::Config = toml::from_str(toml_src).unwrap();
-        let dev = cfg.devices.get("pendant").expect("device.pendant parsed");
-        assert_eq!(
-            dev.key_id.to_string(),
-            "6c8f4a2e-1d33-4b90-9a71-0e5b2f8c4d17"
-        );
-        assert_eq!(dev.label.as_deref(), Some("the one on the lanyard"));
-        assert_eq!(dev.room_profile.as_deref(), Some("default"));
-        assert_eq!(
-            cfg.keys.file.as_deref(),
-            Some(std::path::Path::new("/etc/sapphire/keys.toml"))
-        );
-    }
-
-    #[test]
-    fn a_device_block_carrying_a_token_is_a_parse_error() {
-        // The whole point of key_id is that a secret cannot live here. An
-        // `api_key` field must not silently parse and be ignored.
-        let toml_src = r#"
-[anthropic]
-api_key = "sk-test"
-
-[device.pendant]
-key_id = "6c8f4a2e-1d33-4b90-9a71-0e5b2f8c4d17"
-api_key = "sa-dev-oops"
-"#;
-        let err = toml::from_str::<crate::config::Config>(toml_src).unwrap_err();
-        assert!(
-            err.to_string().contains("api_key"),
-            "unexpected error: {err}"
-        );
     }
 
     #[test]
