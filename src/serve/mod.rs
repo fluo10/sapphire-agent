@@ -431,8 +431,8 @@ async fn rpc_post(
             return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
         }
     };
-    let profile_name = match state.device_auth.resolve(&bearer) {
-        Some(r) => r.room_profile.to_string(),
+    let (profile_name, authenticated_device_id) = match state.device_auth.resolve(&bearer) {
+        Some(r) => (r.room_profile.to_string(), r.device.id.to_string()),
         None => {
             let body = error_response(req_id, RPC_AUTH_REQUIRED, "unknown or revoked bearer token");
             return body.into_response();
@@ -448,9 +448,25 @@ async fn rpc_post(
         "get_session" => handle_get_session(state, req_id, session_id).await,
         "voice/config" => handle_voice_config(state, req_id, req.params).await,
         "voice/pipeline_run" => {
-            handle_voice_pipeline_run(state, req_id, req.params, profile_name).await
+            handle_voice_pipeline_run(
+                state,
+                req_id,
+                req.params,
+                profile_name,
+                authenticated_device_id,
+            )
+            .await
         }
-        "voice/subscribe" => handle_voice_subscribe(state, req_id, req.params, profile_name).await,
+        "voice/subscribe" => {
+            handle_voice_subscribe(
+                state,
+                req_id,
+                req.params,
+                profile_name,
+                authenticated_device_id,
+            )
+            .await
+        }
         _ => {
             let body = error_response(req_id, -32601, "Method not found");
             body.into_response()
@@ -869,6 +885,7 @@ async fn handle_voice_pipeline_run(
     req_id: Value,
     params: Option<Value>,
     room_profile: String,
+    authenticated_device_id: String,
 ) -> axum::response::Response {
     if state.voice.is_none() {
         let body = error_response(
@@ -894,6 +911,21 @@ async fn handle_voice_pipeline_run(
             return body.into_response();
         }
     };
+    // The client-supplied `device_id` is only ever used to key sessions and
+    // the voice-push registry — it is never itself an auth check. Without
+    // this comparison, an authenticated client could claim another device's
+    // id and read/write that device's session or displace its push channel
+    // (`voice_subscribers` is keyed on `device_id` alone). `DeviceAuth`
+    // already established which device this bearer token belongs to; hold
+    // it to that.
+    if device_id != authenticated_device_id {
+        let body = error_response(
+            req_id,
+            -32602,
+            "params.device_id does not match the authenticated device",
+        );
+        return body.into_response();
+    }
     // `room_profile` comes from the bearer token resolved in
     // `rpc_post`; clients no longer pass it as a param.
     let language = params["language"].as_str().map(|s| s.to_string());
@@ -988,6 +1020,7 @@ async fn handle_voice_subscribe(
     req_id: Value,
     params: Option<Value>,
     room_profile: String,
+    authenticated_device_id: String,
 ) -> axum::response::Response {
     let params = params.unwrap_or(Value::Null);
     let device_id = match params["device_id"].as_str() {
@@ -997,6 +1030,17 @@ async fn handle_voice_subscribe(
             return body.into_response();
         }
     };
+    // See the identical check in `handle_voice_pipeline_run`: without it, an
+    // authenticated client could claim another device's id and displace its
+    // push channel, since `voice_subscribers` is keyed on `device_id` alone.
+    if device_id != authenticated_device_id {
+        let body = error_response(
+            req_id,
+            -32602,
+            "params.device_id does not match the authenticated device",
+        );
+        return body.into_response();
+    }
     // `room_profile` comes from the bearer token resolved in
     // `rpc_post`; clients no longer pass it as a param.
 
@@ -2647,6 +2691,59 @@ mod tests {
         assert_eq!(resolved.room_profile, "developer");
         assert!(state.device_auth.resolve("sa-wrong").is_none());
     }
+
+    /// Without this check, an authenticated client could pass someone else's
+    /// `device_id` in `voice/subscribe` params and displace that device's
+    /// push channel — `voice_subscribers` is keyed on `device_id` alone, and
+    /// the value came from client-supplied JSON, not from the token.
+    #[tokio::test]
+    async fn voice_subscribe_rejects_a_device_id_that_disagrees_with_the_token() {
+        let state = ServeState::for_test(true);
+        let authenticated_device_id = state
+            .device_auth
+            .resolve("sa-acp-token")
+            .expect("fixture token should resolve")
+            .device
+            .id
+            .to_string();
+
+        let response = handle_voice_subscribe(
+            Arc::clone(&state),
+            Value::Null,
+            Some(json!({ "device_id": "not-the-authenticated-device" })),
+            "developer".to_string(),
+            authenticated_device_id,
+        )
+        .await;
+
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], -32602);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not match"),
+            "{v}"
+        );
+        // Nothing should have been registered under the impersonated id.
+        assert!(
+            !state
+                .voice_subscribers
+                .lock()
+                .await
+                .contains_key("not-the-authenticated-device")
+        );
+    }
+
+    // `handle_voice_pipeline_run` carries the identical guard (added right
+    // after its own `device_id` extraction), but exercising it directly
+    // needs a configured `VoiceProviders`, which `ServeState::for_test`
+    // deliberately leaves `None` (see its `voice/pipeline_run unavailable`
+    // early return) — outside what's worth building a real STT/TTS fixture
+    // for here.
 
     #[tokio::test]
     async fn hanging_provider_sets_the_drop_flag_when_its_chat_future_is_aborted() {
