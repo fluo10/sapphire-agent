@@ -934,6 +934,28 @@ impl Agent {
                         .namespace_for_room(&incoming.room_id)
                         .to_string();
                     let room_id_for_timer = incoming.room_id.clone();
+                    // Permission gate for the channel path.
+                    //
+                    // `Origin::Channel` never returns `Ask` — a channel
+                    // turn is asynchronous, so there is nobody to hold
+                    // it open for — which is why this needs no `approve`
+                    // and no serialisation. Refused calls simply never
+                    // reach `tokio::spawn`.
+                    //
+                    // Shadowing `tool_calls` is safe: the assistant
+                    // message above was built from a clone, so the
+                    // tool_use blocks in history keep every call, and
+                    // the refusals below supply their tool_results.
+                    let kinds = tools.kinds().await;
+                    let (tool_calls, refused) = crate::tools::policy::partition_without_asking(
+                        crate::tools::policy::Origin::Channel,
+                        &tool_calls,
+                        &kinds,
+                    );
+                    for (id, reason) in &refused {
+                        info!("Refused tool call {id} on the channel path: {reason}");
+                    }
+
                     let mut handles = Vec::with_capacity(tool_calls.len());
                     for call in tool_calls {
                         let tools = Arc::clone(&tools);
@@ -965,6 +987,13 @@ impl Agent {
                             Ok(r) => results.push(r),
                             Err(e) => warn!("Tool task panicked: {e}"),
                         }
+                    }
+
+                    // Every tool_use owes the model a tool_result, and
+                    // the reason is more useful than silence. The turn
+                    // continues — the model may have another route.
+                    for (id, reason) in refused {
+                        results.push((id, crate::tools::ToolOutput::from(reason)));
                     }
 
                     // Split each ToolOutput into the text body (becomes a
@@ -1092,5 +1121,101 @@ fn read_session_date(path: &std::path::Path, boundary_hour: u8) -> NaiveDate {
             local_date_for_timestamp(local, boundary_hour)
         }
         Err(_) => fallback,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::provider::ToolCall;
+    use crate::tools::policy::{Origin, partition_without_asking};
+    use sapphire_framework::workspace::{AppContext, Workspace, WorkspaceState};
+    use std::sync::{Arc, Mutex};
+
+    static TEST_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
+
+    fn test_workspace() -> Arc<Mutex<WorkspaceState>> {
+        // `AppContext` panics on `cache_dir()` access until this is set,
+        // and `Workspace::from_root` reads it. First writer wins, so
+        // calling it on every invocation is safe.
+        TEST_CTX.set_cache_dir(std::env::temp_dir().join("sapphire-agent-channel-gate-test-cache"));
+        // Leaked on purpose: this is a test binary and the OS reclaims
+        // the directory when it exits.
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        std::fs::create_dir_all(dir.path().join(".sapphire-agent")).unwrap();
+        let ws = Workspace::from_root(&TEST_CTX, dir.path()).unwrap();
+        Arc::new(Mutex::new(WorkspaceState::open(ws).unwrap()))
+    }
+
+    /// The channel path refuses `Execute` and `Other` outright. This is
+    /// the one behavioural change the permission work makes to an
+    /// existing transport: `shell` and every MCP tool stop being
+    /// reachable from Matrix and Discord, while everything the chat
+    /// bots actually use keeps working.
+    ///
+    /// Driven through the real `default_tool_set`, so it is the tools'
+    /// own declared kinds being judged, not a hand-written table.
+    #[tokio::test]
+    async fn the_channel_gate_refuses_shell_but_keeps_the_chat_tools() {
+        let tools = crate::tools::default_tool_set(
+            test_workspace(),
+            Some("test-tavily-key".to_string()),
+            &[],
+            crate::timer::TimerManager::new(),
+            Vec::new(),
+        )
+        .await;
+        let kinds = tools.kinds().await;
+
+        let calls: Vec<ToolCall> = [
+            "shell",
+            "web_search",
+            "memory_add",
+            "file_read",
+            "workspace_sync",
+            "mcp__somewhere__do_thing",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| ToolCall {
+            id: format!("c{i}"),
+            name: (*name).to_string(),
+            input: serde_json::json!({}),
+        })
+        .collect();
+
+        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds);
+
+        let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["web_search", "memory_add", "file_read"],
+            "the chat bots' own tools must keep working"
+        );
+
+        let name_of = |id: &str| {
+            calls
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.name.clone())
+                .unwrap()
+        };
+        let blocked: Vec<String> = refused.iter().map(|(id, _)| name_of(id)).collect();
+        assert_eq!(
+            blocked,
+            vec!["shell", "workspace_sync", "mcp__somewhere__do_thing"],
+            "Execute and Other must not be reachable over chat"
+        );
+
+        // Every refusal names its tool, so the model can say which call
+        // it lost and why.
+        for (id, reason) in &refused {
+            let name = name_of(id);
+            assert!(reason.contains(&name), "{reason} should name {name}");
+        }
+
+        // Every call is accounted for exactly once: the model is owed a
+        // tool_result for each tool_use, and a call lost here would make
+        // the next provider request fail rather than merely misbehave.
+        assert_eq!(permitted.len() + refused.len(), calls.len());
     }
 }
