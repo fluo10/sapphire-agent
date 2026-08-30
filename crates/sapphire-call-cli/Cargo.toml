@@ -36,7 +36,7 @@ reqwest = { workspace = true, features = ["blocking"] }
 
 # Local Silero VAD + (later) keyword spotting via the official sherpa-onnx
 # Rust crate. Statically links the C++ runtime; first build is slow.
-sherpa-onnx = "1.13"
+sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"] }
 
 # Model bundle extraction (sherpa-onnx ships tar.bz2 model archives on
 # GitHub releases).

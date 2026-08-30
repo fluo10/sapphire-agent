@@ -43,7 +43,7 @@ jobs:
             continue-on-error: true
           - os: windows-latest
             binary: sapphire-call.exe
-            asset_name: sapphire-call-windows-x86_64.exe
+            asset_name: sapphire-call-windows-x86_64.zip
             continue-on-error: true
     runs-on: ${{ matrix.os }}
     permissions:
@@ -67,10 +67,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --package sapphire-call-cli
 
-      - name: Rename binary
+      - name: Package binary
         shell: bash
-        run: cp target/release/${{ matrix.binary }} ${{ matrix.asset_name }}
-
+        run: |
+          # Windows links sherpa-onnx and ONNX Runtime as DLLs rather than
+          # statically: upstream only ships a /MT static archive for Windows,
+          # which cannot link beside ort's /MD runtime (LNK2038). The exe
+          # therefore does not start on its own — ship the DLLs beside it.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "${{ matrix.asset_name }}" \
+              "./target/release/${{ matrix.binary }}" \
+              ./target/release/*.dll
+          else
+            cp "target/release/${{ matrix.binary }}" "${{ matrix.asset_name }}"
+          fi
       - name: Upload to release
         uses: softprops/action-gh-release@v3
         with:
