@@ -164,42 +164,115 @@ static SENSITIVE_PREFIXES: &[&str] = &[
     "/var/run/docker.sock",
 ];
 
-/// The agent's own config directory — where `config.toml` and, since
-/// tool permissions landed, `acp-permissions.json` live.
+/// Files the agent must not be able to rewrite through its own tools.
 ///
 /// This is not merely tidy. `file_write` is `ToolKind::Edit`, which the
 /// permission policy allows *without asking* from a chat channel and in
-/// ACP's `accept_edits` mode. Without this guard, a Discord message
-/// could write `{"profiles":{"zed":{"always_allow":["shell"]}}}` into
-/// the permission record; the store is read once at startup, so after
-/// the next restart the editor would run `shell` having never been
-/// asked. The gate would still be doing its job — it would just be
-/// consulting an answer the attacker wrote.
+/// ACP's `accept_edits` mode. Unguarded, a Discord message could write
+/// `{"profiles":{"zed":{"always_allow":["shell"]}}}` into the
+/// permission record; the store is read once at startup, so after the
+/// next restart the editor would run `shell` having never been asked.
+/// The gate would still be doing its job — it would just be consulting
+/// an answer somebody else wrote.
+///
+/// Named files rather than the whole config directory, deliberately.
+/// When `workspace_dir` is unset the workspace root *is* the config
+/// file's own directory, so blocking the directory would refuse every
+/// write in the workspace on a default install.
+static PROTECTED_CONFIG_FILES: &[&str] = &["acp-permissions.json", "config.toml"];
+
+/// The agent's own config directory, if this host has one.
 fn agent_config_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "sapphire-agent")
         .map(|dirs| dirs.config_dir().to_path_buf())
 }
 
-/// Refuse writes and deletes under a system path or the agent's own
-/// config directory. `verb` is the word used in the error the model
-/// sees ("Writing to", "Deleting").
-fn refuse_if_sensitive(path: &Path, verb: &str) -> Result<()> {
-    let path_abs = path.to_string_lossy().to_string();
+/// Resolve `path` the way the writer will, so the guard and the write
+/// judge the same file.
+///
+/// `Path::starts_with` alone is not enough: it is a lexical,
+/// component-wise comparison that never collapses `..`, never follows a
+/// symlink, and is case-sensitive even where the filesystem is not.
+/// `WorkspaceState` joins a relative path onto the workspace root and
+/// then canonicalises, so a guard comparing the raw string is judging a
+/// different path from the one that gets written.
+///
+/// The file itself usually does not exist yet, so the *parent* is
+/// canonicalised and the file name re-attached.
+fn resolve_like_the_writer(path: &Path, workspace_root: Option<&Path>) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match workspace_root {
+            Some(root) => root.join(path),
+            None => path.to_path_buf(),
+        }
+    };
 
+    let Some(parent) = absolute.parent() else {
+        return absolute;
+    };
+    let canonical_parent = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    match absolute.file_name() {
+        Some(name) => canonical_parent.join(name),
+        None => canonical_parent,
+    }
+}
+
+/// Compare two paths the way the filesystem will. Windows is
+/// case-insensitive; comparing case-sensitively there lets
+/// `…\CONFIG\acp-permissions.json` reach the file the guard is
+/// protecting.
+fn same_path(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        a.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+/// Refuse writes and deletes to a sensitive system path or to one of
+/// the agent's own configuration files. `verb` is the word used in the
+/// error the model sees ("Writing to", "Deleting").
+fn refuse_if_sensitive(path: &Path, workspace_root: Option<&Path>, verb: &str) -> Result<()> {
+    let resolved = resolve_like_the_writer(path, workspace_root);
+    let resolved_str = resolved.to_string_lossy().to_string();
+
+    // System prefixes are matched against BOTH spellings. The raw path
+    // catches the plain case; the resolved one catches a `..` detour or
+    // a symlink into `/etc`. Joining on Windows rewrites separators, so
+    // a Unix-shaped prefix can survive in the raw string and not the
+    // resolved one — checking both costs nothing and misses neither.
+    let raw_str = path.to_string_lossy().to_string();
     for prefix in SENSITIVE_PREFIXES {
-        if path_abs.starts_with(prefix) || &path_abs == prefix {
-            anyhow::bail!("{verb} '{path_abs}' is not allowed (sensitive system path).");
+        for candidate in [&raw_str, &resolved_str] {
+            if candidate.starts_with(prefix) || candidate == prefix {
+                anyhow::bail!("{verb} '{candidate}' is not allowed (sensitive system path).");
+            }
         }
     }
 
-    if let Some(config_dir) = agent_config_dir()
-        && path.starts_with(&config_dir)
-    {
-        anyhow::bail!(
-            "{verb} '{path_abs}' is not allowed: that is this agent's own \
-             configuration directory, which includes the record of what you \
-             have been given permission to do."
-        );
+    if let Some(config_dir) = agent_config_dir() {
+        let canonical_dir = config_dir
+            .canonicalize()
+            .unwrap_or_else(|_| config_dir.clone());
+        for name in PROTECTED_CONFIG_FILES {
+            if same_path(&resolved, &canonical_dir.join(name))
+                || same_path(&resolved, &config_dir.join(name))
+            {
+                anyhow::bail!(
+                    "{verb} '{resolved_str}' is not allowed: that is this agent's own \
+                     '{name}', which records what you have been given permission to do."
+                );
+            }
+        }
     }
 
     Ok(())
@@ -222,7 +295,8 @@ impl FileWriteTool {
                     Creates the file and any missing parent directories automatically. \
                     When the target file is inside the workspace, the search index \
                     is updated automatically. \
-                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.)."
+                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.) \
+                    and to this agent's own config.toml and acp-permissions.json."
                     .into(),
                 input_schema: json!({
                     "type": "object",
@@ -258,7 +332,14 @@ impl Tool for FileWriteTool {
         let content = input["content"].as_str().context("missing 'content'")?;
 
         let path = expand_path(path_str);
-        refuse_if_sensitive(&path, "Writing to")?;
+        let workspace_root = self
+            .state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .clone();
+        refuse_if_sensitive(&path, Some(&workspace_root), "Writing to")?;
 
         self.state
             .lock()
@@ -294,7 +375,10 @@ impl FileDeleteTool {
                     (resolved against the workspace root). \
                     When the file is inside the workspace, it is also removed from the search index \
                     automatically. \
-                    Cannot delete directories.".into(),
+                    Refuses deletes of sensitive system paths (/etc, /boot, /bin, etc.) \
+                    and of this agent's own config.toml and acp-permissions.json. \
+                    Cannot delete directories."
+                    .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -324,7 +408,14 @@ impl Tool for FileDeleteTool {
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let path = expand_path(path_str);
 
-        refuse_if_sensitive(&path, "Deleting")?;
+        let workspace_root = self
+            .state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .clone();
+        refuse_if_sensitive(&path, Some(&workspace_root), "Deleting")?;
 
         self.state
             .lock()
@@ -357,7 +448,8 @@ impl FileAppendTool {
                     Creates any missing parent directories automatically. \
                     When the target file is inside the workspace, the search index \
                     is updated automatically. \
-                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.)."
+                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.) \
+                    and to this agent's own config.toml and acp-permissions.json."
                     .into(),
                 input_schema: json!({
                     "type": "object",
@@ -393,7 +485,14 @@ impl Tool for FileAppendTool {
         let content = input["content"].as_str().context("missing 'content'")?;
 
         let path = expand_path(path_str);
-        refuse_if_sensitive(&path, "Writing to")?;
+        let workspace_root = self
+            .state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .clone();
+        refuse_if_sensitive(&path, Some(&workspace_root), "Writing to")?;
 
         self.state
             .lock()
@@ -1344,47 +1443,103 @@ mod sensitive_path_tests {
             "/var/run/docker.sock",
         ] {
             assert!(
-                refuse_if_sensitive(Path::new(path), "Writing to").is_err(),
+                refuse_if_sensitive(Path::new(path), None, "Writing to").is_err(),
                 "{path} should be refused"
             );
         }
     }
 
-    /// The agent's own config directory holds `acp-permissions.json`,
-    /// the record of what the agent has been allowed to do.
+    /// The agent's own permission record is the file this guard exists
+    /// for: `file_write` is `ToolKind::Edit`, which the policy runs
+    /// WITHOUT asking on a chat channel and in ACP's `accept_edits`
+    /// mode, so a writable record would let a chat message grant itself
+    /// `always_allow` on `shell` and collect it after the next restart.
     ///
-    /// `file_write` is `ToolKind::Edit`, which the policy runs WITHOUT
-    /// asking on a chat channel and in ACP's `accept_edits` mode. If
-    /// this were writable, a chat message could grant the agent
-    /// `always_allow` on `shell` and collect it after the next restart —
-    /// the permission gate would still be working, just consulting an
-    /// answer somebody else wrote.
+    /// Asserts `agent_config_dir()` is `Some` rather than skipping when
+    /// it is `None`: on such a host `PermissionStore::default_path`
+    /// falls back to the *current directory*, which is very likely
+    /// inside the workspace and not covered here at all. That is
+    /// precisely when there is something to protect, so a silent skip
+    /// would hide the gap rather than report it.
     #[test]
-    fn the_agents_own_config_directory_is_refused() {
-        let Some(config_dir) = agent_config_dir() else {
-            // No home directory on this host; nothing to protect.
-            return;
-        };
+    fn the_agents_own_config_files_are_refused() {
+        let config_dir = agent_config_dir()
+            .expect("no config dir: the permission record would fall back to the cwd, unguarded");
 
-        for name in ["acp-permissions.json", "config.toml", "nested/thing"] {
-            let path = config_dir.join(name);
-            let err = refuse_if_sensitive(&path, "Writing to")
-                .expect_err("the agent's own config dir must not be writable by its tools");
+        for name in PROTECTED_CONFIG_FILES {
+            let err = refuse_if_sensitive(&config_dir.join(name), None, "Writing to")
+                .expect_err("the agent's own config files must not be writable by its tools");
             assert!(
-                err.to_string().contains("configuration directory"),
-                "the refusal should say why, got: {err}"
+                err.to_string().contains(name),
+                "the refusal should name the file, got: {err}"
             );
         }
     }
 
-    /// The guard must not swallow ordinary paths — a workspace file and
-    /// a home-directory note both have to keep working.
+    /// The three ways a lexical `starts_with` check is evaded. Each of
+    /// these reaches the same file the OS would open, so each must be
+    /// refused.
+    #[test]
+    fn the_record_cannot_be_reached_by_another_spelling() {
+        let config_dir = agent_config_dir().expect("config dir");
+        std::fs::create_dir_all(&config_dir).ok();
+        if !config_dir.exists() {
+            // Cannot canonicalise a directory that will not exist; the
+            // straight-path case above still covers the guard.
+            return;
+        }
+
+        // `..` inside an absolute path: lexically different components,
+        // same file once the OS resolves it.
+        let dotdot = config_dir
+            .join("..")
+            .join(config_dir.file_name().unwrap())
+            .join("acp-permissions.json");
+        assert!(
+            refuse_if_sensitive(&dotdot, None, "Writing to").is_err(),
+            "a '..' detour must not evade the guard: {}",
+            dotdot.display()
+        );
+
+        // A relative path resolved against a workspace root that sits
+        // in the config directory — the writer joins it, so the guard
+        // must join it too.
+        let relative = Path::new("acp-permissions.json");
+        assert!(
+            refuse_if_sensitive(relative, Some(&config_dir), "Writing to").is_err(),
+            "a workspace-relative path must not evade the guard"
+        );
+
+        // A relative path climbing out of a sibling workspace.
+        let sibling = config_dir.join("workspace");
+        std::fs::create_dir_all(&sibling).ok();
+        if sibling.exists() {
+            let climbing = Path::new("../acp-permissions.json");
+            assert!(
+                refuse_if_sensitive(climbing, Some(&sibling), "Writing to").is_err(),
+                "a '..' climb out of the workspace must not evade the guard"
+            );
+        }
+    }
+
+    /// The guard must not swallow ordinary paths. In particular, a
+    /// workspace that happens to BE the config directory — which is
+    /// what you get when `workspace_dir` is unset — must still be
+    /// writable for everything except the protected files.
     #[test]
     fn ordinary_paths_are_allowed() {
         for path in ["/tmp/notes.md", "/home/someone/todo.txt"] {
             assert!(
-                refuse_if_sensitive(Path::new(path), "Writing to").is_ok(),
+                refuse_if_sensitive(Path::new(path), None, "Writing to").is_ok(),
                 "{path} should be allowed"
+            );
+        }
+
+        let config_dir = agent_config_dir().expect("config dir");
+        for name in ["notes.md", "memory/thing.md", "heartbeat/daily.md"] {
+            assert!(
+                refuse_if_sensitive(Path::new(name), Some(&config_dir), "Writing to").is_ok(),
+                "{name} must stay writable even when the workspace is the config dir"
             );
         }
     }
@@ -1393,12 +1548,10 @@ mod sensitive_path_tests {
     /// directory is a different directory, and must not be refused.
     #[test]
     fn a_sibling_directory_is_not_the_config_directory() {
-        let Some(config_dir) = agent_config_dir() else {
-            return;
-        };
+        let config_dir = agent_config_dir().expect("config dir");
         let sibling = PathBuf::from(format!("{}-backup", config_dir.display()));
         assert!(
-            refuse_if_sensitive(&sibling.join("notes.md"), "Writing to").is_ok(),
+            refuse_if_sensitive(&sibling.join("acp-permissions.json"), None, "Writing to").is_ok(),
             "{} should be allowed",
             sibling.display()
         );

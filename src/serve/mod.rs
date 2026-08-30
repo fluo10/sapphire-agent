@@ -1703,9 +1703,13 @@ pub(crate) trait TurnHost: Send + Sync {
 
     /// Which row of the permission table this turn is judged by.
     ///
-    /// `Trusted` by default: `/rpc`, voice and the heartbeat were
+    /// `Trusted` by default: `/rpc`, `/a2a` and the voice pipeline were
     /// authenticated before the turn started and have no UI to ask
     /// through, so they must keep running everything.
+    ///
+    /// The heartbeat only reaches this default on its *voice* leg. Its
+    /// chat leg goes through `Agent::handle_message`, which does not use
+    /// `TurnHost` at all and judges itself `Origin::Channel`.
     fn origin(&self) -> crate::tools::policy::Origin {
         crate::tools::policy::Origin::Trusted
     }

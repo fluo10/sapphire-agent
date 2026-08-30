@@ -202,6 +202,19 @@ impl AcpProgress {
     fn failure(&self) -> Option<String> {
         self.error.lock().unwrap().clone()
     }
+
+    /// Move a call from `Pending` to `InProgress`.
+    ///
+    /// `tool_start` fires before the permission gate, so every call
+    /// begins as `Pending`. Without this a permitted call would sit at
+    /// `Pending` for its whole runtime and then jump to `Completed`,
+    /// telling the user it was still waiting on them while it ran.
+    fn mark_in_progress(&self, id: &str) {
+        self.notify(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            ToolCallId::new(id),
+            ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
+        )));
+    }
 }
 
 #[async_trait::async_trait]
@@ -256,8 +269,14 @@ impl super::TurnHost for AcpProgress {
     ) -> crate::tools::policy::Approval {
         use crate::tools::policy::Approval;
 
+        // A standing answer settles it without a round trip, but the
+        // client still needs the call moved off `Pending` — it has been
+        // sitting there since `tool_start`.
         match self.permissions.standing(&self.profile, &call.name) {
-            Some(true) => return Approval::AllowAlways,
+            Some(true) => {
+                self.mark_in_progress(&call.id);
+                return Approval::AllowAlways;
+            }
             Some(false) => return Approval::RejectAlways,
             None => {}
         }
@@ -341,6 +360,9 @@ impl super::TurnHost for AcpProgress {
 
         if approval.is_sticky() {
             self.permissions.record(&self.profile, &call.name, approval);
+        }
+        if approval.allows() {
+            self.mark_in_progress(&call.id);
         }
         approval
     }
