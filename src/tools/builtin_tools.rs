@@ -251,35 +251,116 @@ fn opened_filename(name: &std::ffi::OsStr) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Whether two *existing* paths are the same file.
+/// Canonicalise as much of `path` as exists, keeping the rest.
 ///
-/// Only ever called on directories here, which sidesteps two problems
-/// with identifying the target instead: `same_file` opens the path it
-/// is given, and opening a FIFO blocks until a writer appears; and a
-/// target that does not exist yet — the ordinary case for a write, and
-/// the case a fresh install is always in — has no identity to compare,
-/// which is exactly how the previous version of this guard came to
-/// degrade into a spelling comparison.
-fn same_directory(a: &Path, b: &Path) -> bool {
-    same_file::is_same_file(a, b).unwrap_or(false)
+/// The same walk-up the framework's `canonicalize_or_parent` does, and
+/// for the same reason: a write's target usually does not exist, and
+/// often neither do the directories above it — `write_file` calls
+/// `create_dir_all`. Returning the raw path when `canonicalize` fails
+/// is what let two earlier versions of this guard be talked past, so
+/// this never gives up: it finds the deepest existing ancestor and
+/// re-attaches everything below it.
+fn resolve_as_far_as_possible(path: &Path) -> PathBuf {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+
+    loop {
+        if let Ok(real) = cursor.canonicalize() {
+            let mut out = real;
+            for part in suffix.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        let Some(name) = cursor.file_name().map(|n| n.to_os_string()) else {
+            // Ran out of ancestors without finding one that exists.
+            return path.to_path_buf();
+        };
+        suffix.push(name);
+        if !cursor.pop() {
+            return path.to_path_buf();
+        }
+    }
+}
+
+/// Two existing paths, same file?
+///
+/// `fs::metadata` rather than opening the path: opening a FIFO blocks
+/// until a writer appears, and the model chooses this path. Metadata
+/// follows symlinks, which is what we want — `fs::write` follows them
+/// too.
+fn same_entry(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // `same-file` opens a handle, which is why this is gated on the
+        // target being an ordinary file first.
+        let ordinary = |p: &Path| std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false);
+        if !(ordinary(a) && ordinary(b)) {
+            return false;
+        }
+        same_file::is_same_file(a, b).unwrap_or(false)
+    }
+}
+
+/// Whether two directory paths are the same directory.
+///
+/// Fails **closed**: an answer of "I could not tell" is reported as
+/// "yes, treat it as protected". Every previous version of this guard
+/// defaulted the other way, and that is what each bypass ultimately
+/// exploited — an unresolvable path was read as a safe one.
+fn is_protected_dir(candidate: &Path, protected: &Path) -> bool {
+    // Resolve BOTH sides the same way. Comparing a canonicalised path
+    // against a raw one is how a protected directory that does not
+    // exist yet read as "nothing to protect" — the write would have
+    // created it, record and all.
+    let a = resolve_as_far_as_possible(candidate);
+    let b = resolve_as_far_as_possible(protected);
+    if a == b {
+        return true;
+    }
+    // Identity settles the rest — a symlinked or otherwise differently
+    // spelled directory that exists. `unwrap_or(false)` is safe here
+    // only because the lexical comparison above already ran on two
+    // paths resolved by the same rules.
+    same_file::is_same_file(&a, &b).unwrap_or(false)
 }
 
 /// The protected filename this path would write to, if any.
 ///
-/// Compares two things rather than one whole path: the *parent* by
-/// identity, which is exact because a directory that a write is headed
-/// into exists; and the *leaf* by the name the OS will open. Neither
-/// half depends on the target file existing, which is what went wrong
-/// every previous time.
+/// Compares the *parent* by identity — exact, because a directory a
+/// write is headed into either exists or is about to be created at a
+/// path we can name — and the *leaf* by the name the OS will open.
+/// Neither half depends on the target file existing, which is the
+/// property every earlier version lacked.
 ///
-/// A symlinked leaf is followed once — `read_link` rather than
-/// `canonicalize`, so a dangling link still resolves — because
-/// `fs::write` follows it too.
+/// Also catches a leaf that merely *points* at a protected file: a
+/// symlink (followed once with `read_link`, so a dangling one still
+/// resolves) or a hard link (caught by identity, the only thing that
+/// can catch it).
 fn protected_leaf(
     path: &Path,
     workspace_root: Option<&Path>,
     protected_dir: &Path,
 ) -> Option<String> {
+    use std::path::Component;
+
+    // A drive-relative path (`C:x`, `C:..\x`) resolves against Windows'
+    // per-drive current directory — which neither this guard nor the
+    // workspace root controls, and which `PathBuf::join` silently
+    // discards the root for. No legitimate tool call needs the
+    // spelling, so it is refused rather than modelled.
+    if !path.is_absolute() && path.components().any(|c| matches!(c, Component::Prefix(_))) {
+        return Some("a drive-relative path, which this agent will not write through".to_string());
+    }
+
     let mut candidate = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -289,20 +370,24 @@ fn protected_leaf(
         }
     };
 
-    // Follow a symlinked leaf, bounded. `fs::write` follows it, so a
-    // guard that does not is judging a different file.
-    for _ in 0..8 {
+    // Follow a symlinked leaf, bounded well above any real chain.
+    for _ in 0..40 {
         let collapsed = lexically_normalize(&candidate);
         let (Some(parent), Some(leaf)) = (collapsed.parent(), collapsed.file_name()) else {
             return None;
         };
 
-        let canonical_parent = parent
-            .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf());
-        let name = opened_filename(leaf)?;
+        let resolved_parent = resolve_as_far_as_possible(parent);
+        let name = opened_filename(leaf);
 
-        if same_directory(&canonical_parent, protected_dir) {
+        if is_protected_dir(&resolved_parent, protected_dir) {
+            // A leaf that normalises to nothing still lands inside the
+            // protected directory; refuse rather than reason about it.
+            let Some(name) = name.clone() else {
+                return Some(
+                    "an unnameable entry in this agent's own config directory".to_string(),
+                );
+            };
             let hit = PROTECTED_CONFIG_FILES.iter().find(|protected| {
                 if cfg!(windows) {
                     name.eq_ignore_ascii_case(protected)
@@ -315,17 +400,30 @@ fn protected_leaf(
             }
         }
 
-        let target = canonical_parent.join(&name);
+        // Identity: a hard link is the same file under another name,
+        // and no comparison of spellings can see that.
+        let target = match &name {
+            Some(name) => resolved_parent.join(name),
+            None => resolved_parent.clone(),
+        };
+        for protected in PROTECTED_CONFIG_FILES {
+            if same_entry(&target, &protected_dir.join(protected)) {
+                return Some((*protected).to_string());
+            }
+        }
+
         match std::fs::symlink_metadata(&target) {
             Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(&target) {
                 Ok(dest) if dest.is_absolute() => candidate = dest,
-                Ok(dest) => candidate = canonical_parent.join(dest),
+                Ok(dest) => candidate = resolved_parent.join(dest),
                 Err(_) => return None,
             },
             _ => return None,
         }
     }
-    None
+
+    // A chain that long is not a real path; refuse rather than give up.
+    Some("a symlink chain too long to follow".to_string())
 }
 
 /// Refuse writes and deletes to a sensitive system path or to one of
@@ -1678,19 +1776,77 @@ mod sensitive_path_tests {
         }
     }
 
-    /// A hard link is the same inode under another name. It can only be
-    /// made to a file that exists, so this is the present-file regime
-    /// by construction.
-    #[cfg(unix)]
+    /// A hard link is the same file under another name, and no
+    /// comparison of spellings can see that — only identity can.
+    ///
+    /// Deliberately NOT `#[cfg(unix)]`. NTFS hard links need no
+    /// privilege, and gating this to Unix is how an earlier version
+    /// shipped with hard-link protection removed and a red suite on two
+    /// platforms, while the Windows host it was verified on reported
+    /// everything green because the test never compiled.
     #[test]
-    fn a_hard_link_to_the_record_is_refused() {
+    fn a_hard_link_to_a_protected_file_is_refused() {
         let (_guard, dir) = protected_dir(true);
-        let link = dir.join("innocent.json");
-        std::fs::hard_link(dir.join("acp-permissions.json"), &link).unwrap();
+        let workspace = TempDir::new().unwrap();
 
+        for (link, label) in [
+            (dir.join("innocent.json"), "beside the record"),
+            (workspace.path().join("notes.json"), "in another directory"),
+        ] {
+            if std::fs::hard_link(dir.join("acp-permissions.json"), &link).is_err() {
+                // Cross-volume, or a filesystem without hard links.
+                continue;
+            }
+            assert!(
+                refuse_if_sensitive_in(&link, None, Some(&dir), "Writing to").is_err(),
+                "a hard link {label} must be refused"
+            );
+            assert!(
+                refuse_if_sensitive_in(&link, None, Some(&dir), "Deleting").is_err(),
+                "deleting through a hard link {label} must be refused"
+            );
+        }
+    }
+
+    /// A drive-relative path (`C:x`) resolves against Windows' own
+    /// per-drive current directory, which neither this guard nor the
+    /// workspace root controls — and `PathBuf::join` silently discards
+    /// the root when the path carries a prefix. Enough `..` and it
+    /// climbs to the config directory with the guard looking elsewhere.
+    /// Refused as a spelling, since nothing legitimate needs it.
+    #[test]
+    fn a_drive_relative_path_is_refused() {
+        for present in [true, false] {
+            let (_guard, dir) = protected_dir(present);
+            for spelling in [
+                r"C:acp-permissions.json",
+                r"C:..\..\..\..\acp-permissions.json",
+                r"Z:..\config.toml",
+            ] {
+                assert!(
+                    refused(spelling, Some(&dir), &dir),
+                    "'{spelling}' must be refused (present={present})"
+                );
+            }
+        }
+    }
+
+    /// A protected directory that does not exist yet must not read as
+    /// "nothing to protect": the write would create it, record and all.
+    #[test]
+    fn a_missing_protected_directory_still_protects() {
+        let outer = TempDir::new().unwrap();
+        let dir = outer.path().join("not-created-yet");
+
+        for name in PROTECTED_CONFIG_FILES {
+            assert!(
+                refuse_if_sensitive_in(&dir.join(name), None, Some(&dir), "Writing to").is_err(),
+                "'{name}' must be refused even before the directory exists"
+            );
+        }
         assert!(
-            refuse_if_sensitive_in(&link, None, Some(&dir), "Writing to").is_err(),
-            "a hard link to the record must be refused"
+            refuse_if_sensitive_in(&dir.join("notes.md"), None, Some(&dir), "Writing to").is_ok(),
+            "an ordinary file there is still fine"
         );
     }
 
