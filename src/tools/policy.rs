@@ -280,6 +280,24 @@ mod tests {
         }
     }
 
+    /// `SwitchMode` is declared upstream and by no tool here, so it is
+    /// in neither the safe nor the risky set. `decide`'s doc comment
+    /// claims it therefore lands in the middle row; this is the only
+    /// thing stopping a later edit from quietly moving it. Without this,
+    /// pulling `SwitchMode` into `risky` would compile and pass.
+    #[test]
+    fn an_unclassified_kind_lands_in_the_middle_row() {
+        let kind = ToolKind::SwitchMode;
+        assert_eq!(decide(Origin::Acp(SessionMode::Default), kind), Decision::Ask);
+        assert_eq!(
+            decide(Origin::Acp(SessionMode::AcceptEdits), kind),
+            Decision::Allow
+        );
+        assert_eq!(decide(Origin::Acp(SessionMode::Bypass), kind), Decision::Allow);
+        assert_eq!(decide(Origin::Channel, kind), Decision::Allow);
+        assert_eq!(decide(Origin::Trusted, kind), Decision::Allow);
+    }
+
     #[test]
     fn mode_ids_round_trip() {
         for mode in SessionMode::ALL {
