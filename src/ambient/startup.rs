@@ -270,9 +270,19 @@ mod tests {
         // Confirms step ordering: `device_auth` is a pre-validated `Arc`
         // passed straight through (no auth step happens in `build` itself),
         // so with a real STT entry, `build` gets past STT and fails at
-        // model resolution instead — this crate is built without
-        // `voice-sherpa` in this test run, so that failure names the
-        // feature rather than a model path.
+        // model resolution instead.
+        //
+        // Which message that failure carries depends on the feature set,
+        // so the assertion below is feature-aware. Without `voice-sherpa`
+        // the providers are not compiled in and the error names the
+        // missing feature; with it, model resolution actually runs and
+        // complains that no directory was configured. Both are the same
+        // step, which is what this test is about.
+        //
+        // This used to assert the no-sherpa message unconditionally,
+        // which was safe only because a default-feature build could not
+        // link on Windows at all (two ONNX runtimes, mismatched CRTs) and
+        // so was never run that way.
         let mut cfg = Config::for_test();
         cfg.ambient.enabled = true;
         cfg.ambient.stt_provider = "mock".into();
@@ -290,9 +300,13 @@ mod tests {
             .err()
             .expect("expected an error");
         let msg = format!("{err:#}");
+        #[cfg(feature = "voice-sherpa")]
+        let expected = "model_dir";
+        #[cfg(not(feature = "voice-sherpa"))]
+        let expected = "voice-sherpa";
         assert!(
-            msg.contains("voice-sherpa"),
-            "should fail at model resolution, naming the feature, got: {msg}"
+            msg.contains(expected),
+            "should fail at model resolution (expected {expected:?}), got: {msg}"
         );
     }
 }
