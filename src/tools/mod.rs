@@ -348,6 +348,18 @@ mod tests {
         assert_eq!(got_refs, want);
     }
 
+    /// `mcp_reconnect` is registered only when an MCP server is
+    /// configured, so `every_tool_declares_its_kind` never sees it —
+    /// and it is the one tool that deliberately relies on the *default*
+    /// `Other` rather than declaring a kind. That makes it the case a
+    /// careless `kind()` could silently soften with nothing noticing.
+    #[test]
+    fn mcp_reconnect_stays_in_the_strict_bucket() {
+        let tool = builtin_tools::McpReconnectTool::new(std::sync::Weak::new());
+        assert_eq!(tool.spec().name, "mcp_reconnect");
+        assert_eq!(tool.kind(), ToolKind::Other);
+    }
+
     /// A tool that does not override `kind()` must land in the strictest
     /// bucket, so forgetting to classify one fails safe.
     #[test]

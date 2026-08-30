@@ -75,9 +75,21 @@ pub enum Origin {
     /// so blocking it on a human reply could hang for hours, and routing
     /// the question through the LLM turn would let the model broker its
     /// own permission request.
+    ///
+    /// The heartbeat's chat leg arrives here too, because it shares
+    /// `Agent::handle_message`. That is the right answer rather than an
+    /// accident: heartbeat tasks are workspace files, and `file_write`
+    /// is an `Edit`, which this origin allows unasked — so a trusted
+    /// heartbeat would let a chat message write itself a task that runs
+    /// a command on the next tick.
     Channel,
-    /// `/rpc`, voice, the heartbeat and `/a2a`: already authenticated,
+    /// `/rpc`, voice and `/a2a`: authenticated before the turn began,
     /// with no UI to ask through. Behaviour must not change for these.
+    ///
+    /// `/a2a` is a peer agent rather than a local device, and a peer is
+    /// promptable in ways a device is not. It sits here because it
+    /// presents an operator-issued token from the same device registry
+    /// as `/rpc` — the trust is in the token, not in the locality.
     Trusted,
 }
 

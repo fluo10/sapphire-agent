@@ -209,12 +209,17 @@ impl super::TurnHost for AcpProgress {
     /// The provider's own tool-call id becomes ACP's `toolCallId`, so the
     /// completion below can name the call it completes. There is no input to
     /// report — `TurnHost` does not carry one — so the tool's name serves
-    /// as the title. `InProgress` rather than the default `Pending`: the
-    /// executor has already started the call, whereas `Pending` tells a
-    /// client the call is still waiting on input or approval.
+    /// as the title.
+    ///
+    /// `Pending`, not `InProgress`. This fires *before* the permission
+    /// gate, so at this moment the call may be waiting on the user's
+    /// answer, or about to be refused outright — which is exactly what
+    /// `Pending` means. It said `InProgress` when nothing could stand
+    /// between the executor and the call; that stopped being true when
+    /// the gate landed.
     async fn tool_start(&self, id: &str, name: &str) {
         self.notify(SessionUpdate::ToolCall(
-            AcpToolCall::new(ToolCallId::new(id), name).status(ToolCallStatus::InProgress),
+            AcpToolCall::new(ToolCallId::new(id), name).status(ToolCallStatus::Pending),
         ));
     }
 
@@ -2237,6 +2242,66 @@ mod tests {
         assert!(
             ran.load(std::sync::atomic::Ordering::SeqCst),
             "bypass should have run the tool, not merely skipped asking"
+        );
+    }
+
+    /// `accept_edits` is the middle mode, and the only one whose whole
+    /// point is that it changes *some* answers and not others. An
+    /// `Execute` tool must still be asked about there.
+    #[tokio::test]
+    async fn accept_edits_still_asks_about_commands() {
+        let state = ServeState::for_test_scripted(true, risky_then_reply("done"));
+        state
+            .tools
+            .register_tool(Box::new(super::super::RiskyTool::new()))
+            .await;
+        let addr = spawn(state).await;
+
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), new_session_request(1)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        let mut asked = 0usize;
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 1 {
+                let id = v["result"]["sessionId"].as_str().unwrap().to_string();
+                ws.send(Message::Text(
+                    set_mode_request(2, &id, "accept_edits").to_string().into(),
+                ))
+                .await
+                .unwrap();
+                ws.send(Message::Text(
+                    prompt_request(3, &id, text_prompt("run it"))
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            } else if v["method"] == "session/request_permission" {
+                asked += 1;
+                let answer = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "outcome": { "outcome": "selected", "optionId": "allow_once" } }
+                });
+                ws.send(Message::Text(answer.to_string().into()))
+                    .await
+                    .unwrap();
+            } else if v["id"] == 3 {
+                assert_eq!(v["result"]["stopReason"], "end_turn", "got {v}");
+                break;
+            }
+        }
+        assert_eq!(
+            asked, 1,
+            "accept_edits must still ask about an Execute tool"
         );
     }
 }

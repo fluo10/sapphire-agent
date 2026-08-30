@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sapphire_framework::workspace::WorkspaceState;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
 // ---------------------------------------------------------------------------
@@ -164,6 +164,47 @@ static SENSITIVE_PREFIXES: &[&str] = &[
     "/var/run/docker.sock",
 ];
 
+/// The agent's own config directory — where `config.toml` and, since
+/// tool permissions landed, `acp-permissions.json` live.
+///
+/// This is not merely tidy. `file_write` is `ToolKind::Edit`, which the
+/// permission policy allows *without asking* from a chat channel and in
+/// ACP's `accept_edits` mode. Without this guard, a Discord message
+/// could write `{"profiles":{"zed":{"always_allow":["shell"]}}}` into
+/// the permission record; the store is read once at startup, so after
+/// the next restart the editor would run `shell` having never been
+/// asked. The gate would still be doing its job — it would just be
+/// consulting an answer the attacker wrote.
+fn agent_config_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "sapphire-agent")
+        .map(|dirs| dirs.config_dir().to_path_buf())
+}
+
+/// Refuse writes and deletes under a system path or the agent's own
+/// config directory. `verb` is the word used in the error the model
+/// sees ("Writing to", "Deleting").
+fn refuse_if_sensitive(path: &Path, verb: &str) -> Result<()> {
+    let path_abs = path.to_string_lossy().to_string();
+
+    for prefix in SENSITIVE_PREFIXES {
+        if path_abs.starts_with(prefix) || &path_abs == prefix {
+            anyhow::bail!("{verb} '{path_abs}' is not allowed (sensitive system path).");
+        }
+    }
+
+    if let Some(config_dir) = agent_config_dir()
+        && path.starts_with(&config_dir)
+    {
+        anyhow::bail!(
+            "{verb} '{path_abs}' is not allowed: that is this agent's own \
+             configuration directory, which includes the record of what you \
+             have been given permission to do."
+        );
+    }
+
+    Ok(())
+}
+
 pub struct FileWriteTool {
     state: Arc<Mutex<WorkspaceState>>,
     spec: ToolSpec,
@@ -217,16 +258,7 @@ impl Tool for FileWriteTool {
         let content = input["content"].as_str().context("missing 'content'")?;
 
         let path = expand_path(path_str);
-        let path_abs = path.to_string_lossy().to_string();
-
-        for prefix in SENSITIVE_PREFIXES {
-            if path_abs.starts_with(prefix) || &path_abs == prefix {
-                anyhow::bail!(
-                    "Writing to '{}' is not allowed (sensitive system path).",
-                    path_abs
-                );
-            }
-        }
+        refuse_if_sensitive(&path, "Writing to")?;
 
         self.state
             .lock()
@@ -291,6 +323,8 @@ impl Tool for FileDeleteTool {
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let path = expand_path(path_str);
+
+        refuse_if_sensitive(&path, "Deleting")?;
 
         self.state
             .lock()
@@ -359,16 +393,7 @@ impl Tool for FileAppendTool {
         let content = input["content"].as_str().context("missing 'content'")?;
 
         let path = expand_path(path_str);
-        let path_abs = path.to_string_lossy().to_string();
-
-        for prefix in SENSITIVE_PREFIXES {
-            if path_abs.starts_with(prefix) || &path_abs == prefix {
-                anyhow::bail!(
-                    "Writing to '{}' is not allowed (sensitive system path).",
-                    path_abs
-                );
-            }
-        }
+        refuse_if_sensitive(&path, "Writing to")?;
 
         self.state
             .lock()
@@ -1304,6 +1329,80 @@ fn is_hex_sha256(s: &str) -> bool {
     s.len() == 64
         && s.chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+#[cfg(test)]
+mod sensitive_path_tests {
+    use super::*;
+
+    #[test]
+    fn system_paths_are_refused() {
+        for path in [
+            "/etc/passwd",
+            "/bin/sh",
+            "/proc/self/mem",
+            "/var/run/docker.sock",
+        ] {
+            assert!(
+                refuse_if_sensitive(Path::new(path), "Writing to").is_err(),
+                "{path} should be refused"
+            );
+        }
+    }
+
+    /// The agent's own config directory holds `acp-permissions.json`,
+    /// the record of what the agent has been allowed to do.
+    ///
+    /// `file_write` is `ToolKind::Edit`, which the policy runs WITHOUT
+    /// asking on a chat channel and in ACP's `accept_edits` mode. If
+    /// this were writable, a chat message could grant the agent
+    /// `always_allow` on `shell` and collect it after the next restart —
+    /// the permission gate would still be working, just consulting an
+    /// answer somebody else wrote.
+    #[test]
+    fn the_agents_own_config_directory_is_refused() {
+        let Some(config_dir) = agent_config_dir() else {
+            // No home directory on this host; nothing to protect.
+            return;
+        };
+
+        for name in ["acp-permissions.json", "config.toml", "nested/thing"] {
+            let path = config_dir.join(name);
+            let err = refuse_if_sensitive(&path, "Writing to")
+                .expect_err("the agent's own config dir must not be writable by its tools");
+            assert!(
+                err.to_string().contains("configuration directory"),
+                "the refusal should say why, got: {err}"
+            );
+        }
+    }
+
+    /// The guard must not swallow ordinary paths — a workspace file and
+    /// a home-directory note both have to keep working.
+    #[test]
+    fn ordinary_paths_are_allowed() {
+        for path in ["/tmp/notes.md", "/home/someone/todo.txt"] {
+            assert!(
+                refuse_if_sensitive(Path::new(path), "Writing to").is_ok(),
+                "{path} should be allowed"
+            );
+        }
+    }
+
+    /// A path that merely starts with the same characters as the config
+    /// directory is a different directory, and must not be refused.
+    #[test]
+    fn a_sibling_directory_is_not_the_config_directory() {
+        let Some(config_dir) = agent_config_dir() else {
+            return;
+        };
+        let sibling = PathBuf::from(format!("{}-backup", config_dir.display()));
+        assert!(
+            refuse_if_sensitive(&sibling.join("notes.md"), "Writing to").is_ok(),
+            "{} should be allowed",
+            sibling.display()
+        );
+    }
 }
 
 #[cfg(test)]

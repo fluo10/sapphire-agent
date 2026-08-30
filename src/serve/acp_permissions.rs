@@ -125,14 +125,18 @@ impl PermissionStore {
     /// mid-write cannot leave a half-written record that the next start
     /// would discard entirely.
     fn flush(&self) {
-        let json = {
-            let state = self.state.lock().expect("permission store poisoned");
-            match serde_json::to_vec_pretty(&*state) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("ACP: could not serialise the permission record: {e}");
-                    return;
-                }
+        // The lock is held across the write and the rename, not just the
+        // serialisation. Two connections recording an answer at once
+        // would otherwise both write the same `.json.tmp` and rename it,
+        // and the interleaving can publish a half-written file. Holding
+        // it costs nothing — these are small synchronous writes, and the
+        // critical section still never spans an await.
+        let state = self.state.lock().expect("permission store poisoned");
+        let json = match serde_json::to_vec_pretty(&*state) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("ACP: could not serialise the permission record: {e}");
+                return;
             }
         };
 

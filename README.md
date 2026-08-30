@@ -140,7 +140,13 @@ recorded in `~/.config/sapphire-agent/acp-permissions.json`, keyed by room
 profile and tool name. Delete the file to be asked everything again. It sits
 beside the host-local config rather than in the workspace on purpose: trusting
 a particular editor is a statement about *this machine*, not something to sync
-to other hosts.
+to other hosts. The agent's own tools cannot write to that directory — see the
+refusal in `file_write` — because a tool that could edit the permission record
+could grant itself anything.
+
+Both standing answers only apply where the agent would otherwise ask. "Never
+allow this tool" is not a kill switch: `bypass` runs everything regardless, and
+`accept_edits` runs edits regardless.
 
 Declining a tool does not end the turn. The model is told the call was
 refused and can try another route.
@@ -149,8 +155,15 @@ refused and can try another route.
 cannot call `shell` or any MCP tool at all. A chat turn is asynchronous, so
 holding one open waiting for a human could hang it for hours; and routing the
 question through the model would let it broker its own permission request.
-`/rpc`, the voice pipeline, the heartbeat and `/a2a` are unchanged and still
-run everything.
+`/rpc`, the voice pipeline and `/a2a` are unchanged and still run everything.
+
+**The heartbeat's chat leg counts as a channel.** A scheduled task under
+`<workspace>/heartbeat/` runs through the same path as a chat message when it
+replies to a room, so it cannot call `shell` or MCP tools either. This is
+deliberate rather than an oversight: heartbeat task bodies are workspace files,
+and `file_write` is an edit, which a channel may perform without being asked —
+so trusting that path would let a chat message write itself a task that runs a
+command on the next tick.
 
 ### Known limitations
 
