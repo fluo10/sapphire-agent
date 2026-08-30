@@ -37,6 +37,13 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102.x URI name-constraint acceptance; transitive via serenity → tokio-tungstenite 0.21." },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102.x wildcard-name constraint acceptance; transitive via serenity → tokio-tungstenite 0.21." },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102.x CRL parsing panic; transitive via serenity → tokio-tungstenite 0.21." },
+
+    # --- unmaintained, reached only through matrix-sdk 0.16 ---
+    # RustSec lists no safe upgrade for either, and both are several layers
+    # below anything we call. They leave the graph when matrix-sdk moves off
+    # them, so re-check on the next matrix-sdk bump.
+    { id = "RUSTSEC-2026-0247", reason = "bitmaps is unmaintained; transitive via matrix-sdk → eyeball-im → imbl." },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is unmaintained; transitive via matrix-sdk → aquamarine, and vodozemac → matrix-pickle-derive." },
 ]
 
 [licenses]
@@ -73,4 +80,6 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# sapphire-framework is a sibling app in the project-sapphire superproject,
+# consumed straight from git because it is not published to crates.io.
+allow-git = ["https://github.com/fluo10/sapphire-framework"]
