@@ -40,10 +40,15 @@ pub(crate) struct PermissionStore {
 }
 
 impl PermissionStore {
-    // `default_path()` — `~/.config/sapphire-agent/acp-permissions.json`,
-    // resolved the way `Config::default_path` resolves the config file —
-    // arrives with the `ServeState` wiring that first calls it. Writing
-    // it here would be a dead function until then.
+    /// `~/.config/sapphire-agent/acp-permissions.json`, resolved the
+    /// way `Config::default_path` resolves the config file itself.
+    pub(crate) fn default_path() -> PathBuf {
+        if let Some(dirs) = directories::ProjectDirs::from("", "", "sapphire-agent") {
+            dirs.config_dir().join("acp-permissions.json")
+        } else {
+            PathBuf::from("acp-permissions.json")
+        }
+    }
 
     /// Load what is on disk. Never fails: a missing file is an empty
     /// record, and an unreadable one is logged and treated as empty.

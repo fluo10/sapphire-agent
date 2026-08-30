@@ -61,6 +61,10 @@ pub struct ServeState {
     pub(crate) registry: Arc<ProviderRegistry>,
     pub(crate) workspace: Arc<Workspace>,
     pub(crate) tools: Arc<ToolSet>,
+    /// Standing answers to `session/request_permission`. Shared across
+    /// connections because the record is host-wide, keyed by room
+    /// profile inside.
+    pub(crate) permissions: Arc<acp_permissions::PermissionStore>,
     /// Cross-device session store (kind = `"rpc"` for now; #122 PR 3
     /// renames the on-disk dir to `cross-device/`). Holds the
     /// user-selectable, multi-device sessions resumed via
@@ -164,6 +168,13 @@ impl ServeState {
             registry,
             workspace,
             tools,
+            // Built here rather than passed in: the path is fixed by the
+            // host, nothing else needs to choose it, and threading an
+            // eleventh argument through would earn nothing. Tests build
+            // `ServeState` by struct literal and point this at a tempdir.
+            permissions: Arc::new(acp_permissions::PermissionStore::open(
+                acp_permissions::PermissionStore::default_path(),
+            )),
             cross_device_session_store,
             device_default_session_store,
             mcp_session_store,
@@ -2685,6 +2696,9 @@ rooms    = []
                 crate::config::DigestConfig::default(),
             )),
             tools: Arc::new(ToolSet::new(vec![Box::new(EchoTool::new())], Vec::new())),
+            permissions: Arc::new(acp_permissions::PermissionStore::open(
+                base.join("acp-permissions.json"),
+            )),
             cross_device_session_store: Arc::new(SessionStore::new(base.join("sessions"), "rpc")),
             device_default_session_store: Arc::new(SessionStore::new(
                 base.join("device-default"),
