@@ -1808,14 +1808,22 @@ mod sensitive_path_tests {
         }
     }
 
-    /// A drive-relative path (`C:x`) resolves against Windows' own
-    /// per-drive current directory, which neither this guard nor the
-    /// workspace root controls — and `PathBuf::join` silently discards
-    /// the root when the path carries a prefix. Enough `..` and it
-    /// climbs to the config directory with the guard looking elsewhere.
-    /// Refused as a spelling, since nothing legitimate needs it.
+    /// `C:x` means two different things, and the guard has to be right
+    /// about both.
+    ///
+    /// On Windows it is *drive-relative*: it resolves against that
+    /// drive's own current directory, which neither this guard nor the
+    /// workspace root controls, and `PathBuf::join` silently discards
+    /// the root when a path carries a prefix. Enough `..` and it climbs
+    /// to the config directory with the guard looking elsewhere. So it
+    /// is refused as a spelling — nothing legitimate needs it.
+    ///
+    /// Everywhere else `C:` is an ordinary run of filename characters,
+    /// there is no prefix component, and the path is an unremarkable
+    /// relative filename that must keep working. Asserting the refusal
+    /// on both platforms is how this first went red on Linux.
     #[test]
-    fn a_drive_relative_path_is_refused() {
+    fn a_drive_relative_path_is_refused_on_windows_and_ordinary_elsewhere() {
         for present in [true, false] {
             let (_guard, dir) = protected_dir(present);
             for spelling in [
@@ -1823,10 +1831,20 @@ mod sensitive_path_tests {
                 r"C:..\..\..\..\acp-permissions.json",
                 r"Z:..\config.toml",
             ] {
-                assert!(
-                    refused(spelling, Some(&dir), &dir),
-                    "'{spelling}' must be refused (present={present})"
-                );
+                let refused_here = refused(spelling, Some(&dir), &dir);
+                if cfg!(windows) {
+                    assert!(
+                        refused_here,
+                        "'{spelling}' is drive-relative here and must be refused \
+                         (present={present})"
+                    );
+                } else {
+                    assert!(
+                        !refused_here,
+                        "'{spelling}' is an ordinary filename here and must be allowed \
+                         (present={present})"
+                    );
+                }
             }
         }
     }
