@@ -183,11 +183,36 @@ command on the next tick.
   the editor as `completed`, whether it succeeded, errored, or was declined.
   The model still sees the reason and reacts to it; only the editor's status
   display is wrong.
-- **Not yet exercised against a real Zed.** The endpoint is covered by
-  automated tests (framing, auth, `initialize`/`session/new`/`session/prompt`/
-  `session/cancel`), but has not yet been driven end-to-end from an actual
-  Zed install. Treat it as untested against real client behaviour until
-  someone does that smoke test.
+- **Partly exercised against a real Zed** (2026-08-31). Confirmed working
+  from an actual Zed install: the connection, `initialize`, `session/new`
+  with its mode list, and the permission prompt for an `Execute` tool —
+  both allowing and declining. Still unconfirmed against a real client:
+  the mode picker actually switching modes, "always allow" surviving a
+  reconnect, multi-turn conversations, and cancellation.
+- **No token usage is reported.** The provider layer discards the `usage`
+  the API returns, so neither `session/update: usage_update` nor
+  `PromptResponse.usage` is sent, and the editor cannot show what a turn
+  cost or how full the context is.
+
+### Configuring `websocat` in Zed
+
+One trap, since Zed spawns the command **without a shell**: do not quote
+the header argument. In a terminal you would write
+`-H 'Authorization: Bearer …'` and the shell would strip the quotes; in
+`settings.json` the quotes become part of the header value and the server
+answers `401` before the WebSocket upgrade. Write it bare:
+
+```jsonc
+"args": [
+  "--text",
+  "wss://your-host/acp",
+  "-H",
+  "Authorization: Bearer <token>"   // no surrounding quotes
+]
+```
+
+`-H` takes multiple values, so it has to come *after* the URL or it
+swallows it.
 
 ## License
 
