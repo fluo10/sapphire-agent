@@ -121,6 +121,50 @@ bearer token travels in a plain header, so TLS is expected to already be
 terminating in front of the endpoint (a reverse proxy, typically) rather than
 being provided by the agent itself.
 
+### Permission and modes
+
+Tool calls from the editor are gated. Each tool declares what it does (read,
+search, edit, delete, execute), and what happens next depends on the session's
+mode:
+
+| Mode | Reads, searches, fetches | Edits and deletes | Commands, MCP tools |
+|---|---|---|---|
+| `default` | run | **ask** | **ask** |
+| `accept_edits` | run | run | **ask** |
+| `bypass` | run | run | run |
+
+Zed's mode picker switches between them; the session starts in `default`.
+
+When the agent asks, "Always allow this tool" and "Never allow this tool" are
+recorded in `~/.config/sapphire-agent/acp-permissions.json`, keyed by room
+profile and tool name. Delete the file to be asked everything again. It sits
+beside the host-local config rather than in the workspace on purpose: trusting
+a particular editor is a statement about *this machine*, not something to sync
+to other hosts. The agent's own tools cannot write to that directory — see the
+refusal in `file_write` — because a tool that could edit the permission record
+could grant itself anything.
+
+Both standing answers only apply where the agent would otherwise ask. "Never
+allow this tool" is not a kill switch: `bypass` runs everything regardless, and
+`accept_edits` runs edits regardless.
+
+Declining a tool does not end the turn. The model is told the call was
+refused and can try another route.
+
+**Chat channels are not asked — they are restricted.** Matrix and Discord
+cannot call `shell` or any MCP tool at all. A chat turn is asynchronous, so
+holding one open waiting for a human could hang it for hours; and routing the
+question through the model would let it broker its own permission request.
+`/rpc`, the voice pipeline and `/a2a` are unchanged and still run everything.
+
+**The heartbeat's chat leg counts as a channel.** A scheduled task under
+`<workspace>/heartbeat/` runs through the same path as a chat message when it
+replies to a room, so it cannot call `shell` or MCP tools either. This is
+deliberate rather than an oversight: heartbeat task bodies are workspace files,
+and `file_write` is an edit, which a channel may perform without being asked —
+so trusting that path would let a chat message write itself a task that runs a
+command on the next tick.
+
 ### Known limitations
 
 - **Replies are not streamed token by token.** `Provider::chat` returns a
@@ -131,16 +175,44 @@ being provided by the agent itself.
   has no resumption mechanism, and `session/load` is not implemented.
 - **Tool calls reach the editor as a bare name.** No arguments and no results
   are sent — the shared turn executor reports only a tool's id and name — so
-  Zed shows "shell" rather than the command it ran or what came back.
-- **A failed tool is reported as completed.** The executor's `ToolOutput`
-  carries no success bit, so every tool that finishes is sent to the editor
-  as `completed`, whether it succeeded or errored. The model still sees the
-  error text and reacts to it; only the editor's status display is wrong.
-- **Not yet exercised against a real Zed.** The endpoint is covered by
-  automated tests (framing, auth, `initialize`/`session/new`/`session/prompt`/
-  `session/cancel`), but has not yet been driven end-to-end from an actual
-  Zed install. Treat it as untested against real client behaviour until
-  someone does that smoke test.
+  Zed shows "shell" rather than the command it ran or what came back. The one
+  exception is a permission request, which does carry the tool's kind and its
+  raw input so you can see what you are approving.
+- **A failed or refused tool is reported as completed.** The executor's
+  `ToolOutput` carries no success bit, so every tool that finishes is sent to
+  the editor as `completed`, whether it succeeded, errored, or was declined.
+  The model still sees the reason and reacts to it; only the editor's status
+  display is wrong.
+- **Partly exercised against a real Zed** (2026-08-31). Confirmed working
+  from an actual Zed install: the connection, `initialize`, `session/new`
+  with its mode list, and the permission prompt for an `Execute` tool —
+  both allowing and declining. Still unconfirmed against a real client:
+  the mode picker actually switching modes, "always allow" surviving a
+  reconnect, multi-turn conversations, and cancellation.
+- **No token usage is reported.** The provider layer discards the `usage`
+  the API returns, so neither `session/update: usage_update` nor
+  `PromptResponse.usage` is sent, and the editor cannot show what a turn
+  cost or how full the context is.
+
+### Configuring `websocat` in Zed
+
+One trap, since Zed spawns the command **without a shell**: do not quote
+the header argument. In a terminal you would write
+`-H 'Authorization: Bearer …'` and the shell would strip the quotes; in
+`settings.json` the quotes become part of the header value and the server
+answers `401` before the WebSocket upgrade. Write it bare:
+
+```jsonc
+"args": [
+  "--text",
+  "wss://your-host/acp",
+  "-H",
+  "Authorization: Bearer <token>"   // no surrounding quotes
+]
+```
+
+`-H` takes multiple values, so it has to come *after* the URL or it
+swallows it.
 
 ## License
 

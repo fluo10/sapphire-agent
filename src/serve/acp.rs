@@ -57,10 +57,13 @@
 use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Error, InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
-    ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, CurrentModeUpdate, Error,
+    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionId, SessionMode as AcpSessionMode, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent, ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields,
 };
 use agent_client_protocol::{
     Agent, Client, ConnectionTo, Lines, on_receive_notification, on_receive_request,
@@ -116,6 +119,9 @@ struct AcpSession {
     /// Entries are removed by the turn that owns them, so this holds only
     /// turns that are still running.
     turns: HashMap<u64, CancellationToken>,
+    /// The permission mode this session is in. Per session, not per
+    /// connection: two sessions on one socket are judged separately.
+    mode: crate::tools::policy::SessionMode,
 }
 
 /// Sessions live for the lifetime of one ACP connection: a `HashMap` behind
@@ -147,14 +153,31 @@ struct AcpProgress {
     /// The message from the most recent `turn_error`. A blocking mutex is
     /// enough: it is never held across an await.
     error: std::sync::Mutex<Option<String>>,
+    /// The room profile this connection's bearer token resolved to.
+    /// Standing permission answers are recorded under it.
+    profile: String,
+    /// The session's mode as of the moment this turn started. Copied
+    /// rather than shared: a `session/set_mode` arriving mid-turn must
+    /// not change the rules under a call already being judged.
+    mode: crate::tools::policy::SessionMode,
+    permissions: Arc<super::acp_permissions::PermissionStore>,
 }
 
 impl AcpProgress {
-    fn new(session_id: SessionId, connection: ConnectionTo<Client>) -> Self {
+    fn new(
+        session_id: SessionId,
+        connection: ConnectionTo<Client>,
+        profile: String,
+        mode: crate::tools::policy::SessionMode,
+        permissions: Arc<super::acp_permissions::PermissionStore>,
+    ) -> Self {
         Self {
             session_id,
             connection,
             error: std::sync::Mutex::new(None),
+            profile,
+            mode,
+            permissions,
         }
     }
 
@@ -182,16 +205,21 @@ impl AcpProgress {
 }
 
 #[async_trait::async_trait]
-impl super::TurnProgress for AcpProgress {
+impl super::TurnHost for AcpProgress {
     /// The provider's own tool-call id becomes ACP's `toolCallId`, so the
     /// completion below can name the call it completes. There is no input to
-    /// report — `TurnProgress` does not carry one — so the tool's name serves
-    /// as the title. `InProgress` rather than the default `Pending`: the
-    /// executor has already started the call, whereas `Pending` tells a
-    /// client the call is still waiting on input or approval.
+    /// report — `TurnHost` does not carry one — so the tool's name serves
+    /// as the title.
+    ///
+    /// `Pending`, not `InProgress`. This fires *before* the permission
+    /// gate, so at this moment the call may be waiting on the user's
+    /// answer, or about to be refused outright — which is exactly what
+    /// `Pending` means. It said `InProgress` when nothing could stand
+    /// between the executor and the call; that stopped being true when
+    /// the gate landed.
     async fn tool_start(&self, id: &str, name: &str) {
         self.notify(SessionUpdate::ToolCall(
-            AcpToolCall::new(ToolCallId::new(id), name).status(ToolCallStatus::InProgress),
+            AcpToolCall::new(ToolCallId::new(id), name).status(ToolCallStatus::Pending),
         ));
     }
 
@@ -209,6 +237,130 @@ impl super::TurnProgress for AcpProgress {
     /// place the cause is offered to put in it.
     async fn turn_error(&self, message: &str) {
         *self.error.lock().unwrap() = Some(message.to_string());
+    }
+
+    fn origin(&self) -> crate::tools::policy::Origin {
+        crate::tools::policy::Origin::Acp(self.mode)
+    }
+
+    /// Move a call from `Pending` to `InProgress`.
+    ///
+    /// `tool_start` fires before the permission gate, so every call
+    /// begins as `Pending` — which is accurate then, and wrong the
+    /// moment the call is actually running. Without this edge a
+    /// permitted call would sit at `Pending` for its whole runtime and
+    /// then jump to `Completed`, telling the user it was still waiting
+    /// on them while it ran.
+    async fn tool_allowed(&self, id: &str) {
+        self.notify(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            ToolCallId::new(id),
+            ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
+        )));
+    }
+
+    /// Put the call to the user, unless a standing answer settles it.
+    ///
+    /// The standing answer is consulted here rather than inside
+    /// `decide` because `decide` is a pure function over the policy
+    /// table and knows nothing about what this host has been told
+    /// before.
+    async fn approve(
+        &self,
+        call: &crate::provider::ToolCall,
+        kind: crate::tools::ToolKind,
+    ) -> crate::tools::policy::Approval {
+        use crate::tools::policy::Approval;
+
+        // A standing answer settles it without a round trip. Moving the
+        // call off `Pending` is not done here: the gate calls
+        // `tool_allowed` for every permitted call, asked or not.
+        match self.permissions.standing(&self.profile, &call.name) {
+            Some(true) => return Approval::AllowAlways,
+            Some(false) => return Approval::RejectAlways,
+            None => {}
+        }
+
+        let request = RequestPermissionRequest::new(
+            self.session_id.clone(),
+            ToolCallUpdate::new(
+                ToolCallId::new(call.id.as_str()),
+                ToolCallUpdateFields::new()
+                    .title(call.name.clone())
+                    .kind(kind)
+                    .raw_input(call.input.clone()),
+            ),
+            vec![
+                PermissionOption::new("allow_once", "Allow once", PermissionOptionKind::AllowOnce),
+                PermissionOption::new(
+                    "allow_always",
+                    "Always allow this tool",
+                    PermissionOptionKind::AllowAlways,
+                ),
+                PermissionOption::new("reject_once", "Reject", PermissionOptionKind::RejectOnce),
+                PermissionOption::new(
+                    "reject_always",
+                    "Never allow this tool",
+                    PermissionOptionKind::RejectAlways,
+                ),
+            ],
+        );
+
+        // `block_task`, and it is only sound because of where this
+        // runs. The SDK's own documentation says never to await a sent
+        // request inside a handler — the dispatch loop would stop
+        // parsing frames and the client's answer could never arrive, so
+        // it deadlocks. `approve` is called from `run_llm_turn`, which
+        // the `session/prompt` handler hands to `ConnectionTo::spawn`
+        // precisely so the turn runs outside that loop. That is the
+        // case the SDK marks as safe.
+        let answer = match self.connection.send_request(request).block_task().await {
+            Ok(a) => a,
+            Err(e) => {
+                // The client went away, or refused the method. Either
+                // way nobody said yes, and running unguarded because
+                // the question failed to arrive is the wrong direction
+                // to fail in.
+                warn!(
+                    "ACP: could not ask about '{}' on session {}: {e}. Treating as declined.",
+                    call.name, self.session_id
+                );
+                return Approval::RejectOnce;
+            }
+        };
+
+        let approval = match answer.outcome {
+            // The turn is being cancelled; the cancel path answers the
+            // prompt with `Cancelled`, so this call must simply not run.
+            RequestPermissionOutcome::Cancelled => Approval::RejectOnce,
+            RequestPermissionOutcome::Selected(selected) => match selected.option_id.0.as_ref() {
+                "allow_once" => Approval::AllowOnce,
+                "allow_always" => Approval::AllowAlways,
+                "reject_always" => Approval::RejectAlways,
+                "reject_once" => Approval::RejectOnce,
+                other => {
+                    warn!(
+                        "ACP: unknown permission option '{other}' for '{}'; treating as declined.",
+                        call.name
+                    );
+                    Approval::RejectOnce
+                }
+            },
+            // `RequestPermissionOutcome` is `#[non_exhaustive]`, so a
+            // future ACP version can add an outcome this build has
+            // never heard of. Nobody said yes, so nothing runs.
+            _ => {
+                warn!(
+                    "ACP: unrecognised permission outcome for '{}'; treating as declined.",
+                    call.name
+                );
+                Approval::RejectOnce
+            }
+        };
+
+        if approval.is_sticky() {
+            self.permissions.record(&self.profile, &call.name, approval);
+        }
+        approval
     }
 }
 
@@ -455,10 +607,25 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                             // No turn is running yet, so there is nothing for
                             // a `session/cancel` to reach.
                             turns: HashMap::new(),
+                            mode: crate::tools::policy::SessionMode::Default,
                         },
                     );
 
-                    responder.respond(NewSessionResponse::new(session_id))
+                    // The client learns the modes here, and starts in
+                    // the one that asks. `NewSessionResponse.modes` is a
+                    // plain `Option` in the schema, with no capability
+                    // gating it, so `initialize` needs no change.
+                    let modes = SessionModeState::new(
+                        crate::tools::policy::SessionMode::Default.id(),
+                        crate::tools::policy::SessionMode::ALL
+                            .into_iter()
+                            .map(|m| {
+                                AcpSessionMode::new(m.id(), m.name()).description(m.description())
+                            })
+                            .collect(),
+                    );
+
+                    responder.respond(NewSessionResponse::new(session_id).modes(modes))
                 }
             },
             on_receive_request!(),
@@ -497,8 +664,52 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
         .on_receive_request(
             {
                 let sessions = Arc::clone(&sessions);
+                async move |req: SetSessionModeRequest,
+                            responder,
+                            connection: ConnectionTo<Client>| {
+                    let Some(mode) =
+                        crate::tools::policy::SessionMode::from_id(req.mode_id.0.as_ref())
+                    else {
+                        // `plan` lands here. An error is the honest
+                        // reply: silently picking another mode would
+                        // leave the user believing the agent is
+                        // planning when it is about to act.
+                        return responder.respond_with_error(
+                            Error::invalid_params().data(format!("unknown mode '{}'", req.mode_id)),
+                        );
+                    };
+
+                    {
+                        let mut guard = sessions.inner.lock().await;
+                        let Some(session) = guard.get_mut(&req.session_id) else {
+                            return responder.respond_with_error(
+                                Error::invalid_params()
+                                    .data(format!("unknown session '{}'", req.session_id)),
+                            );
+                        };
+                        session.mode = mode;
+                    }
+
+                    // Announce it: a client that changed the mode from
+                    // one surface should see it reflected on the others.
+                    if let Err(e) = connection.send_notification(SessionNotification::new(
+                        req.session_id.clone(),
+                        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode.id())),
+                    )) {
+                        warn!("ACP: dropped a current_mode_update: {e}");
+                    }
+
+                    responder.respond(SetSessionModeResponse::new())
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let sessions = Arc::clone(&sessions);
                 let state = Arc::clone(&state);
                 let connection_cancel = connection_cancel.clone();
+                let profile_name = profile_name.clone();
                 async move |req: PromptRequest, responder, connection: ConnectionTo<Client>| {
                     // Register this turn's cancellation token in the same
                     // lock that resolves the session, so a `session/cancel`
@@ -511,10 +722,10 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         guard.get_mut(&req.session_id).map(|session| {
                             let turn_cancel = connection_cancel.child_token();
                             session.turns.insert(turn, turn_cancel.clone());
-                            (session.agent_session_id.clone(), turn_cancel)
+                            (session.agent_session_id.clone(), turn_cancel, session.mode)
                         })
                     };
-                    let Some((agent_session_id, turn_cancel)) = looked_up else {
+                    let Some((agent_session_id, turn_cancel, mode)) = looked_up else {
                         // Not created on the fly: a prompt naming a session
                         // this connection never minted is a client bug, and
                         // starting one here would quietly open a second
@@ -573,8 +784,13 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     // editor's conversation lands in the same session store,
                     // with the same system prompt, as `/rpc` and A2A.
                     let session_id = req.session_id.clone();
-                    let progress =
-                        Arc::new(AcpProgress::new(session_id.clone(), connection.clone()));
+                    let progress = Arc::new(AcpProgress::new(
+                        session_id.clone(),
+                        connection.clone(),
+                        profile_name.clone(),
+                        mode,
+                        Arc::clone(&state.permissions),
+                    ));
 
                     // The turn runs OUTSIDE the dispatch loop, and the
                     // `Responder` travels with it.
@@ -618,7 +834,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                                     state,
                                     agent_session_id,
                                     crate::provider::ChatMessage::user(&text),
-                                    Arc::clone(&progress) as Arc<dyn super::TurnProgress>,
+                                    Arc::clone(&progress) as Arc<dyn super::TurnHost>,
                                     None,
                                 ) => TurnEnd::Ran(outcome),
                             };
@@ -1187,6 +1403,61 @@ mod tests {
         }
     }
 
+    /// Like `drive`, but answers any `session/request_permission` the
+    /// agent sends with `option_id`. Returns the session updates, the
+    /// final reply, and how many permission requests arrived.
+    ///
+    /// The count is the point: a test that only checks the outcome
+    /// cannot tell "allowed without asking" from "asked and allowed",
+    /// and those are the two things this feature is about.
+    async fn drive_answering(
+        addr: &str,
+        prompt: serde_json::Value,
+        option_id: &str,
+    ) -> (Vec<serde_json::Value>, serde_json::Value, usize) {
+        let mut ws = connect(addr).await;
+        for request in [initialize_request(0), new_session_request(1)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        let mut updates = Vec::new();
+        let mut asked = 0usize;
+
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+
+            if v["id"] == 1 {
+                let id = v["result"]["sessionId"].as_str().unwrap().to_string();
+                ws.send(Message::Text(
+                    prompt_request(2, &id, prompt.clone()).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            } else if v["method"] == "session/request_permission" {
+                asked += 1;
+                let answer = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "outcome": { "outcome": "selected", "optionId": option_id }
+                    }
+                });
+                ws.send(Message::Text(answer.to_string().into()))
+                    .await
+                    .unwrap();
+            } else if v["method"] == "session/update" {
+                updates.push(v["params"]["update"].clone());
+            } else if v["id"] == 2 {
+                return (updates, v, asked);
+            }
+        }
+    }
+
     /// `Provider::chat` returns a whole response, so the reply arrives as
     /// exactly one `agent_message_chunk` — one, not zero, and not a faked
     /// token stream.
@@ -1329,23 +1600,45 @@ mod tests {
             .iter()
             .position(|k| *k == "tool_call")
             .unwrap_or_else(|| panic!("no tool_call update, got {kinds:?}"));
-        let completed = kinds
+        // Two `tool_call_update`s now, in order: the gate clearing the
+        // call, then the executor finishing it. `tool_call` itself
+        // fires before the gate, so it can only say `pending`.
+        let mut updated = kinds
             .iter()
-            .position(|k| *k == "tool_call_update")
+            .enumerate()
+            .filter(|(_, k)| **k == "tool_call_update")
+            .map(|(i, _)| i);
+        let in_progress = updated
+            .next()
             .unwrap_or_else(|| panic!("no tool_call_update, got {kinds:?}"));
+        let completed = updated
+            .next()
+            .unwrap_or_else(|| panic!("only one tool_call_update, got {kinds:?}"));
         let first_chunk = kinds
             .iter()
             .position(|k| *k == "agent_message_chunk")
             .unwrap_or_else(|| panic!("no agent_message_chunk, got {kinds:?}"));
         assert!(
-            started < completed && completed < first_chunk,
-            "start then end then reply, got {kinds:?}"
+            started < in_progress && in_progress < completed && completed < first_chunk,
+            "start, allowed, end, then reply, got {kinds:?}"
         );
 
         // The provider's own tool-call id is what ACP's toolCallId carries,
-        // so a client can correlate the completion with the start.
+        // so a client can correlate every later update with the start.
         assert_eq!(updates[started]["toolCallId"], "call-1");
         assert_eq!(updates[started]["title"], "echo");
+        // `Pending` is the schema's default, so it is omitted from the
+        // wire rather than sent — a client seeing no status reads it as
+        // pending. Absent is therefore the correct assertion here, and
+        // anything else would mean the call claimed to be underway
+        // before the gate had cleared it.
+        assert!(
+            updates[started]["status"].is_null(),
+            "tool_call fires before the gate, so it must not claim a status: {}",
+            updates[started]
+        );
+        assert_eq!(updates[in_progress]["toolCallId"], "call-1");
+        assert_eq!(updates[in_progress]["status"], "in_progress");
         assert_eq!(updates[completed]["toolCallId"], "call-1");
         assert_eq!(updates[completed]["status"], "completed");
         assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
@@ -1671,6 +1964,384 @@ mod tests {
             hanging.dropped.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "both provider calls must be abandoned, not just the newest"
+        );
+    }
+
+    /// Scripts a turn that calls `risky` once, then replies.
+    fn risky_then_reply(reply: &str) -> Vec<crate::provider::ChatResponse> {
+        vec![
+            crate::provider::ChatResponse {
+                text: None,
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "risky".to_string(),
+                    input: serde_json::json!({}),
+                }],
+                stop_reason: None,
+            },
+            crate::provider::ChatResponse {
+                text: Some(reply.to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            },
+        ]
+    }
+
+    /// An `Execute` tool in the default mode puts the question to the
+    /// user, and an allow lets it run.
+    #[tokio::test]
+    async fn an_execute_tool_asks_and_runs_when_allowed() {
+        let state = ServeState::for_test_scripted(true, risky_then_reply("done"));
+        let risky = super::super::RiskyTool::new();
+        let ran = risky.ran_flag();
+        state.tools.register_tool(Box::new(risky)).await;
+        let addr = spawn(state).await;
+
+        let (_updates, reply, asked) =
+            drive_answering(&addr, text_prompt("run it"), "allow_once").await;
+
+        assert_eq!(asked, 1, "exactly one permission request, got {asked}");
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "an allowed tool must actually run"
+        );
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
+    }
+
+    /// A refusal does not end the turn: the model gets a tool_result
+    /// saying so and answers normally. Showing the user an error dialog
+    /// because they declined would be wrong twice over — the agent is
+    /// fine, and they already know what they chose.
+    #[tokio::test]
+    async fn a_refusal_does_not_end_the_turn() {
+        let state = ServeState::for_test_scripted(true, risky_then_reply("understood"));
+        let risky = super::super::RiskyTool::new();
+        let ran = risky.ran_flag();
+        state.tools.register_tool(Box::new(risky)).await;
+        let addr = spawn(state).await;
+
+        let (updates, reply, asked) =
+            drive_answering(&addr, text_prompt("run it"), "reject_once").await;
+
+        assert_eq!(asked, 1);
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a declined tool must not run"
+        );
+        assert_eq!(
+            reply["result"]["stopReason"], "end_turn",
+            "a declined tool is not a failed turn, got {reply}"
+        );
+        let chunks: Vec<&str> = updates
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|u| u["content"]["text"].as_str())
+            .collect();
+        assert_eq!(chunks, vec!["understood"]);
+    }
+
+    /// A `Read` tool is never put to the user. This is what keeps the
+    /// feature usable: a dialog per `file_read` would be intolerable.
+    #[tokio::test]
+    async fn a_safe_tool_is_not_put_to_the_user() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo".to_string(),
+                        input: serde_json::json!({ "text": "ping" }),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        let addr = spawn(state).await;
+
+        let (_updates, reply, asked) =
+            drive_answering(&addr, text_prompt("echo"), "allow_once").await;
+
+        assert_eq!(asked, 0, "a Read tool must not ask");
+        assert_eq!(reply["result"]["stopReason"], "end_turn");
+    }
+
+    /// `allow_always` is recorded, so a second call in the same turn
+    /// uses the standing answer instead of asking again.
+    #[tokio::test]
+    async fn allow_always_is_not_asked_twice() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "risky".to_string(),
+                        input: serde_json::json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-2".to_string(),
+                        name: "risky".to_string(),
+                        input: serde_json::json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        state
+            .tools
+            .register_tool(Box::new(super::super::RiskyTool::new()))
+            .await;
+        let addr = spawn(state).await;
+
+        let (_updates, reply, asked) =
+            drive_answering(&addr, text_prompt("run it twice"), "allow_always").await;
+
+        assert_eq!(asked, 1, "the second call must use the recorded answer");
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
+    }
+
+    fn set_mode_request(id: i64, session_id: &str, mode_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/set_mode",
+            "params": { "sessionId": session_id, "modeId": mode_id }
+        })
+    }
+
+    /// The client learns the modes when the session is created, and
+    /// starts in the one that asks.
+    #[tokio::test]
+    async fn session_new_advertises_the_three_modes() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let addr = spawn(state).await;
+        let replies =
+            conversation(&addr, vec![initialize_request(0), new_session_request(1)]).await;
+
+        let modes = &replies[1]["result"]["modes"];
+        assert_eq!(modes["currentModeId"], "default", "got {modes}");
+        let ids: Vec<&str> = modes["availableModes"]
+            .as_array()
+            .expect("availableModes is an array")
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["default", "accept_edits", "bypass"]);
+        // A picker with no labels is not a picker.
+        assert!(
+            modes["availableModes"][0]["name"]
+                .as_str()
+                .is_some_and(|n| !n.is_empty()),
+            "each mode needs a human-readable name, got {modes}"
+        );
+    }
+
+    /// Switching modes is acknowledged and announced.
+    #[tokio::test]
+    async fn set_mode_switches_and_notifies() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let addr = spawn(state).await;
+
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), new_session_request(1)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        let mut saw_mode_update = false;
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 1 {
+                let id = v["result"]["sessionId"].as_str().unwrap().to_string();
+                ws.send(Message::Text(
+                    set_mode_request(2, &id, "bypass").to_string().into(),
+                ))
+                .await
+                .unwrap();
+            } else if v["method"] == "session/update"
+                && v["params"]["update"]["sessionUpdate"] == "current_mode_update"
+            {
+                assert_eq!(v["params"]["update"]["currentModeId"], "bypass");
+                saw_mode_update = true;
+            } else if v["id"] == 2 {
+                assert!(v["error"].is_null(), "set_mode failed: {v}");
+                break;
+            }
+        }
+        assert!(saw_mode_update, "a mode change must be announced");
+    }
+
+    /// `plan` is not implemented, and must not silently resolve to
+    /// something else — a client told "fine" would believe the agent is
+    /// planning when it is about to act.
+    ///
+    /// Hand-rolled rather than via `roundtrip`, because a session lives
+    /// only as long as the connection that minted it: a second
+    /// connection would fail on the session id, not on the mode id, and
+    /// the test would pass for the wrong reason.
+    #[tokio::test]
+    async fn an_unknown_mode_is_invalid_params() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let addr = spawn(state).await;
+
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), new_session_request(1)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 1 {
+                let id = v["result"]["sessionId"].as_str().unwrap().to_string();
+                ws.send(Message::Text(
+                    set_mode_request(2, &id, "plan").to_string().into(),
+                ))
+                .await
+                .unwrap();
+            } else if v["id"] == 2 {
+                assert_eq!(v["error"]["code"], -32602, "got {v}");
+                assert!(
+                    v["error"]["data"]
+                        .as_str()
+                        .is_some_and(|d| d.contains("plan")),
+                    "the error should name the mode it rejected, got {v}"
+                );
+                break;
+            }
+        }
+    }
+
+    /// The mode is not decoration: `bypass` stops the asking.
+    #[tokio::test]
+    async fn bypass_mode_does_not_ask() {
+        let state = ServeState::for_test_scripted(true, risky_then_reply("done"));
+        let risky = super::super::RiskyTool::new();
+        let ran = risky.ran_flag();
+        state.tools.register_tool(Box::new(risky)).await;
+        let addr = spawn(state).await;
+
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), new_session_request(1)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 1 {
+                let id = v["result"]["sessionId"].as_str().unwrap().to_string();
+                ws.send(Message::Text(
+                    set_mode_request(2, &id, "bypass").to_string().into(),
+                ))
+                .await
+                .unwrap();
+                ws.send(Message::Text(
+                    prompt_request(3, &id, text_prompt("run it"))
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            } else if v["method"] == "session/request_permission" {
+                panic!("bypass mode must not ask, got {v}");
+            } else if v["id"] == 3 {
+                assert_eq!(v["result"]["stopReason"], "end_turn", "got {v}");
+                break;
+            }
+        }
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "bypass should have run the tool, not merely skipped asking"
+        );
+    }
+
+    /// `accept_edits` is the middle mode, and the only one whose whole
+    /// point is that it changes *some* answers and not others. An
+    /// `Execute` tool must still be asked about there.
+    #[tokio::test]
+    async fn accept_edits_still_asks_about_commands() {
+        let state = ServeState::for_test_scripted(true, risky_then_reply("done"));
+        state
+            .tools
+            .register_tool(Box::new(super::super::RiskyTool::new()))
+            .await;
+        let addr = spawn(state).await;
+
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), new_session_request(1)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        let mut asked = 0usize;
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 1 {
+                let id = v["result"]["sessionId"].as_str().unwrap().to_string();
+                ws.send(Message::Text(
+                    set_mode_request(2, &id, "accept_edits").to_string().into(),
+                ))
+                .await
+                .unwrap();
+                ws.send(Message::Text(
+                    prompt_request(3, &id, text_prompt("run it"))
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            } else if v["method"] == "session/request_permission" {
+                asked += 1;
+                let answer = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "outcome": { "outcome": "selected", "optionId": "allow_once" } }
+                });
+                ws.send(Message::Text(answer.to_string().into()))
+                    .await
+                    .unwrap();
+            } else if v["id"] == 3 {
+                assert_eq!(v["result"]["stopReason"], "end_turn", "got {v}");
+                break;
+            }
+        }
+        assert_eq!(
+            asked, 1,
+            "accept_edits must still ask about an Execute tool"
         );
     }
 }

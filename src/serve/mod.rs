@@ -11,6 +11,7 @@
 
 pub mod a2a;
 pub mod acp;
+pub mod acp_permissions;
 pub mod mcp;
 
 use crate::channel::RoomInfo;
@@ -60,6 +61,10 @@ pub struct ServeState {
     pub(crate) registry: Arc<ProviderRegistry>,
     pub(crate) workspace: Arc<Workspace>,
     pub(crate) tools: Arc<ToolSet>,
+    /// Standing answers to `session/request_permission`. Shared across
+    /// connections because the record is host-wide, keyed by room
+    /// profile inside.
+    pub(crate) permissions: Arc<acp_permissions::PermissionStore>,
     /// Cross-device session store (kind = `"rpc"` for now; #122 PR 3
     /// renames the on-disk dir to `cross-device/`). Holds the
     /// user-selectable, multi-device sessions resumed via
@@ -163,6 +168,13 @@ impl ServeState {
             registry,
             workspace,
             tools,
+            // Built here rather than passed in: the path is fixed by the
+            // host, nothing else needs to choose it, and threading an
+            // eleventh argument through would earn nothing. Tests build
+            // `ServeState` by struct literal and point this at a tempdir.
+            permissions: Arc::new(acp_permissions::PermissionStore::open(
+                acp_permissions::PermissionStore::default_path(),
+            )),
             cross_device_session_store,
             device_default_session_store,
             mcp_session_store,
@@ -1667,7 +1679,8 @@ fn apply_input_kind_label(mut msg: ChatMessage) -> ChatMessage {
     msg
 }
 
-/// Where a turn reports its per-tool progress.
+/// Where a turn reports its per-tool progress — and who it asks before
+/// running a tool the policy wants asked about.
 ///
 /// `run_llm_turn` is the shared executor behind `/rpc`, the voice pipeline,
 /// A2A and the ACP endpoint — but each caller wants its
@@ -1677,11 +1690,53 @@ fn apply_input_kind_label(mut msg: ChatMessage) -> ChatMessage {
 /// heartbeats, A2A) don't surface intermediate progress at all. Putting
 /// reporting behind this trait keeps the turn executor itself agnostic to
 /// which of those shapes (if any) is listening.
+///
+/// Named `TurnHost` rather than `TurnProgress` because of the second
+/// job: `origin` and `approve` ask rather than report. Both carry
+/// defaults, so a transport with no way to reach a human implements
+/// neither and keeps behaving exactly as it did.
 #[async_trait::async_trait]
-pub(crate) trait TurnProgress: Send + Sync {
+pub(crate) trait TurnHost: Send + Sync {
     async fn tool_start(&self, id: &str, name: &str);
     async fn tool_end(&self, id: &str, name: &str);
     async fn turn_error(&self, message: &str);
+
+    /// Which row of the permission table this turn is judged by.
+    ///
+    /// `Trusted` by default: `/rpc`, `/a2a` and the voice pipeline were
+    /// authenticated before the turn started and have no UI to ask
+    /// through, so they must keep running everything.
+    ///
+    /// The heartbeat only reaches this default on its *voice* leg. Its
+    /// chat leg goes through `Agent::handle_message`, which does not use
+    /// `TurnHost` at all and judges itself `Origin::Channel`.
+    fn origin(&self) -> crate::tools::policy::Origin {
+        crate::tools::policy::Origin::Trusted
+    }
+
+    /// This call cleared the gate and is about to run.
+    ///
+    /// Separate from `tool_start`, which fires *before* the gate and so
+    /// cannot say whether the call will run, wait on a human, or be
+    /// refused. A host that draws a status needs both edges; one that
+    /// does not implements neither.
+    async fn tool_allowed(&self, id: &str) {
+        let _ = id;
+    }
+
+    /// Called only when `decide` returned `Ask`.
+    ///
+    /// The default answers `AllowOnce` — a host that never returns an
+    /// asking `origin()` can never reach this, so the default exists
+    /// for safety rather than for use.
+    async fn approve(
+        &self,
+        call: &crate::provider::ToolCall,
+        kind: crate::tools::ToolKind,
+    ) -> crate::tools::policy::Approval {
+        let _ = (call, kind);
+        crate::tools::policy::Approval::AllowOnce
+    }
 }
 
 /// Builds the `{id, name}` params shared by the `tool_start`/`tool_end`
@@ -1694,7 +1749,7 @@ fn tool_event_params(id: &str, name: &str) -> Value {
 /// The `/rpc` and voice shape: JSON-RPC notifications (and, on provider
 /// failure, a JSON-RPC error) delivered over the SSE channel — exactly
 /// what `run_llm_turn` used to emit inline before progress reporting moved
-/// behind [`TurnProgress`].
+/// behind [`TurnHost`].
 pub(crate) struct SseProgress {
     tx: mpsc::Sender<Result<Event, Infallible>>,
     req_id: Value,
@@ -1707,7 +1762,7 @@ impl SseProgress {
 }
 
 #[async_trait::async_trait]
-impl TurnProgress for SseProgress {
+impl TurnHost for SseProgress {
     async fn tool_start(&self, id: &str, name: &str) {
         let _ = self
             .tx
@@ -1741,7 +1796,7 @@ impl TurnProgress for SseProgress {
 pub(crate) struct NullProgress;
 
 #[async_trait::async_trait]
-impl TurnProgress for NullProgress {
+impl TurnHost for NullProgress {
     async fn tool_start(&self, _id: &str, _name: &str) {}
     async fn tool_end(&self, _id: &str, _name: &str) {}
     async fn turn_error(&self, _message: &str) {}
@@ -1762,7 +1817,7 @@ impl TurnProgress for NullProgress {
 pub(crate) enum TurnStop {
     /// The model produced its final message; `text` is `Some`.
     Replied,
-    /// A `Provider::chat` call failed. `TurnProgress::turn_error` has
+    /// A `Provider::chat` call failed. `TurnHost::turn_error` has
     /// already been handed the message, so the cause is available to
     /// whoever is reporting; `text` is `None`.
     ProviderError,
@@ -1825,7 +1880,7 @@ pub(crate) async fn run_llm_turn(
     state: Arc<ServeState>,
     session_id: String,
     user_msg: ChatMessage,
-    progress: Arc<dyn TurnProgress>,
+    progress: Arc<dyn TurnHost>,
     timer_origin: Option<crate::timer::TimerOrigin>,
 ) -> LlmTurnOutcome {
     // Pick the right store up front so every persistence call in this
@@ -1999,16 +2054,58 @@ pub(crate) async fn run_llm_turn(
                     progress.tool_start(&call.id, &call.name).await;
                 }
 
+                // Permission gate.
+                //
+                // Serial on purpose. `decide` is a cheap pure call, but
+                // `approve` puts a dialog in front of a human, and
+                // firing several at once would stack them on the poor
+                // soul in the editor. Execution below stays concurrent.
+                let kinds = state.tools.kinds().await;
+                let origin = progress.origin();
+                let mut permitted: Vec<crate::provider::ToolCall> = Vec::new();
+                let mut refused: Vec<(String, String)> = Vec::new();
+                for call in &tool_calls {
+                    use crate::tools::policy::{Decision, Refusal, kind_of, refusal_message};
+
+                    let kind = kind_of(&call.name, &kinds);
+                    let verdict = crate::tools::policy::decide(origin, kind);
+                    let refusal = match verdict {
+                        Decision::Allow => None,
+                        Decision::Deny => Some(refusal_message(&call.name, Refusal::Unavailable)),
+                        Decision::Ask => {
+                            if progress.approve(call, kind).await.allows() {
+                                None
+                            } else {
+                                Some(refusal_message(&call.name, Refusal::UserDeclined))
+                            }
+                        }
+                    };
+
+                    match refusal {
+                        None => {
+                            // Every permitted call, not just an asked
+                            // one: a client that saw `tool_start` needs
+                            // to know this one is running rather than
+                            // still waiting on it.
+                            progress.tool_allowed(&call.id).await;
+                            permitted.push(call.clone());
+                        }
+                        Some(reason) => {
+                            info!("Refused tool {} (id={}): {verdict:?}", call.name, call.id);
+                            refused.push((call.id.clone(), reason));
+                        }
+                    }
+                }
+
                 // Execute all tools concurrently — each call wrapped in
                 // the session's memory namespace (task_local) so the
                 // memory tool writes under `memory/<namespace>/...`.
                 let tools = Arc::clone(&state.tools);
                 let ns = namespace.clone();
                 let timer_origin = timer_origin.clone();
-                let results: Vec<(String, crate::tools::ToolOutput)> =
-                    futures_util::future::join_all(tool_calls.iter().map(|c| {
+                let mut results: Vec<(String, crate::tools::ToolOutput)> =
+                    futures_util::future::join_all(permitted.into_iter().map(|c| {
                         let tools = Arc::clone(&tools);
-                        let c = c.clone();
                         let ns = ns.clone();
                         let origin = timer_origin.clone();
                         async move {
@@ -2028,6 +2125,17 @@ pub(crate) async fn run_llm_turn(
                         }
                     }))
                     .await;
+
+                // A refused call still owes the model a tool_result:
+                // every tool_use in the assistant message must be
+                // answered, and the reason is more useful to the model
+                // than silence. The turn is NOT ended — the model may
+                // have another route, and ACP's `Refusal` stop reason
+                // means "the agent declined", which is a different
+                // thing from "the user declined".
+                for (id, reason) in refused {
+                    results.push((id, crate::tools::ToolOutput::from(reason)));
+                }
 
                 // Notify client of each tool completing
                 for call in &tool_calls {
@@ -2317,8 +2425,66 @@ impl crate::tools::Tool for EchoTool {
         &self.spec
     }
 
+    /// A test fixture standing in for an ordinary read-only tool.
+    /// Deliberately NOT `Other`: that is the ask-me bucket, and the
+    /// pre-existing ACP tests drive turns with a helper that answers no
+    /// permission requests, so leaving this unclassified would make them
+    /// hang rather than fail once the permission gate lands.
+    fn kind(&self) -> crate::tools::ToolKind {
+        crate::tools::ToolKind::Read
+    }
+
     async fn execute(&self, input: &Value) -> anyhow::Result<String> {
         Ok(input["text"].as_str().unwrap_or_default().to_string())
+    }
+}
+
+/// A stand-in for `shell`: `ToolKind::Execute`, so the policy asks or
+/// refuses. Carries a per-instance "did I run" flag, which is how the
+/// gate tests tell "refused" from "ran and returned an error".
+///
+/// Per instance, not a `static`: `cargo test` runs tests in parallel and
+/// several tests construct one of these, so a process-global flag would
+/// make the assertions depend on scheduling.
+#[cfg(test)]
+pub(crate) struct RiskyTool {
+    spec: crate::provider::ToolSpec,
+    ran: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl RiskyTool {
+    pub(crate) fn new() -> Self {
+        Self {
+            spec: crate::provider::ToolSpec {
+                name: "risky".into(),
+                description: "Pretend to run a command.".into(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            },
+            ran: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// A handle the test keeps after the tool is boxed into the ToolSet.
+    pub(crate) fn ran_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.ran)
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::tools::Tool for RiskyTool {
+    fn spec(&self) -> &crate::provider::ToolSpec {
+        &self.spec
+    }
+
+    fn kind(&self) -> crate::tools::ToolKind {
+        crate::tools::ToolKind::Execute
+    }
+
+    async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
+        self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok("ran".to_string())
     }
 }
 
@@ -2551,6 +2717,9 @@ rooms    = []
                 crate::config::DigestConfig::default(),
             )),
             tools: Arc::new(ToolSet::new(vec![Box::new(EchoTool::new())], Vec::new())),
+            permissions: Arc::new(acp_permissions::PermissionStore::open(
+                base.join("acp-permissions.json"),
+            )),
             cross_device_session_store: Arc::new(SessionStore::new(base.join("sessions"), "rpc")),
             device_default_session_store: Arc::new(SessionStore::new(
                 base.join("device-default"),
@@ -2574,6 +2743,182 @@ rooms    = []
 mod tests {
     use super::*;
     use crate::provider::{Role, UserInputKind};
+
+    /// A refused tool still gets a `tool_result`, and the turn carries
+    /// on. Refusing must not look to the model like the tool vanished,
+    /// and must not end the turn — the model may have another route.
+    #[tokio::test]
+    async fn a_refused_tool_returns_a_result_and_the_turn_continues() {
+        use crate::tools::policy::Origin;
+
+        /// Records what it was told, so the test can assert a refused
+        /// call is still reported as starting and ending. A client that
+        /// hears `tool_start` and never `tool_end` leaves the entry
+        /// spinning in its tool list forever.
+        #[derive(Default)]
+        struct ChannelHost {
+            started: std::sync::Mutex<Vec<String>>,
+            ended: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl TurnHost for ChannelHost {
+            async fn tool_start(&self, id: &str, _name: &str) {
+                self.started.lock().unwrap().push(id.to_string());
+            }
+            async fn tool_end(&self, id: &str, _name: &str) {
+                self.ended.lock().unwrap().push(id.to_string());
+            }
+            async fn turn_error(&self, _message: &str) {}
+            fn origin(&self) -> Origin {
+                Origin::Channel
+            }
+        }
+
+        // `risky` is Execute, so `Origin::Channel` refuses it. The
+        // second scripted response is the model carrying on afterwards.
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "risky".to_string(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    text: Some("could not run that".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        let risky = RiskyTool::new();
+        let ran = risky.ran_flag();
+        state.tools.register_tool(Box::new(risky)).await;
+
+        let host = Arc::new(ChannelHost::default());
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-refused".to_string(),
+            ChatMessage::user("run it"),
+            Arc::clone(&host) as Arc<dyn TurnHost>,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("could not run that"));
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a refused tool must not have executed"
+        );
+
+        // The model must still be told what happened to the call it
+        // made. Asserting on the turn's own text is not enough: the
+        // scripted provider ignores the history it is handed, so an
+        // implementation that refused the tool and then dropped its
+        // result entirely would produce exactly the same reply — and
+        // would fail the *next* real provider request with a 400,
+        // because a tool_use without its tool_result is malformed.
+        let history = state.sessions.lock().await;
+        let messages = history.get("s-refused").expect("the session exists");
+        let refusal = messages
+            .iter()
+            .flat_map(|m| &m.parts)
+            .find_map(|part| match part {
+                ContentPart::ToolResult {
+                    tool_use_id,
+                    content,
+                } if tool_use_id == "call-1" => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the refused call still owes the model a tool_result");
+        assert!(
+            refusal.contains("risky"),
+            "the refusal should name the tool, got {refusal}"
+        );
+
+        // Started and never ended leaves the entry spinning in a
+        // client's tool list.
+        assert_eq!(*host.started.lock().unwrap(), vec!["call-1".to_string()]);
+        assert_eq!(*host.ended.lock().unwrap(), vec!["call-1".to_string()]);
+    }
+
+    /// The same call is allowed once the origin is a trusted one, so
+    /// the refusal above is the policy talking and not a broken tool.
+    #[tokio::test]
+    async fn a_trusted_origin_runs_the_same_tool() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "risky".to_string(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    text: Some("ran it".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        let risky = RiskyTool::new();
+        let ran = risky.ran_flag();
+        state.tools.register_tool(Box::new(risky)).await;
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-allowed".to_string(),
+            ChatMessage::user("run it"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("ran it"));
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a trusted origin must have executed it"
+        );
+    }
+
+    /// The pre-existing transports keep today's behaviour. `Trusted` is
+    /// what makes that true: `decide` allows everything for it, so no
+    /// `/rpc`, voice or heartbeat turn can start asking for permission.
+    #[test]
+    fn existing_transports_are_trusted() {
+        use crate::tools::policy::Origin;
+
+        let (tx, _rx) = mpsc::channel(4);
+        let sse = SseProgress::new(tx, json!(1));
+        assert_eq!(sse.origin(), Origin::Trusted);
+        assert_eq!(NullProgress.origin(), Origin::Trusted);
+    }
+
+    /// A host that cannot ask must not block the call. The default lets
+    /// it through, which is what keeps the existing transports behaving
+    /// exactly as before.
+    #[tokio::test]
+    async fn the_default_approval_allows_once() {
+        use crate::tools::{ToolKind, policy::Approval};
+
+        let call = crate::provider::ToolCall {
+            id: "c1".to_string(),
+            name: "shell".to_string(),
+            input: json!({}),
+        };
+        assert_eq!(
+            NullProgress.approve(&call, ToolKind::Execute).await,
+            Approval::AllowOnce
+        );
+    }
 
     #[test]
     fn apply_label_passes_text_through_unchanged() {

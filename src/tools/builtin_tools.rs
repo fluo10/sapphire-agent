@@ -1,12 +1,12 @@
 use crate::image_cache::ImageCache;
 use crate::provider::ToolSpec;
-use crate::tools::{Tool, ToolOutput, ToolSet};
+use crate::tools::{Tool, ToolKind, ToolOutput, ToolSet};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sapphire_framework::workspace::WorkspaceState;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
 // ---------------------------------------------------------------------------
@@ -87,6 +87,10 @@ impl FileReadTool {
 
 #[async_trait]
 impl Tool for FileReadTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Read
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -160,6 +164,320 @@ static SENSITIVE_PREFIXES: &[&str] = &[
     "/var/run/docker.sock",
 ];
 
+/// Files the agent must not be able to rewrite through its own tools.
+///
+/// This is not merely tidy. `file_write` is `ToolKind::Edit`, which the
+/// permission policy allows *without asking* from a chat channel and in
+/// ACP's `accept_edits` mode. Unguarded, a Discord message could write
+/// `{"profiles":{"zed":{"always_allow":["shell"]}}}` into the
+/// permission record; the store is read once at startup, so after the
+/// next restart the editor would run `shell` having never been asked.
+/// The gate would still be doing its job — it would just be consulting
+/// an answer somebody else wrote.
+///
+/// Named files rather than the whole config directory, deliberately.
+/// When `workspace_dir` is unset the workspace root *is* the config
+/// file's own directory, so blocking the directory would refuse every
+/// write in the workspace on a default install.
+static PROTECTED_CONFIG_FILES: &[&str] = &["acp-permissions.json", "config.toml"];
+
+/// The agent's own config directory, if this host has one.
+fn agent_config_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "sapphire-agent")
+        .map(|dirs| dirs.config_dir().to_path_buf())
+}
+
+/// Collapse `.` and `..` without touching the filesystem.
+///
+/// `canonicalize` needs every component to exist, so
+/// `nope/../acp-permissions.json` defeats it when `nope` does not; a
+/// guard that then falls back to the raw path carries an un-collapsed
+/// `..` into the comparison and matches nothing, while the writer's
+/// `create_dir_all` makes `nope` and the kernel collapses the `..` at
+/// open time.
+///
+/// Note the deliberate imprecision: collapsing `..` lexically disagrees
+/// with the kernel whenever a symlink sits in the path, because the
+/// kernel resolves the link first. That direction is accepted — see
+/// `protected_leaf`, which does not rely on the whole path matching.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                // An ordinary component: this `..` cancels it.
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // A root or drive prefix: `/..` is `/`. Drop it — it
+                // cannot climb, and keeping it would leave an
+                // un-collapsed `..` in a path the guard then compares.
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                // Nothing to cancel and no root to stop at: keep it, so
+                // a relative path can still be joined onto a root.
+                _ => out.push(".."),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The filename the operating system will actually open, given the
+/// filename as written.
+///
+/// Windows accepts several spellings of one name and normalises them
+/// away before the filesystem sees them, so a guard that compares the
+/// string as given is comparing something the OS never uses:
+///
+/// - `name::$DATA` is the file's default data stream — i.e. the file
+///   itself. A colon is never legal in an NTFS filename, so everything
+///   from the first one onwards is stream syntax and is cut.
+/// - Trailing dots and spaces are stripped during path normalisation,
+///   so `name.` and `name ` both open `name`.
+///
+/// Returns `None` when nothing is left, which is not a filename any
+/// spelling of a protected file can reduce to.
+fn opened_filename(name: &std::ffi::OsStr) -> Option<String> {
+    let name = name.to_string_lossy();
+    if !cfg!(windows) {
+        return Some(name.into_owned());
+    }
+    let before_stream = name.split(':').next().unwrap_or("");
+    let trimmed = before_stream.trim_end_matches(['.', ' ']);
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Canonicalise as much of `path` as exists, keeping the rest.
+///
+/// The same walk-up the framework's `canonicalize_or_parent` does, and
+/// for the same reason: a write's target usually does not exist, and
+/// often neither do the directories above it — `write_file` calls
+/// `create_dir_all`. Returning the raw path when `canonicalize` fails
+/// is what let two earlier versions of this guard be talked past, so
+/// this never gives up: it finds the deepest existing ancestor and
+/// re-attaches everything below it.
+fn resolve_as_far_as_possible(path: &Path) -> PathBuf {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+
+    loop {
+        if let Ok(real) = cursor.canonicalize() {
+            let mut out = real;
+            for part in suffix.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        let Some(name) = cursor.file_name().map(|n| n.to_os_string()) else {
+            // Ran out of ancestors without finding one that exists.
+            return path.to_path_buf();
+        };
+        suffix.push(name);
+        if !cursor.pop() {
+            return path.to_path_buf();
+        }
+    }
+}
+
+/// Two existing paths, same file?
+///
+/// `fs::metadata` rather than opening the path: opening a FIFO blocks
+/// until a writer appears, and the model chooses this path. Metadata
+/// follows symlinks, which is what we want — `fs::write` follows them
+/// too.
+fn same_entry(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // `same-file` opens a handle, which is why this is gated on the
+        // target being an ordinary file first.
+        let ordinary = |p: &Path| std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false);
+        if !(ordinary(a) && ordinary(b)) {
+            return false;
+        }
+        same_file::is_same_file(a, b).unwrap_or(false)
+    }
+}
+
+/// Whether two directory paths are the same directory.
+///
+/// Fails **closed**: an answer of "I could not tell" is reported as
+/// "yes, treat it as protected". Every previous version of this guard
+/// defaulted the other way, and that is what each bypass ultimately
+/// exploited — an unresolvable path was read as a safe one.
+fn is_protected_dir(candidate: &Path, protected: &Path) -> bool {
+    // Resolve BOTH sides the same way. Comparing a canonicalised path
+    // against a raw one is how a protected directory that does not
+    // exist yet read as "nothing to protect" — the write would have
+    // created it, record and all.
+    let a = resolve_as_far_as_possible(candidate);
+    let b = resolve_as_far_as_possible(protected);
+    if a == b {
+        return true;
+    }
+    // Identity settles the rest — a symlinked or otherwise differently
+    // spelled directory that exists. `unwrap_or(false)` is safe here
+    // only because the lexical comparison above already ran on two
+    // paths resolved by the same rules.
+    same_file::is_same_file(&a, &b).unwrap_or(false)
+}
+
+/// The protected filename this path would write to, if any.
+///
+/// Compares the *parent* by identity — exact, because a directory a
+/// write is headed into either exists or is about to be created at a
+/// path we can name — and the *leaf* by the name the OS will open.
+/// Neither half depends on the target file existing, which is the
+/// property every earlier version lacked.
+///
+/// Also catches a leaf that merely *points* at a protected file: a
+/// symlink (followed once with `read_link`, so a dangling one still
+/// resolves) or a hard link (caught by identity, the only thing that
+/// can catch it).
+fn protected_leaf(
+    path: &Path,
+    workspace_root: Option<&Path>,
+    protected_dir: &Path,
+) -> Option<String> {
+    use std::path::Component;
+
+    // A drive-relative path (`C:x`, `C:..\x`) resolves against Windows'
+    // per-drive current directory — which neither this guard nor the
+    // workspace root controls, and which `PathBuf::join` silently
+    // discards the root for. No legitimate tool call needs the
+    // spelling, so it is refused rather than modelled.
+    if !path.is_absolute() && path.components().any(|c| matches!(c, Component::Prefix(_))) {
+        return Some("a drive-relative path, which this agent will not write through".to_string());
+    }
+
+    let mut candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match workspace_root {
+            Some(root) => root.join(path),
+            None => path.to_path_buf(),
+        }
+    };
+
+    // Follow a symlinked leaf, bounded well above any real chain.
+    for _ in 0..40 {
+        let collapsed = lexically_normalize(&candidate);
+        let (Some(parent), Some(leaf)) = (collapsed.parent(), collapsed.file_name()) else {
+            return None;
+        };
+
+        let resolved_parent = resolve_as_far_as_possible(parent);
+        let name = opened_filename(leaf);
+
+        if is_protected_dir(&resolved_parent, protected_dir) {
+            // A leaf that normalises to nothing still lands inside the
+            // protected directory; refuse rather than reason about it.
+            let Some(name) = name.clone() else {
+                return Some(
+                    "an unnameable entry in this agent's own config directory".to_string(),
+                );
+            };
+            let hit = PROTECTED_CONFIG_FILES.iter().find(|protected| {
+                if cfg!(windows) {
+                    name.eq_ignore_ascii_case(protected)
+                } else {
+                    name == **protected
+                }
+            });
+            if let Some(hit) = hit {
+                return Some((*hit).to_string());
+            }
+        }
+
+        // Identity: a hard link is the same file under another name,
+        // and no comparison of spellings can see that.
+        let target = match &name {
+            Some(name) => resolved_parent.join(name),
+            None => resolved_parent.clone(),
+        };
+        for protected in PROTECTED_CONFIG_FILES {
+            if same_entry(&target, &protected_dir.join(protected)) {
+                return Some((*protected).to_string());
+            }
+        }
+
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(&target) {
+                Ok(dest) if dest.is_absolute() => candidate = dest,
+                Ok(dest) => candidate = resolved_parent.join(dest),
+                Err(_) => return None,
+            },
+            _ => return None,
+        }
+    }
+
+    // A chain that long is not a real path; refuse rather than give up.
+    Some("a symlink chain too long to follow".to_string())
+}
+
+/// Refuse writes and deletes to a sensitive system path or to one of
+/// the agent's own configuration files.
+///
+/// `protected_dir` is the directory holding those files: the agent's
+/// own config directory in production, a tempdir under test. `verb` is
+/// the word used in the error the model sees ("Writing to", "Deleting").
+fn refuse_if_sensitive_in(
+    path: &Path,
+    workspace_root: Option<&Path>,
+    protected_dir: Option<&Path>,
+    verb: &str,
+) -> Result<()> {
+    // System prefixes are matched against both the raw path and the
+    // collapsed one: the raw catches the plain case, the collapsed
+    // catches a `..` detour. macOS canonicalises `/etc` to
+    // `/private/etc`, so neither spelling alone is enough.
+    let raw_str = path.to_string_lossy().to_string();
+    // Separators normalised to `/`: `SENSITIVE_PREFIXES` are Unix-shaped,
+    // and `lexically_normalize` rebuilds the path with the platform's
+    // separator, so on Windows the collapsed form would never match one
+    // and a `..` detour would slip through the check.
+    let collapsed_str = lexically_normalize(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    if SENSITIVE_PREFIXES.iter().any(|prefix| {
+        [&raw_str, &collapsed_str]
+            .iter()
+            .any(|candidate| candidate.starts_with(prefix) || *candidate == prefix)
+    }) {
+        // Echo the path the model supplied rather than a canonicalised
+        // absolute one, which would put the real home directory into a
+        // reply that may reach a chat channel.
+        anyhow::bail!("{verb} '{raw_str}' is not allowed (sensitive system path).");
+    }
+
+    if let Some(dir) = protected_dir
+        && let Some(name) = protected_leaf(path, workspace_root, dir)
+    {
+        anyhow::bail!(
+            "{verb} '{raw_str}' is not allowed: that is this agent's own \
+             '{name}', which records what you have been given permission to do."
+        );
+    }
+
+    Ok(())
+}
+
+/// Production entry point: protect the agent's real config directory.
+fn refuse_if_sensitive(path: &Path, workspace_root: Option<&Path>, verb: &str) -> Result<()> {
+    refuse_if_sensitive_in(path, workspace_root, agent_config_dir().as_deref(), verb)
+}
+
 pub struct FileWriteTool {
     state: Arc<Mutex<WorkspaceState>>,
     spec: ToolSpec,
@@ -177,7 +495,8 @@ impl FileWriteTool {
                     Creates the file and any missing parent directories automatically. \
                     When the target file is inside the workspace, the search index \
                     is updated automatically. \
-                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.)."
+                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.) \
+                    and to this agent's own config.toml and acp-permissions.json."
                     .into(),
                 input_schema: json!({
                     "type": "object",
@@ -200,6 +519,10 @@ impl FileWriteTool {
 
 #[async_trait]
 impl Tool for FileWriteTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Edit
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -209,16 +532,14 @@ impl Tool for FileWriteTool {
         let content = input["content"].as_str().context("missing 'content'")?;
 
         let path = expand_path(path_str);
-        let path_abs = path.to_string_lossy().to_string();
-
-        for prefix in SENSITIVE_PREFIXES {
-            if path_abs.starts_with(prefix) || &path_abs == prefix {
-                anyhow::bail!(
-                    "Writing to '{}' is not allowed (sensitive system path).",
-                    path_abs
-                );
-            }
-        }
+        let workspace_root = self
+            .state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .clone();
+        refuse_if_sensitive(&path, Some(&workspace_root), "Writing to")?;
 
         self.state
             .lock()
@@ -254,7 +575,10 @@ impl FileDeleteTool {
                     (resolved against the workspace root). \
                     When the file is inside the workspace, it is also removed from the search index \
                     automatically. \
-                    Cannot delete directories.".into(),
+                    Refuses deletes of sensitive system paths (/etc, /boot, /bin, etc.) \
+                    and of this agent's own config.toml and acp-permissions.json. \
+                    Cannot delete directories."
+                    .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -272,6 +596,10 @@ impl FileDeleteTool {
 
 #[async_trait]
 impl Tool for FileDeleteTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Delete
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -279,6 +607,15 @@ impl Tool for FileDeleteTool {
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let path = expand_path(path_str);
+
+        let workspace_root = self
+            .state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .clone();
+        refuse_if_sensitive(&path, Some(&workspace_root), "Deleting")?;
 
         self.state
             .lock()
@@ -311,7 +648,8 @@ impl FileAppendTool {
                     Creates any missing parent directories automatically. \
                     When the target file is inside the workspace, the search index \
                     is updated automatically. \
-                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.)."
+                    Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.) \
+                    and to this agent's own config.toml and acp-permissions.json."
                     .into(),
                 input_schema: json!({
                     "type": "object",
@@ -334,6 +672,10 @@ impl FileAppendTool {
 
 #[async_trait]
 impl Tool for FileAppendTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Edit
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -343,16 +685,14 @@ impl Tool for FileAppendTool {
         let content = input["content"].as_str().context("missing 'content'")?;
 
         let path = expand_path(path_str);
-        let path_abs = path.to_string_lossy().to_string();
-
-        for prefix in SENSITIVE_PREFIXES {
-            if path_abs.starts_with(prefix) || &path_abs == prefix {
-                anyhow::bail!(
-                    "Writing to '{}' is not allowed (sensitive system path).",
-                    path_abs
-                );
-            }
-        }
+        let workspace_root = self
+            .state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .clone();
+        refuse_if_sensitive(&path, Some(&workspace_root), "Writing to")?;
 
         self.state
             .lock()
@@ -405,6 +745,10 @@ impl DirListTool {
 
 #[async_trait]
 impl Tool for DirListTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Search
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -527,6 +871,10 @@ fn walk_recurse(
 
 #[async_trait]
 impl Tool for DirWalkTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Search
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -636,6 +984,10 @@ impl ShellTool {
 
 #[async_trait]
 impl Tool for ShellTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Execute
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -822,6 +1174,10 @@ fn wmo_code_description(code: i64) -> &'static str {
 
 #[async_trait]
 impl Tool for WeatherTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Fetch
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -1042,6 +1398,10 @@ impl WebSearchTool {
 
 #[async_trait]
 impl Tool for WebSearchTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Fetch
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -1215,6 +1575,10 @@ impl RecallImageTool {
 
 #[async_trait]
 impl Tool for RecallImageTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Read
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -1264,6 +1628,370 @@ fn is_hex_sha256(s: &str) -> bool {
     s.len() == 64
         && s.chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+#[cfg(test)]
+mod sensitive_path_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A stand-in for the agent's config directory.
+    ///
+    /// `present` decides whether the protected files already exist.
+    /// **Both regimes matter, and the absent one matters more**: on a
+    /// fresh install nothing has recorded a permission answer yet, so
+    /// `acp-permissions.json` is not there — and an earlier version of
+    /// this guard leaned on file identity, which can only answer when
+    /// the target exists. Its tests created the files every time and so
+    /// never exercised the regime production actually starts in. That
+    /// is how an NTFS alternate-data-stream bypass shipped.
+    fn protected_dir(present: bool) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        if present {
+            std::fs::write(path.join("acp-permissions.json"), b"{}").unwrap();
+            std::fs::write(path.join("config.toml"), b"").unwrap();
+        }
+        (dir, path)
+    }
+
+    fn refused(path: &str, workspace_root: Option<&Path>, protected: &Path) -> bool {
+        refuse_if_sensitive_in(
+            Path::new(path),
+            workspace_root,
+            Some(protected),
+            "Writing to",
+        )
+        .is_err()
+    }
+
+    #[test]
+    fn system_paths_are_refused() {
+        for path in [
+            "/etc/passwd",
+            "/bin/sh",
+            "/proc/self/mem",
+            "/var/run/docker.sock",
+        ] {
+            assert!(
+                refuse_if_sensitive_in(Path::new(path), None, None, "Writing to").is_err(),
+                "{path} should be refused"
+            );
+            // A `..` detour to the same place.
+            let detour = format!("/tmp/../{}", path.trim_start_matches('/'));
+            assert!(
+                refuse_if_sensitive_in(Path::new(&detour), None, None, "Writing to").is_err(),
+                "{detour} should be refused"
+            );
+        }
+    }
+
+    /// Every spelling that reaches a protected file must be refused —
+    /// run twice, once with the files present and once absent, because
+    /// the guard must not depend on the target existing.
+    #[test]
+    fn no_spelling_reaches_a_protected_file() {
+        for present in [true, false] {
+            let (_guard, dir) = protected_dir(present);
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+
+            let mut spellings: Vec<String> = vec![
+                "acp-permissions.json".into(),
+                "config.toml".into(),
+                // A `..` through a directory that does NOT exist: the
+                // writer's create_dir_all makes it and the kernel
+                // collapses the `..` at open time.
+                "nope/../acp-permissions.json".into(),
+                "a/b/c/../../../acp-permissions.json".into(),
+                // ...and through one that does.
+                "sub/../acp-permissions.json".into(),
+                "./acp-permissions.json".into(),
+            ];
+            // Absolute spellings of the same.
+            spellings.push(
+                dir.join("acp-permissions.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            spellings.push(
+                dir.join("nope/../acp-permissions.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+
+            if cfg!(windows) {
+                // `name::$DATA` is the file's own default data stream.
+                // A colon is never legal in an NTFS filename, so this
+                // is stream syntax and the OS opens the plain file.
+                spellings.push("acp-permissions.json::$DATA".into());
+                spellings.push("config.toml::$DATA".into());
+                // Trailing dots and spaces are stripped when Windows
+                // normalises a path.
+                spellings.push("acp-permissions.json.".into());
+                spellings.push("acp-permissions.json  ".into());
+                spellings.push("acp-permissions.json. . ".into());
+                spellings.push("ACP-PERMISSIONS.JSON".into());
+            }
+
+            for spelling in &spellings {
+                assert!(
+                    refused(spelling, Some(&dir), &dir),
+                    "'{spelling}' must not reach a protected file (present={present})"
+                );
+            }
+
+            // A climb out of a subdirectory workspace.
+            assert!(
+                refused("../acp-permissions.json", Some(&dir.join("sub")), &dir),
+                "a climb out of the workspace must be refused (present={present})"
+            );
+        }
+    }
+
+    /// A symlink is a different path that opens the same file, and
+    /// `fs::write` follows it. The guard follows it too — with
+    /// `read_link` rather than `canonicalize`, so a *dangling* link
+    /// pointing at a record that does not exist yet still resolves.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_protected_file_is_refused() {
+        for present in [true, false] {
+            let (_guard, dir) = protected_dir(present);
+            let workspace = TempDir::new().unwrap();
+
+            let link = workspace.path().join("notes.json");
+            std::os::unix::fs::symlink(dir.join("acp-permissions.json"), &link).unwrap();
+            assert!(
+                refuse_if_sensitive_in(&link, None, Some(&dir), "Writing to").is_err(),
+                "a symlink to the record must be refused (present={present})"
+            );
+
+            // A relative link, resolved against its own directory.
+            let rel = dir.join("innocent.json");
+            std::os::unix::fs::symlink("acp-permissions.json", &rel).unwrap();
+            assert!(
+                refuse_if_sensitive_in(&rel, None, Some(&dir), "Writing to").is_err(),
+                "a relative symlink must be refused (present={present})"
+            );
+        }
+    }
+
+    /// A hard link is the same file under another name, and no
+    /// comparison of spellings can see that — only identity can.
+    ///
+    /// Deliberately NOT `#[cfg(unix)]`. NTFS hard links need no
+    /// privilege, and gating this to Unix is how an earlier version
+    /// shipped with hard-link protection removed and a red suite on two
+    /// platforms, while the Windows host it was verified on reported
+    /// everything green because the test never compiled.
+    #[test]
+    fn a_hard_link_to_a_protected_file_is_refused() {
+        let (_guard, dir) = protected_dir(true);
+        let workspace = TempDir::new().unwrap();
+
+        for (link, label) in [
+            (dir.join("innocent.json"), "beside the record"),
+            (workspace.path().join("notes.json"), "in another directory"),
+        ] {
+            if std::fs::hard_link(dir.join("acp-permissions.json"), &link).is_err() {
+                // Cross-volume, or a filesystem without hard links.
+                continue;
+            }
+            assert!(
+                refuse_if_sensitive_in(&link, None, Some(&dir), "Writing to").is_err(),
+                "a hard link {label} must be refused"
+            );
+            assert!(
+                refuse_if_sensitive_in(&link, None, Some(&dir), "Deleting").is_err(),
+                "deleting through a hard link {label} must be refused"
+            );
+        }
+    }
+
+    /// `C:x` means two different things, and the guard has to be right
+    /// about both.
+    ///
+    /// On Windows it is *drive-relative*: it resolves against that
+    /// drive's own current directory, which neither this guard nor the
+    /// workspace root controls, and `PathBuf::join` silently discards
+    /// the root when a path carries a prefix. Enough `..` and it climbs
+    /// to the config directory with the guard looking elsewhere. So it
+    /// is refused as a spelling — nothing legitimate needs it.
+    ///
+    /// Everywhere else `C:` is an ordinary run of filename characters,
+    /// there is no prefix component, and the path is an unremarkable
+    /// relative filename that must keep working. Asserting the refusal
+    /// on both platforms is how this first went red on Linux.
+    #[test]
+    fn a_drive_relative_path_is_refused_on_windows_and_ordinary_elsewhere() {
+        for present in [true, false] {
+            let (_guard, dir) = protected_dir(present);
+            for spelling in [
+                r"C:acp-permissions.json",
+                r"C:..\..\..\..\acp-permissions.json",
+                r"Z:..\config.toml",
+            ] {
+                let refused_here = refused(spelling, Some(&dir), &dir);
+                if cfg!(windows) {
+                    assert!(
+                        refused_here,
+                        "'{spelling}' is drive-relative here and must be refused \
+                         (present={present})"
+                    );
+                } else {
+                    assert!(
+                        !refused_here,
+                        "'{spelling}' is an ordinary filename here and must be allowed \
+                         (present={present})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A protected directory that does not exist yet must not read as
+    /// "nothing to protect": the write would create it, record and all.
+    #[test]
+    fn a_missing_protected_directory_still_protects() {
+        let outer = TempDir::new().unwrap();
+        let dir = outer.path().join("not-created-yet");
+
+        for name in PROTECTED_CONFIG_FILES {
+            assert!(
+                refuse_if_sensitive_in(&dir.join(name), None, Some(&dir), "Writing to").is_err(),
+                "'{name}' must be refused even before the directory exists"
+            );
+        }
+        assert!(
+            refuse_if_sensitive_in(&dir.join("notes.md"), None, Some(&dir), "Writing to").is_ok(),
+            "an ordinary file there is still fine"
+        );
+    }
+
+    /// The guard must not swallow ordinary paths. In particular a
+    /// workspace that IS the protected directory — which is what an
+    /// unset `workspace_dir` gives you — stays writable for everything
+    /// except the named files.
+    #[test]
+    fn ordinary_paths_are_allowed() {
+        for present in [true, false] {
+            let (_guard, dir) = protected_dir(present);
+
+            for path in ["/tmp/notes.md", "/home/someone/todo.txt"] {
+                assert!(!refused(path, None, &dir), "{path} should be allowed");
+            }
+            for name in [
+                "notes.md",
+                "memory/thing.md",
+                "heartbeat/daily.md",
+                "acp-permissions.json.backup",
+                "not-config.toml",
+            ] {
+                assert!(
+                    !refused(name, Some(&dir), &dir),
+                    "{name} must stay writable (present={present})"
+                );
+            }
+        }
+    }
+
+    /// The same filename in a lookalike directory is a different file.
+    #[test]
+    fn a_sibling_directory_is_not_the_protected_one() {
+        let (_guard, dir) = protected_dir(true);
+        let sibling = TempDir::new().unwrap();
+        std::fs::write(sibling.path().join("acp-permissions.json"), b"{}").unwrap();
+
+        assert!(
+            !refused(
+                &sibling
+                    .path()
+                    .join("acp-permissions.json")
+                    .to_string_lossy(),
+                None,
+                &dir
+            ),
+            "a different directory's file of the same name should be allowed"
+        );
+    }
+
+    /// Deleting is guarded on the same terms as writing. Nothing else
+    /// exercises the other verb.
+    #[test]
+    fn the_delete_verb_is_guarded_too() {
+        let (_guard, dir) = protected_dir(true);
+        let err = refuse_if_sensitive_in(
+            &dir.join("acp-permissions.json"),
+            None,
+            Some(&dir),
+            "Deleting",
+        )
+        .expect_err("deleting the record must be refused");
+        assert!(err.to_string().starts_with("Deleting"), "got {err}");
+    }
+
+    /// The production wrapper must actually consult the agent's own
+    /// config directory. Nothing else covers that wiring, and a guard
+    /// pointed at the wrong directory would pass every other test here.
+    #[test]
+    fn the_production_wrapper_protects_the_real_config_dir() {
+        let Some(config_dir) = agent_config_dir() else {
+            panic!("no config dir: PermissionStore falls back to the cwd, which nothing guards");
+        };
+        assert!(
+            refuse_if_sensitive(&config_dir.join("acp-permissions.json"), None, "Writing to")
+                .is_err(),
+            "the real permission record must be refused"
+        );
+        assert!(
+            refuse_if_sensitive(&config_dir.join("notes.md"), None, "Writing to").is_ok(),
+            "an ordinary file in the config dir must stay writable"
+        );
+    }
+
+    #[test]
+    fn lexical_normalisation_collapses_without_touching_the_disk() {
+        assert_eq!(
+            lexically_normalize(Path::new("/a/b/../c/./d")),
+            PathBuf::from("/a/c/d")
+        );
+        // Never pop past the root, and never leave a `..` behind that a
+        // later comparison would have to reason about.
+        assert_eq!(
+            lexically_normalize(Path::new("/../..")),
+            PathBuf::from(std::path::MAIN_SEPARATOR_STR)
+        );
+        // A leading `..` on a relative path has nothing to cancel and
+        // is kept, so it can still be joined onto a workspace root.
+        assert_eq!(
+            lexically_normalize(Path::new("../x")),
+            PathBuf::from("../x")
+        );
+        assert_eq!(lexically_normalize(Path::new("")), PathBuf::from(""));
+        assert_eq!(lexically_normalize(Path::new("x")), PathBuf::from("x"));
+    }
+
+    #[test]
+    fn the_opened_filename_is_what_windows_will_open() {
+        let name = |s: &str| opened_filename(std::ffi::OsStr::new(s));
+
+        assert_eq!(
+            name("acp-permissions.json").as_deref(),
+            Some("acp-permissions.json")
+        );
+        if cfg!(windows) {
+            assert_eq!(name("x.json::$DATA").as_deref(), Some("x.json"));
+            assert_eq!(name("x.json:stream").as_deref(), Some("x.json"));
+            assert_eq!(name("x.json. . ").as_deref(), Some("x.json"));
+            // Nothing left is not a spelling of any real file.
+            assert_eq!(name("::$DATA"), None);
+            assert_eq!(name(". "), None);
+        } else {
+            // Elsewhere these are ordinary filename characters.
+            assert_eq!(name("x.json::$DATA").as_deref(), Some("x.json::$DATA"));
+            assert_eq!(name("x.json.").as_deref(), Some("x.json."));
+        }
+    }
 }
 
 #[cfg(test)]

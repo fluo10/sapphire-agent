@@ -7957,6 +7957,7 @@ dependencies = [
  "hound",
  "matrix-sdk",
  "reqwest",
+ "same-file",
  "sapphire-framework",
  "serde",
  "serde_json",

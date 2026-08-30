@@ -28,7 +28,7 @@ use crate::ambient::speaker::candidates::CandidateStore;
 use crate::ambient::speaker::registry::SpeakerNames;
 use crate::ambient::transcript::TranscriptStore;
 use crate::provider::ToolSpec;
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolKind};
 
 pub struct AmbientToolState {
     pub transcripts: TranscriptStore,
@@ -84,6 +84,10 @@ impl TranscriptReadTool {
 
 #[async_trait]
 impl Tool for TranscriptReadTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Read
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -149,6 +153,10 @@ impl SpeakerCandidatesTool {
 
 #[async_trait]
 impl Tool for SpeakerCandidatesTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Search
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -219,6 +227,10 @@ impl SpeakerPromoteTool {
 
 #[async_trait]
 impl Tool for SpeakerPromoteTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Edit
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
