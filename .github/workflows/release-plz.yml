@@ -28,6 +28,7 @@ jobs:
       - name: Install ALSA dev libs (cpal build-time dep for sapphire-call-cli)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/refresh-sherpa-onnx-libs
       - name: Run release-plz
         id: release
         uses: release-plz/action@v0.5
@@ -115,6 +116,7 @@ jobs:
       - name: Install ALSA dev libs (cpal build-time dep for sapphire-call-cli)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/refresh-sherpa-onnx-libs
       - name: Run release-plz
         uses: release-plz/action@v0.5
         with:

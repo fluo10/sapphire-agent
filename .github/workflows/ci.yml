@@ -33,6 +33,7 @@ jobs:
             libxrandr-dev \
             pkg-config
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/refresh-sherpa-onnx-libs
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
   test:
@@ -60,4 +61,5 @@ jobs:
             libxrandr-dev \
             pkg-config
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/refresh-sherpa-onnx-libs
       - run: cargo test --workspace

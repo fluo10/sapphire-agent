@@ -81,6 +81,7 @@ jobs:
             pkg-config
 
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/refresh-sherpa-onnx-libs
       - run: cargo build --release --package sapphire-call-desktop
 
       - name: Package binary
