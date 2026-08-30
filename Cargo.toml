@@ -120,6 +120,13 @@ directories = "6.0"
 # Shell path expansion (~/)
 shellexpand = "3.1"
 
+# Identity comparison for the tool path guard: "is this the same file",
+# answered by device+inode / volume+file-index rather than by spelling.
+# The stdlib exposes the Windows half only behind an unstable feature.
+# Already in the tree via walkdir; naming it directly makes the reason
+# it is here visible.
+same-file = "1.0"
+
 # Date/time with serde support (human-readable ISO 8601 timestamps)
 chrono = { version = "0.4", features = ["serde"] }
 

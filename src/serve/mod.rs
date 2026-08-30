@@ -1714,6 +1714,16 @@ pub(crate) trait TurnHost: Send + Sync {
         crate::tools::policy::Origin::Trusted
     }
 
+    /// This call cleared the gate and is about to run.
+    ///
+    /// Separate from `tool_start`, which fires *before* the gate and so
+    /// cannot say whether the call will run, wait on a human, or be
+    /// refused. A host that draws a status needs both edges; one that
+    /// does not implements neither.
+    async fn tool_allowed(&self, id: &str) {
+        let _ = id;
+    }
+
     /// Called only when `decide` returned `Ask`.
     ///
     /// The default answers `AllowOnce` — a host that never returns an
@@ -2072,7 +2082,14 @@ pub(crate) async fn run_llm_turn(
                     };
 
                     match refusal {
-                        None => permitted.push(call.clone()),
+                        None => {
+                            // Every permitted call, not just an asked
+                            // one: a client that saw `tool_start` needs
+                            // to know this one is running rather than
+                            // still waiting on it.
+                            progress.tool_allowed(&call.id).await;
+                            permitted.push(call.clone());
+                        }
                         Some(reason) => {
                             info!("Refused tool {} (id={}): {verdict:?}", call.name, call.id);
                             refused.push((call.id.clone(), reason));

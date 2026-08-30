@@ -202,19 +202,6 @@ impl AcpProgress {
     fn failure(&self) -> Option<String> {
         self.error.lock().unwrap().clone()
     }
-
-    /// Move a call from `Pending` to `InProgress`.
-    ///
-    /// `tool_start` fires before the permission gate, so every call
-    /// begins as `Pending`. Without this a permitted call would sit at
-    /// `Pending` for its whole runtime and then jump to `Completed`,
-    /// telling the user it was still waiting on them while it ran.
-    fn mark_in_progress(&self, id: &str) {
-        self.notify(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-            ToolCallId::new(id),
-            ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
-        )));
-    }
 }
 
 #[async_trait::async_trait]
@@ -256,6 +243,21 @@ impl super::TurnHost for AcpProgress {
         crate::tools::policy::Origin::Acp(self.mode)
     }
 
+    /// Move a call from `Pending` to `InProgress`.
+    ///
+    /// `tool_start` fires before the permission gate, so every call
+    /// begins as `Pending` — which is accurate then, and wrong the
+    /// moment the call is actually running. Without this edge a
+    /// permitted call would sit at `Pending` for its whole runtime and
+    /// then jump to `Completed`, telling the user it was still waiting
+    /// on them while it ran.
+    async fn tool_allowed(&self, id: &str) {
+        self.notify(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            ToolCallId::new(id),
+            ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
+        )));
+    }
+
     /// Put the call to the user, unless a standing answer settles it.
     ///
     /// The standing answer is consulted here rather than inside
@@ -269,14 +271,11 @@ impl super::TurnHost for AcpProgress {
     ) -> crate::tools::policy::Approval {
         use crate::tools::policy::Approval;
 
-        // A standing answer settles it without a round trip, but the
-        // client still needs the call moved off `Pending` — it has been
-        // sitting there since `tool_start`.
+        // A standing answer settles it without a round trip. Moving the
+        // call off `Pending` is not done here: the gate calls
+        // `tool_allowed` for every permitted call, asked or not.
         match self.permissions.standing(&self.profile, &call.name) {
-            Some(true) => {
-                self.mark_in_progress(&call.id);
-                return Approval::AllowAlways;
-            }
+            Some(true) => return Approval::AllowAlways,
             Some(false) => return Approval::RejectAlways,
             None => {}
         }
@@ -360,9 +359,6 @@ impl super::TurnHost for AcpProgress {
 
         if approval.is_sticky() {
             self.permissions.record(&self.profile, &call.name, approval);
-        }
-        if approval.allows() {
-            self.mark_in_progress(&call.id);
         }
         approval
     }
@@ -1604,23 +1600,45 @@ mod tests {
             .iter()
             .position(|k| *k == "tool_call")
             .unwrap_or_else(|| panic!("no tool_call update, got {kinds:?}"));
-        let completed = kinds
+        // Two `tool_call_update`s now, in order: the gate clearing the
+        // call, then the executor finishing it. `tool_call` itself
+        // fires before the gate, so it can only say `pending`.
+        let mut updated = kinds
             .iter()
-            .position(|k| *k == "tool_call_update")
+            .enumerate()
+            .filter(|(_, k)| **k == "tool_call_update")
+            .map(|(i, _)| i);
+        let in_progress = updated
+            .next()
             .unwrap_or_else(|| panic!("no tool_call_update, got {kinds:?}"));
+        let completed = updated
+            .next()
+            .unwrap_or_else(|| panic!("only one tool_call_update, got {kinds:?}"));
         let first_chunk = kinds
             .iter()
             .position(|k| *k == "agent_message_chunk")
             .unwrap_or_else(|| panic!("no agent_message_chunk, got {kinds:?}"));
         assert!(
-            started < completed && completed < first_chunk,
-            "start then end then reply, got {kinds:?}"
+            started < in_progress && in_progress < completed && completed < first_chunk,
+            "start, allowed, end, then reply, got {kinds:?}"
         );
 
         // The provider's own tool-call id is what ACP's toolCallId carries,
-        // so a client can correlate the completion with the start.
+        // so a client can correlate every later update with the start.
         assert_eq!(updates[started]["toolCallId"], "call-1");
         assert_eq!(updates[started]["title"], "echo");
+        // `Pending` is the schema's default, so it is omitted from the
+        // wire rather than sent — a client seeing no status reads it as
+        // pending. Absent is therefore the correct assertion here, and
+        // anything else would mean the call claimed to be underway
+        // before the gate had cleared it.
+        assert!(
+            updates[started]["status"].is_null(),
+            "tool_call fires before the gate, so it must not claim a status: {}",
+            updates[started]
+        );
+        assert_eq!(updates[in_progress]["toolCallId"], "call-1");
+        assert_eq!(updates[in_progress]["status"], "in_progress");
         assert_eq!(updates[completed]["toolCallId"], "call-1");
         assert_eq!(updates[completed]["status"], "completed");
         assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
