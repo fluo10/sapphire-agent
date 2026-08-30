@@ -1678,11 +1678,41 @@ fn apply_input_kind_label(mut msg: ChatMessage) -> ChatMessage {
 /// heartbeats, A2A) don't surface intermediate progress at all. Putting
 /// reporting behind this trait keeps the turn executor itself agnostic to
 /// which of those shapes (if any) is listening.
+///
+/// The per-transport hook a turn reports through — and, now, asks
+/// through.
+///
+/// Renamed from `TurnProgress`: it is no longer only about reporting.
+/// Both new methods carry defaults, so a transport that has no way to
+/// ask a human implements neither and keeps behaving exactly as it did.
 #[async_trait::async_trait]
-pub(crate) trait TurnProgress: Send + Sync {
+pub(crate) trait TurnHost: Send + Sync {
     async fn tool_start(&self, id: &str, name: &str);
     async fn tool_end(&self, id: &str, name: &str);
     async fn turn_error(&self, message: &str);
+
+    /// Which row of the permission table this turn is judged by.
+    ///
+    /// `Trusted` by default: `/rpc`, voice and the heartbeat were
+    /// authenticated before the turn started and have no UI to ask
+    /// through, so they must keep running everything.
+    fn origin(&self) -> crate::tools::policy::Origin {
+        crate::tools::policy::Origin::Trusted
+    }
+
+    /// Called only when `decide` returned `Ask`.
+    ///
+    /// The default answers `AllowOnce` — a host that never returns an
+    /// asking `origin()` can never reach this, so the default exists
+    /// for safety rather than for use.
+    async fn approve(
+        &self,
+        call: &crate::provider::ToolCall,
+        kind: crate::tools::ToolKind,
+    ) -> crate::tools::policy::Approval {
+        let _ = (call, kind);
+        crate::tools::policy::Approval::AllowOnce
+    }
 }
 
 /// Builds the `{id, name}` params shared by the `tool_start`/`tool_end`
@@ -1695,7 +1725,7 @@ fn tool_event_params(id: &str, name: &str) -> Value {
 /// The `/rpc` and voice shape: JSON-RPC notifications (and, on provider
 /// failure, a JSON-RPC error) delivered over the SSE channel — exactly
 /// what `run_llm_turn` used to emit inline before progress reporting moved
-/// behind [`TurnProgress`].
+/// behind [`TurnHost`].
 pub(crate) struct SseProgress {
     tx: mpsc::Sender<Result<Event, Infallible>>,
     req_id: Value,
@@ -1708,7 +1738,7 @@ impl SseProgress {
 }
 
 #[async_trait::async_trait]
-impl TurnProgress for SseProgress {
+impl TurnHost for SseProgress {
     async fn tool_start(&self, id: &str, name: &str) {
         let _ = self
             .tx
@@ -1742,7 +1772,7 @@ impl TurnProgress for SseProgress {
 pub(crate) struct NullProgress;
 
 #[async_trait::async_trait]
-impl TurnProgress for NullProgress {
+impl TurnHost for NullProgress {
     async fn tool_start(&self, _id: &str, _name: &str) {}
     async fn tool_end(&self, _id: &str, _name: &str) {}
     async fn turn_error(&self, _message: &str) {}
@@ -1763,7 +1793,7 @@ impl TurnProgress for NullProgress {
 pub(crate) enum TurnStop {
     /// The model produced its final message; `text` is `Some`.
     Replied,
-    /// A `Provider::chat` call failed. `TurnProgress::turn_error` has
+    /// A `Provider::chat` call failed. `TurnHost::turn_error` has
     /// already been handed the message, so the cause is available to
     /// whoever is reporting; `text` is `None`.
     ProviderError,
@@ -1826,7 +1856,7 @@ pub(crate) async fn run_llm_turn(
     state: Arc<ServeState>,
     session_id: String,
     user_msg: ChatMessage,
-    progress: Arc<dyn TurnProgress>,
+    progress: Arc<dyn TurnHost>,
     timer_origin: Option<crate::timer::TimerOrigin>,
 ) -> LlmTurnOutcome {
     // Pick the right store up front so every persistence call in this
@@ -2584,6 +2614,37 @@ rooms    = []
 mod tests {
     use super::*;
     use crate::provider::{Role, UserInputKind};
+
+    /// The pre-existing transports keep today's behaviour. `Trusted` is
+    /// what makes that true: `decide` allows everything for it, so no
+    /// `/rpc`, voice or heartbeat turn can start asking for permission.
+    #[test]
+    fn existing_transports_are_trusted() {
+        use crate::tools::policy::Origin;
+
+        let (tx, _rx) = mpsc::channel(4);
+        let sse = SseProgress::new(tx, json!(1));
+        assert_eq!(sse.origin(), Origin::Trusted);
+        assert_eq!(NullProgress.origin(), Origin::Trusted);
+    }
+
+    /// A host that cannot ask must not block the call. The default lets
+    /// it through, which is what keeps the existing transports behaving
+    /// exactly as before.
+    #[tokio::test]
+    async fn the_default_approval_allows_once() {
+        use crate::tools::{ToolKind, policy::Approval};
+
+        let call = crate::provider::ToolCall {
+            id: "c1".to_string(),
+            name: "shell".to_string(),
+            input: json!({}),
+        };
+        assert_eq!(
+            NullProgress.approve(&call, ToolKind::Execute).await,
+            Approval::AllowOnce
+        );
+    }
 
     #[test]
     fn apply_label_passes_text_through_unchanged() {

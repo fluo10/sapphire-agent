@@ -182,10 +182,10 @@ impl AcpProgress {
 }
 
 #[async_trait::async_trait]
-impl super::TurnProgress for AcpProgress {
+impl super::TurnHost for AcpProgress {
     /// The provider's own tool-call id becomes ACP's `toolCallId`, so the
     /// completion below can name the call it completes. There is no input to
-    /// report — `TurnProgress` does not carry one — so the tool's name serves
+    /// report — `TurnHost` does not carry one — so the tool's name serves
     /// as the title. `InProgress` rather than the default `Pending`: the
     /// executor has already started the call, whereas `Pending` tells a
     /// client the call is still waiting on input or approval.
@@ -618,7 +618,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                                     state,
                                     agent_session_id,
                                     crate::provider::ChatMessage::user(&text),
-                                    Arc::clone(&progress) as Arc<dyn super::TurnProgress>,
+                                    Arc::clone(&progress) as Arc<dyn super::TurnHost>,
                                     None,
                                 ) => TurnEnd::Ran(outcome),
                             };
