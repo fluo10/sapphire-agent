@@ -260,7 +260,7 @@ git commit -m "feat(tools): declare an ACP ToolKind for every tool"
 
 **Interfaces:**
 - Consumes: `crate::tools::ToolKind`（Task 1）
-- Produces: `policy::SessionMode`（`ALL` / `id()` / `name()` / `description()` / `from_id()`）、`policy::Origin`、`policy::Decision`、`policy::Approval`（`allows()` / `is_sticky()`）、`policy::decide(Origin, ToolKind) -> Decision`
+- Produces: `policy::SessionMode`（`ALL` / `id()` / `name()` / `description()` / `from_id()`）、`policy::Origin`、`policy::Decision`、`policy::Approval`（`allows()` / `is_sticky()`）、`policy::Refusal`、`policy::decide(Origin, ToolKind) -> Decision`、`policy::kind_of(&str, &[(String, ToolKind)]) -> ToolKind`、`policy::refusal_message(&str, Refusal) -> String`、`policy::partition_without_asking(Origin, &[ToolCall], &[(String, ToolKind)]) -> (Vec<ToolCall>, Vec<(String, String)>)`
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -360,6 +360,96 @@ mod tests {
         assert!(Approval::AllowAlways.allows());
         assert!(!Approval::RejectOnce.allows());
         assert!(!Approval::RejectAlways.allows());
+    }
+
+    /// An unregistered name must not be treated as safe on its way to
+    /// `ToolSet::execute`'s "Unknown tool" reply.
+    #[test]
+    fn an_unknown_tool_name_is_other() {
+        let kinds = vec![("file_read".to_string(), ToolKind::Read)];
+        assert_eq!(kind_of("file_read", &kinds), ToolKind::Read);
+        assert_eq!(kind_of("no_such_tool", &kinds), ToolKind::Other);
+    }
+
+    /// Both refusal reasons name the tool, so the model can tell which
+    /// of several calls was refused, and say why.
+    #[test]
+    fn refusal_messages_name_the_tool_and_the_reason() {
+        let declined = refusal_message("shell", Refusal::UserDeclined);
+        assert!(declined.contains("shell"), "got {declined}");
+        assert!(declined.contains("declined"), "got {declined}");
+
+        let unavailable = refusal_message("shell", Refusal::Unavailable);
+        assert!(unavailable.contains("shell"), "got {unavailable}");
+        assert_ne!(
+            declined, unavailable,
+            "the model should be able to tell a refusal from an unavailability"
+        );
+    }
+
+    /// The channel path's whole gate, in one call: safe calls survive,
+    /// risky ones are dropped and come back as refusals that still name
+    /// their call id.
+    #[test]
+    fn partition_drops_risky_calls_and_reports_them() {
+        let kinds = vec![
+            ("file_read".to_string(), ToolKind::Read),
+            ("shell".to_string(), ToolKind::Execute),
+            ("mcp__x__y".to_string(), ToolKind::Other),
+        ];
+        let calls = vec![
+            call("c1", "file_read"),
+            call("c2", "shell"),
+            call("c3", "mcp__x__y"),
+        ];
+
+        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds);
+
+        let kept: Vec<&str> = permitted.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(kept, vec!["c1"]);
+
+        let refused_ids: Vec<&str> = refused.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(refused_ids, vec!["c2", "c3"]);
+        assert!(refused[0].1.contains("shell"), "got {}", refused[0].1);
+    }
+
+    /// A trusted origin refuses nothing, so the helper is a no-op there.
+    #[test]
+    fn partition_keeps_everything_for_a_trusted_origin() {
+        let kinds = vec![("shell".to_string(), ToolKind::Execute)];
+        let calls = vec![call("c1", "shell")];
+
+        let (permitted, refused) = partition_without_asking(Origin::Trusted, &calls, &kinds);
+
+        assert_eq!(permitted.len(), 1);
+        assert!(refused.is_empty());
+    }
+
+    /// `Ask` cannot be honoured without a human, so an origin that
+    /// somehow produces one is refused rather than waved through. This
+    /// is what keeps a future policy change from silently opening the
+    /// channel path.
+    #[test]
+    fn partition_refuses_rather_than_allows_an_ask() {
+        let kinds = vec![("shell".to_string(), ToolKind::Execute)];
+        let calls = vec![call("c1", "shell")];
+
+        let (permitted, refused) = partition_without_asking(
+            Origin::Acp(SessionMode::Default),
+            &calls,
+            &kinds,
+        );
+
+        assert!(permitted.is_empty(), "an Ask must not be treated as Allow");
+        assert_eq!(refused.len(), 1);
+    }
+
+    fn call(id: &str, name: &str) -> crate::provider::ToolCall {
+        crate::provider::ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: serde_json::json!({}),
+        }
     }
 }
 ```
@@ -515,12 +605,80 @@ pub fn decide(origin: Origin, kind: ToolKind) -> Decision {
         Origin::Acp(SessionMode::Default) => Decision::Ask,
     }
 }
+
+/// Why a call was refused. The model reads the difference: one is
+/// worth rephrasing around, the other is not worth retrying at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// A human was asked and said no.
+    UserDeclined,
+    /// The policy refuses it outright on this transport; nobody was asked.
+    Unavailable,
+}
+
+/// Look a tool's kind up by name.
+///
+/// An unregistered name yields `Other`. It will come back from
+/// `ToolSet::execute` as "Unknown tool" anyway, but it must not travel
+/// there classified as safe on the way.
+pub fn kind_of(name: &str, kinds: &[(String, ToolKind)]) -> ToolKind {
+    kinds
+        .iter()
+        .find(|(known, _)| known == name)
+        .map(|(_, kind)| *kind)
+        .unwrap_or(ToolKind::Other)
+}
+
+/// What the model is told in place of a result.
+///
+/// One function rather than a literal at each call site: both tool
+/// loops refuse calls, and two copies of this wording would drift.
+pub fn refusal_message(tool: &str, why: Refusal) -> String {
+    match why {
+        Refusal::UserDeclined => format!(
+            "Permission denied: the user declined the '{tool}' call. \
+             Do not retry it without being asked to."
+        ),
+        Refusal::Unavailable => format!(
+            "Permission denied: the '{tool}' tool is not available on this \
+             transport. Try another approach, or ask the user to run it."
+        ),
+    }
+}
+
+/// Split calls into the ones that may run and the ones that may not,
+/// for an origin that has nobody to ask.
+///
+/// `Ask` is treated as a refusal, not as an allowance. Today only
+/// `Origin::Channel` reaches this, and `decide` never returns `Ask` for
+/// it — but a later policy change that did must not silently open the
+/// channel path, so the unreachable case fails closed.
+pub fn partition_without_asking(
+    origin: Origin,
+    calls: &[crate::provider::ToolCall],
+    kinds: &[(String, ToolKind)],
+) -> (Vec<crate::provider::ToolCall>, Vec<(String, String)>) {
+    let mut permitted = Vec::with_capacity(calls.len());
+    let mut refused = Vec::new();
+
+    for call in calls {
+        match decide(origin, kind_of(&call.name, kinds)) {
+            Decision::Allow => permitted.push(call.clone()),
+            Decision::Deny | Decision::Ask => refused.push((
+                call.id.clone(),
+                refusal_message(&call.name, Refusal::Unavailable),
+            )),
+        }
+    }
+
+    (permitted, refused)
+}
 ```
 
 - [ ] **Step 4: テストが通ることを確認**
 
 Run: `cargo test --workspace tools::policy`
-Expected: PASS（6 テスト）。
+Expected: PASS（11 テスト）。
 
 - [ ] **Step 5: コミット**
 
@@ -683,7 +841,7 @@ Expected: FAIL — `PermissionStore` が未定義。
 use crate::tools::policy::Approval;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing::warn;
 
@@ -831,13 +989,9 @@ impl PermissionStore {
         }
     }
 }
-
-/// Silences an unused-import warning when the module is compiled
-/// without the ACP feature paths that use `Path`.
-const _: fn(&Path) = |_| {};
 ```
 
-**注意:** 末尾の `const _: fn(&Path)` は `Path` を実際に使わない場合の保険。`use std::path::{Path, PathBuf}` から `Path` が不要なら import ごと消してよい（`cargo clippy` の指示に従うこと）。
+**注意:** `use std::path::PathBuf;` だけでよい — `Path` は使わない。`cargo clippy --workspace --all-targets -- -D warnings` が未使用 import を弾くので、それに従うこと。
 
 - [ ] **Step 4: テストが通ることを確認**
 
@@ -1031,7 +1185,9 @@ git commit -m "refactor(serve): TurnProgress becomes TurnHost, with origin and a
                 },
             ],
         );
-        state.tools.register_tool(Box::new(RiskyTool::new())).await;
+        let risky = RiskyTool::new();
+        let ran = risky.ran_flag();
+        state.tools.register_tool(Box::new(risky)).await;
 
         let outcome = run_llm_turn(
             Arc::clone(&state),
@@ -1044,9 +1200,10 @@ git commit -m "refactor(serve): TurnProgress becomes TurnHost, with origin and a
 
         assert_eq!(outcome.text.as_deref(), Some("could not run that"));
         assert!(
-            !RiskyTool::was_run(),
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
             "a refused tool must not have executed"
         );
+    }
     }
 
     /// The same call is allowed once the origin is a trusted one, so
@@ -1087,36 +1244,38 @@ git commit -m "refactor(serve): TurnProgress becomes TurnHost, with origin and a
     }
 ```
 
-あわせて `src/serve/mod.rs` のテスト用フィクスチャ群（`EchoTool` の隣）に `RiskyTool` を足す。実行されたかどうかを静的フラグで観測する。
+あわせて `src/serve/mod.rs` のテスト用フィクスチャ群（`EchoTool` の隣）に `RiskyTool` を足す。実行されたかどうかをインスタンス単位のフラグで観測する。
 
 ```rust
 /// A stand-in for `shell`: `ToolKind::Execute`, so the policy asks or
-/// refuses. Records whether it actually ran, which is how the gate
-/// tests tell "refused" from "ran and returned an error".
+/// refuses. Carries a per-instance "did I run" flag, which is how the
+/// gate tests tell "refused" from "ran and returned an error".
+///
+/// Per instance, not a `static`: `cargo test` runs tests in parallel and
+/// several tasks construct one of these, so a process-global flag would
+/// make the assertions depend on scheduling.
 #[cfg(test)]
 pub(crate) struct RiskyTool {
     spec: crate::provider::ToolSpec,
+    ran: Arc<std::sync::atomic::AtomicBool>,
 }
-
-#[cfg(test)]
-static RISKY_TOOL_RAN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 impl RiskyTool {
     pub(crate) fn new() -> Self {
-        RISKY_TOOL_RAN.store(false, std::sync::atomic::Ordering::SeqCst);
         Self {
             spec: crate::provider::ToolSpec {
                 name: "risky".into(),
                 description: "Pretend to run a command.".into(),
                 input_schema: json!({ "type": "object", "properties": {} }),
             },
+            ran: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    pub(crate) fn was_run() -> bool {
-        RISKY_TOOL_RAN.load(std::sync::atomic::Ordering::SeqCst)
+    /// A handle the test keeps after the tool is boxed into the ToolSet.
+    pub(crate) fn ran_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.ran)
     }
 }
 
@@ -1132,18 +1291,13 @@ impl crate::tools::Tool for RiskyTool {
     }
 
     async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
-        RISKY_TOOL_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok("ran".to_string())
     }
 }
 ```
 
-**注意:** `RISKY_TOOL_RAN` はプロセス全体で共有されるので、`RiskyTool` を使うテストは**それぞれ別のツール名を持つ別インスタンスにするか、`cargo test -- --test-threads=1` で走らせるか**を検討すること。上の 2 テストのうち観測しているのは 1 つだけなので、そのままで衝突しない。3 つ目を足すときは注意。
-
-- [ ] **Step 2: テストが落ちることを確認**
-
-Run: `cargo test --workspace a_refused_tool_returns_a_result_and_the_turn_continues`
-Expected: FAIL — ゲートがないので `risky` が実行され、`was_run()` が `true` になる。
+登録するときは、ボックス化する前にフラグのハンドルを取ること（Step 1 のテストがその形で書いてある）。
 
 - [ ] **Step 3: ゲートを実装する**
 
@@ -1161,32 +1315,20 @@ Expected: FAIL — ゲートがないので `risky` が実行され、`was_run()
                 let mut permitted: Vec<crate::provider::ToolCall> = Vec::new();
                 let mut refused: Vec<(String, String)> = Vec::new();
                 for call in &tool_calls {
-                    let kind = kinds
-                        .iter()
-                        .find(|(name, _)| *name == call.name)
-                        .map(|(_, k)| *k)
-                        // An unknown name reaches `ToolSet::execute` and
-                        // comes back as "Unknown tool", but it must not
-                        // reach it as a *trusted* one on the way.
-                        .unwrap_or(crate::tools::ToolKind::Other);
+                    use crate::tools::policy::{Decision, Refusal, kind_of, refusal_message};
 
+                    let kind = kind_of(&call.name, &kinds);
                     let verdict = crate::tools::policy::decide(origin, kind);
                     let refusal = match verdict {
-                        crate::tools::policy::Decision::Allow => None,
-                        crate::tools::policy::Decision::Deny => Some(format!(
-                            "Permission denied: the '{}' tool is not available on this \
-                             transport. Try another approach, or ask the user to run it.",
-                            call.name
-                        )),
-                        crate::tools::policy::Decision::Ask => {
+                        Decision::Allow => None,
+                        Decision::Deny => {
+                            Some(refusal_message(&call.name, Refusal::Unavailable))
+                        }
+                        Decision::Ask => {
                             if progress.approve(call, kind).await.allows() {
                                 None
                             } else {
-                                Some(format!(
-                                    "Permission denied: the user declined the '{}' call. \
-                                     Do not retry it without being asked to.",
-                                    call.name
-                                ))
+                                Some(refusal_message(&call.name, Refusal::UserDeclined))
                             }
                         }
                     };
@@ -1246,64 +1388,117 @@ git commit -m "feat(serve): gate tool execution on the permission policy"
 
 ### Task 6: `agent.rs` のループにゲートを差す（Matrix / Discord）
 
-こちらは `TurnHost` を使っていない。`Origin::Channel` は `Ask` を返さないので `approve()` は呼ばれず、`Deny` を弾くだけ。並行実行の形も変えない。
+こちらは `TurnHost` を使っていない。`Origin::Channel` は `Ask` を返さないので `approve()` は呼ばれず、拒否されたものを実行に回さないだけ。並行実行の形も変えない。
+
+Task 2 の `partition_without_asking` がこのゲートの本体なので、ここでの仕事は「それを正しい場所で呼び、拒否分を結果に合流させる」ことに尽きる。
 
 **Files:**
 - Modify: `src/agent.rs`（ツール実行ブロック）
 - Test: `src/agent.rs` の `mod tests`
 
 **Interfaces:**
-- Consumes: `policy::decide` / `policy::Origin` / `policy::Decision`（Task 2）、`ToolSet::kinds`（Task 1）
+- Consumes: `policy::partition_without_asking` / `policy::Origin`（Task 2）、`ToolSet::kinds`（Task 1）
 - Produces: なし（内部変更）
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`src/agent.rs` の `mod tests` に。ツールセットだけを相手にした狭いテストにする — `handle_message` 全体を駆動するとチャネルのフィクスチャが要って割に合わない。
+`src/agent.rs` の `mod tests` に。実物の `ToolSet` を組み立て、そこから取った `kinds()` を通してゲートを駆動する — これは production の `partition_without_asking` を production の分類データで動かすテストであって、判定表の再宣言ではない。
 
 ```rust
-    /// The channel loop refuses `Execute` and `Other` outright. This is
+    /// The channel path refuses `Execute` and `Other` outright. This is
     /// the one behavioural change the permission work makes to an
     /// existing transport: `shell` and every MCP tool stop being
-    /// reachable from Matrix and Discord.
+    /// reachable from Matrix and Discord, while everything the chat
+    /// bots actually use keeps working.
     #[tokio::test]
-    async fn channels_refuse_risky_tools_and_allow_safe_ones() {
-        use crate::tools::ToolKind;
-        use crate::tools::policy::{Decision, Origin, decide};
+    async fn the_channel_gate_refuses_shell_but_keeps_the_chat_tools() {
+        use crate::provider::ToolCall;
+        use crate::tools::policy::{Origin, partition_without_asking};
 
-        // Mirrors what the loop does: look the kind up by name, then
-        // decide. Pinning it here keeps the channel path honest even
-        // though the loop itself is exercised end-to-end elsewhere.
+        let tools = crate::tools::default_tool_set(
+            test_workspace(),
+            Some("test-tavily-key".to_string()),
+            &[],
+            crate::timer::TimerManager::new(),
+            Vec::new(),
+        )
+        .await;
+        let kinds = tools.kinds().await;
+
+        let calls: Vec<ToolCall> = [
+            "shell",
+            "web_search",
+            "memory_add",
+            "file_read",
+            "workspace_sync",
+            "mcp__somewhere__do_thing",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| ToolCall {
+            id: format!("c{i}"),
+            name: (*name).to_string(),
+            input: serde_json::json!({}),
+        })
+        .collect();
+
+        let (permitted, refused) =
+            partition_without_asking(Origin::Channel, &calls, &kinds);
+
+        let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
-            decide(Origin::Channel, ToolKind::Execute),
-            Decision::Deny,
-            "shell must not be reachable from a channel"
+            kept,
+            vec!["web_search", "memory_add", "file_read"],
+            "the chat bots' own tools must keep working"
         );
+
+        let blocked: Vec<&str> = refused
+            .iter()
+            .map(|(id, _)| {
+                calls
+                    .iter()
+                    .find(|c| &c.id == id)
+                    .map(|c| c.name.as_str())
+                    .unwrap()
+            })
+            .collect();
         assert_eq!(
-            decide(Origin::Channel, ToolKind::Other),
-            Decision::Deny,
-            "MCP tools must not be reachable from a channel"
+            blocked,
+            vec!["shell", "workspace_sync", "mcp__somewhere__do_thing"],
+            "Execute and Other must not be reachable over chat"
         );
-        assert_eq!(
-            decide(Origin::Channel, ToolKind::Fetch),
-            Decision::Allow,
-            "web_search must still work from a channel"
-        );
-        assert_eq!(
-            decide(Origin::Channel, ToolKind::Edit),
-            Decision::Allow,
-            "the memory tools must still work from a channel"
-        );
+
+        // Every refusal names its tool, so the model can say which call
+        // it lost and why.
+        for (id, reason) in &refused {
+            let name = calls.iter().find(|c| &c.id == id).unwrap().name.as_str();
+            assert!(reason.contains(name), "{reason} should name {name}");
+        }
     }
 ```
 
-**注記:** これは Task 2 の判定表テストと重なる。意図的で、`agent.rs` の読者が「このループがどの行を使うか」をその場で読めることに価値がある。ループ本体の実挙動は Step 3 の実装レビューで担保する。
+`test_workspace()` は Task 1 で `src/tools/mod.rs` のテストに書いたものと同じ形。`src/agent.rs` のテストからは見えないので、こちらの `mod tests` にも同じヘルパを置く。
 
-- [ ] **Step 2: テストが通ることを確認（まだゲートは無い）**
+```rust
+    fn test_workspace() -> Arc<std::sync::Mutex<sapphire_framework::workspace::WorkspaceState>> {
+        use sapphire_framework::workspace::{AppContext, Workspace, WorkspaceState};
+        static TEST_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
 
-Run: `cargo test --workspace channels_refuse_risky_tools`
-Expected: PASS。Task 2 の実装だけで通る。**これはゲートが入った証拠ではない** — Step 3 が本体。
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        std::fs::create_dir_all(dir.path().join(".sapphire-agent")).unwrap();
+        let ws = Workspace::from_root(&TEST_CTX, dir.path()).unwrap();
+        Arc::new(std::sync::Mutex::new(WorkspaceState::open(ws).unwrap()))
+    }
+```
 
-- [ ] **Step 3: ゲートを実装する**
+- [ ] **Step 2: テストが落ちることを確認**
+
+Run: `cargo test --workspace the_channel_gate_refuses_shell`
+Expected: PASS。`partition_without_asking` は Task 2 で入っているので、このテストはゲートを差す前から通る。
+
+**これはゲートが入った証拠ではない。** このテストが押さえているのは「production の分類 × production の判定でどのツールが落ちるか」であって、`agent.rs` がそれを実際に呼んでいるかではない。呼び出しの配線は Step 3 で入れ、Step 4 の全体テストで既存のチャネル経路が壊れていないことを見る。配線そのものの回帰は最終レビューの担当。
+
+- [ ] **Step 3: ゲートを配線する**
 
 `src/agent.rs` の `let mut handles = Vec::with_capacity(tool_calls.len());` の直前に挿入する。
 
@@ -1316,41 +1511,14 @@ Expected: PASS。Task 2 の実装だけで通る。**これはゲートが入っ
                     // and no serialisation. Refused calls simply never
                     // reach `tokio::spawn`.
                     let kinds = tools.kinds().await;
-                    let mut refused: Vec<(String, String)> = Vec::new();
-                    let mut tool_calls = tool_calls;
-                    tool_calls.retain(|call| {
-                        let kind = kinds
-                            .iter()
-                            .find(|(name, _)| *name == call.name)
-                            .map(|(_, k)| *k)
-                            .unwrap_or(crate::tools::ToolKind::Other);
-                        match crate::tools::policy::decide(
-                            crate::tools::policy::Origin::Channel,
-                            kind,
-                        ) {
-                            crate::tools::policy::Decision::Allow => true,
-                            // `Ask` is unreachable for `Origin::Channel`;
-                            // treat it as a refusal rather than silently
-                            // running, so a future policy change fails
-                            // safe here too.
-                            _ => {
-                                info!(
-                                    "Refused tool {} (id={}) on the channel path",
-                                    call.name, call.id
-                                );
-                                refused.push((
-                                    call.id.clone(),
-                                    format!(
-                                        "Permission denied: the '{}' tool is not available \
-                                         over chat. Try another approach, or ask the user \
-                                         to run it themselves.",
-                                        call.name
-                                    ),
-                                ));
-                                false
-                            }
-                        }
-                    });
+                    let (tool_calls, refused) = crate::tools::policy::partition_without_asking(
+                        crate::tools::policy::Origin::Channel,
+                        &tool_calls,
+                        &kinds,
+                    );
+                    for (id, reason) in &refused {
+                        info!("Refused tool call {id} on the channel path: {reason}");
+                    }
 ```
 
 そのあと、既存の結果収集ループ
@@ -1376,7 +1544,10 @@ Expected: PASS。Task 2 の実装だけで通る。**これはゲートが入っ
                     }
 ```
 
-**注意:** `tools` はこのスコープで `Arc<ToolSet>` として既に束縛されている（`let tools = Arc::clone(&...)` が上にある）。無ければ `Arc::clone` を足すこと。`let mut tool_calls = tool_calls;` は既存の束縛をシャドウして可変にするためで、この直前で `tool_calls` が `ChatMessage::assistant_with_tools` に**クローンして**渡されていることを確認すること（渡していれば `retain` で消しても履歴には影響しない）。渡していなければ、`retain` の前に履歴用のクローンを取ること。
+**確認事項が 2 つある。**
+
+1. `tools` がこのスコープで `Arc<ToolSet>` として束縛されているか。無ければ `let tools = Arc::clone(&self.tools);` 相当を上に足すこと。
+2. `partition_without_asking` は `tool_calls` をシャドウする。**この直前で `tool_calls` が `ChatMessage::assistant_with_tools` にクローンして渡されていることを確認すること。** 渡していれば、拒否分を落としても履歴の tool_use ブロックは元のまま残る（そして拒否分の tool_result が下で合流するので、tool_use と tool_result は一対一で対応し続ける）。もしクローンではなくムーブしていたら、シャドウする前に履歴用のクローンを取ること。**ここを間違えると tool_use と tool_result の数が合わず、次のプロバイダ呼び出しが 400 で落ちる。**
 
 - [ ] **Step 4: テストが通ることを確認**
 
@@ -1480,7 +1651,7 @@ git commit -m "feat(agent): refuse Execute and Other tools on the channel path"
     }
 ```
 
-続けてテスト本体。`RiskyTool`（Task 5 で追加済み）を使うが、`RISKY_TOOL_RAN` がプロセス共有なので、ここでは**実行の有無ではなく返ってきたテキスト**で判定する。
+続けてテスト本体。`RiskyTool`（Task 5 で追加済み）を使う。ここでは実行の有無ではなく**返ってきたテキストと承認要求の回数**で判定するので、`ran_flag()` は使わない。
 
 ```rust
     /// An `Execute` tool in the default mode puts the question to the
@@ -2111,7 +2282,7 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Expected: 警告ゼロ。Task 3 の `const _: fn(&Path)` のような保険は、不要なら消すこと。
+Expected: 警告ゼロ。
 
 - [ ] **Step 2: 全テスト**
 
