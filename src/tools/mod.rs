@@ -8,6 +8,7 @@ use crate::mcp_client::{self, McpClient, build_tools_for_client};
 use crate::provider::{ToolCall, ToolSpec};
 use anyhow::Result;
 use async_trait::async_trait;
+pub use agent_client_protocol::schema::v1::ToolKind;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -50,6 +51,17 @@ pub trait Tool: Send + Sync {
     /// The spec advertised to the LLM.
     fn spec(&self) -> &ToolSpec;
 
+    /// What this tool does, in ACP's vocabulary. Drives both the
+    /// `session/update` display and the permission policy, so there is
+    /// exactly one classification rather than two that drift apart.
+    ///
+    /// The default is `Other` — the strictest bucket — so a tool added
+    /// without a `kind()` fails safe: it asks (ACP) or is refused
+    /// (channels) rather than silently running unguarded.
+    fn kind(&self) -> ToolKind {
+        ToolKind::Other
+    }
+
     /// Execute the tool with the given JSON input. Used by all tools
     /// that return only text — which is most of them.
     async fn execute(&self, input: &serde_json::Value) -> Result<String>;
@@ -90,6 +102,19 @@ impl ToolSet {
     /// Return a snapshot of the current tool specs.
     pub async fn specs(&self) -> Vec<ToolSpec> {
         self.inner.read().await.specs.clone()
+    }
+
+    /// Every registered tool's name and kind. Exists so the policy test
+    /// can pin the whole classification table in one assertion rather
+    /// than constructing each tool by hand.
+    pub async fn kinds(&self) -> Vec<(String, ToolKind)> {
+        self.inner
+            .read()
+            .await
+            .tools
+            .iter()
+            .map(|t| (t.spec().name.to_string(), t.kind()))
+            .collect()
     }
 
     /// Execute a tool call. The returned `ToolOutput` carries the
@@ -252,4 +277,96 @@ pub async fn default_tool_set(
     }
 
     tool_set
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sapphire_framework::workspace::{AppContext, Workspace, WorkspaceState};
+    use std::sync::Mutex;
+
+    static TEST_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
+
+    fn test_workspace() -> Arc<Mutex<WorkspaceState>> {
+        // AppContext panics on any cache_dir() access until set_cache_dir has
+        // been called once; Workspace::from_root reads it to compute the
+        // workspace's cache path. set_cache_dir is "first writer wins" and
+        // silently ignores later calls, so it is safe to call on every
+        // invocation of this helper (matches sapphire-framework's own
+        // workspace_state.rs test pattern).
+        TEST_CTX.set_cache_dir(std::env::temp_dir().join("sapphire-agent-tools-test-cache"));
+        // Leaked on purpose: this is a test binary and the OS reclaims
+        // the directory when it exits.
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        std::fs::create_dir_all(dir.path().join(".sapphire-agent")).unwrap();
+        let ws = Workspace::from_root(&TEST_CTX, dir.path()).unwrap();
+        Arc::new(Mutex::new(WorkspaceState::open(ws).unwrap()))
+    }
+
+    /// Every tool declares what it does. A tool added without a `kind()`
+    /// lands in `Other` — the strictest bucket — so this table failing
+    /// on a newly added tool is the intended prompt to classify it.
+    #[tokio::test]
+    async fn every_tool_declares_its_kind() {
+        let tools = default_tool_set(
+            test_workspace(),
+            Some("test-tavily-key".to_string()),
+            &[],
+            crate::timer::TimerManager::new(),
+            Vec::new(),
+        )
+        .await;
+
+        let mut got = tools.kinds().await;
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        let got_refs: Vec<(&str, ToolKind)> =
+            got.iter().map(|(n, k)| (n.as_str(), *k)).collect();
+
+        let want: Vec<(&str, ToolKind)> = vec![
+            ("dir_list", ToolKind::Search),
+            ("dir_walk", ToolKind::Search),
+            ("file_append", ToolKind::Edit),
+            ("file_delete", ToolKind::Delete),
+            ("file_read", ToolKind::Read),
+            ("file_write", ToolKind::Edit),
+            ("memory_add", ToolKind::Edit),
+            ("memory_append", ToolKind::Edit),
+            ("memory_read", ToolKind::Read),
+            ("memory_remove", ToolKind::Delete),
+            ("memory_update", ToolKind::Edit),
+            ("shell", ToolKind::Execute),
+            ("timer_cancel", ToolKind::Delete),
+            ("timer_preset", ToolKind::Edit),
+            ("timer_set", ToolKind::Edit),
+            ("timer_status", ToolKind::Search),
+            ("weather", ToolKind::Fetch),
+            ("web_search", ToolKind::Fetch),
+            ("workspace_search", ToolKind::Search),
+            ("workspace_sync", ToolKind::Other),
+        ];
+
+        assert_eq!(got_refs, want);
+    }
+
+    /// A tool that does not override `kind()` must land in the strictest
+    /// bucket, so forgetting to classify one fails safe.
+    #[test]
+    fn the_default_kind_is_other() {
+        struct Bare(ToolSpec);
+        #[async_trait]
+        impl Tool for Bare {
+            fn spec(&self) -> &ToolSpec {
+                &self.0
+            }
+            async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
+                Ok(String::new())
+            }
+        }
+        let bare = Bare(ToolSpec {
+            name: "bare".into(),
+            description: String::new().into(),
+            input_schema: serde_json::json!({}),
+        });
+        assert_eq!(bare.kind(), ToolKind::Other);
+    }
 }

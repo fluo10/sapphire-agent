@@ -2317,6 +2317,15 @@ impl crate::tools::Tool for EchoTool {
         &self.spec
     }
 
+    /// A test fixture standing in for an ordinary read-only tool.
+    /// Deliberately NOT `Other`: that is the ask-me bucket, and the
+    /// pre-existing ACP tests drive turns with a helper that answers no
+    /// permission requests, so leaving this unclassified would make them
+    /// hang rather than fail once the permission gate lands.
+    fn kind(&self) -> crate::tools::ToolKind {
+        crate::tools::ToolKind::Read
+    }
+
     async fn execute(&self, input: &Value) -> anyhow::Result<String> {
         Ok(input["text"].as_str().unwrap_or_default().to_string())
     }

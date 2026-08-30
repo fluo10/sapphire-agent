@@ -15,7 +15,7 @@ use serde_json::json;
 use crate::config::TimerPreset;
 use crate::provider::ToolSpec;
 use crate::timer::{TimerKind, TimerManager, TimerSnapshot, current_origin, find_preset};
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolKind};
 
 /// Format a snapshot as a single-line human-readable string for the LLM.
 fn format_snapshot(s: &TimerSnapshot) -> String {
@@ -100,6 +100,10 @@ impl TimerSetTool {
 
 #[async_trait]
 impl Tool for TimerSetTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Edit
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -178,6 +182,10 @@ impl TimerPresetTool {
 
 #[async_trait]
 impl Tool for TimerPresetTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Edit
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -237,6 +245,10 @@ impl TimerCancelTool {
 
 #[async_trait]
 impl Tool for TimerCancelTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Delete
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -279,6 +291,10 @@ impl TimerStatusTool {
 
 #[async_trait]
 impl Tool for TimerStatusTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Search
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }

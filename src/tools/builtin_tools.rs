@@ -1,6 +1,6 @@
 use crate::image_cache::ImageCache;
 use crate::provider::ToolSpec;
-use crate::tools::{Tool, ToolOutput, ToolSet};
+use crate::tools::{Tool, ToolKind, ToolOutput, ToolSet};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -87,6 +87,10 @@ impl FileReadTool {
 
 #[async_trait]
 impl Tool for FileReadTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Read
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -200,6 +204,10 @@ impl FileWriteTool {
 
 #[async_trait]
 impl Tool for FileWriteTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Edit
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -272,6 +280,10 @@ impl FileDeleteTool {
 
 #[async_trait]
 impl Tool for FileDeleteTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Delete
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -334,6 +346,10 @@ impl FileAppendTool {
 
 #[async_trait]
 impl Tool for FileAppendTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Edit
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -405,6 +421,10 @@ impl DirListTool {
 
 #[async_trait]
 impl Tool for DirListTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Search
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -527,6 +547,10 @@ fn walk_recurse(
 
 #[async_trait]
 impl Tool for DirWalkTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Search
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -636,6 +660,10 @@ impl ShellTool {
 
 #[async_trait]
 impl Tool for ShellTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Execute
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -822,6 +850,10 @@ fn wmo_code_description(code: i64) -> &'static str {
 
 #[async_trait]
 impl Tool for WeatherTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Fetch
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -1042,6 +1074,10 @@ impl WebSearchTool {
 
 #[async_trait]
 impl Tool for WebSearchTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Fetch
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -1215,6 +1251,10 @@ impl RecallImageTool {
 
 #[async_trait]
 impl Tool for RecallImageTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Read
+    }
+
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
