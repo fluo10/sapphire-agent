@@ -16,12 +16,14 @@ A personal AI assistant agent that lives in a [`sapphire-framework`](https://git
 - **Background**: heartbeat cron tasks, periodic memory compaction, periodic workspace re-index, daily / weekly / monthly / yearly logs with catch-up.
 - **Voice**: optional `sapphire-call voice` satellite with local STT/TTS (via `sherpa-onnx`), Silero VAD, and an openWakeWord wake detector. See [crates/sapphire-call](crates/sapphire-call/).
 - **Ambient audio ingest**: optional always-on capture from a wearable/pendant device — `POST /audio/ingest` takes raw audio (metadata in query params, no JSON/base64 framing) from a bearer-authenticated device, re-gates it, transcribes it, attributes it to a speaker against reference audio curated in the workspace, and stores the transcript outside the workspace. Records without answering: nothing in this path starts an LLM turn. `transcript_read`, `speaker_candidates` and `speaker_promote` expose the result as agent tools. Disabled by default — enable via `[ambient].enabled = true`; see `config.example.toml`.
-- **Agent-to-agent**: `/a2a` endpoint speaks the v1 A2A protocol (JSON-RPC `SendMessage`, AgentCard) with per-profile bearer-token auth — enable via `[a2a].enabled = true`.
+- **Agent-to-agent**: `/a2a` endpoint speaks the v1 A2A protocol (JSON-RPC `SendMessage`, AgentCard) with per-device bearer-token auth — enable via `[a2a].enabled = true`.
 - **External AI integration**: `/mcp` endpoint publishes `write_report` and `recall_memory` tools so Claude Code (and other MCP clients) can share project context with the agent — see [docs/mcp-integration.md](docs/mcp-integration.md).
 - **Editor integration**: `/acp` endpoint speaks the Agent Client Protocol over WebSocket, so Zed can drive the running agent — enable via `[acp].enabled = true`; see [Zed / ACP](#zed--acp) below.
 - **Commands**:
   - `sapphire-agent` — start the channel listeners + JSON-RPC HTTP control API (`/rpc`, `/mcp`, `/a2a`, `/acp`)
-  - `sapphire-agent verify` — validate config and report loaded workspace files
+  - `sapphire-agent verify` — validate config and report loaded workspace files, including the device -> room_profile bindings
+  - `sapphire-agent device add|list|rotate|retire` — register a device, mint or replace its bearer token, or stop it; `device add` prints the token to stdout and the `[room_profile.<n>].devices` line to paste to stderr
+  - `sapphire-agent user add|list` — register the person or agent a device belongs to
   - `sapphire-call` — interactive REPL / voice satellite client (separate crate; see [crates/sapphire-call](crates/sapphire-call/))
 
 ## Install
@@ -66,26 +68,32 @@ layer cannot turn this on):
 enabled = true
 ```
 
-**2. Mint a token.** Authentication reuses the same bearer scheme as `/a2a`
-and `/mcp`: add a token under a `[room_profile.<name>]`'s `api_keys`, and
-that token both authenticates the connection and selects the room profile
-(and therefore the provider and memory namespace) the ACP session runs
-under. A dedicated profile keeps the editor on its own model or namespace:
+**2. Mint a token.** Authentication reuses the same device table as `/a2a`
+and `/mcp`: register a device, bind its id under a `[room_profile.<name>]`'s
+`devices`, and that device's token both authenticates the connection and
+selects the room profile (and therefore the provider and memory namespace)
+the ACP session runs under. A dedicated profile keeps the editor on its own
+model or namespace:
+
+```sh
+sapphire-agent device add --name zed-editor
+# token on stdout, device id + a devices=[...] line to paste on stderr
+```
 
 ```toml
 [room_profile.zed]
-profile  = "default"
-rooms    = []                      # ACP-only; no chat rooms map here
-api_keys = ["sa-acp-<long random>"]
+profile = "default"
+rooms   = []              # ACP-only; no chat rooms map here
+devices = ["a3f9k2p"]     # id printed by `device add --name zed-editor`
 ```
 
-Note that `[acp].enabled = true` opens `/acp` to **every** token in every
-`[room_profile.*].api_keys`, not only to one minted for the editor — each
-simply connects under its own profile. No privilege is gained by doing so
-(`/a2a` already runs the full tool set through the same executor for the same
-tokens), but if you want the editor confined to its own model, namespace or
+Note that `[acp].enabled = true` opens `/acp` to **every** device bound to
+**any** room profile, not only to one minted for the editor — each simply
+connects under its own profile. No privilege is gained by doing so (`/a2a`
+already runs the full tool set through the same executor for the same
+devices), but if you want the editor confined to its own model, namespace or
 audit trail, that is what the dedicated profile above is for; giving it a
-token does not take `/acp` away from the others.
+device does not take `/acp` away from the others.
 
 **3. Install [`websocat`](https://github.com/vi/websocat).** Zed's
 `agent_servers` setting only takes a `command` to spawn, not a URL — and ACP

@@ -118,6 +118,9 @@ pub struct ServeState {
     /// by `voice/subscribe`, removed by the per-subscription writer task
     /// when its SSE channel closes (i.e. satellite disconnects).
     pub(crate) voice_subscribers: Arc<VoiceSubscribers>,
+    /// Bearer token -> device -> room profile. Shared with ambient ingest so
+    /// there is exactly one answer to "who is this token" in the process.
+    pub(crate) device_auth: Arc<crate::device_auth::DeviceAuth>,
 }
 
 impl ServeState {
@@ -136,6 +139,7 @@ impl ServeState {
         mcp_session_store: Arc<SessionStore>,
         voice: Option<Arc<VoiceProviders>>,
         image_cache: Option<Arc<crate::image_cache::ImageCache>>,
+        device_auth: Arc<crate::device_auth::DeviceAuth>,
     ) -> Self {
         // Scan once on startup: each MCP session's first-line meta
         // carries `namespace` + `project`, so this reproduces the
@@ -170,6 +174,7 @@ impl ServeState {
             voice,
             voice_subscribers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             image_cache,
+            device_auth,
         }
     }
 
@@ -399,9 +404,9 @@ async fn summarize_all_sessions(state: &Arc<ServeState>) {
 // ---------------------------------------------------------------------------
 
 /// JSON-RPC error code returned when the Authorization header is present
-/// but the bearer token is not registered under any
-/// `[room_profile.<n>].api_keys`. Mirrors `codes::AUTH_REQUIRED` used by
-/// `/a2a` and `/mcp` so the three protocol surfaces stay symmetrical.
+/// but the bearer token does not resolve through `DeviceAuth`. Mirrors
+/// `codes::AUTH_REQUIRED` used by `/a2a` and `/mcp` so the three protocol
+/// surfaces stay symmetrical.
 const RPC_AUTH_REQUIRED: i32 = -32001;
 
 async fn rpc_post(
@@ -426,8 +431,8 @@ async fn rpc_post(
             return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
         }
     };
-    let profile_name = match state.config.resolve_a2a_token(&bearer) {
-        Some(name) => name.to_string(),
+    let (profile_name, authenticated_device_id) = match state.device_auth.resolve(&bearer) {
+        Some(r) => (r.room_profile.to_string(), r.device.id.to_string()),
         None => {
             let body = error_response(req_id, RPC_AUTH_REQUIRED, "unknown or revoked bearer token");
             return body.into_response();
@@ -443,9 +448,25 @@ async fn rpc_post(
         "get_session" => handle_get_session(state, req_id, session_id).await,
         "voice/config" => handle_voice_config(state, req_id, req.params).await,
         "voice/pipeline_run" => {
-            handle_voice_pipeline_run(state, req_id, req.params, profile_name).await
+            handle_voice_pipeline_run(
+                state,
+                req_id,
+                req.params,
+                profile_name,
+                authenticated_device_id,
+            )
+            .await
         }
-        "voice/subscribe" => handle_voice_subscribe(state, req_id, req.params, profile_name).await,
+        "voice/subscribe" => {
+            handle_voice_subscribe(
+                state,
+                req_id,
+                req.params,
+                profile_name,
+                authenticated_device_id,
+            )
+            .await
+        }
         _ => {
             let body = error_response(req_id, -32601, "Method not found");
             body.into_response()
@@ -501,8 +522,9 @@ async fn handle_initialize(
 ) -> axum::response::Response {
     // `room_profile` is no longer accepted as a JSON-RPC param — the
     // bearer token resolved in `rpc_post` is the sole profile selector
-    // (mirrors A2A / MCP). `resolve_a2a_token` only returns names that
-    // exist in the config, so no extra validation is needed here.
+    // (mirrors A2A / MCP). `DeviceAuth::resolve` only returns profile
+    // names that exist in the config, so no extra validation is needed
+    // here.
 
     // Resolve to an internal UUID session_id.
     // - Session-Id header: already a UUID (internal), use directly.
@@ -863,6 +885,7 @@ async fn handle_voice_pipeline_run(
     req_id: Value,
     params: Option<Value>,
     room_profile: String,
+    authenticated_device_id: String,
 ) -> axum::response::Response {
     if state.voice.is_none() {
         let body = error_response(
@@ -888,6 +911,21 @@ async fn handle_voice_pipeline_run(
             return body.into_response();
         }
     };
+    // The client-supplied `device_id` is only ever used to key sessions and
+    // the voice-push registry — it is never itself an auth check. Without
+    // this comparison, an authenticated client could claim another device's
+    // id and read/write that device's session or displace its push channel
+    // (`voice_subscribers` is keyed on `device_id` alone). `DeviceAuth`
+    // already established which device this bearer token belongs to; hold
+    // it to that.
+    if device_id != authenticated_device_id {
+        let body = error_response(
+            req_id,
+            -32602,
+            "params.device_id does not match the authenticated device",
+        );
+        return body.into_response();
+    }
     // `room_profile` comes from the bearer token resolved in
     // `rpc_post`; clients no longer pass it as a param.
     let language = params["language"].as_str().map(|s| s.to_string());
@@ -982,6 +1020,7 @@ async fn handle_voice_subscribe(
     req_id: Value,
     params: Option<Value>,
     room_profile: String,
+    authenticated_device_id: String,
 ) -> axum::response::Response {
     let params = params.unwrap_or(Value::Null);
     let device_id = match params["device_id"].as_str() {
@@ -991,6 +1030,17 @@ async fn handle_voice_subscribe(
             return body.into_response();
         }
     };
+    // See the identical check in `handle_voice_pipeline_run`: without it, an
+    // authenticated client could claim another device's id and displace its
+    // push channel, since `voice_subscribers` is keyed on `device_id` alone.
+    if device_id != authenticated_device_id {
+        let body = error_response(
+            req_id,
+            -32602,
+            "params.device_id does not match the authenticated device",
+        );
+        return body.into_response();
+    }
     // `room_profile` comes from the bearer token resolved in
     // `rpc_post`; clients no longer pass it as a param.
 
@@ -2438,6 +2488,29 @@ impl ServeState {
         // OS reclaims the directory when it exits.
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let base = dir.path().to_path_buf();
+        let workspace_dir = base.join("workspace");
+
+        // Device auth fixture: one device ("developer-device") routed to
+        // room_profile "developer", with its bearer token fixed at
+        // "sa-acp-token" so the many tests presenting that literal keep
+        // working. Written by hand rather than through
+        // `KeyStore::generate` (which always mints a random token) — the
+        // key file format documents `token` as its only required field,
+        // exactly like this. Mirrors the fixture shape in
+        // `device_auth::tests`, minus the random token.
+        let keys_file = base.join("keys.toml");
+        let devices_file = crate::config::workspace_devices_path(&workspace_dir);
+        std::fs::create_dir_all(devices_file.parent().unwrap()).unwrap();
+        let mut devices = sapphire_framework::registry::Devices::load(&devices_file).unwrap();
+        let device = devices.add("developer-device", None, None).unwrap();
+        std::fs::write(
+            &keys_file,
+            format!(
+                "[[key]]\ntoken = \"sa-acp-token\"\nlabel = \"developer-device\"\ndevice_id = \"{}\"\n",
+                device.id
+            ),
+        )
+        .unwrap();
 
         let mut config = Config::parse_for_test(
             r#"
@@ -2450,12 +2523,18 @@ provider = "stub"
 [room_profile.developer]
 profile  = "dev"
 rooms    = []
-api_keys = ["sa-acp-token"]
 "#,
         );
         config.acp = Some(crate::config::AcpConfig {
             enabled: acp_enabled,
         });
+        config.keys.file = Some(keys_file.clone());
+        config.room_profiles.get_mut("developer").unwrap().devices = vec![device.id.to_string()];
+
+        let device_auth = Arc::new(
+            crate::device_auth::DeviceAuth::open(&keys_file, &devices_file, &config.room_profiles)
+                .expect("test device_auth fixture should build"),
+        );
 
         // Registered under both names: `provider_for_session` falls
         // through to the background provider when no room_profile is
@@ -2468,7 +2547,7 @@ api_keys = ["sa-acp-token"]
             config,
             registry: Arc::new(registry),
             workspace: Arc::new(Workspace::new(
-                base.join("workspace"),
+                workspace_dir,
                 crate::config::DigestConfig::default(),
             )),
             tools: Arc::new(ToolSet::new(vec![Box::new(EchoTool::new())], Vec::new())),
@@ -2486,6 +2565,7 @@ api_keys = ["sa-acp-token"]
             voice: None,
             image_cache: None,
             voice_subscribers: Default::default(),
+            device_auth,
         })
     }
 }
@@ -2599,12 +2679,66 @@ mod tests {
     #[tokio::test]
     async fn fixture_state_resolves_the_test_token() {
         let state = ServeState::for_test(true);
-        assert_eq!(
-            state.config.resolve_a2a_token("sa-acp-token"),
-            Some("developer")
-        );
-        assert_eq!(state.config.resolve_a2a_token("sa-wrong"), None);
+        let resolved = state
+            .device_auth
+            .resolve("sa-acp-token")
+            .expect("fixture token should resolve");
+        assert_eq!(resolved.room_profile, "developer");
+        assert!(state.device_auth.resolve("sa-wrong").is_none());
     }
+
+    /// Without this check, an authenticated client could pass someone else's
+    /// `device_id` in `voice/subscribe` params and displace that device's
+    /// push channel — `voice_subscribers` is keyed on `device_id` alone, and
+    /// the value came from client-supplied JSON, not from the token.
+    #[tokio::test]
+    async fn voice_subscribe_rejects_a_device_id_that_disagrees_with_the_token() {
+        let state = ServeState::for_test(true);
+        let authenticated_device_id = state
+            .device_auth
+            .resolve("sa-acp-token")
+            .expect("fixture token should resolve")
+            .device
+            .id
+            .to_string();
+
+        let response = handle_voice_subscribe(
+            Arc::clone(&state),
+            Value::Null,
+            Some(json!({ "device_id": "not-the-authenticated-device" })),
+            "developer".to_string(),
+            authenticated_device_id,
+        )
+        .await;
+
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], -32602);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not match"),
+            "{v}"
+        );
+        // Nothing should have been registered under the impersonated id.
+        assert!(
+            !state
+                .voice_subscribers
+                .lock()
+                .await
+                .contains_key("not-the-authenticated-device")
+        );
+    }
+
+    // `handle_voice_pipeline_run` carries the identical guard (added right
+    // after its own `device_id` extraction), but exercising it directly
+    // needs a configured `VoiceProviders`, which `ServeState::for_test`
+    // deliberately leaves `None` (see its `voice/pipeline_run unavailable`
+    // early return) — outside what's worth building a real STT/TTS fixture
+    // for here.
 
     #[tokio::test]
     async fn hanging_provider_sets_the_drop_flag_when_its_chat_future_is_aborted() {

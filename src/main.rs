@@ -6,9 +6,11 @@
 mod agent;
 mod ambient;
 mod channel;
+mod cli_device;
 mod config;
 mod config_layer;
 mod context_compression;
+mod device_auth;
 mod frontmatter;
 mod heartbeat;
 mod heartbeat_config;
@@ -86,6 +88,16 @@ struct Cli {
 enum Command {
     /// Validate the config file and exit
     Verify,
+    /// Manage the devices that authenticate to this agent.
+    Device {
+        #[command(subcommand)]
+        command: cli_device::DeviceCommand,
+    },
+    /// Manage the users devices belong to.
+    User {
+        #[command(subcommand)]
+        command: cli_device::UserCommand,
+    },
 }
 
 /// One-word tag naming where a setting's effective value came from, for `verify`.
@@ -106,6 +118,15 @@ async fn main() -> Result<()> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        // `tracing_subscriber::fmt` defaults to stdout. `device add` prints
+        // the minted token alone to stdout so it can be piped straight into
+        // a file or a device's provisioning step; a stray log line ahead of
+        // it (e.g. the framework's own "key file permissions are not
+        // restricted on this platform" warning on non-Unix hosts) would
+        // corrupt that. Every other command's output is also `println!`, so
+        // sending logs to stderr instead keeps the split intact everywhere,
+        // not just here.
+        .with_writer(std::io::stderr)
         .init();
 
     init_app_ctx();
@@ -150,6 +171,16 @@ async fn main() -> Result<()> {
         );
     }
 
+    let migration_errors = config.migration_errors();
+    if !migration_errors.is_empty() {
+        anyhow::bail!(
+            "config at {} uses settings that were removed in the device-registry \
+             migration:\n\n  - {}\n",
+            config_path.display(),
+            migration_errors.join("\n\n  - ")
+        );
+    }
+
     match cli.command {
         Some(Command::Verify) => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
@@ -161,6 +192,32 @@ async fn main() -> Result<()> {
                 for err in &profile_errors {
                     println!("  - {err}");
                 }
+            }
+            // The device -> room_profile binding is written by hand, so it
+            // needs somewhere to be checked.
+            let keys_file = config
+                .keys
+                .file
+                .clone()
+                .or_else(device_auth::DeviceAuth::default_key_file);
+            match keys_file {
+                Some(keys_file) => {
+                    let devices_file = config::workspace_devices_path(&workspace_dir);
+                    match device_auth::DeviceAuth::open(
+                        &keys_file,
+                        &devices_file,
+                        &config.room_profiles,
+                    ) {
+                        Ok(auth) => {
+                            println!("  Device table      : {}", devices_file.display());
+                            for (device, rp) in auth.bindings() {
+                                println!("    {device:<20} -> room_profile '{rp}'");
+                            }
+                        }
+                        Err(e) => println!("  Devices           : INVALID: {e:#}"),
+                    }
+                }
+                None => println!("  Devices           : [keys].file unset"),
             }
             match &workspace_path {
                 Some(p) => println!("  Workspace config  : {}", p.display()),
@@ -247,6 +304,30 @@ async fn main() -> Result<()> {
                     None => println!("  {label:<28} -"),
                 }
             }
+        }
+        Some(Command::Device { command }) => {
+            let workspace_dir = config.resolved_workspace_dir(&config_path);
+            let keys_file = config
+                .keys
+                .file
+                .clone()
+                .or_else(device_auth::DeviceAuth::default_key_file)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[keys].file is unset and no platform config directory is \
+                         resolvable; set [keys].file explicitly"
+                    )
+                })?;
+            return cli_device::run_device(
+                command,
+                &config::workspace_devices_path(&workspace_dir),
+                &config::workspace_users_path(&workspace_dir),
+                &keys_file,
+            );
+        }
+        Some(Command::User { command }) => {
+            let workspace_dir = config.resolved_workspace_dir(&config_path);
+            return cli_device::run_user(command, &config::workspace_users_path(&workspace_dir));
         }
         None => {
             let bind = cli.bind;
@@ -383,18 +464,47 @@ async fn main() -> Result<()> {
                 Some(Arc::new(providers))
             };
 
+            // ── Device auth (bearer token -> device -> room profile) ────────
+            // Built once, here, and shared as one `Arc` between ambient
+            // ingest and `ServeState` (`/rpc`, `/a2a`, `/acp`, `/mcp`) so
+            // there is exactly one answer to "who is this token" in the
+            // process. A missing or unusable key file is fatal — see
+            // `DeviceAuth::open`'s own doc.
+            let keys_file = config
+                .keys
+                .file
+                .clone()
+                .or_else(device_auth::DeviceAuth::default_key_file)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[keys].file is unset and no platform config directory is resolvable; \
+                         set [keys].file explicitly"
+                    )
+                })?;
+            let devices_file = config::workspace_devices_path(&workspace_dir);
+            let device_auth = Arc::new(device_auth::DeviceAuth::open(
+                &keys_file,
+                &devices_file,
+                &config.room_profiles,
+            )?);
+
             // ── Ambient audio ingest (optional) ─────────────────────────────
             // Built here — after `voice_providers` exists, before it is
             // moved into `ServeState::new` below — so it can resolve
             // `[ambient].stt_provider` against the same registry. A borrow
-            // is enough; `build` never needs to own the registry.
+            // is enough; `build` never needs to own the registry. Shares
+            // `device_auth` with `ServeState` rather than resolving its own.
             // Every failure here is fatal and loud: an ambient subsystem
             // that starts but cannot authenticate, transcribe, or store
             // looks exactly like a broken device from the outside, and the
             // device has no way to tell you.
-            let ambient_runtime =
-                ambient::startup::build(&config, &workspace_dir, voice_providers.as_deref())
-                    .context("ambient audio ingest failed to start")?;
+            let ambient_runtime = ambient::startup::build(
+                &config,
+                &workspace_dir,
+                voice_providers.as_deref(),
+                Arc::clone(&device_auth),
+            )
+            .context("ambient audio ingest failed to start")?;
 
             // ── Image cache (workspace-external) ──────────────────────────
             // Resolves once at startup. A missing platform cache dir
@@ -467,6 +577,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&mcp_session_store),
                 voice_providers,
                 image_cache.clone(),
+                Arc::clone(&device_auth),
             ));
             // Wire serve_state into the timer manager so voice-origin
             // timers can push fire messages back to their satellite.
@@ -1132,6 +1243,42 @@ fn migrate_pre_namespace_layout(workspace_dir: &std::path::Path) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_add_requires_a_name() {
+        assert!(Cli::try_parse_from(["sapphire-agent", "device", "add"]).is_err());
+    }
+
+    #[test]
+    fn device_add_takes_a_name_and_a_description() {
+        let cli = Cli::try_parse_from([
+            "sapphire-agent",
+            "device",
+            "add",
+            "--name",
+            "pendant",
+            "--description",
+            "the one on the lanyard",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Device {
+                command: cli_device::DeviceCommand::Add { ref name, description: Some(_), .. }
+            }) if name == "pendant"
+        ));
+    }
+
+    #[test]
+    fn device_retire_defaults_to_keeping_the_row() {
+        let cli = Cli::try_parse_from(["sapphire-agent", "device", "retire", "pendant"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Device {
+                command: cli_device::DeviceCommand::Retire { purge: false, .. }
+            })
+        ));
+    }
 
     fn write_stub(path: &std::path::Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

@@ -17,10 +17,13 @@
 # host-local file also sets them, in which case this file wins.
 #
 # It may only set settings that belong to the agent. Credentials
-# ([anthropic].api_key, [matrix], [discord], [tools],
-# [room_profile.<n>].api_keys), bind addresses, cache and workspace
-# paths, and STT/TTS model paths are host-local: if the workspace file
-# sets one, it is ignored and named in a warning at startup.
+# ([anthropic].api_key, [matrix], [discord], [tools]), bind addresses,
+# cache and workspace paths, and STT/TTS model paths are host-local: if
+# the workspace file sets one, it is ignored and named in a warning at
+# startup. `[room_profile.<n>].devices` is different: it names device
+# ids from the workspace device table, not a secret, so the workspace
+# layer may set it. The bearer token itself lives only in the
+# host-local key file — see "Device key file" below.
 #
 # [providers.<n>].base_url is host-local too, and deliberately so even
 # though a private-network DNS name would work from every host: a
@@ -172,9 +175,11 @@ system_prompt = "You are a helpful personal assistant."
 # `default` namespace, global session_policy).
 #
 # API sessions pin a room profile via the bearer token sent in
-# `Authorization: Bearer <token>` on every `/rpc` request — the token
-# must appear in some `[room_profile.<n>].api_keys` below, same
-# mechanism MCP and A2A use (sapphire-call: `[server].token` or
+# `Authorization: Bearer <token>` on every `/rpc` request. The token
+# resolves to a device (`sapphire-agent device add`, see "Device key
+# file" below), and that device's id must appear in some
+# `[room_profile.<n>].devices` below — same mechanism `/a2a`, `/acp`,
+# `/mcp` and ambient ingest all use (sapphire-call: `[server].token` or
 # `--token <TOKEN>`).
 #
 # [room_profile.everyday]
@@ -194,19 +199,26 @@ system_prompt = "You are a helpful personal assistant."
 # session_policy   = "compact"
 # rooms            = ["!nsfw:example.com"]
 #
-# /rpc (sapphire-call), A2A (Agent2Agent Protocol), and MCP clients all
-# reach a room_profile through bearer tokens declared here. Each token
-# must be unique across all room profiles — startup fails if two
-# profiles share one — and an incoming `Authorization: Bearer <token>`
-# resolves implicitly to the owning profile, so external clients never
-# name room_profile themselves. Leave `api_keys = []` (or omit) to
-# deny external access to a profile.
+# /rpc (sapphire-call), A2A (Agent2Agent Protocol), MCP clients, `/acp`
+# and ambient ingest all reach a room_profile through devices declared
+# here. Each device id must be unique across all room profiles —
+# startup fails if two profiles share one, and also if a live device is
+# in the workspace device table but bound to none — and an incoming
+# `Authorization: Bearer <token>` resolves implicitly (token -> device
+# -> room profile), so external clients never name room_profile
+# themselves. Leave `devices = []` (or omit) to deny external access to
+# a profile.
+#
+# Every device id here comes from `sapphire-agent device add`, which
+# prints the id to mint — a 7-character grain-id — on stderr alongside
+# the token (printed alone to stdout, so `device add ... > token.txt`
+# captures just the secret). See "Device key file" below.
 #
 # [room_profile.sapphire_world]
 # profile          = "default"
 # memory_namespace = "sapphire_world"
-# rooms            = []                       # A2A-only; no chat rooms map here
-# api_keys         = ["sa-a2a-<long random>"] # one token per allowed client
+# rooms            = []             # A2A-only; no chat rooms map here
+# devices          = ["a3f9k2p"]    # id printed by `device add --name a2a-client`
 #
 # A typical MCP setup for an external coding assistant (Claude Code
 # and similar) sharing the user's default memory namespace. The
@@ -215,9 +227,9 @@ system_prompt = "You are a helpful personal assistant."
 #
 # [room_profile.claude_code]
 # profile          = "default"
-# memory_namespace = "default"                # share the everyday namespace
-# rooms            = []                       # MCP-only; no chat rooms map here
-# api_keys         = ["sa-mcp-<long random>"]
+# memory_namespace = "default"      # share the everyday namespace
+# rooms            = []             # MCP-only; no chat rooms map here
+# devices          = ["k7d2m9x"]    # id printed by `device add --name claude-code`
 #
 # Caveat: workspace retrieve (FTS / vector search) currently spans every
 # namespace because the agent's retrieve tools don't yet set the
@@ -230,9 +242,9 @@ system_prompt = "You are a helpful personal assistant."
 # ─────────────────────────────────────────────────────────────────────
 # Mounts `/a2a` (JSON-RPC) and `/.well-known/agent-card.json` on the
 # same HTTP server as `/rpc`. Disabled by default — flip `enabled` to
-# turn the routes on. Auth is per-room_profile bearer tokens in
-# `[room_profile.<n>].api_keys`; this section configures only the
-# public face of the agent.
+# turn the routes on. Auth resolves through the same device table as
+# every other endpoint: token -> device -> `[room_profile.<n>].devices`;
+# this section configures only the public face of the agent.
 #
 # [a2a]
 # enabled           = true
@@ -244,8 +256,8 @@ system_prompt = "You are a helpful personal assistant."
 # MCP (Model Context Protocol) server
 # ─────────────────────────────────────────────────────────────────────
 # Mounts `/mcp` (JSON-RPC) on the same HTTP server as `/rpc`. Always
-# enabled — there's no `[mcp]` block — but gated entirely by
-# `[room_profile.<n>].api_keys`: without a configured token, every
+# enabled — there's no `[mcp]` block — but gated entirely by the device
+# table: without a device bound to a room profile's `devices`, every
 # request returns 401. See the `[room_profile.claude_code]` example
 # above for the typical wiring.
 #
@@ -407,7 +419,7 @@ system_prompt = "You are a helpful personal assistant."
 # framing (and no base64 inflation) around a multi-kilobyte payload.
 #
 #   POST /audio/ingest?segment=<id>&started_at=<unix_ms>&rate=16000&live=1
-#   Authorization: Bearer <token from [keys].file, see [device.*] below>
+#   Authorization: Bearer <token from `sapphire-agent device add`, see below>
 #   Content-Type: audio/L16   (raw s16le)  — or: audio/wav
 #   <raw audio bytes>
 #
@@ -475,40 +487,46 @@ system_prompt = "You are a helpful personal assistant."
 # directory gains an id and becomes rename-safe.
 
 # ── Device key file (host-local) ────────────────────────────────────
-# Ambient capture devices authenticate with a bearer token that lives
-# only in `sapphire-framework`'s key file — never in this config — so
-# a leaked config reveals no credential and revoking a device is a
-# key-file edit, not an agent restart. Defaults to
+# Every authenticated entry point — ambient ingest, `/rpc`, `/a2a`,
+# `/acp`, `/mcp` — resolves the same way: bearer token -> key file entry
+# -> workspace device -> room profile. The token lives only in
+# `sapphire-framework`'s key file — never in this config — so a leaked
+# config reveals no credential. `DeviceAuth` holds a snapshot of the key
+# file and the device table taken at startup with no reload path, so a
+# revoke, rotate, retire, or `[room_profile.*].devices` edit takes effect
+# on this agent's next restart, not immediately. Defaults to
 # `dirs::config_dir()/sapphire-agent/keys.toml`.
 #
 # [keys]
 # file = "/etc/sapphire/keys.toml"
 #
-# The key file itself (`sapphire-framework` format, not this file):
+# `sapphire-agent` owns this file's rows; there is normally no reason to
+# hand-edit it. It is written only by:
 #
-#   [[key]]
-#   token       = "sa-dev-...."     # bearer token the device sends
-#   label       = "pendant, lanyard"  # a note; nothing reads this back
-#   expires_at  = "2027-01-01T00:00:00Z"  # optional
+#   sapphire-agent device add --name pendant --description "the one on the lanyard"
+#   sapphire-agent device rotate <name-or-id>
+#   sapphire-agent device retire <name-or-id> [--purge]
 #
-# `[[key]]` entries get an id assigned on load; `[device.<name>]`
-# below binds that id (not the token) to a device name, so this file
-# never has to hold a secret.
+# `device add` prints the freshly minted token to stdout ONLY (safe to
+# pipe: `device add --name pendant > pendant.token`), and everything
+# else — the device id, timestamps, and the `[room_profile.<n>].devices`
+# line to paste — to stderr.
 
-# ── Capture devices ──────────────────────────────────────────────────
-# One block per physical device. `key_id` is the id the framework's
-# `KeyStore` assigns the matching `[[key]]` entry above at load time —
-# `sapphire-agent verify` does not currently print it; find it by
-# loading the key file yourself (e.g. a one-off script against
-# `sapphire_framework::remote_server::KeyStore::load`) after adding a
-# key. A device block carrying an `api_key` (or any other secret field) is
-# a hard parse error, not a silently-ignored key: this is what lets
-# `[device.*]` be safe to share through the workspace config layer.
+# ── Devices (owned by `sapphire-agent device`, not this file) ────────
+# There is no `[device.*]` block here anymore: the device table lives at
+# `<workspace_dir>/.sapphire-agent/devices.toml`, next to
+# `.sapphire-agent/config.toml`, and is entirely owned by the `device`
+# subcommand above — this config only *routes* an existing device id to
+# a room profile, via `[room_profile.<n>].devices` (see the room_profile
+# examples earlier in this file).
 #
-# [device.pendant]
-# key_id       = "6c8f4a2e-1d33-4b90-9a71-0e5b2f8c4d17"
-# label        = "the one on the lanyard"   # reaches the system prompt
-# room_profile = "default"                  # reserved for S4 (server-side wake word)
+# Every device that is not retired must appear in exactly one
+# room_profile's `devices` array — startup refuses to run otherwise.
+# This includes devices that only ever reach ambient ingest: the moment
+# a captured conversation is answered rather than merely recorded, the
+# room_profile a device is bound to is what decides which LLM profile
+# and which memory namespace that conversation uses, so an ambient-only
+# device is not exempt from being routed.
 
 # ── Timer / Pomodoro presets ────────────────────────────────────────
 # Single-shot timers ("5分後に教えて") don't need configuration — the
@@ -540,9 +558,10 @@ steps  = [
 # ]
 
 # Agent Client Protocol endpoint (GET /acp, WebSocket).
-# Lets an ACP client such as Zed drive this agent. Authentication reuses the
-# bearer tokens in [room_profile.<name>].api_keys, and the token that connects
-# selects the room profile the ACP session runs under.
+# Lets an ACP client such as Zed drive this agent. Authentication resolves
+# through the same device table as every other endpoint (token -> device ->
+# room profile via [room_profile.<name>].devices), and the token that
+# connects selects the room profile the ACP session runs under.
 # Host-local: the workspace config layer cannot set this.
 [acp]
 enabled = false

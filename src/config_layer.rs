@@ -49,6 +49,11 @@ pub const WORKSPACE_ALLOWLIST: &[&[&str]] = &[
     &["room_profile", "*", "profile"],
     &["room_profile", "*", "memory_namespace"],
     &["room_profile", "*", "rooms"],
+    // Routing, like `rooms` above — which device runs under which profile. Not
+    // a credential: the tokens live in the host-local key file and a key names
+    // its own device, so a poisoned workspace layer can re-route a device but
+    // cannot admit one.
+    &["room_profile", "*", "devices"],
     &["room_profile", "*", "session_policy"],
     &["room_profile", "*", "voice_pipeline"],
     // Provider refinements. `api_key` and `base_url` are deliberately absent:
@@ -259,6 +264,14 @@ mod tests {
     fn wildcard_matches_any_single_map_key() {
         assert!(path_allowed(&["room_profile", "work", "profile"]));
         assert!(path_allowed(&["room_profile", "anything-at-all", "rooms"]));
+    }
+
+    #[test]
+    fn the_workspace_layer_may_route_devices_but_not_hold_tokens() {
+        // `devices` is routing, exactly like `rooms`, which is already allowed.
+        // `api_keys` held raw credentials and stays refused.
+        assert!(path_allowed(&["room_profile", "work", "devices"]));
+        assert!(!path_allowed(&["room_profile", "work", "api_keys"]));
     }
 
     #[test]
@@ -568,6 +581,7 @@ background_profile = "default"
 profile = "default"
 memory_namespace = "work"
 rooms = ["!a:example.org"]
+devices = ["a3f9k2p"]
 session_policy = "compact"
 voice_pipeline = "desk"
 

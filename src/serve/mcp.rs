@@ -16,11 +16,11 @@
 //!     AI can pick up where the user left off — possibly across
 //!     hosts.
 //!
-//! Auth: `Authorization: Bearer <token>` matched against
-//! `[room_profile.<n>].api_keys` (same mechanism as `/a2a`). The
-//! match implicitly resolves which room_profile this MCP session
-//! writes/reads as, so clients don't name the profile. Configure a
-//! room_profile with `rooms = []` (no chat rooms) for MCP-only use.
+//! Auth: `Authorization: Bearer <token>` resolved through `DeviceAuth`
+//! (same mechanism as `/a2a`). The match implicitly resolves which
+//! room_profile this MCP session writes/reads as, so clients don't name
+//! the profile. Configure a room_profile with `rooms = []` (no chat
+//! rooms) for MCP-only use.
 //!
 //! Trust boundary (asymmetric):
 //!   - Writes flow into the room_profile's namespace as ordinary
@@ -119,8 +119,8 @@ pub async fn handle_mcp_post(
         Some(b) => b,
         None => return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response(),
     };
-    let profile_name = match state.config.resolve_a2a_token(&bearer) {
-        Some(name) => name.to_string(),
+    let profile_name = match state.device_auth.resolve(&bearer) {
+        Some(r) => r.room_profile.to_string(),
         None => {
             return jsonrpc_error(
                 req_id,

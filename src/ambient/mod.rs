@@ -7,7 +7,6 @@
 //! `docs/superpowers/specs/2026-08-26-ambient-audio-ingest-design.md`.
 
 pub mod audio;
-pub mod auth;
 pub mod cache;
 pub mod ingest;
 pub mod models;

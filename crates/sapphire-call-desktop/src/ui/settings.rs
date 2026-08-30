@@ -27,11 +27,9 @@ pub fn ui(mut contexts: EguiContexts, mut state: ResMut<AppState>, bridge: NonSe
         ui.add_space(4.0);
         let token = state.config.server.token.get_or_insert_default();
         ui.label("API key (bearer token)");
-        ui.add(
-            egui::TextEdit::singleline(token)
-                .password(true)
-                .hint_text("must match a [room_profile.*].api_keys entry"),
-        );
+        ui.add(egui::TextEdit::singleline(token).password(true).hint_text(
+            "minted by `sapphire-agent device add`, listed in [room_profile.*].devices",
+        ));
 
         ui.add_space(8.0);
         ui.checkbox(&mut state.config.tts.enabled, "Speak replies (TTS)");

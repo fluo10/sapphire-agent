@@ -18,6 +18,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pushed on that tick.
 - **Sessions are no longer carried between devices.** Keep the workspace
   on an external sync service if you need that.
+- **`[room_profile.<n>].api_keys` removed** — plaintext bearer tokens no
+  longer live in config.toml. Replaced by `[room_profile.<n>].devices`,
+  a list of device ids from the workspace's `devices.toml`. An existing
+  config that still sets `api_keys` fails at startup; run `sapphire-agent
+  device add --name <device>` for each client and list the printed ids
+  under `devices` instead.
+- **`[device.<n>]` removed** — ambient ingest's hand-written key-id blocks
+  are replaced by the same workspace device table used by every other
+  entry point. An existing config that still sets one fails at startup;
+  run `sapphire-agent device add --name <name>` to re-register the
+  device (the old token cannot be carried over).
+- **A usable key file is now mandatory at startup**, not just when
+  ambient ingest is enabled — every authenticated endpoint (`/rpc`,
+  `/a2a`, `/acp`, `/mcp`, ambient ingest) now resolves through the same
+  `DeviceAuth`. A Matrix-only or fresh install that never needed a key
+  file before must now run `sapphire-agent device add --name <device>`
+  at least once before the agent will start.
 
 ## [0.7.2](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.7.1...sapphire-agent-v0.7.2) - 2026-05-24
 

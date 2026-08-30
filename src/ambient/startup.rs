@@ -18,11 +18,11 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::device_auth::DeviceAuth;
 use crate::tools::Tool;
 use crate::tools::ambient_tools::{AmbientToolState, ambient_tools};
 use crate::voice::VoiceProviders;
 
-use super::auth::DeviceRegistry;
 use super::cache::AudioCache;
 use super::ingest::{self, AmbientState, Segment};
 use super::models;
@@ -43,17 +43,21 @@ pub struct AmbientRuntime {
 
 /// Build everything, or `None` when `[ambient].enabled` is false.
 ///
+/// `device_auth` is built once by the caller and shared with `ServeState` —
+/// there is exactly one answer to "who is this token" in the process, so
+/// this function never resolves `[keys].file` or opens a device store
+/// itself.
+///
 /// Assembles, in order, failing loudly at each step:
 /// 1. the cache root (`[ambient].cache_dir`, else a platform default);
-/// 2. the device key store (`[keys].file`, else a platform default);
-/// 3. the configured STT provider, by name;
-/// 4. the VAD/embedding models;
-/// 5. the audio cache and the transcript store;
-/// 6. the speaker registry, loaded from workspace reference audio;
-/// 7. the candidate store, seeding the registry with every candidate
+/// 2. the configured STT provider, by name;
+/// 3. the VAD/embedding models;
+/// 4. the audio cache and the transcript store;
+/// 5. the speaker registry, loaded from workspace reference audio;
+/// 6. the candidate store, seeding the registry with every candidate
 ///    already on disk so a known voice matches on its next segment;
-/// 8. the admission channel, the ingest state, and the worker;
-/// 9. the agent tools, sharing the *same* `Arc<Mutex<CandidateStore>>` as
+/// 7. the admission channel, the ingest state, and the worker;
+/// 8. the agent tools, sharing the *same* `Arc<Mutex<CandidateStore>>` as
 ///    the worker — two stores over one directory would diverge in memory,
 ///    and promoting through a tool would leave the worker still matching
 ///    and re-promoting that voice.
@@ -61,6 +65,7 @@ pub fn build(
     config: &Config,
     workspace_dir: &Path,
     voice: Option<&VoiceProviders>,
+    device_auth: Arc<DeviceAuth>,
 ) -> Result<Option<AmbientRuntime>> {
     if !config.ambient.enabled {
         return Ok(None);
@@ -81,22 +86,7 @@ pub fn build(
             )
         })?;
 
-    // 2. Device key store. A missing or unusable key file is fatal here
-    // (not just an empty store) — see `DeviceRegistry::open`'s own doc.
-    let key_file = config
-        .keys
-        .file
-        .clone()
-        .or_else(DeviceRegistry::default_key_file)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "[keys].file is unset and no platform config directory is resolvable; \
-                 set [keys].file explicitly"
-            )
-        })?;
-    let devices = DeviceRegistry::open(&key_file, &config.devices)?;
-
-    // 3. STT provider, resolved by name. A typo here must not degrade
+    // 2. STT provider, resolved by name. A typo here must not degrade
     // into silent empty transcripts, so a missing provider is an error
     // that names what was configured.
     let stt = voice
@@ -108,10 +98,10 @@ pub fn build(
             )
         })?;
 
-    // 4. VAD re-gate + speaker embedding models.
+    // 3. VAD re-gate + speaker embedding models.
     let resolved = models::resolve(&config.ambient)?;
 
-    // 5. Audio cache + transcript store. The transcript store is opened
+    // 4. Audio cache + transcript store. The transcript store is opened
     // twice (once here for the worker, once below for the tools) rather
     // than shared: unlike `CandidateStore`, it holds no in-memory state
     // that two instances could diverge on, it is pure file I/O.
@@ -124,7 +114,7 @@ pub fn build(
     let tool_transcripts = TranscriptStore::open(transcripts_dir, config.day_boundary_hour)
         .context("opening ambient transcript store (tools)")?;
 
-    // 6. Speaker registry, loaded from workspace reference audio.
+    // 5. Speaker registry, loaded from workspace reference audio.
     let voices_dir = workspace_dir.join("voices");
     let mut registry = SpeakerRegistry::open(
         voices_dir.clone(),
@@ -137,7 +127,7 @@ pub fn build(
         .load_reference_audio(resolved.embedder.as_ref())
         .context("loading workspace reference audio")?;
 
-    // 7. Candidate store, seeding the registry so a candidate that was
+    // 6. Candidate store, seeding the registry so a candidate that was
     // already enrolled before a restart still matches on its next
     // segment instead of being enrolled a second time under a new id.
     // It is given the active model id: candidate centroids carry no
@@ -154,9 +144,9 @@ pub fn build(
     }
     let candidates = Arc::new(Mutex::new(candidate_store));
 
-    // 8. Admission channel, ingest state, worker.
+    // 7. Admission channel, ingest state, worker.
     let (tx, rx) = mpsc::channel(config.ambient.max_queue);
-    let ambient_state = Arc::new(AmbientState::new(config.ambient.clone(), devices, tx));
+    let ambient_state = Arc::new(AmbientState::new(config.ambient.clone(), device_auth, tx));
     let routes = ingest::routes(ambient_state);
 
     let worker = Worker {
@@ -175,7 +165,7 @@ pub fn build(
         language: None,
     };
 
-    // 9. Tools, sharing the worker's own `Arc<Mutex<CandidateStore>>`.
+    // 8. Tools, sharing the worker's own `Arc<Mutex<CandidateStore>>`.
     let tool_state = Arc::new(Mutex::new(AmbientToolState {
         transcripts: tool_transcripts,
         candidates: Arc::clone(&candidates),
@@ -231,26 +221,27 @@ mod tests {
         let mut cfg = Config::for_test();
         cfg.ambient.enabled = false;
         let tmp = tempfile::tempdir().unwrap();
-        let result = build(&cfg, tmp.path(), None).unwrap();
+        let device_auth = test_device_auth(tmp.path());
+        let result = build(&cfg, tmp.path(), None, device_auth).unwrap();
         assert!(result.is_none(), "ambient is opt-in");
     }
 
-    #[test]
-    fn build_errors_on_a_missing_key_file_and_names_it() {
-        let mut cfg = Config::for_test();
-        cfg.ambient.enabled = true;
-        let tmp = tempfile::tempdir().unwrap();
-        let missing = tmp.path().join("keys.toml");
-        cfg.keys.file = Some(missing.clone());
-
-        let err = build(&cfg, tmp.path(), None)
-            .err()
-            .expect("expected an error");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains(&missing.display().to_string()),
-            "error should name the key file, got: {msg}"
-        );
+    /// A minimal, valid `DeviceAuth`: one usable key, bound to no device.
+    /// `build` no longer resolves `[keys].file` or opens a device store
+    /// itself — that now happens once, before `build` is called, and is
+    /// covered by `device_auth::tests` (see in particular
+    /// `open_fails_when_the_key_file_has_no_usable_key`, which is what
+    /// `build_errors_on_a_missing_key_file_and_names_it` used to test here
+    /// before the key file resolution moved out of this module).
+    fn test_device_auth(dir: &std::path::Path) -> Arc<DeviceAuth> {
+        let keys_file = dir.join("keys.toml");
+        let devices_file = dir.join("devices.toml");
+        let mut keys = sapphire_framework::remote_server::KeyStore::load(&keys_file).unwrap();
+        keys.generate("sat", None, None, Some("test".into()), None)
+            .unwrap();
+        Arc::new(
+            DeviceAuth::open(&keys_file, &devices_file, &std::collections::HashMap::new()).unwrap(),
+        )
     }
 
     #[test]
@@ -259,18 +250,12 @@ mod tests {
         cfg.ambient.enabled = true;
         cfg.ambient.stt_provider = "nonexistent".into();
         let tmp = tempfile::tempdir().unwrap();
-        let key_path = tmp.path().join("keys.toml");
-        std::fs::write(
-            &key_path,
-            "[[key]]\ntoken = \"sa-dev-good\"\nlabel = \"pendant-key\"\n",
-        )
-        .unwrap();
-        cfg.keys.file = Some(key_path);
+        let device_auth = test_device_auth(tmp.path());
 
         // No `voice` registry at all — indistinguishable, from `build`'s
         // point of view, from one that exists but never configured a
         // `[stt_provider.nonexistent]` block.
-        let err = build(&cfg, tmp.path(), None)
+        let err = build(&cfg, tmp.path(), None, device_auth)
             .err()
             .expect("expected an error");
         let msg = format!("{err:#}");
@@ -282,9 +267,10 @@ mod tests {
 
     #[test]
     fn build_reaches_model_resolution_once_stt_resolves() {
-        // Confirms step ordering: with a valid key file and a real STT
-        // entry, `build` gets past auth and STT and fails at model
-        // resolution instead — this crate is built without
+        // Confirms step ordering: `device_auth` is a pre-validated `Arc`
+        // passed straight through (no auth step happens in `build` itself),
+        // so with a real STT entry, `build` gets past STT and fails at
+        // model resolution instead — this crate is built without
         // `voice-sherpa` in this test run, so that failure names the
         // feature rather than a model path.
         let mut cfg = Config::for_test();
@@ -297,16 +283,10 @@ mod tests {
             },
         );
         let tmp = tempfile::tempdir().unwrap();
-        let key_path = tmp.path().join("keys.toml");
-        std::fs::write(
-            &key_path,
-            "[[key]]\ntoken = \"sa-dev-good\"\nlabel = \"pendant-key\"\n",
-        )
-        .unwrap();
-        cfg.keys.file = Some(key_path);
+        let device_auth = test_device_auth(tmp.path());
 
         let voice = crate::voice::VoiceProviders::from_config(&cfg).unwrap();
-        let err = build(&cfg, tmp.path(), Some(&voice))
+        let err = build(&cfg, tmp.path(), Some(&voice), device_auth)
             .err()
             .expect("expected an error");
         let msg = format!("{err:#}");
