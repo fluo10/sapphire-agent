@@ -1668,7 +1668,8 @@ fn apply_input_kind_label(mut msg: ChatMessage) -> ChatMessage {
     msg
 }
 
-/// Where a turn reports its per-tool progress.
+/// Where a turn reports its per-tool progress — and who it asks before
+/// running a tool the policy wants asked about.
 ///
 /// `run_llm_turn` is the shared executor behind `/rpc`, the voice pipeline,
 /// A2A and the ACP endpoint — but each caller wants its
@@ -1679,12 +1680,10 @@ fn apply_input_kind_label(mut msg: ChatMessage) -> ChatMessage {
 /// reporting behind this trait keeps the turn executor itself agnostic to
 /// which of those shapes (if any) is listening.
 ///
-/// The per-transport hook a turn reports through — and, now, asks
-/// through.
-///
-/// Renamed from `TurnProgress`: it is no longer only about reporting.
-/// Both new methods carry defaults, so a transport that has no way to
-/// ask a human implements neither and keeps behaving exactly as it did.
+/// Named `TurnHost` rather than `TurnProgress` because of the second
+/// job: `origin` and `approve` ask rather than report. Both carry
+/// defaults, so a transport with no way to reach a human implements
+/// neither and keeps behaving exactly as it did.
 #[async_trait::async_trait]
 pub(crate) trait TurnHost: Send + Sync {
     async fn tool_start(&self, id: &str, name: &str);
@@ -2073,9 +2072,8 @@ pub(crate) async fn run_llm_turn(
                 let ns = namespace.clone();
                 let timer_origin = timer_origin.clone();
                 let mut results: Vec<(String, crate::tools::ToolOutput)> =
-                    futures_util::future::join_all(permitted.iter().map(|c| {
+                    futures_util::future::join_all(permitted.into_iter().map(|c| {
                         let tools = Arc::clone(&tools);
-                        let c = c.clone();
                         let ns = ns.clone();
                         let origin = timer_origin.clone();
                         async move {
@@ -2718,11 +2716,23 @@ mod tests {
     async fn a_refused_tool_returns_a_result_and_the_turn_continues() {
         use crate::tools::policy::Origin;
 
-        struct ChannelHost;
+        /// Records what it was told, so the test can assert a refused
+        /// call is still reported as starting and ending. A client that
+        /// hears `tool_start` and never `tool_end` leaves the entry
+        /// spinning in its tool list forever.
+        #[derive(Default)]
+        struct ChannelHost {
+            started: std::sync::Mutex<Vec<String>>,
+            ended: std::sync::Mutex<Vec<String>>,
+        }
         #[async_trait::async_trait]
         impl TurnHost for ChannelHost {
-            async fn tool_start(&self, _id: &str, _name: &str) {}
-            async fn tool_end(&self, _id: &str, _name: &str) {}
+            async fn tool_start(&self, id: &str, _name: &str) {
+                self.started.lock().unwrap().push(id.to_string());
+            }
+            async fn tool_end(&self, id: &str, _name: &str) {
+                self.ended.lock().unwrap().push(id.to_string());
+            }
             async fn turn_error(&self, _message: &str) {}
             fn origin(&self) -> Origin {
                 Origin::Channel
@@ -2754,11 +2764,12 @@ mod tests {
         let ran = risky.ran_flag();
         state.tools.register_tool(Box::new(risky)).await;
 
+        let host = Arc::new(ChannelHost::default());
         let outcome = run_llm_turn(
             Arc::clone(&state),
             "s-refused".to_string(),
             ChatMessage::user("run it"),
-            Arc::new(ChannelHost),
+            Arc::clone(&host) as Arc<dyn TurnHost>,
             None,
         )
         .await;
@@ -2768,6 +2779,36 @@ mod tests {
             !ran.load(std::sync::atomic::Ordering::SeqCst),
             "a refused tool must not have executed"
         );
+
+        // The model must still be told what happened to the call it
+        // made. Asserting on the turn's own text is not enough: the
+        // scripted provider ignores the history it is handed, so an
+        // implementation that refused the tool and then dropped its
+        // result entirely would produce exactly the same reply — and
+        // would fail the *next* real provider request with a 400,
+        // because a tool_use without its tool_result is malformed.
+        let history = state.sessions.lock().await;
+        let messages = history.get("s-refused").expect("the session exists");
+        let refusal = messages
+            .iter()
+            .flat_map(|m| &m.parts)
+            .find_map(|part| match part {
+                ContentPart::ToolResult {
+                    tool_use_id,
+                    content,
+                } if tool_use_id == "call-1" => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the refused call still owes the model a tool_result");
+        assert!(
+            refusal.contains("risky"),
+            "the refusal should name the tool, got {refusal}"
+        );
+
+        // Started and never ended leaves the entry spinning in a
+        // client's tool list.
+        assert_eq!(*host.started.lock().unwrap(), vec!["call-1".to_string()]);
+        assert_eq!(*host.ended.lock().unwrap(), vec!["call-1".to_string()]);
     }
 
     /// The same call is allowed once the origin is a trusted one, so
