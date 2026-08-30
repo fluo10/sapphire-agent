@@ -7,9 +7,9 @@ pub mod workspace_tools;
 use crate::config::McpServerConfig;
 use crate::mcp_client::{self, McpClient, build_tools_for_client};
 use crate::provider::{ToolCall, ToolSpec};
+pub use agent_client_protocol::schema::v1::ToolKind;
 use anyhow::Result;
 use async_trait::async_trait;
-pub use agent_client_protocol::schema::v1::ToolKind;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -320,8 +320,7 @@ mod tests {
 
         let mut got = tools.kinds().await;
         got.sort_by(|a, b| a.0.cmp(&b.0));
-        let got_refs: Vec<(&str, ToolKind)> =
-            got.iter().map(|(n, k)| (n.as_str(), *k)).collect();
+        let got_refs: Vec<(&str, ToolKind)> = got.iter().map(|(n, k)| (n.as_str(), *k)).collect();
 
         let want: Vec<(&str, ToolKind)> = vec![
             ("dir_list", ToolKind::Search),

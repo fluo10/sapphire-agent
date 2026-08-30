@@ -563,5 +563,13 @@ steps  = [
 # room profile via [room_profile.<name>].devices), and the token that
 # connects selects the room profile the ACP session runs under.
 # Host-local: the workspace config layer cannot set this.
+#
+# Tool permission is NOT configured here. Which tools need approval is
+# decided by what each tool does, and by the session mode the editor picks
+# (default / accept_edits / bypass). Standing "always allow" and "never
+# allow" answers are recorded in the host-local
+# ~/.config/sapphire-agent/acp-permissions.json — delete it to be asked
+# everything again. Chat channels (Matrix, Discord) are never asked: they
+# simply cannot call shell or MCP tools.
 [acp]
 enabled = false

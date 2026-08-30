@@ -58,12 +58,12 @@ use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, CurrentModeUpdate, Error,
-    InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
-    SessionId, SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
-    SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
-    ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionId, SessionMode as AcpSessionMode, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent, ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields,
 };
 use agent_client_protocol::{
     Agent, Client, ConnectionTo, Lines, on_receive_notification, on_receive_request,
@@ -652,8 +652,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         // leave the user believing the agent is
                         // planning when it is about to act.
                         return responder.respond_with_error(
-                            Error::invalid_params()
-                                .data(format!("unknown mode '{}'", req.mode_id)),
+                            Error::invalid_params().data(format!("unknown mode '{}'", req.mode_id)),
                         );
                     };
 
@@ -2102,7 +2101,9 @@ mod tests {
         assert_eq!(ids, vec!["default", "accept_edits", "bypass"]);
         // A picker with no labels is not a picker.
         assert!(
-            modes["availableModes"][0]["name"].as_str().is_some_and(|n| !n.is_empty()),
+            modes["availableModes"][0]["name"]
+                .as_str()
+                .is_some_and(|n| !n.is_empty()),
             "each mode needs a human-readable name, got {modes}"
         );
     }
@@ -2181,7 +2182,9 @@ mod tests {
             } else if v["id"] == 2 {
                 assert_eq!(v["error"]["code"], -32602, "got {v}");
                 assert!(
-                    v["error"]["data"].as_str().is_some_and(|d| d.contains("plan")),
+                    v["error"]["data"]
+                        .as_str()
+                        .is_some_and(|d| d.contains("plan")),
                     "the error should name the mode it rejected, got {v}"
                 );
                 break;
@@ -2218,7 +2221,9 @@ mod tests {
                 .await
                 .unwrap();
                 ws.send(Message::Text(
-                    prompt_request(3, &id, text_prompt("run it")).to_string().into(),
+                    prompt_request(3, &id, text_prompt("run it"))
+                        .to_string()
+                        .into(),
                 ))
                 .await
                 .unwrap();

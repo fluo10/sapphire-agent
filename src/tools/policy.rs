@@ -258,12 +258,18 @@ mod tests {
     #[test]
     fn editing_asks_only_in_acp_default() {
         for kind in EDITING {
-            assert_eq!(decide(Origin::Acp(SessionMode::Default), kind), Decision::Ask);
+            assert_eq!(
+                decide(Origin::Acp(SessionMode::Default), kind),
+                Decision::Ask
+            );
             assert_eq!(
                 decide(Origin::Acp(SessionMode::AcceptEdits), kind),
                 Decision::Allow
             );
-            assert_eq!(decide(Origin::Acp(SessionMode::Bypass), kind), Decision::Allow);
+            assert_eq!(
+                decide(Origin::Acp(SessionMode::Bypass), kind),
+                Decision::Allow
+            );
             assert_eq!(decide(Origin::Channel, kind), Decision::Allow);
             assert_eq!(decide(Origin::Trusted, kind), Decision::Allow);
         }
@@ -275,12 +281,18 @@ mod tests {
     #[test]
     fn risky_kinds_are_refused_on_channels_and_asked_in_acp() {
         for kind in RISKY {
-            assert_eq!(decide(Origin::Acp(SessionMode::Default), kind), Decision::Ask);
+            assert_eq!(
+                decide(Origin::Acp(SessionMode::Default), kind),
+                Decision::Ask
+            );
             assert_eq!(
                 decide(Origin::Acp(SessionMode::AcceptEdits), kind),
                 Decision::Ask
             );
-            assert_eq!(decide(Origin::Acp(SessionMode::Bypass), kind), Decision::Allow);
+            assert_eq!(
+                decide(Origin::Acp(SessionMode::Bypass), kind),
+                Decision::Allow
+            );
             assert_eq!(decide(Origin::Channel, kind), Decision::Deny);
             assert_eq!(decide(Origin::Trusted, kind), Decision::Allow);
         }
@@ -304,12 +316,18 @@ mod tests {
     #[test]
     fn an_unclassified_kind_lands_in_the_middle_row() {
         let kind = ToolKind::SwitchMode;
-        assert_eq!(decide(Origin::Acp(SessionMode::Default), kind), Decision::Ask);
+        assert_eq!(
+            decide(Origin::Acp(SessionMode::Default), kind),
+            Decision::Ask
+        );
         assert_eq!(
             decide(Origin::Acp(SessionMode::AcceptEdits), kind),
             Decision::Allow
         );
-        assert_eq!(decide(Origin::Acp(SessionMode::Bypass), kind), Decision::Allow);
+        assert_eq!(
+            decide(Origin::Acp(SessionMode::Bypass), kind),
+            Decision::Allow
+        );
         assert_eq!(decide(Origin::Channel, kind), Decision::Allow);
         assert_eq!(decide(Origin::Trusted, kind), Decision::Allow);
     }
