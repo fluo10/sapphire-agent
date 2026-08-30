@@ -40,9 +40,25 @@ impl SessionMode {
         }
     }
 
-    // The human-readable `name()` and `description()` that the client's
-    // mode picker shows arrive with the `session/new` handler that first
-    // sends them; writing them here would be two dead methods until then.
+    /// Human-readable name for the client's mode picker.
+    pub fn name(self) -> &'static str {
+        match self {
+            SessionMode::Default => "Ask before editing",
+            SessionMode::AcceptEdits => "Accept edits",
+            SessionMode::Bypass => "Bypass permissions",
+        }
+    }
+
+    /// One line under the name, saying what the mode actually changes.
+    pub fn description(self) -> &'static str {
+        match self {
+            SessionMode::Default => "Ask before writing files or running commands.",
+            SessionMode::AcceptEdits => {
+                "Write files without asking; still ask before running commands."
+            }
+            SessionMode::Bypass => "Run everything without asking.",
+        }
+    }
 
     /// `None` for an id this agent does not implement — `plan`, notably.
     pub fn from_id(id: &str) -> Option<SessionMode> {

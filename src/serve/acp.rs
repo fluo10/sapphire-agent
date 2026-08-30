@@ -57,10 +57,12 @@
 use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Error, InitializeRequest,
+    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, CurrentModeUpdate, Error,
+    InitializeRequest,
     InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
     PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
-    SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
+    SessionId, SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
+    SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
     ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{
@@ -586,7 +588,21 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         },
                     );
 
-                    responder.respond(NewSessionResponse::new(session_id))
+                    // The client learns the modes here, and starts in
+                    // the one that asks. `NewSessionResponse.modes` is a
+                    // plain `Option` in the schema, with no capability
+                    // gating it, so `initialize` needs no change.
+                    let modes = SessionModeState::new(
+                        crate::tools::policy::SessionMode::Default.id(),
+                        crate::tools::policy::SessionMode::ALL
+                            .into_iter()
+                            .map(|m| {
+                                AcpSessionMode::new(m.id(), m.name()).description(m.description())
+                            })
+                            .collect(),
+                    );
+
+                    responder.respond(NewSessionResponse::new(session_id).modes(modes))
                 }
             },
             on_receive_request!(),
@@ -621,6 +637,50 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                 }
             },
             on_receive_notification!(),
+        )
+        .on_receive_request(
+            {
+                let sessions = Arc::clone(&sessions);
+                async move |req: SetSessionModeRequest,
+                            responder,
+                            connection: ConnectionTo<Client>| {
+                    let Some(mode) =
+                        crate::tools::policy::SessionMode::from_id(req.mode_id.0.as_ref())
+                    else {
+                        // `plan` lands here. An error is the honest
+                        // reply: silently picking another mode would
+                        // leave the user believing the agent is
+                        // planning when it is about to act.
+                        return responder.respond_with_error(
+                            Error::invalid_params()
+                                .data(format!("unknown mode '{}'", req.mode_id)),
+                        );
+                    };
+
+                    {
+                        let mut guard = sessions.inner.lock().await;
+                        let Some(session) = guard.get_mut(&req.session_id) else {
+                            return responder.respond_with_error(
+                                Error::invalid_params()
+                                    .data(format!("unknown session '{}'", req.session_id)),
+                            );
+                        };
+                        session.mode = mode;
+                    }
+
+                    // Announce it: a client that changed the mode from
+                    // one surface should see it reflected on the others.
+                    if let Err(e) = connection.send_notification(SessionNotification::new(
+                        req.session_id.clone(),
+                        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode.id())),
+                    )) {
+                        warn!("ACP: dropped a current_mode_update: {e}");
+                    }
+
+                    responder.respond(SetSessionModeResponse::new())
+                }
+            },
+            on_receive_request!(),
         )
         .on_receive_request(
             {
@@ -1269,6 +1329,58 @@ mod tests {
     ///
     /// The session id is returned rather than discarded so callers can
     /// assert against *that* session in the shared store, instead of
+    /// against whatever session happens to be the only one there.
+    ///
+    /// `conversation` cannot be used here: it filters frames down to one
+    /// request id and would drop exactly the notifications under test,
+    /// turning a wrong ordering into a slow hang instead of a failure.
+    async fn drive(
+        addr: &str,
+        prompt: serde_json::Value,
+    ) -> (String, Vec<serde_json::Value>, serde_json::Value) {
+        let mut ws = connect(addr).await;
+        for request in [initialize_request(0), new_session_request(1)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        let mut session_id: Option<String> = None;
+        let mut updates = Vec::new();
+
+        loop {
+            let frame = next_frame(&mut ws).await;
+            let Message::Text(t) = frame else { continue };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+
+            if v["id"] == 1 {
+                let id = v["result"]["sessionId"]
+                    .as_str()
+                    .expect("sessionId present")
+                    .to_string();
+                session_id = Some(id.clone());
+                ws.send(Message::Text(
+                    prompt_request(2, &id, prompt.clone()).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            } else if v["method"] == "session/update" {
+                assert_eq!(
+                    v["params"]["sessionId"],
+                    *session_id.as_ref().expect("a session exists by now"),
+                    "an update must name the session it belongs to, got {v}"
+                );
+                updates.push(v["params"]["update"].clone());
+            } else if v["id"] == 2 {
+                return (
+                    session_id.expect("the prompt was sent, so a session exists"),
+                    updates,
+                    v,
+                );
+            }
+        }
+    }
+
     /// Like `drive`, but answers any `session/request_permission` the
     /// agent sends with `option_id`. Returns the session updates, the
     /// final reply, and how many permission requests arrived.
@@ -1320,58 +1432,6 @@ mod tests {
                 updates.push(v["params"]["update"].clone());
             } else if v["id"] == 2 {
                 return (updates, v, asked);
-            }
-        }
-    }
-
-    /// against whatever session happens to be the only one there.
-    ///
-    /// `conversation` cannot be used here: it filters frames down to one
-    /// request id and would drop exactly the notifications under test,
-    /// turning a wrong ordering into a slow hang instead of a failure.
-    async fn drive(
-        addr: &str,
-        prompt: serde_json::Value,
-    ) -> (String, Vec<serde_json::Value>, serde_json::Value) {
-        let mut ws = connect(addr).await;
-        for request in [initialize_request(0), new_session_request(1)] {
-            ws.send(Message::Text(request.to_string().into()))
-                .await
-                .unwrap();
-        }
-
-        let mut session_id: Option<String> = None;
-        let mut updates = Vec::new();
-
-        loop {
-            let frame = next_frame(&mut ws).await;
-            let Message::Text(t) = frame else { continue };
-            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-
-            if v["id"] == 1 {
-                let id = v["result"]["sessionId"]
-                    .as_str()
-                    .expect("sessionId present")
-                    .to_string();
-                session_id = Some(id.clone());
-                ws.send(Message::Text(
-                    prompt_request(2, &id, prompt.clone()).to_string().into(),
-                ))
-                .await
-                .unwrap();
-            } else if v["method"] == "session/update" {
-                assert_eq!(
-                    v["params"]["sessionId"],
-                    *session_id.as_ref().expect("a session exists by now"),
-                    "an update must name the session it belongs to, got {v}"
-                );
-                updates.push(v["params"]["update"].clone());
-            } else if v["id"] == 2 {
-                return (
-                    session_id.expect("the prompt was sent, so a session exists"),
-                    updates,
-                    v,
-                );
             }
         }
     }
@@ -2011,5 +2071,167 @@ mod tests {
 
         assert_eq!(asked, 1, "the second call must use the recorded answer");
         assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
+    }
+
+    fn set_mode_request(id: i64, session_id: &str, mode_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/set_mode",
+            "params": { "sessionId": session_id, "modeId": mode_id }
+        })
+    }
+
+    /// The client learns the modes when the session is created, and
+    /// starts in the one that asks.
+    #[tokio::test]
+    async fn session_new_advertises_the_three_modes() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let addr = spawn(state).await;
+        let replies =
+            conversation(&addr, vec![initialize_request(0), new_session_request(1)]).await;
+
+        let modes = &replies[1]["result"]["modes"];
+        assert_eq!(modes["currentModeId"], "default", "got {modes}");
+        let ids: Vec<&str> = modes["availableModes"]
+            .as_array()
+            .expect("availableModes is an array")
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["default", "accept_edits", "bypass"]);
+        // A picker with no labels is not a picker.
+        assert!(
+            modes["availableModes"][0]["name"].as_str().is_some_and(|n| !n.is_empty()),
+            "each mode needs a human-readable name, got {modes}"
+        );
+    }
+
+    /// Switching modes is acknowledged and announced.
+    #[tokio::test]
+    async fn set_mode_switches_and_notifies() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let addr = spawn(state).await;
+
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), new_session_request(1)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        let mut saw_mode_update = false;
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 1 {
+                let id = v["result"]["sessionId"].as_str().unwrap().to_string();
+                ws.send(Message::Text(
+                    set_mode_request(2, &id, "bypass").to_string().into(),
+                ))
+                .await
+                .unwrap();
+            } else if v["method"] == "session/update"
+                && v["params"]["update"]["sessionUpdate"] == "current_mode_update"
+            {
+                assert_eq!(v["params"]["update"]["currentModeId"], "bypass");
+                saw_mode_update = true;
+            } else if v["id"] == 2 {
+                assert!(v["error"].is_null(), "set_mode failed: {v}");
+                break;
+            }
+        }
+        assert!(saw_mode_update, "a mode change must be announced");
+    }
+
+    /// `plan` is not implemented, and must not silently resolve to
+    /// something else — a client told "fine" would believe the agent is
+    /// planning when it is about to act.
+    ///
+    /// Hand-rolled rather than via `roundtrip`, because a session lives
+    /// only as long as the connection that minted it: a second
+    /// connection would fail on the session id, not on the mode id, and
+    /// the test would pass for the wrong reason.
+    #[tokio::test]
+    async fn an_unknown_mode_is_invalid_params() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let addr = spawn(state).await;
+
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), new_session_request(1)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 1 {
+                let id = v["result"]["sessionId"].as_str().unwrap().to_string();
+                ws.send(Message::Text(
+                    set_mode_request(2, &id, "plan").to_string().into(),
+                ))
+                .await
+                .unwrap();
+            } else if v["id"] == 2 {
+                assert_eq!(v["error"]["code"], -32602, "got {v}");
+                assert!(
+                    v["error"]["data"].as_str().is_some_and(|d| d.contains("plan")),
+                    "the error should name the mode it rejected, got {v}"
+                );
+                break;
+            }
+        }
+    }
+
+    /// The mode is not decoration: `bypass` stops the asking.
+    #[tokio::test]
+    async fn bypass_mode_does_not_ask() {
+        let state = ServeState::for_test_scripted(true, risky_then_reply("done"));
+        let risky = super::super::RiskyTool::new();
+        let ran = risky.ran_flag();
+        state.tools.register_tool(Box::new(risky)).await;
+        let addr = spawn(state).await;
+
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), new_session_request(1)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 1 {
+                let id = v["result"]["sessionId"].as_str().unwrap().to_string();
+                ws.send(Message::Text(
+                    set_mode_request(2, &id, "bypass").to_string().into(),
+                ))
+                .await
+                .unwrap();
+                ws.send(Message::Text(
+                    prompt_request(3, &id, text_prompt("run it")).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            } else if v["method"] == "session/request_permission" {
+                panic!("bypass mode must not ask, got {v}");
+            } else if v["id"] == 3 {
+                assert_eq!(v["result"]["stopReason"], "end_turn", "got {v}");
+                break;
+            }
+        }
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "bypass should have run the tool, not merely skipped asking"
+        );
     }
 }
