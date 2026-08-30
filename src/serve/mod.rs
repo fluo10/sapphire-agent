@@ -11,6 +11,7 @@
 
 pub mod a2a;
 pub mod acp;
+pub mod acp_permissions;
 pub mod mcp;
 
 use crate::channel::RoomInfo;
