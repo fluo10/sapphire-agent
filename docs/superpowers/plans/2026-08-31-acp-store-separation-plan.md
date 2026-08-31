@@ -43,15 +43,17 @@ spec は「ターン中の `maybe_compress` は残す」と書いたが、その
 
 **解決: 新ストアでは書かない。** 圧縮はメモリ上の最適化で、永続化していたのは再開のため。その再開こそイベントからの復元が置き換えるので、書く理由が消える。プロセスが再起動すればイベントから完全な履歴が読み直され、必要ならまた圧縮される。
 
-### ダイジェストはワークスペース外に出さない（spec の決定を覆す）
+### ダイジェストはワークスペース外のキャッシュに置く（spec のとおり）
 
-spec は「サマリーとダイジェストはどちらもワークスペース外へ」と書いた。**ダイジェストについてはこれを取り消す。**
+spec の「サマリーとダイジェストはどちらもワークスペース外へ」は正しい。ストアのイベントにしてはいけない理由が2つある。
 
-理由は2つ。ひとつは、ACP セッションを横断ダイジェストに載せる以上、ダイジェストは `namespace` と `created_at` と `title` を伴って読まれる必要があり、キャッシュに置くとそのメタデータをセッションファイルとキャッシュの二箇所に持つことになる。**ストアのイベントとして持てば、それらはヘッダから引ける。**
+**`<workspace>/sessions` は retrieve の索引に入っている。** `SessionStore.base_dir` がそこで、`notify_updated` が `ws_state` に変更を通知している。ダイジェストは会話が伸びるたびに作り直されるので、イベントとして追記すると**似た内容の要約が同じファイルに積み上がり、検索結果を歪める。** 開発のようにターンの長いやりとりでは特に効く。
 
-もうひとつは分量。ツール結果と違い、ダイジェストは1セッション1日あたり数百バイトの散文で、ワークスペースを膨らませる類のものではない。ワークスペース外に出す動機が無い。
+**刈り取りでは解けない。** イベントは `parent` 鎖で繋がっているので、途中の要素を消すと子が孤児になる。append-only とダイジェストの刈り取りは両立しない。
 
-したがって新ストアは `EventBody::Digest` を持つ。`channel` ストアのダイジェスト（`src/agent.rs` が書いているもの）は**今のまま**で、移設しない。
+**メタデータの二重化は起きない。** キャッシュが持つのは本文と時刻だけで、`namespace` / `created_at` / `title` は読み出し時に**ストアのヘッダから結合する**。キャッシュは `session_id` をキーに最新の1件だけを持つので、上書きによってそもそも溜まらない。加えて日跨ぎの取りこぼし用に `prune_before` を用意し、デイリーログを書いた時点で呼ぶ。
+
+`channel` ストアのダイジェスト（`src/agent.rs` が書いているもの）は**今のまま**で、移設しない。
 
 ### ACP セッションはデイリーログと横断ダイジェストに載せる
 
@@ -1554,218 +1556,396 @@ git commit -m "refactor(acp): serve ACP sessions from their own store"
 
 ### Task 6: ACP セッションを横断ダイジェストに載せる
 
-「今日エージェントと何をしたか」が他の部屋のシステムプロンプトにも出るようにする。ダイジェストは新ストアのイベントとして持ち、既存の語彙に射影して読ませる。
+「今日エージェントと何をしたか」が他の部屋のシステムプロンプトにも出るようにする。ダイジェストはワークスペース外のキャッシュに置き、定期的に作り直す。
 
 **Files:**
+- Create: `src/digest_cache.rs`
 - Modify: `src/acp_session.rs`
 - Modify: `src/serve/mod.rs`
 - Modify: `src/periodic_log.rs`
 - Modify: `src/main.rs`
-- Test: `src/acp_session.rs` と `src/periodic_log.rs` の `mod tests`
+- Test: `src/digest_cache.rs`、`src/acp_session.rs`、`src/periodic_log.rs` の `mod tests`
 
 **Interfaces:**
-- Consumes: Task 2 の `Line` / `EventBody` / `SessionHeader`、Task 4 の `digest_all_sessions`
-- Produces: `EventBody::Digest { digest, since }`、`AcpSessionStore::append_intraday_digest(&self, session_id: &str, digest: &str, since: Option<DateTime<Utc>>) -> Result<()>`、`AcpSessionStore::intraday_digests_for_day(&self, date: NaiveDate, boundary_hour: u8) -> Vec<(SessionMeta, IntradayDigestLine)>`、`AcpSessionStore::sessions_needing_digest(&self, idle: chrono::Duration, now: DateTime<Utc>) -> Vec<String>`
+- Consumes: Task 2 の `SessionHeader` / `Event` / `EventBody`、Task 4 の `digest_all_sessions`
+- Produces: `DigestCache::open(PathBuf) -> Result<Arc<Self>>`、`DigestCache::default_dir() -> Option<PathBuf>`、`DigestCache::put(&self, session_id: &str, digest: &str, since: Option<DateTime<Utc>>) -> Result<()>`、`DigestCache::get(&self, session_id: &str) -> Option<IntradayDigestLine>`、`DigestCache::prune_before(&self, cutoff: DateTime<Utc>) -> usize`、`AcpSessionStore::intraday_digests_for_day(&self, date, boundary_hour, cache: &DigestCache) -> Vec<(SessionMeta, IntradayDigestLine)>`、`AcpSessionStore::sessions_needing_digest(&self, cache: &DigestCache, date: NaiveDate, boundary_hour: u8) -> Vec<String>`
 
-#### 設計上の要点
+#### ダイジェストをストアのイベントにしない理由
 
-**ダイジェストはイベントであって、キャッシュではない。** spec は「ワークスペース外へ」と書いたが取り消した——理由は plan 冒頭の「spec が答えていなかった点」に書いてある。要するに、横断ダイジェストの読み手は `namespace` と `created_at` と `title` を必要とし、それらはヘッダにある。キャッシュに出すとメタデータを二重に持つことになる。
+**セッション JSONL は retrieve の索引に入っている。** `SessionStore.base_dir` は
+`<workspace>/sessions` で、`notify_updated` が `ws_state` に変更を通知している。
+ダイジェストをイベントとして追記すると、**似た内容の要約が同じファイルに何度も
+積まれ、検索結果を歪める。** 開発のようにターンの長いやりとりでは特に効く。
 
-**アイドル判定に in-memory の地図は要らない。** `src/agent.rs` の `flush_intraday_digest` は `last_activity_at` と `last_flushed_at` を `Mutex<HashMap>` で持っているが、新ストアでは**どちらもファイルの中にある**——最後のメッセージイベントの `at` が活動時刻、最後のダイジェストイベントの `at` がフラッシュ済みの印。再起動を跨いでも正しく動く点で、既存版より素直になる。
+刈り取りで対処することもできない。イベントは `parent` 鎖で繋がっているので、
+途中の要素を消すと子が孤児になる。**append-only とダイジェストの刈り取りは両立しない。**
 
-- [ ] **Step 1: 失敗するテストを書く（ストア側）**
+したがってキャッシュに置く。spec の当初の判断（「ワークスペース外へ」）が正しかった。
+
+**メタデータの二重化は起きない。** キャッシュが持つのは本文と時刻だけで、
+`namespace` / `created_at` / `title` は読み出し時に**ストアのヘッダから結合する**。
+キャッシュは `session_id` をキーに**最新の1件だけ**を保持するので、上書きによって
+そもそも溜まらない。日跨ぎの取りこぼしのために `prune_before` も用意する。
+
+**キャッシュは ACP 専用にしない。** キーはセッション id だけで、ACP を知らない。
+[#189](https://github.com/fluo10/sapphire-agent/issues/189) で `/rpc` を同じ扱いに
+するなら、そのまま使い回せる。
+
+#### 生成のタイミング
+
+**「30分ごとに定期確認し、前回のダイジェスト以降にイベントが増えたセッションだけ
+作り直す」。** アイドル時間で測らないのは、更新のタイミングが予測しづらくなるため。
+定期確認なら「次は毎時0分と30分」と分かる。
+
+判定に in-memory の地図は要らない。前回いつダイジェストしたかはキャッシュの
+`digest_at` にあり、最後にイベントが増えた時刻はストアの中にある。**再起動を
+跨いでも正しく動く**点で、`src/agent.rs` の `last_activity_at` / `last_flushed_at`
+方式より素直になる。
+
+- [ ] **Step 1: 失敗するテストを書く（キャッシュ）**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_digest_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DigestCache::open(dir.path().to_path_buf()).unwrap();
+
+        cache.put("s1", "we fixed the parser", None).unwrap();
+        let got = cache.get("s1").expect("the digest is cached");
+        assert_eq!(got.digest, "we fixed the parser");
+    }
+
+    /// One entry per session, overwritten in place. This is what keeps
+    /// near-identical digests from piling up: there is nowhere for them
+    /// to pile.
+    #[test]
+    fn a_second_digest_replaces_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DigestCache::open(dir.path().to_path_buf()).unwrap();
+
+        cache.put("s1", "early", None).unwrap();
+        cache.put("s1", "late", None).unwrap();
+
+        assert_eq!(cache.get("s1").unwrap().digest, "late");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// Pruning is what the daily log calls once yesterday has been
+    /// written up: the digest has served its purpose and the permanent
+    /// record now carries the day.
+    #[test]
+    fn pruning_drops_entries_older_than_the_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DigestCache::open(dir.path().to_path_buf()).unwrap();
+
+        cache.put("old", "yesterday's work", None).unwrap();
+        let cutoff = Utc::now() + chrono::Duration::seconds(1);
+        cache.put_at("fresh", "today's work", None, cutoff + chrono::Duration::hours(1))
+            .unwrap();
+
+        assert_eq!(cache.prune_before(cutoff), 1);
+        assert!(cache.get("old").is_none());
+        assert!(cache.get("fresh").is_some());
+    }
+
+    /// A session id is used as a filename, so anything that could climb
+    /// out of the cache directory must not.
+    #[test]
+    fn a_traversing_session_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DigestCache::open(dir.path().to_path_buf()).unwrap();
+
+        assert!(cache.put("../escape", "nope", None).is_err());
+        assert!(cache.get("../escape").is_none());
+    }
+
+    /// Corruption is a miss, not a panic — the whole point of a cache.
+    #[test]
+    fn an_unparseable_entry_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DigestCache::open(dir.path().to_path_buf()).unwrap();
+        std::fs::write(dir.path().join("s1.json"), "{ not json").unwrap();
+        assert!(cache.get("s1").is_none());
+    }
+}
+```
+
+- [ ] **Step 2: テストが落ちることを確認**
+
+Run: `cargo test -p sapphire-agent digest_cache`
+Expected: FAIL — `DigestCache` が未定義。
+
+- [ ] **Step 3: キャッシュを実装する**
+
+```rust
+//! Intra-day session digests, kept outside the workspace.
+//!
+//! A digest answers "what has this session covered today" for the
+//! cross-session block in other rooms' system prompts. It is
+//! regenerated as the conversation grows, so successive digests are
+//! near-duplicates of each other.
+//!
+//! That is why they do not live in the session log. `<workspace>/sessions`
+//! is in the retrieve index, and a file accumulating a dozen restatements
+//! of the same afternoon would skew every search that touches it. Nor can
+//! they be pruned from the log: session events are chained by `parent`,
+//! and removing one orphans its children.
+//!
+//! So: one entry per session, overwritten in place, outside the
+//! workspace. Nothing accumulates, and losing the whole directory costs
+//! today's cross-session block and nothing else — the permanent record
+//! is the daily log.
+
+use anyhow::{Result, bail};
+use chrono::{DateTime, Utc};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tracing::warn;
+
+use crate::session::IntradayDigestLine;
+
+pub struct DigestCache {
+    dir: PathBuf,
+}
+
+impl DigestCache {
+    pub fn open(dir: PathBuf) -> Result<Arc<Self>> {
+        std::fs::create_dir_all(&dir)?;
+        Ok(Arc::new(Self { dir }))
+    }
+
+    /// `~/.cache/sapphire-agent/digests`, beside the image and
+    /// tool-result caches.
+    pub fn default_dir() -> Option<PathBuf> {
+        dirs::cache_dir().map(|d| d.join("sapphire-agent").join("digests"))
+    }
+
+    /// Session ids reach here from a transport, so they are not trusted
+    /// to be filenames.
+    fn path_for(&self, session_id: &str) -> Result<PathBuf> {
+        if session_id.is_empty()
+            || session_id.contains(['/', '\\', ':'])
+            || session_id.contains("..")
+        {
+            bail!("session id '{session_id}' is not usable as a cache filename");
+        }
+        Ok(self.dir.join(format!("{session_id}.json")))
+    }
+
+    pub fn put(&self, session_id: &str, digest: &str, since: Option<DateTime<Utc>>) -> Result<()> {
+        self.put_at(session_id, digest, since, Utc::now())
+    }
+
+    /// `put` with an explicit timestamp. Exists so tests can place an
+    /// entry on either side of a prune cutoff.
+    pub fn put_at(
+        &self,
+        session_id: &str,
+        digest: &str,
+        since: Option<DateTime<Utc>>,
+        digest_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let path = self.path_for(session_id)?;
+        let line = IntradayDigestLine {
+            digest_at,
+            digest: digest.to_string(),
+            since,
+        };
+        std::fs::write(&path, serde_json::to_string(&line)?)?;
+        Ok(())
+    }
+
+    pub fn get(&self, session_id: &str) -> Option<IntradayDigestLine> {
+        let path = self.path_for(session_id).ok()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        match serde_json::from_str(&text) {
+            Ok(line) => Some(line),
+            Err(e) => {
+                warn!("digest cache: {session_id} is unreadable ({e}); treating as absent");
+                None
+            }
+        }
+    }
+
+    /// Drop every entry digested before `cutoff`. Called once the daily
+    /// log for that day has been written — the digest has done its job
+    /// and the permanent record has taken over. Returns how many went.
+    pub fn prune_before(&self, cutoff: DateTime<Utc>) -> usize {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let stale = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<IntradayDigestLine>(&t).ok())
+                .map(|line| line.digest_at < cutoff)
+                // Unreadable entries are useless anyway.
+                .unwrap_or(true);
+            if stale && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+}
+```
+
+`src/main.rs` に `mod digest_cache;` を足す。
+
+- [ ] **Step 4: テストが通ることを確認**
+
+Run: `cargo test -p sapphire-agent digest_cache`
+Expected: PASS（5テスト）。
+
+- [ ] **Step 5: 失敗するテストを書く（ストア側の結合と判定）**
 
 `src/acp_session.rs` の `mod tests` に追記する。
 
 ```rust
+    fn digest_cache(dir: &tempfile::TempDir) -> Arc<crate::digest_cache::DigestCache> {
+        crate::digest_cache::DigestCache::open(dir.path().join("digests")).unwrap()
+    }
+
+    /// The digest's text comes from the cache; its namespace, title and
+    /// creation time come from the store's header. Neither side
+    /// duplicates the other, which is what makes an external cache
+    /// affordable here.
     #[test]
-    fn a_digest_is_an_event_and_reads_back_for_its_day() {
-        let (_d, store) = store();
+    fn a_digest_is_joined_against_the_stores_header() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
         store.create("s1", "work", "/p").unwrap();
         store.append_message("s1", &ChatMessage::user("did a thing")).unwrap();
-        store.append_intraday_digest("s1", "we fixed the parser", None).unwrap();
+        store.append_title("s1", "parser hunt").unwrap();
+        cache.put("s1", "we fixed the parser", None).unwrap();
 
         let today = chrono::Local::now().date_naive();
-        let found = store.intraday_digests_for_day(today, 4);
+        let found = store.intraday_digests_for_day(today, 4, &cache);
         assert_eq!(found.len(), 1);
         let (meta, digest) = &found[0];
         assert_eq!(digest.digest, "we fixed the parser");
         assert_eq!(meta.session_id, "s1");
         assert_eq!(
             meta.channel, "acp",
-            "the projection must say which store this came from — \
+            "the projection says which store this came from — \
              build_today_digest_for_namespace routes on it"
         );
-        assert_eq!(
-            meta.namespace.as_deref(),
-            Some("work"),
-            "the namespace comes from the header, which is why the digest \
-             belongs in the store rather than in a cache"
-        );
+        assert_eq!(meta.namespace.as_deref(), Some("work"));
+        assert_eq!(meta.title.as_deref(), Some("parser hunt"));
     }
 
-    /// Only the newest digest of the day is used: an earlier one covers a
-    /// prefix of the same conversation.
+    /// Losing the cache must not lose the session.
     #[test]
-    fn the_latest_digest_of_the_day_wins() {
-        let (_d, store) = store();
-        store.create("s1", "default", "/p").unwrap();
+    fn a_session_with_no_cached_digest_is_simply_absent() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
+        store.create("s1", "work", "/p").unwrap();
         store.append_message("s1", &ChatMessage::user("x")).unwrap();
-        store.append_intraday_digest("s1", "early", None).unwrap();
-        store.append_intraday_digest("s1", "late", None).unwrap();
 
         let today = chrono::Local::now().date_naive();
-        let found = store.intraday_digests_for_day(today, 4);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].1.digest, "late");
+        assert!(store.intraday_digests_for_day(today, 4, &cache).is_empty());
+        assert!(store.history("s1").is_some(), "the session still loads");
     }
 
-    /// A digest is not a message: it must not enter the model's history.
+    /// The scheduling rule, stated as a test: a session whose newest
+    /// message post-dates its cached digest is due for a new one. Not
+    /// "has been idle for N minutes" — the sweep runs on a fixed
+    /// cadence, so the only question is whether anything was added.
     #[test]
-    fn a_digest_does_not_appear_in_history() {
-        let (_d, store) = store();
+    fn a_session_with_events_newer_than_its_digest_is_due() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
         store.create("s1", "default", "/p").unwrap();
-        store.append_message("s1", &ChatMessage::user("real")).unwrap();
-        store.append_intraday_digest("s1", "a digest", None).unwrap();
+        cache
+            .put_at("s1", "covered up to here", None, Utc::now() - chrono::Duration::hours(1))
+            .unwrap();
+        store.append_message("s1", &ChatMessage::user("something new")).unwrap();
 
-        let history = store.history("s1").unwrap();
-        assert_eq!(history.len(), 1);
-    }
-
-    /// A session that has gone quiet since its last message, and has not
-    /// been digested since, is due for one. This is the whole idle-flush
-    /// predicate, and it reads entirely off the file — no in-memory
-    /// activity map to lose across a restart.
-    #[test]
-    fn an_idle_undigested_session_is_due_for_a_digest() {
-        let (_d, store) = store();
-        store.create("quiet", "default", "/p").unwrap();
-        store.append_message("quiet", &ChatMessage::user("said something")).unwrap();
-
-        let much_later = Utc::now() + chrono::Duration::hours(1);
-        let due = store.sessions_needing_digest(chrono::Duration::minutes(10), much_later);
-        assert_eq!(due, vec!["quiet".to_string()]);
-    }
-
-    #[test]
-    fn a_session_digested_since_its_last_message_is_not_due_again() {
-        let (_d, store) = store();
-        store.create("done", "default", "/p").unwrap();
-        store.append_message("done", &ChatMessage::user("said something")).unwrap();
-        store.append_intraday_digest("done", "covered", None).unwrap();
-
-        let much_later = Utc::now() + chrono::Duration::hours(1);
-        assert!(
-            store
-                .sessions_needing_digest(chrono::Duration::minutes(10), much_later)
-                .is_empty()
+        let today = chrono::Local::now().date_naive();
+        assert_eq!(
+            store.sessions_needing_digest(&cache, today, 4),
+            vec!["s1".to_string()]
         );
     }
 
-    /// Still being typed into. Digesting now would produce a digest that
-    /// is stale before it is read.
     #[test]
-    fn a_session_with_recent_activity_is_not_due_yet() {
-        let (_d, store) = store();
-        store.create("busy", "default", "/p").unwrap();
-        store.append_message("busy", &ChatMessage::user("mid-conversation")).unwrap();
+    fn a_session_with_nothing_new_since_its_digest_is_not_due() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
+        store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &ChatMessage::user("said something")).unwrap();
+        cache.put("s1", "covered", None).unwrap();
 
-        assert!(
-            store
-                .sessions_needing_digest(chrono::Duration::minutes(10), Utc::now())
-                .is_empty()
+        let today = chrono::Local::now().date_naive();
+        assert!(store.sessions_needing_digest(&cache, today, 4).is_empty());
+    }
+
+    #[test]
+    fn a_never_digested_session_with_messages_is_due() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
+        store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &ChatMessage::user("first words")).unwrap();
+
+        let today = chrono::Local::now().date_naive();
+        assert_eq!(
+            store.sessions_needing_digest(&cache, today, 4),
+            vec!["s1".to_string()]
         );
+    }
+
+    /// A session that has said nothing today is not resurrected. Its
+    /// day has been written up already; digesting it now would file old
+    /// work under today.
+    #[test]
+    fn a_session_with_no_messages_today_is_not_due() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
+        store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &ChatMessage::user("old news")).unwrap();
+
+        let tomorrow = chrono::Local::now().date_naive() + chrono::Duration::days(1);
+        assert!(store.sessions_needing_digest(&cache, tomorrow, 4).is_empty());
     }
 ```
 
-- [ ] **Step 2: テストが落ちることを確認**
+- [ ] **Step 6: テストが落ちることを確認**
 
 Run: `cargo test -p sapphire-agent acp_session`
-Expected: FAIL — `append_intraday_digest` が未定義。
+Expected: FAIL — `intraday_digests_for_day` が未定義。
 
-- [ ] **Step 3: `Digest` イベントを足す**
-
-`src/acp_session.rs` の `EventBody` と `Line` に variant を足す。
-
-```rust
-// EventBody に:
-    /// What this session covered today, for the cross-session block in
-    /// other rooms' system prompts.
-    ///
-    /// An event rather than a cache entry: the digest is read alongside
-    /// the session's namespace, title and creation time, and those live
-    /// in the header. A few hundred bytes a day is not what would make
-    /// a workspace heavy — tool results were, and those went out.
-    Digest {
-        digest: String,
-        since: Option<DateTime<Utc>>,
-    },
-
-// Line に:
-    Digest {
-        id: Uuid,
-        parent: Option<Uuid>,
-        at: DateTime<Utc>,
-        digest: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        since: Option<DateTime<Utc>>,
-    },
-```
-
-**この variant を足したことで壊れる `match` を全部直す。** コンパイラが指す:
-`events()` の `Line` → `Event` 変換、`summary()` の走査（ダイジェストは
-`has_messages` にも `title` にも `is_closed` にも影響しないので `Line::Digest { .. } => {}`）、
-`history()` の `EventBody` の扱い（`if let EventBody::Message` なので自動的に無視される)。
-
-- [ ] **Step 4: 書き込みと読み出しを足す**
+- [ ] **Step 7: 結合と判定を実装する**
 
 ```rust
 impl AcpSessionStore {
-    pub fn append_intraday_digest(
-        &self,
-        session_id: &str,
-        digest: &str,
-        since: Option<DateTime<Utc>>,
-    ) -> Result<()> {
-        let id = Uuid::now_v7();
-        self.append_line(
-            session_id,
-            id,
-            Line::Digest {
-                id,
-                parent: self.tip(session_id),
-                at: Utc::now(),
-                digest: digest.to_string(),
-                since,
-            },
-        )
-    }
-
-    /// The latest digest per session whose `digest_at` falls inside
-    /// `date`'s local window, projected into the vocabulary the
-    /// cross-session digest builder already speaks.
+    /// Today's digest per session, in the vocabulary the cross-session
+    /// digest builder already speaks.
     ///
-    /// The projection is read-only and deliberate: `format_sessions` and
-    /// `build_today_digest_for_namespace` are shared with four other
-    /// stores, and teaching them a second shape would spread this
-    /// store's format into code that has no business knowing it.
+    /// The text comes from `cache`; everything around it comes from the
+    /// session's header. The projection is read-only and deliberate:
+    /// `build_today_digest_for_namespace` is shared with four other
+    /// stores, and teaching it a second shape would spread this store's
+    /// format into code with no business knowing it.
     pub fn intraday_digests_for_day(
         &self,
         date: NaiveDate,
         boundary_hour: u8,
+        cache: &crate::digest_cache::DigestCache,
     ) -> Vec<(SessionMeta, IntradayDigestLine)> {
         let (day_start, day_end) = crate::session::day_window(date, boundary_hour);
         let mut out = Vec::new();
         for session_id in self.all_session_ids() {
-            // A file untouched before the window cannot hold a digest in it.
-            if let Some(path) = self.find(&session_id)
-                && let Ok(fs_meta) = path.metadata()
-                && let Ok(mtime) = fs_meta.modified()
-            {
-                let mtime_utc: DateTime<Utc> = mtime.into();
-                if mtime_utc < day_start {
-                    continue;
-                }
+            let Some(digest) = cache.get(&session_id) else {
+                continue;
+            };
+            if digest.digest_at < day_start || digest.digest_at >= day_end {
+                continue;
             }
             let Some(header) = self.header(&session_id) else {
                 continue;
@@ -1773,23 +1953,55 @@ impl AcpSessionStore {
             let Some(events) = self.events(&session_id) else {
                 continue;
             };
-            let latest = events
-                .iter()
-                .filter(|e| e.at >= day_start && e.at < day_end)
-                .filter_map(|e| match &e.body {
-                    EventBody::Digest { digest, since } => Some(IntradayDigestLine {
-                        digest_at: e.at,
-                        digest: digest.clone(),
-                        since: *since,
-                    }),
-                    _ => None,
-                })
-                .last();
-            let Some(digest) = latest else { continue };
             out.push((self.project_meta(&header, &events), digest));
         }
         out.sort_by_key(|(meta, _)| meta.created_at);
         out
+    }
+
+    /// Sessions whose newest message post-dates their cached digest, and
+    /// which said something inside `date`'s window.
+    ///
+    /// Deliberately not an idle threshold. The sweep runs on a fixed
+    /// cadence, so the only question worth asking is whether anything
+    /// was added since last time — which makes the next update time
+    /// predictable instead of a function of when the user stopped
+    /// typing. Both sides of the comparison are durable (a cache file
+    /// and a session event), so a restart does not reset the schedule.
+    pub fn sessions_needing_digest(
+        &self,
+        cache: &crate::digest_cache::DigestCache,
+        date: NaiveDate,
+        boundary_hour: u8,
+    ) -> Vec<String> {
+        let (day_start, day_end) = crate::session::day_window(date, boundary_hour);
+        let mut due = Vec::new();
+        for session_id in self.all_session_ids() {
+            let Some(events) = self.events(&session_id) else {
+                continue;
+            };
+            let last_message = events
+                .iter()
+                .filter(|e| matches!(e.body, EventBody::Message { .. }))
+                .map(|e| e.at)
+                .last();
+            let Some(last_message) = last_message else {
+                continue;
+            };
+            // Said nothing today: its day is already written up.
+            if last_message < day_start || last_message >= day_end {
+                continue;
+            }
+            if cache
+                .get(&session_id)
+                .is_some_and(|d| d.digest_at >= last_message)
+            {
+                continue;
+            }
+            due.push(session_id);
+        }
+        due.sort();
+        due
     }
 
     /// This store's sessions in the vocabulary the log and digest
@@ -1826,158 +2038,40 @@ impl AcpSessionStore {
             .filter_map(|p| Some(p.file_stem()?.to_str()?.to_string()))
             .collect()
     }
-
-    /// Sessions that have gone quiet and have not been digested since
-    /// their last message.
-    ///
-    /// Both facts come off the file — the last message event's `at` and
-    /// the last digest event's `at` — so this survives a restart, which
-    /// the channel-side equivalent in `agent.rs` does not.
-    ///
-    /// Only files touched in the last day are considered. That is a
-    /// correctness rule before it is a speed one: a session idle since
-    /// yesterday should have been digested yesterday, and digesting it
-    /// now would file yesterday's work under today.
-    pub fn sessions_needing_digest(
-        &self,
-        idle: chrono::Duration,
-        now: DateTime<Utc>,
-    ) -> Vec<String> {
-        let mut due = Vec::new();
-        for session_id in self.all_session_ids() {
-            if let Some(path) = self.find(&session_id)
-                && let Ok(fs_meta) = path.metadata()
-                && let Ok(mtime) = fs_meta.modified()
-            {
-                let mtime_utc: DateTime<Utc> = mtime.into();
-                if now - mtime_utc > chrono::Duration::days(1) {
-                    continue;
-                }
-            }
-            let Some(events) = self.events(&session_id) else {
-                continue;
-            };
-            let last_message = events
-                .iter()
-                .filter(|e| matches!(e.body, EventBody::Message { .. }))
-                .map(|e| e.at)
-                .last();
-            let Some(last_message) = last_message else {
-                continue;
-            };
-            if now - last_message < idle {
-                continue;
-            }
-            let last_digest = events
-                .iter()
-                .filter(|e| matches!(e.body, EventBody::Digest { .. }))
-                .map(|e| e.at)
-                .last();
-            if last_digest.is_some_and(|d| d >= last_message) {
-                continue;
-            }
-            due.push(session_id);
-        }
-        due.sort();
-        due
-    }
 }
 ```
 
-`SessionMeta` の `title` フィールド名と型は現物に合わせること（`src/session.rs:41` の定義を読む）。`day_window` と `collect_session_files` は `src/session.rs` の private 関数なので、**両方 `pub(crate)` にする**（`collect_session_files` は Task 2 で済んでいる）。
+`SessionMeta` のフィールド名と型は現物（`src/session.rs:41`）に合わせること。`day_window` は `src/session.rs` の private 関数なので `pub(crate)` にする。`use` に `chrono::NaiveDate` と `crate::session::{IntradayDigestLine, SessionMeta}` を足す。
 
-`use` に `chrono::NaiveDate` と `crate::session::{IntradayDigestLine, SessionMeta}` を足す。
-
-- [ ] **Step 5: テストが通ることを確認**
+- [ ] **Step 8: テストが通ることを確認**
 
 Run: `cargo test -p sapphire-agent acp_session`
 Expected: PASS（18テスト）。
 
-- [ ] **Step 6: 横断ダイジェストの組み立てに ACP を渡す**
+- [ ] **Step 9: 30分ごとの掃き出しタスクを足す**
 
-`src/periodic_log.rs` の `build_today_digest_for_namespace` と `build_all_today_digests` に引数 `acp_store: Option<&AcpSessionStore>` を足す（`device_default_store` の隣、同じ `Option<&_>` の形）。
-
-```rust
-    if let Some(s) = acp_store {
-        entries.extend(s.intraday_digests_for_day(today, boundary_hour));
-    }
-```
-
-namespace の解決に `"acp"` の腕を足す。ACP はヘッダに namespace を持つので、
-`device-default` と同じ扱いでよい。
+`ServeState` に `pub(crate) digest_cache: Arc<DigestCache>` を足し（`src/main.rs` で `DigestCache::open(DigestCache::default_dir()...)` を組み立てて渡す）、`src/serve/mod.rs` にタスクを足す。
 
 ```rust
-        let is_rpc = meta.channel == "rpc";
-        let is_device_default = meta.channel == "device-default";
-        let is_acp = meta.channel == "acp";
-        let ns = if is_rpc {
-            crate::config::DEFAULT_NAMESPACE_NAME.to_string()
-        } else if is_device_default || is_acp {
-            // These pin their namespace at creation time — honour it
-            // directly rather than deriving one from a room id they
-            // do not have.
-            meta.namespace
-                .clone()
-                .unwrap_or_else(|| crate::config::DEFAULT_NAMESPACE_NAME.to_string())
-        } else {
-            room_to_namespace(&meta.room_id)
-        };
-```
-
-ラベルの分岐も同じ（`room_id` が空なので、room ベースのラベルは使えない）。
-
-```rust
-        let room_label = if is_rpc || is_device_default || is_acp {
-            meta.title
-                .clone()
-                .unwrap_or_else(|| format!("{}/{}", meta.channel, short_id(&meta.session_id)))
-        } else {
-            format!("{}/{}", meta.channel, short_id(&meta.room_id))
-        };
-```
-
-呼び出し側（`grep -rn "build_all_today_digests\|build_today_digest_for_namespace" src/`）に `Some(&state.acp_session_store)` を渡す。`ServeState` に届かない呼び出し側があれば `None` を渡す。
-
-- [ ] **Step 7: `build_today_digest_for_namespace` のテストを1本足す**
-
-```rust
-    /// An ACP session's digest reaches the room's system prompt, and it
-    /// is routed by the namespace in its header rather than by a room id
-    /// it does not have.
-    #[test]
-    fn an_acp_digest_lands_in_its_own_namespace() {
-        // 既存の build_today_digest_for_namespace テストの組み立てに
-        // ならい、AcpSessionStore を tempdir に作って
-        // create / append_message / append_intraday_digest してから
-        // acp_store: Some(&store) で呼ぶ。
-        // 期待: namespace "work" で呼ぶと本文にダイジェストが含まれ、
-        //       namespace "default" で呼ぶと None。
-    }
-```
-
-**このテストは実装者が既存テストの組み立てに合わせて書くこと。** 上のコメントが要件で、確かめるべき性質は2つ——(1) 自分の namespace のブロックに現れる、(2) 別の namespace のブロックには現れない。
-
-- [ ] **Step 8: アイドル・フラッシュのタスクを足す**
-
-`src/serve/mod.rs` に、静かになった ACP セッションを定期的にダイジェストするタスクを足す。`ServeState` を作った後、サーバ起動時に spawn する。
-
-```rust
-/// Periodically digest ACP sessions that have gone quiet.
+/// Refresh the digest of every ACP session that has grown since it was
+/// last digested.
 ///
-/// Without this the only digest an ACP session ever gets is the one at
-/// shutdown, which on a long-running server means the cross-session
-/// block never mentions today's work until the process restarts.
-///
-/// Unlike the channel-side flush in `agent.rs`, this keeps no in-memory
-/// activity map: "last message" and "last digest" are both events in the
-/// session file, so a restart does not reset the schedule.
-pub(crate) fn spawn_acp_digest_flush(state: Arc<ServeState>) {
+/// A fixed cadence rather than an idle timer: the next refresh is at a
+/// time the user can predict, and a long agent turn does not decide
+/// when it happens. Sessions with nothing new are skipped, so a quiet
+/// half hour costs one directory walk and no model calls.
+pub(crate) fn spawn_acp_digest_sweep(state: Arc<ServeState>) {
     tokio::spawn(async move {
-        let period = std::time::Duration::from_secs(300);
-        let idle = chrono::Duration::minutes(15);
+        let period = std::time::Duration::from_secs(1800);
         loop {
             tokio::time::sleep(period).await;
-            let due = state.acp_session_store.sessions_needing_digest(idle, Utc::now());
+            let today = chrono::Local::now().date_naive();
+            let boundary = state.config.day_boundary_hour;
+            let due = state.acp_session_store.sessions_needing_digest(
+                &state.digest_cache,
+                today,
+                boundary,
+            );
             for session_id in due {
                 let Some(messages) = state.acp_session_store.history(&session_id) else {
                     continue;
@@ -1988,11 +2082,8 @@ pub(crate) fn spawn_acp_digest_flush(state: Arc<ServeState>) {
                 let provider = state.provider_for_session(&session_id).await;
                 match generate_summary(&*provider, &messages).await {
                     Ok(summary) if !summary.trim().is_empty() => {
-                        if let Err(e) = state
-                            .acp_session_store
-                            .append_intraday_digest(&session_id, &summary, None)
-                        {
-                            warn!("Failed to persist ACP digest for {session_id}: {e}");
+                        if let Err(e) = state.digest_cache.put(&session_id, &summary, None) {
+                            warn!("Failed to cache ACP digest for {session_id}: {e}");
                         }
                     }
                     Ok(_) => warn!("ACP digest for {session_id} was empty; skipping"),
@@ -2004,11 +2095,11 @@ pub(crate) fn spawn_acp_digest_flush(state: Arc<ServeState>) {
 }
 ```
 
-`axum::serve` を始める直前で `spawn_acp_digest_flush(Arc::clone(&state));` を呼ぶ。
+`axum::serve` を始める直前で `spawn_acp_digest_sweep(Arc::clone(&state));` を呼ぶ。
 
-**空ダイジェストは記録しない。** 記録すると `sessions_needing_digest` が「済み」と見なして、次に本文が書ける機会を潰す。上のコードはそうなっている（`Ok(_)` の腕で何も書かない）ので、**変えないこと。**
+**空ダイジェストはキャッシュしない。** キャッシュすると `sessions_needing_digest` が「済み」と見なして、次に本文が書ける機会を潰す。上のコードはそうなっている（`Ok(_)` の腕で何も書かない）ので、**変えないこと。**
 
-- [ ] **Step 9: シャットダウン時にも ACP を拾う**
+- [ ] **Step 10: シャットダウン時にも ACP を拾う**
 
 Task 4 で作った `digest_all_sessions` に ACP の分岐を足す。関数は in-memory の `state.sessions` を見ているので、ACP セッションもそこにいる。
 
@@ -2018,11 +2109,8 @@ Task 4 で作った `digest_all_sessions` に ACP の分岐を足す。関数は
         match generate_summary(&*provider, &messages).await {
             Ok(summary) if !summary.trim().is_empty() => {
                 if is_acp.contains(&session_id) {
-                    if let Err(e) = state
-                        .acp_session_store
-                        .append_intraday_digest(&session_id, &summary, None)
-                    {
-                        warn!("Failed to persist shutdown digest for {session_id}: {e}");
+                    if let Err(e) = state.digest_cache.put(&session_id, &summary, None) {
+                        warn!("Failed to cache shutdown digest for {session_id}: {e}");
                     }
                 } else if let Err(e) = state
                     .store_for_session(&session_id)
@@ -2037,20 +2125,88 @@ Task 4 で作った `digest_all_sessions` に ACP の分岐を足す。関数は
     }
 ```
 
-Task 4 が入れた `!acp.contains(*sid)` フィルタを外し、代わりに ACP の id 集合を
-`is_acp` としてスナップショットと一緒に取る。ログの文言 `"digesting {} RPC session(s)"` は
-`"digesting {} session(s)"` に直す。
+Task 4 が入れた `!acp.contains(*sid)` フィルタを外し、代わりに ACP の id 集合を `is_acp` としてスナップショットと一緒に取る。ログの文言 `"digesting {} RPC session(s)"` は `"digesting {} session(s)"` に直す。
 
-- [ ] **Step 10: テストが通ることを確認**
+- [ ] **Step 11: 横断ダイジェストの組み立てに ACP を渡す**
+
+`src/periodic_log.rs` の `build_today_digest_for_namespace` と `build_all_today_digests` に引数を2つ足す（`device_default_store` の隣）。
+
+```rust
+    acp_store: Option<&AcpSessionStore>,
+    digest_cache: Option<&DigestCache>,
+```
+
+```rust
+    if let (Some(s), Some(c)) = (acp_store, digest_cache) {
+        entries.extend(s.intraday_digests_for_day(today, boundary_hour, c));
+    }
+```
+
+namespace の解決に `"acp"` の腕を足す。ACP はヘッダに namespace を持つので `device-default` と同じ扱いでよい。
+
+```rust
+        let is_rpc = meta.channel == "rpc";
+        let is_device_default = meta.channel == "device-default";
+        let is_acp = meta.channel == "acp";
+        let ns = if is_rpc {
+            crate::config::DEFAULT_NAMESPACE_NAME.to_string()
+        } else if is_device_default || is_acp {
+            // These pin their namespace at creation time — honour it
+            // directly rather than deriving one from a room id they do
+            // not have.
+            meta.namespace
+                .clone()
+                .unwrap_or_else(|| crate::config::DEFAULT_NAMESPACE_NAME.to_string())
+        } else {
+            room_to_namespace(&meta.room_id)
+        };
+```
+
+ラベルの分岐も同じ（`room_id` が空なので room ベースのラベルは使えない）。
+
+```rust
+        let room_label = if is_rpc || is_device_default || is_acp {
+            meta.title
+                .clone()
+                .unwrap_or_else(|| format!("{}/{}", meta.channel, short_id(&meta.session_id)))
+        } else {
+            format!("{}/{}", meta.channel, short_id(&meta.room_id))
+        };
+```
+
+呼び出し側（`grep -rn "build_all_today_digests\|build_today_digest_for_namespace" src/`）に `Some(&state.acp_session_store), Some(&state.digest_cache)` を渡す。`ServeState` に届かない呼び出し側があれば両方 `None`。
+
+- [ ] **Step 12: `build_today_digest_for_namespace` のテストを1本足す**
+
+```rust
+    /// An ACP session's digest reaches the room's system prompt, and it
+    /// is routed by the namespace in its header rather than by a room id
+    /// it does not have.
+    #[test]
+    fn an_acp_digest_lands_in_its_own_namespace() {
+        // 既存の build_today_digest_for_namespace テストの組み立てにならい、
+        // AcpSessionStore と DigestCache を tempdir に作り、
+        // create / append_message / cache.put してから
+        // acp_store: Some(&store), digest_cache: Some(&cache) で呼ぶ。
+        //
+        // 期待は2つ:
+        //   (1) namespace "work" で呼ぶと本文にダイジェストが含まれる
+        //   (2) namespace "default" で呼ぶと None
+    }
+```
+
+**実装者が既存テストの組み立てに合わせて書くこと。** 上のコメントが要件で、確かめる性質は「自分の namespace のブロックに現れる」「別の namespace には現れない」の2つ。
+
+- [ ] **Step 13: テストが通ることを確認**
 
 Run: `cargo test -p sapphire-agent`
 Expected: PASS。
 
-- [ ] **Step 11: コミット**
+- [ ] **Step 14: コミット**
 
 ```bash
 git checkout -- Cargo.lock
-git add src/acp_session.rs src/serve/mod.rs src/periodic_log.rs src/main.rs
+git add src/digest_cache.rs src/acp_session.rs src/serve/mod.rs src/periodic_log.rs src/main.rs
 git commit -m "feat(acp): put ACP sessions in the cross-session today digest"
 ```
 
@@ -2289,7 +2445,33 @@ pub async fn generate_daily_log<F>(
 **これが無いと ACP セッションは `namespace_for_room("")` に落ちて、デフォルト
 namespace のログに全部流れ込む。** ヘッダに namespace があるのに使わないのは誤り。
 
-- [ ] **Step 6: heartbeat から ACP ストアを渡す**
+- [ ] **Step 6: デイリーログを書いたらダイジェストを刈る**
+
+`generate_daily_log` が `Ok(true)` を返した——つまりその日の恒久的な記録を書いた——時点で、その日以前のダイジェストは役目を終えている。`heartbeat.rs` の呼び出し側で刈る。
+
+```rust
+                        Ok(true) => {
+                            any_generated = true;
+                            // The permanent record for that day now
+                            // exists, so the digests that were standing
+                            // in for it can go.
+                            if let Some(cache) = self.serve_state.as_ref().map(|s| &s.digest_cache)
+                            {
+                                let (_, day_end) = crate::session::day_window(
+                                    yesterday,
+                                    self.day_boundary_hour,
+                                );
+                                let removed = cache.prune_before(day_end);
+                                if removed > 0 {
+                                    info!("Pruned {removed} digest(s) covered by the daily log");
+                                }
+                            }
+                        }
+```
+
+`catchup_pending_daily_logs` の中の生成箇所（`periodic_log.rs:887`）でも同じことをしたくなるが、**そこでは刈らない。** catch-up は過去日を埋める処理で、そのとき生きているキャッシュは今日のもの。過去日のログを書いたからといって今日のダイジェストを消してはいけない。上のコードが `yesterday` の `day_end` を切り口にしているのは、まさにその境界を守るため。
+
+- [ ] **Step 7: heartbeat から ACP ストアを渡す**
 
 `Heartbeat` は `serve_state: Option<Arc<ServeState>>` を既に持っている。`:128` と `:208` の呼び出しで
 
@@ -2299,21 +2481,21 @@ namespace のログに全部流れ込む。** ヘッダに namespace がある�
 
 を新しい引数に渡す。`serve_state` が `None`（serve が動いていない構成）なら `None` になり、既存どおりの挙動。
 
-- [ ] **Step 7: テストが通ることを確認**
+- [ ] **Step 8: テストが通ることを確認**
 
 Run: `cargo test -p sapphire-agent`
 Expected: PASS。
 
 `generate_daily_log` の既存テスト（あれば）は引数が1つ増えて落ちる。**`None` を渡して通す。** 引数追加以外に挙動が変わっていないことを確認すること。
 
-- [ ] **Step 8: フォーマットと lint**
+- [ ] **Step 9: フォーマットと lint**
 
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-- [ ] **Step 9: コミット**
+- [ ] **Step 10: コミット**
 
 ```bash
 git checkout -- Cargo.lock
@@ -2339,7 +2521,8 @@ PR #188 が README に書いた「ACP セッションは `/rpc` セッション�
 - 各イベントは UUIDv7 の `id` と `parent` を持ち、順序の権威は `parent` 鎖であって id の時刻ではない。
 - ツール結果はワークスペース外の `<cache_dir>/sapphire-agent/tool-results/` にハッシュで置かれ、JSONL は参照だけを持つ。**キャッシュを消してもセッションは読める**（結果がプレースホルダになる）。同期対象ではないので、別端末では結果が失われた状態で開く。
 - namespace 境界は memory namespace であって room profile ではない、という PR #188 が書いた注意書きは**そのまま残す**。まだ正しい。
-- **ACP セッションはデイリーログと横断ダイジェストの両方に載る。** ヘッダの namespace で振り分けられ、`channel` は `"acp"` として記録される。静かになって15分でダイジェストが作られ、シャットダウン時にも作られる。`/rpc` / device-default / MCP は載らない（[#189](https://github.com/fluo10/sapphire-agent/issues/189)）。
+- **ACP セッションはデイリーログと横断ダイジェストの両方に載る。** ヘッダの namespace で振り分けられ、`channel` は `"acp"` として記録される。`/rpc` / device-default / MCP は載らない（[#189](https://github.com/fluo10/sapphire-agent/issues/189)）。
+- **ダイジェストは30分ごとに掃き出され、前回以降にイベントが増えたセッションだけ作り直される。** 置き場所は `<cache_dir>/sapphire-agent/digests/` で、1セッション1件を上書きする。ワークスペースの外なのは、`<workspace>/sessions` が retrieve の索引に入っており、似た要約が積み上がると検索を歪めるため。デイリーログを書いた時点で、その日以前の分は刈られる。消えても失うのは今日の横断ブロックだけで、恒久的な記録はデイリーログのほう。
 
 - [ ] **Step 2: spec に訂正を追記する**
 
@@ -2375,21 +2558,27 @@ spec 本文は書き換えず、末尾に `## 実装時の訂正` を新設し�
 **ACP セッションは含める**——エージェントと今日何をしたかは残すべき記録であり、
 それが横断ダイジェストとデイリーログの両方に載ることを、この分離の要件とした。
 
-### ダイジェストはワークスペース外に出さない
+### ダイジェストをキャッシュに置く理由は、同期コストではなく検索汚染だった
 
-spec は「サマリーとダイジェストはどちらもワークスペース外へ」と書いた。
-**ダイジェストについては取り消す。**
+spec は「サマリーとダイジェストはどちらもワークスペース外へ。同期されなくなり、
+別端末では再生成になる」と書いた。結論は正しいが、理由がもう一つある。
 
-横断ダイジェストの読み手は本文だけでなく `namespace` と `created_at` と `title` を
-必要とする。キャッシュに出すとそれらをセッションファイルとキャッシュの二箇所に
-持つことになり、ずれ得る。ストアのイベントとして持てばヘッダから引ける。
-分量も、ツール結果と違って1セッション1日あたり数百バイトの散文で、
-ワークスペースを重くする類のものではない——重かったのはツール結果のほうで、
-それは実際に外へ出した。
+**`<workspace>/sessions` は retrieve の索引に入っている**（`SessionStore.base_dir`
+がそこで、`notify_updated` が `ws_state` に通知している）。ダイジェストは会話が
+伸びるたびに作り直されるので、セッションファイルに追記すると似た内容の要約が
+積み上がり、検索結果を歪める。ターンの長い開発セッションでは特に効く。
+
+そしてイベントとして持った場合、**刈り取りでは解けない**——イベントは `parent`
+鎖で繋がっており、途中を消すと子が孤児になる。append-only と刈り取りは両立しない。
+
+キャッシュは `session_id` をキーに最新1件だけを保持し、上書きで更新する。
+横断ダイジェストの読み手が必要とする `namespace` / `created_at` / `title` は
+ストアのヘッダから結合するので、メタデータの二重化は起きない。
+デイリーログを書いた時点で、その日以前の分を `prune_before` で刈る。
 
 `channel` ストアのダイジェスト（`src/agent.rs` が書いているもの）は移設しない。
-デイリーログ生成時のダイジェスト刈り取りも、`channel` ストアの話なので
-この plan の対象外のまま。
+同じ検索汚染は起きているはずだが、それは `channel` ストアの話であり、
+ストア分離と同じ PR に混ぜると壊れたときに切り分けられない。
 ```
 
 - [ ] **Step 3: ワークスペース全体のテスト**
