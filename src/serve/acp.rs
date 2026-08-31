@@ -1243,6 +1243,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
             .map(|s| s.agent_session_id.clone())
             .collect();
         let mut open = state.open_acp_sessions.lock().await;
+        let mut pending_cwd = state.pending_cwd.lock().await;
         for id in held {
             if let Some(count) = open.get_mut(&id) {
                 *count = count.saturating_sub(1);
@@ -1250,6 +1251,12 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     open.remove(&id);
                 }
             }
+            // A session created here but never prompted left its cwd
+            // waiting in `pending_cwd` for a first turn that will now
+            // never come. Safe to remove unconditionally: any run that
+            // did reach `ensure_session` already took its own entry out,
+            // so this is a no-op for those and a leak fix for the rest.
+            pending_cwd.remove(&id);
         }
     }
 
