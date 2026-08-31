@@ -58,12 +58,13 @@ use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, CurrentModeUpdate, Error,
-    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionId, SessionMode as AcpSessionMode, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities,
+    SessionId, SessionInfo, SessionListCapabilities, SessionMode as AcpSessionMode,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, TextContent, ToolCall as AcpToolCall, ToolCallId,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{
     Agent, Client, ConnectionTo, Lines, on_receive_notification, on_receive_request,
@@ -555,8 +556,13 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                 // checked above already authenticated the peer, so ACP never
                 // sees an unauthenticated client.
                 responder.respond(
-                    InitializeResponse::new(version)
-                        .agent_capabilities(AgentCapabilities::new().load_session(false)),
+                    InitializeResponse::new(version).agent_capabilities(
+                        AgentCapabilities::new()
+                            .load_session(false)
+                            .session_capabilities(
+                                SessionCapabilities::new().list(SessionListCapabilities::new()),
+                            ),
+                    ),
                 )
             },
             on_receive_request!(),
@@ -638,6 +644,64 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     );
 
                     responder.respond(NewSessionResponse::new(session_id).modes(modes))
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                let profile_name = profile_name.clone();
+                async move |req: ListSessionsRequest, responder, _connection| {
+                    let namespace = state
+                        .config
+                        .namespace_for_room_profile(&profile_name)
+                        .to_string();
+                    let store = Arc::clone(&state.cross_device_session_store);
+                    let wanted_cwd = req.cwd.as_ref().map(|c| c.to_string_lossy().to_string());
+
+                    let sessions: Vec<SessionInfo> = store
+                        .list_session_headers()
+                        .into_iter()
+                        // A closed session is archived, not current.
+                        .filter(|(_, is_closed)| !is_closed)
+                        .map(|(meta, _)| meta)
+                        .filter(|meta| {
+                            // Three filters, and the namespace one is a
+                            // boundary rather than a convenience. A file
+                            // too old to name its namespace is not shown:
+                            // an unknown owner is not the same as "mine".
+                            meta.namespace.as_deref() == Some(namespace.as_str())
+                        })
+                        .filter(|meta| match &wanted_cwd {
+                            Some(wanted) => meta.cwd.as_deref() == Some(wanted.as_str()),
+                            None => true,
+                        })
+                        .filter_map(|meta| {
+                            let path = store.absolute_path_for(&meta.session_id)?;
+                            let updated_at = std::fs::metadata(&path)
+                                .and_then(|m| m.modified())
+                                .ok()
+                                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+                            let cwd = meta
+                                .cwd
+                                .as_deref()
+                                .map(PathBuf::from)
+                                .unwrap_or_else(PathBuf::new);
+                            let mut info =
+                                SessionInfo::new(SessionId::new(meta.session_id.clone()), cwd);
+                            info = info.title(meta.title.clone());
+                            if let Some(updated_at) = updated_at {
+                                info = info.updated_at(updated_at);
+                            }
+                            Some(info)
+                        })
+                        .collect();
+
+                    // No pagination: the whole list, every time. A
+                    // cursor earns its keep when a namespace holds
+                    // thousands of sessions, and none does yet.
+                    responder.respond(ListSessionsResponse::new(sessions))
                 }
             },
             on_receive_request!(),
@@ -2380,6 +2444,217 @@ mod tests {
         assert_eq!(
             asked, 1,
             "accept_edits must still ask about an Execute tool"
+        );
+    }
+
+    fn list_request(id: i64, cwd: Option<&str>) -> serde_json::Value {
+        let params = match cwd {
+            Some(cwd) => serde_json::json!({ "cwd": cwd }),
+            None => serde_json::json!({}),
+        };
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "session/list", "params": params
+        })
+    }
+
+    /// The boundary. A token pinned to one room profile must not see
+    /// another profile's conversations, and a file too old to say which
+    /// namespace it belongs to is not shown either — an unknown owner is
+    /// not the same as "mine".
+    #[tokio::test]
+    async fn list_only_returns_this_namespaces_sessions() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.cross_device_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+
+        let mine = store
+            .create_session(&("r-mine".to_string(), None), "rpc", &ours)
+            .unwrap();
+        let theirs = store
+            .create_session(&("r-theirs".to_string(), None), "rpc", "someone-else")
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(&addr, vec![initialize_request(0), list_request(1, None)]).await;
+
+        let ids: Vec<&str> = replies[1]["result"]["sessions"]
+            .as_array()
+            .expect("sessions is an array")
+            .iter()
+            .map(|s| s["sessionId"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&mine.as_str()), "got {ids:?}");
+        assert!(
+            !ids.contains(&theirs.as_str()),
+            "another namespace leaked into the list: {ids:?}"
+        );
+        assert_eq!(replies[1]["result"]["nextCursor"], serde_json::Value::Null);
+    }
+
+    /// A file written before `namespace` existed cannot say whose it is.
+    /// An unknown owner is not the same as "mine", so it is not listed.
+    /// Written by hand because `create_session` always records one.
+    #[tokio::test]
+    async fn list_omits_sessions_with_no_namespace() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.cross_device_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let mine = store
+            .create_session(&("r-mine".to_string(), None), "rpc", &ours)
+            .unwrap();
+
+        // A legacy meta line: no `namespace` key at all.
+        let legacy_dir = store
+            .absolute_path_for(&mine)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let legacy = legacy_dir.join("00000000-0000-7000-8000-00000000dead.jsonl");
+        std::fs::write(
+            &legacy,
+            format!(
+                "{}\n",
+                serde_json::json!({"meta": {
+                    "session_id": "00000000-0000-7000-8000-00000000dead",
+                    "room_id": "r-legacy",
+                    "thread_id": null,
+                    "channel": "rpc",
+                    "created_at": "2020-01-01T00:00:00Z"
+                }})
+            ),
+        )
+        .unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(&addr, vec![initialize_request(0), list_request(1, None)]).await;
+
+        let ids: Vec<&str> = replies[1]["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["sessionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![mine.as_str()],
+            "a namespace-less file leaked: {ids:?}"
+        );
+    }
+
+    /// A closed session is archived, not current. Listing it would offer
+    /// the user a thread the agent has already summarised and moved on
+    /// from.
+    #[tokio::test]
+    async fn list_omits_closed_sessions() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.cross_device_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+
+        let open = store
+            .create_session(&("r-open".to_string(), None), "rpc", &ours)
+            .unwrap();
+        let closed = store
+            .create_session(&("r-closed".to_string(), None), "rpc", &ours)
+            .unwrap();
+        store.close_session(&closed).unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(&addr, vec![initialize_request(0), list_request(1, None)]).await;
+
+        let ids: Vec<&str> = replies[1]["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["sessionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![open.as_str()], "got {ids:?}");
+    }
+
+    /// The editor filters by project. A session with no recorded cwd
+    /// belongs to no project, so it is absent when a cwd is asked for
+    /// and present when one is not — which is how conversations from
+    /// before cwd was recorded stay reachable.
+    #[tokio::test]
+    async fn list_honours_the_cwd_filter() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.cross_device_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+
+        let no_cwd = store
+            .create_session(&("r-nocwd".to_string(), None), "rpc", &ours)
+            .unwrap();
+        let here = store
+            .ensure_session(
+                "s-here",
+                &("r-here".to_string(), None),
+                "rpc",
+                None,
+                &ours,
+                Some("/projects/here".to_string()),
+            )
+            .map(|_| "s-here".to_string())
+            .unwrap();
+        store
+            .ensure_session(
+                "s-elsewhere",
+                &("r-elsewhere".to_string(), None),
+                "rpc",
+                None,
+                &ours,
+                Some("/projects/elsewhere".to_string()),
+            )
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(
+            &addr,
+            vec![
+                initialize_request(0),
+                list_request(1, Some("/projects/here")),
+                list_request(2, None),
+            ],
+        )
+        .await;
+
+        let ids = |r: &serde_json::Value| -> Vec<String> {
+            r["result"]["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["sessionId"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        assert_eq!(ids(&replies[1]), vec![here.clone()], "filtered by cwd");
+        let all = ids(&replies[2]);
+        assert!(
+            all.contains(&no_cwd),
+            "unfiltered must include the cwd-less session: {all:?}"
+        );
+        assert_eq!(all.len(), 3, "got {all:?}");
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_listing() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let addr = spawn(state).await;
+        let reply = roundtrip(&addr, initialize_request(0)).await;
+        assert!(
+            !reply["result"]["agentCapabilities"]["sessionCapabilities"]["list"].is_null(),
+            "got {reply}"
         );
     }
 }
