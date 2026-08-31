@@ -1570,9 +1570,9 @@ git commit -m "refactor(acp): serve ACP sessions from their own store"
 - Consumes: Task 2 の `SessionHeader` / `Event` / `EventBody`、Task 4 の `digest_all_sessions`
 - Produces: `DigestCache::open(PathBuf) -> Result<Arc<Self>>`、`DigestCache::default_dir() -> Option<PathBuf>`、`DigestCache::put(&self, session_id: &str, digest: &str, since: Option<DateTime<Utc>>) -> Result<()>`、`DigestCache::get(&self, session_id: &str) -> Option<IntradayDigestLine>`、`DigestCache::prune_before(&self, cutoff: DateTime<Utc>) -> usize`、`AcpSessionStore::intraday_digests_for_day(&self, date, boundary_hour, cache: &DigestCache) -> Vec<(SessionMeta, IntradayDigestLine)>`、`AcpSessionStore::sessions_needing_digest(&self, cache: &DigestCache, date: NaiveDate, boundary_hour: u8) -> Vec<String>`
 
-#### Task 5 の後で前提が一つ変わっている
+#### 直前のタスクが header() を削除したので、前提が一つ変わっている
 
-Task 5 は `AcpSessionStore::header` と `is_closed` を削除した——`summary()` が
+直前のタスクが `AcpSessionStore::header` と `is_closed` を削除した——`summary()` が
 `SessionHeader` と `is_closed` の両方を含む上位互換で、実際に呼ぶ側がいなかったため。
 **したがってこの Task は `header()` ではなく `summary()` を使う。** `summary()` は
 `title` も返すので、`project_meta` がイベントを走査してタイトルを拾う必要も無くなり、
