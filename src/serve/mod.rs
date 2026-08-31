@@ -1924,7 +1924,7 @@ pub(crate) async fn run_llm_turn(
     if Arc::ptr_eq(&store, &state.cross_device_session_store) {
         let pending_pub_id = state.pending_sessions.lock().await.remove(&session_id);
         if let Err(e) = store
-            .ensure_session(&session_id, &key, "rpc", pending_pub_id, &namespace)
+            .ensure_session(&session_id, &key, "rpc", pending_pub_id, &namespace, None)
             .map(|_| ())
         {
             warn!("Failed to ensure session file: {e}");
