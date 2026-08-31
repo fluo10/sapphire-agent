@@ -100,6 +100,21 @@ impl Workspace {
         }
     }
 
+    /// This workspace's root directory, as an absolute path.
+    ///
+    /// `dir` is not itself guaranteed absolute: `--config` accepts a
+    /// relative path, and `resolve_workspace_dir`'s fallback derives the
+    /// workspace directory from the config file's own (possibly
+    /// relative) parent. `session/list` reports this as `SessionInfo.cwd`
+    /// for a session with no client-reported cwd, and the ACP schema
+    /// documents that field as required and absolute — so this
+    /// canonicalizes on read, falling back to the raw directory (still
+    /// correct, just possibly relative) only if canonicalization fails,
+    /// e.g. because the directory does not exist yet.
+    pub fn root(&self) -> PathBuf {
+        self.dir.canonicalize().unwrap_or_else(|_| self.dir.clone())
+    }
+
     /// Replace the cached "today's digest" map. Caller is responsible for
     /// computing the map (which walks every relevant session JSONL); this
     /// method just swaps the cache atomically.

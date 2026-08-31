@@ -698,13 +698,25 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                                 .cwd
                                 .as_deref()
                                 .map(PathBuf::from)
-                                .unwrap_or_else(PathBuf::new);
+                                // No client ever reported a cwd for this
+                                // session — it predates the field, or it
+                                // came in over /rpc, voice or chat.
+                                // `SessionInfo.cwd` is required and must
+                                // be absolute, so an empty path would be
+                                // a contract violation dressed up as a
+                                // null. The agent's own workspace root is
+                                // both absolute and true: the
+                                // conversation belongs to the agent, not
+                                // to an editor project. An editor
+                                // filtering by its project directory
+                                // therefore will not match it, which is
+                                // the intended behaviour for these
+                                // sessions.
+                                .unwrap_or_else(|| state.workspace.root());
                             let mut info =
                                 SessionInfo::new(SessionId::new(meta.session_id.clone()), cwd);
                             info = info.title(meta.title.clone());
-                            if let Some(updated_at) = updated_at {
-                                info = info.updated_at(updated_at);
-                            }
+                            info = info.updated_at(updated_at);
                             Some(info)
                         })
                         .collect();
@@ -2744,6 +2756,66 @@ mod tests {
             "unfiltered must include the cwd-less session: {all:?}"
         );
         assert_eq!(all.len(), 3, "got {all:?}");
+    }
+
+    /// A session with no client-reported cwd (it predates the field, or
+    /// came in over `/rpc`, voice or chat) still has to report an
+    /// absolute path: `SessionInfo.cwd` is required and the schema
+    /// documents it as absolute, so an empty string would be a contract
+    /// violation dressed up as a null. The agent's own workspace root
+    /// stands in for it — true, because the conversation belongs to the
+    /// agent rather than to any editor project — which is also why it
+    /// must never match a project-scoped `cwd` filter.
+    #[tokio::test]
+    async fn list_reports_the_workspace_root_for_a_session_with_no_cwd() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.cross_device_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let workspace_root = state.workspace.root();
+
+        let no_cwd = store
+            .create_session(&("r-nocwd".to_string(), None), "rpc", &ours)
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(
+            &addr,
+            vec![
+                initialize_request(0),
+                list_request(1, None),
+                list_request(2, Some("/projects/elsewhere")),
+            ],
+        )
+        .await;
+
+        let session = |r: &serde_json::Value| -> Option<serde_json::Value> {
+            r["result"]["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["sessionId"].as_str() == Some(no_cwd.as_str()))
+                .cloned()
+        };
+
+        let unfiltered = session(&replies[1]).expect("present when no cwd is requested");
+        let reported_cwd = unfiltered["cwd"].as_str().expect("cwd is a string");
+        assert!(
+            std::path::Path::new(reported_cwd).is_absolute(),
+            "got {reported_cwd:?}"
+        );
+        assert_eq!(
+            PathBuf::from(reported_cwd),
+            workspace_root,
+            "must be the agent's own workspace root"
+        );
+
+        assert!(
+            session(&replies[2]).is_none(),
+            "absent when the request filters by an unrelated project directory"
+        );
     }
 
     #[tokio::test]
