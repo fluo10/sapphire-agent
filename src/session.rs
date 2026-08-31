@@ -1051,7 +1051,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Enumerate `<base_dir>/<namespace>/<kind>/*.jsonl` across every namespace
 /// directory. Returns an empty Vec when `base_dir` doesn't exist yet (fresh
 /// install) or has no namespace subdirs. Each returned path is absolute.
-fn collect_session_files(base_dir: &Path, kind: &str) -> Vec<PathBuf> {
+pub(crate) fn collect_session_files(base_dir: &Path, kind: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(base_dir) else {
         return out;

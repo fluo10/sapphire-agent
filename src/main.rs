@@ -3,6 +3,7 @@
 // limit once the framework's redb/tantivy types are also in the graph.
 #![recursion_limit = "256"]
 
+mod acp_session;
 mod agent;
 mod ambient;
 mod channel;
