@@ -55,10 +55,12 @@ sapphire-call           # one-off interactive session (separate crate)
 ## Zed / ACP
 
 `sapphire-agent` can be driven directly from [Zed](https://zed.dev) as an ACP
-(Agent Client Protocol) agent, running against the same production workspace,
-memory and sessions as every other transport — a Zed conversation is not a
-separate agent, it lands in the same session store as `/rpc`, Matrix and
-Discord.
+(Agent Client Protocol) agent, running against the same production workspace
+and memory as every other transport — a Zed conversation is not a separate
+agent. Its sessions do get their own store, though: a separate directory
+tree and line format from `/rpc`, Matrix and Discord, not a `cwd`-tagged row
+folded into one of theirs. See
+[Loading past sessions](#loading-past-sessions) below for the layout.
 
 **1. Enable the endpoint** in your config (host-local; the workspace config
 layer cannot turn this on):
@@ -167,27 +169,65 @@ command on the next tick.
 
 ### Loading past sessions
 
+An ACP session lives at `<sessions_dir>/<namespace>/acp/<id>.jsonl`, its own
+tree with its own line format — separate from `/rpc`'s. It is routed by the
+`namespace` recorded in the session's own header, not by a room id (an ACP
+session has none), and it is recorded with `channel: "acp"`. Every line is
+`kind`-tagged; the first is the header (`session_id`, `namespace`, `cwd`,
+`created_at`), and every event after it carries a UUIDv7 `id` and the
+`parent` it was appended after. **The `parent` chain is the authority on
+order, not the `id`'s embedded clock** — two writers with skewed clocks
+would otherwise sort against each other wrongly.
+
 Zed's session picker lists this token's own conversations: `session/list`
 returns every open session under the connecting device's room profile's
-memory namespace, and Zed can further narrow it to the project directory it
-has open (`cwd`).
+memory namespace — that is the isolation boundary, not the room profile
+itself, so two profiles that leave `memory_namespace` unset both land on
+`default` and see each other's sessions. Zed can further narrow the list to
+the project directory it has open (`cwd`), which every ACP session records
+(the header field is required, not optional, since `session/new` always
+reports one).
 Picking one hands it to `session/load`, which replays the stored
 conversation into the editor before answering the request, or to
 `session/resume`, which does the same without the replay. Either way the
 session is a real one afterwards — prompting it continues the existing
 history rather than starting a fresh conversation.
 
-**Sessions from before this feature, and any created over `/rpc`, have no
-recorded `cwd`.** The project filter matches on `cwd`, so these sessions
-never show up in a project-filtered list — only in an unfiltered one.
-`cwd` is recorded once, from `session/new`'s own field, at the moment a
-session is first created; there is no way to backfill it onto a session
-that already exists.
+**A tool call's result is cached outside the workspace, addressed by
+hash.** It is written to `<cache_dir>/sapphire-agent/tool-results/<sha256>`,
+and the JSONL keeps only the hash. A second, separate cache holds one
+intra-day digest per session — "what this session has covered today" — at
+`<cache_dir>/sapphire-agent/digests/<session_id>.json`, overwritten in
+place rather than appended to. Losing either is survivable, in different
+ways:
+
+- **A missing tool result** degrades that `tool_result` to a placeholder
+  sentence on reload. The `tool_use`/`tool_result` pairing the API
+  validates stays intact, so the session still loads and the model can
+  call the tool again if it needs the content.
+- **A missing digest** costs only today's cross-session block — the block
+  other rooms' system prompts use to see what this session has been doing
+  today. It is not the durable record: the daily log is, built from the
+  session's own events rather than from the digest.
+
+Both caches sit outside the workspace for the same reason: `<workspace>/sessions`
+is in the retrieve search index, and a digest that is rewritten as the
+conversation grows would otherwise pile up near-duplicate summaries inside
+an indexed file and skew search — sync cost is secondary. A digest also
+cannot be pruned out of the session log itself: events are chained by
+`parent`, and removing one orphans its children.
+
+**ACP sessions appear in both the cross-session "today" digest and the
+daily log.** The digest is kept current by a sweep on a rolling 30-minute
+cadence from process start, which regenerates only the sessions whose
+newest message postdates their cached digest. `/rpc`, device-default and
+MCP sessions still do not reach the daily log —
+[#189](https://github.com/fluo10/sapphire-agent/issues/189).
 
 **Tool calls are not restored on replay.** See "A loaded session's tool
-calls are not replayed" below — the JSONL transcript a replay reads from
-never recorded a tool call's name, input or result in the first place, for
-the same reason it never recorded usage.
+calls are not replayed" below — the replay path projects only text parts
+out of the stored history, not `tool_use`/`tool_result` parts, even though
+the JSONL keeps enough of both to resume the conversation with the model.
 
 **Opening the same session on two connections at once is not safe to
 prompt from both.** Nothing stops a second Zed window — or any other ACP
@@ -235,11 +275,12 @@ whole turn.
   the API returns, so neither `session/update: usage_update` nor
   `PromptResponse.usage` is sent, and the editor cannot show what a turn
   cost or how full the context is.
-- **A loaded session's tool calls are not replayed.** `session/load`
-  reconstructs only user and assistant text from the JSONL transcript — it
-  never recorded a tool call's name, input or result, so there is nothing
-  to replay it from. A restored conversation shows what was said, not what
-  the agent did.
+- **A loaded session's tool calls are not replayed.** `session/load`'s
+  replay projects only text parts out of the stored history. The JSONL does
+  keep a tool call's name, input and (by hash, via the tool-result cache)
+  its result — enough for the model to resume the conversation — but the
+  replay path does not forward any of it to the editor. A restored
+  conversation shows what was said, not what the agent did.
 
 ### Configuring `websocat` in Zed
 

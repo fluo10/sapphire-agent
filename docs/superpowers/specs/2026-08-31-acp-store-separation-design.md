@@ -272,3 +272,60 @@ replay の順序、adopt の手順、接続カウンタ — どれも「どの�
 - **`SessionMeta` の残りの Option フィールド。** `public_id` / `project` /
   `device_id` / `room_profile` も、それぞれ1つのトランスポートしか使わない。
   ACP を分けた後、同じ問いが MCP と voice にも立つ。
+
+## 実装時の訂正
+
+実装中に確認した3点。spec 本文の前提を訂正する。
+
+### `summarize_all_sessions` は関数ごとは消せない
+
+同じ関数が `append_intraday_digest` も呼んでおり、それが `cross_device` ストアの
+**唯一の**ダイジェスト生成源だった。関数ごと消すと `build_today_digest_for_namespace`
+が組み立てる「今日の横断メモ」から `/rpc` セッション分が落ちる。spec 自身が
+「ダイジェストは保持」と言っているので、関数ごとの削除は spec に反していた。
+
+削ったのは `append_summary` の呼び出しだけ。関数は `digest_all_sessions` に改名した。
+
+### `/rpc` セッションはデイリーログに入っていない
+
+`generate_daily_log` は引数のストアを1つだけ読む。渡っているのは
+`channel_session_store`（`heartbeat.rs` の `Heartbeat.session_store` に `main.rs` が
+`channel_session_store` を入れている）なので、**デイリーログは Matrix / Discord の
+会話だけから作られている。**
+
+これは「旧フォーマットの `/rpc` ファイルを移行しなくてよい、デイリーログには
+入っているから」という判断の根拠を崩す。判断そのものは変わらない（retrieve の
+検索対象ではある）が、根拠は一つ減る。
+
+`/rpc` / device-default / MCP をデイリーログに含めるかは別の判断なので
+[#189](https://github.com/fluo10/sapphire-agent/issues/189) に切り出した。
+**ACP セッションは含める**——エージェントと今日何をしたかは残すべき記録であり、
+それが横断ダイジェストとデイリーログの両方に載ることを、この分離の要件とした。
+`generate_daily_log` に `acp_store: Option<&AcpSessionStore>` を渡し、
+`channel_session_store` の結果と `created_at` でマージしている
+(`sessions_for_day_merged`, `periodic_log.rs`)。
+
+### ダイジェストをキャッシュに置く理由は、同期コストではなく検索汚染だった
+
+spec は「サマリーとダイジェストはどちらもワークスペース外へ。同期されなくなり、
+別端末では再生成になる」と書いた。結論は正しいが、理由がもう一つある。
+
+**`<workspace>/sessions` は retrieve の索引に入っている**（`SessionStore.base_dir`
+がそこで、`notify_updated` が `ws_state` に通知している）。ダイジェストは会話が
+伸びるたびに作り直されるので、セッションファイルに追記すると似た内容の要約が
+積み上がり、検索結果を歪める。ターンの長い開発セッションでは特に効く。
+
+そしてイベントとして持った場合、**刈り取りでは解けない**——イベントは `parent`
+鎖で繋がっており、途中を消すと子が孤児になる。append-only と刈り取りは両立しない。
+だから ACP ストアの新形式でも、ダイジェストはイベント（`kind: message` / `title` /
+`closed` のいずれか）としては存在しない。`digests/` キャッシュだけに置く。
+
+キャッシュは `session_id` をキーに最新1件だけを保持し、上書きで更新する。
+横断ダイジェストの読み手が必要とする `namespace` / `created_at` / `title` は
+ストアのヘッダから結合するので、メタデータの二重化は起きない。
+デイリーログを書いた時点で、その日以前の分を `prune_before` で刈る。
+
+`channel` ストアのダイジェスト（`src/agent.rs` が書いているもの）は移設しない。
+同じ検索汚染は起きているはずだが、それは `channel` ストアの話であり、
+ストア分離と同じ PR に混ぜると壊れたときに切り分けられない。
+[#190](https://github.com/fluo10/sapphire-agent/issues/190) に切り出した。
