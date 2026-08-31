@@ -15,8 +15,9 @@
 //! transport expects, so [`lines_transport`] adapts the socket without
 //! reframing anything.
 //!
-//! `initialize`, `session/new`, `session/prompt` and `session/cancel` are
-//! answered here.
+//! `initialize`, `session/new`, `session/prompt`, `session/cancel`,
+//! `session/list`, `session/load`, `session/resume` and `session/set_mode`
+//! are answered here.
 //!
 //! A prompt is not implemented here beyond its ACP shape: it extracts the
 //! text, hands the turn to [`super::run_llm_turn`] — the same executor

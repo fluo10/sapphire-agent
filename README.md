@@ -168,8 +168,9 @@ command on the next tick.
 ### Loading past sessions
 
 Zed's session picker lists this token's own conversations: `session/list`
-returns every open session under the connecting device's room profile, and
-Zed can further narrow it to the project directory it has open (`cwd`).
+returns every open session under the connecting device's room profile's
+memory namespace, and Zed can further narrow it to the project directory it
+has open (`cwd`).
 Picking one hands it to `session/load`, which replays the stored
 conversation into the editor before answering the request, or to
 `session/resume`, which does the same without the replay. Either way the
