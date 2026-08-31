@@ -246,6 +246,35 @@ where
     dates
 }
 
+/// Merge `session_store`'s sessions for `date` with `acp_store`'s (when
+/// present), filtered by `room_predicate` on both sides and ordered by
+/// `created_at` — the exact input `format_sessions` reads.
+///
+/// Pure and read-only (no LLM call), so this is the seam the two-source
+/// merge itself is tested through: `generate_daily_log` cannot be driven
+/// from a test without a real provider, but this can.
+fn sessions_for_day_merged<F>(
+    session_store: &SessionStore,
+    acp_store: Option<&AcpSessionStore>,
+    date: NaiveDate,
+    boundary_hour: u8,
+    room_predicate: &F,
+) -> Vec<(SessionMeta, Vec<StoredMessage>)>
+where
+    F: Fn(&crate::session::SessionMeta) -> bool,
+{
+    let mut sessions = session_store.sessions_for_day_filtered(date, boundary_hour, room_predicate);
+    if let Some(acp) = acp_store {
+        sessions.extend(
+            acp.sessions_for_day(date, boundary_hour)
+                .into_iter()
+                .filter(|(meta, _)| room_predicate(meta)),
+        );
+    }
+    sessions.sort_by_key(|(meta, _)| meta.created_at);
+    sessions
+}
+
 /// Generate a daily log for `date` and write it to `memory/daily/YYYY-MM-DD.md`.
 /// Returns `Ok(true)` if a log was written, `Ok(false)` if there were no
 /// sessions for that day *and* no pre-existing draft at the target path.
@@ -267,16 +296,13 @@ pub async fn generate_daily_log<F>(
 where
     F: Fn(&crate::session::SessionMeta) -> bool,
 {
-    let mut sessions =
-        session_store.sessions_for_day_filtered(date, boundary_hour, &room_predicate);
-    if let Some(acp) = acp_store {
-        sessions.extend(
-            acp.sessions_for_day(date, boundary_hour)
-                .into_iter()
-                .filter(|(meta, _)| room_predicate(meta)),
-        );
-    }
-    sessions.sort_by_key(|(meta, _)| meta.created_at);
+    let sessions = sessions_for_day_merged(
+        session_store,
+        acp_store,
+        date,
+        boundary_hour,
+        &room_predicate,
+    );
     let stem = daily_stem(date);
     let has_existing = read_body(workspace_dir, namespace, LogKind::Daily, &stem)
         .is_some_and(|b| !b.trim().is_empty());
@@ -1734,6 +1760,261 @@ mod tests {
         assert!(
             other_namespace.is_none(),
             "the ACP digest must not leak into a different namespace: {other_namespace:?}"
+        );
+    }
+
+    // ── the two-source merge (`sessions_for_day_merged` / `pending_daily_dates`) ──
+    //
+    // `generate_daily_log` can't be driven from a test without a real LLM
+    // provider (`write_log_with_digest` calls one), so the merge it relies
+    // on is exercised directly through the pure helper instead.
+
+    /// Build a fresh channel-store + ACP-store pair under one temp dir,
+    /// namespaced under `sessions/{channel,acp}` the way `main.rs` lays
+    /// them out.
+    fn merge_test_stores(td: &tempfile::TempDir) -> (SessionStore, AcpSessionStore) {
+        let sessions_base = td.path().join("sessions");
+        let channel_store = SessionStore::new(sessions_base.join("channel"), "channel");
+        let tool_result_cache =
+            crate::tool_result_cache::ToolResultCache::open(td.path().join("tool-results"))
+                .unwrap();
+        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), tool_result_cache);
+        (channel_store, acp_store)
+    }
+
+    /// Append a message to an existing channel-store session with an
+    /// explicit (possibly backdated) timestamp, bypassing `append()`
+    /// (which always stamps `Utc::now()`). Mirrors the file format
+    /// documented at the top of `session.rs` and the hand-crafted-line
+    /// pattern `session.rs`'s own tests already use for backdating.
+    fn backdate_channel_message(
+        store: &SessionStore,
+        session_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        text: &str,
+    ) {
+        let path = store.absolute_path_for(session_id).expect("session exists");
+        let line = serde_json::json!({
+            "timestamp": at,
+            "role": "user",
+            "parts": [{"Text": text}],
+        });
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    /// Same idea for the ACP store: a raw `Line::Message` written
+    /// directly to the file so `at` can be backdated. Mirrors the
+    /// forged-event pattern `acp_session.rs`'s own tests use.
+    fn backdate_acp_message(
+        store: &AcpSessionStore,
+        session_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        text: &str,
+    ) {
+        let path = store.path_for_test(session_id);
+        let line = serde_json::json!({
+            "kind": "message",
+            "id": uuid::Uuid::now_v7(),
+            "parent": serde_json::Value::Null,
+            "at": at,
+            "role": "user",
+            "parts": [{"text": text}],
+        });
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    /// Both sources reach the transcript input, interleaved by
+    /// `created_at` rather than one block after the other. The ACP
+    /// session is created *first* (so it must sort first); the merge
+    /// pushes channel-store results first and extends with the ACP
+    /// results after, so this only passes if the trailing
+    /// `sort_by_key(created_at)` actually re-orders rather than leaving
+    /// push order intact.
+    #[test]
+    fn merged_sessions_for_day_interleaves_both_stores_by_created_at() {
+        let td = make_tempdir();
+        let (channel_store, acp_store) = merge_test_stores(&td);
+
+        acp_store.create("acp1", "default", "/p").unwrap();
+        acp_store
+            .append_message("acp1", &ChatMessage::user("acp said this first"))
+            .unwrap();
+
+        let chan_id = channel_store
+            .create_session(&("room1".to_string(), None), "matrix", "default")
+            .unwrap();
+        channel_store
+            .append(&chan_id, &ChatMessage::user("channel said this second"))
+            .unwrap();
+
+        let today = chrono::Local::now().date_naive();
+        let predicate = |_: &SessionMeta| true;
+        let sessions =
+            sessions_for_day_merged(&channel_store, Some(&acp_store), today, 4, &predicate);
+
+        assert_eq!(
+            sessions.len(),
+            2,
+            "both sources must contribute: {sessions:?}"
+        );
+        assert!(
+            sessions[0].0.created_at <= sessions[1].0.created_at,
+            "result must be ordered by created_at: {:?}",
+            sessions
+                .iter()
+                .map(|(m, _)| (&m.session_id, m.created_at))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            sessions[0].0.session_id, "acp1",
+            "the ACP session was created first and must sort first — proves the merge \
+             re-sorts by created_at instead of leaving the channel-store half \
+             (pushed first) ahead of the ACP half (extended in after) regardless of \
+             actual timing"
+        );
+    }
+
+    /// The room predicate is applied to the ACP side too, not just the
+    /// channel-store side — the property `Heartbeat::namespace_for_session`'s
+    /// `"acp"` arm exists to make true. An ACP session's own header
+    /// namespace decides which namespace's log it belongs to.
+    #[test]
+    fn merged_sessions_for_day_applies_the_room_predicate_to_acp_too() {
+        let td = make_tempdir();
+        let (channel_store, acp_store) = merge_test_stores(&td);
+
+        acp_store.create("work-session", "work", "/p").unwrap();
+        acp_store
+            .append_message("work-session", &ChatMessage::user("work stuff"))
+            .unwrap();
+        acp_store
+            .create("default-session", "default", "/p")
+            .unwrap();
+        acp_store
+            .append_message("default-session", &ChatMessage::user("default stuff"))
+            .unwrap();
+
+        let today = chrono::Local::now().date_naive();
+
+        let work_predicate = |meta: &SessionMeta| meta.namespace.as_deref() == Some("work");
+        let work_sessions =
+            sessions_for_day_merged(&channel_store, Some(&acp_store), today, 4, &work_predicate);
+        assert_eq!(
+            work_sessions
+                .iter()
+                .map(|(m, _)| m.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["work-session"],
+            "only the 'work'-namespace ACP session should pass a 'work' predicate: \
+             {work_sessions:?}"
+        );
+
+        let default_predicate = |meta: &SessionMeta| meta.namespace.as_deref() == Some("default");
+        let default_sessions = sessions_for_day_merged(
+            &channel_store,
+            Some(&acp_store),
+            today,
+            4,
+            &default_predicate,
+        );
+        assert_eq!(
+            default_sessions
+                .iter()
+                .map(|(m, _)| m.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["default-session"],
+            "only the 'default'-namespace ACP session should pass a 'default' \
+             predicate: {default_sessions:?}"
+        );
+    }
+
+    /// `pending_daily_dates` merges the two stores' date sets and dedups
+    /// them: a date only the ACP store knows about must still surface as
+    /// pending, and a date both stores know about must appear exactly
+    /// once, not twice.
+    #[test]
+    fn pending_daily_dates_merges_and_dedups_across_stores() {
+        let td = make_tempdir();
+        let (channel_store, acp_store) = merge_test_stores(&td);
+        let boundary_hour = 4u8;
+
+        let today = crate::session::local_date_for_timestamp(Local::now(), boundary_hour);
+        let channel_only_day = today - Duration::days(4);
+        let acp_only_day = today - Duration::days(3);
+        let shared_day = today - Duration::days(2);
+
+        let (channel_only_start, _) = crate::session::day_window(channel_only_day, boundary_hour);
+        let (acp_only_start, _) = crate::session::day_window(acp_only_day, boundary_hour);
+        let (shared_start, _) = crate::session::day_window(shared_day, boundary_hour);
+
+        // Channel store knows channel_only_day and shared_day.
+        let chan1 = channel_store
+            .create_session(&("room1".to_string(), None), "matrix", "default")
+            .unwrap();
+        backdate_channel_message(
+            &channel_store,
+            &chan1,
+            channel_only_start + Duration::hours(1),
+            "channel only",
+        );
+        let chan2 = channel_store
+            .create_session(&("room1".to_string(), None), "matrix", "default")
+            .unwrap();
+        backdate_channel_message(
+            &channel_store,
+            &chan2,
+            shared_start + Duration::hours(1),
+            "channel side of the shared day",
+        );
+
+        // ACP store knows acp_only_day and shared_day.
+        acp_store.create("acp-only", "default", "/p").unwrap();
+        backdate_acp_message(
+            &acp_store,
+            "acp-only",
+            acp_only_start + Duration::hours(1),
+            "acp only",
+        );
+        acp_store.create("acp-shared", "default", "/p").unwrap();
+        backdate_acp_message(
+            &acp_store,
+            "acp-shared",
+            shared_start + Duration::hours(2),
+            "acp side of the shared day",
+        );
+
+        let predicate = |_: &SessionMeta| true;
+        let pending = pending_daily_dates(
+            &channel_store,
+            Some(&acp_store),
+            td.path(),
+            "default",
+            boundary_hour,
+            predicate,
+        );
+
+        assert!(
+            pending.contains(&channel_only_day),
+            "a channel-only date must still be pending: {pending:?}"
+        );
+        assert!(
+            pending.contains(&acp_only_day),
+            "a date only the ACP store knows about must be reported as pending: {pending:?}"
+        );
+        assert_eq!(
+            pending.iter().filter(|&&d| d == shared_day).count(),
+            1,
+            "a date both stores know about must appear exactly once, not twice: {pending:?}"
         );
     }
 }
