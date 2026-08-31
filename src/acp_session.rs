@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 use uuid::Uuid;
@@ -183,27 +183,32 @@ impl AcpSessionStore {
         Ok(())
     }
 
-    /// The id of the last event, reading the file once if this process
-    /// has not appended to the session yet.
-    fn tip(&self, session_id: &str) -> Option<Uuid> {
-        if let Some(id) = self.tips.lock().unwrap().get(session_id) {
-            return Some(*id);
-        }
-        let last = self.events(session_id)?.last().map(|e| e.id)?;
-        self.tips
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), last);
-        Some(last)
-    }
-
-    fn append_line(&self, session_id: &str, id: Uuid, line: Line) -> Result<()> {
+    /// Read the tip, write `body(parent)` as the next line, and record
+    /// the new tip — all under one held lock.
+    ///
+    /// `tip()` and the write used to be separate lock acquisitions, so
+    /// two threads appending to the *same session* on the *same store*
+    /// could both observe the same tip and both write with that parent,
+    /// fabricating a fork that means nothing (unlike the cross-process
+    /// case this format is meant to tolerate, where a fork reflects a
+    /// writer that genuinely didn't know about the other's latest
+    /// event). Holding `tips` across the read-modify-write closes that
+    /// window: the whole "who is the tip, append after them, become the
+    /// tip" sequence is now one atomic step. Reading the file to find a
+    /// lazy tip happens while the lock is held too — `events()` never
+    /// touches `tips`, so this cannot deadlock.
+    fn append_line(&self, session_id: &str, id: Uuid, body: impl FnOnce(Option<Uuid>) -> Line) -> Result<()> {
+        let mut tips = self.tips.lock().unwrap();
+        let parent = match tips.get(session_id) {
+            Some(tip) => Some(*tip),
+            None => self.events(session_id).and_then(|evs| evs.last().map(|e| e.id)),
+        };
         let path = self
             .find(session_id)
             .ok_or_else(|| anyhow::anyhow!("no ACP session '{session_id}'"))?;
         let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
-        writeln!(file, "{}", serde_json::to_string(&line)?)?;
-        self.tips.lock().unwrap().insert(session_id.to_string(), id);
+        writeln!(file, "{}", serde_json::to_string(&body(parent))?)?;
+        tips.insert(session_id.to_string(), id);
         Ok(())
     }
 
@@ -214,44 +219,34 @@ impl AcpSessionStore {
             .map(|part| self.store_part(part))
             .collect::<Result<Vec<_>>>()?;
         let id = Uuid::now_v7();
-        self.append_line(
-            session_id,
+        let role = msg.role.clone();
+        self.append_line(session_id, id, move |parent| Line::Message {
             id,
-            Line::Message {
-                id,
-                parent: self.tip(session_id),
-                at: Utc::now(),
-                role: msg.role.clone(),
-                parts,
-            },
-        )
+            parent,
+            at: Utc::now(),
+            role,
+            parts,
+        })
     }
 
     pub fn append_title(&self, session_id: &str, title: &str) -> Result<()> {
         let id = Uuid::now_v7();
-        self.append_line(
-            session_id,
+        let title = title.to_string();
+        self.append_line(session_id, id, move |parent| Line::Title {
             id,
-            Line::Title {
-                id,
-                parent: self.tip(session_id),
-                at: Utc::now(),
-                title: title.to_string(),
-            },
-        )
+            parent,
+            at: Utc::now(),
+            title,
+        })
     }
 
     pub fn close(&self, session_id: &str) -> Result<()> {
         let id = Uuid::now_v7();
-        self.append_line(
-            session_id,
+        self.append_line(session_id, id, move |parent| Line::Closed {
             id,
-            Line::Closed {
-                id,
-                parent: self.tip(session_id),
-                at: Utc::now(),
-            },
-        )
+            parent,
+            at: Utc::now(),
+        })
     }
 
     /// A tool result's content goes to the cache; the log keeps a hash.
@@ -558,5 +553,60 @@ mod tests {
         assert_eq!(by_id["empty"].title, None);
         assert!(by_id["used"].has_messages);
         assert_eq!(by_id["used"].title.as_deref(), Some("greetings"));
+    }
+
+    /// Two threads appending to the *same session* on the *same store*
+    /// must be ordered by the `tips` lock, not raced: the second writer
+    /// must always see the first writer's freshly-written tip. Before
+    /// the fix, `tip()` (read) and the write that followed it were two
+    /// separate lock acquisitions, so both threads could observe the
+    /// same tip and both write with that parent — a fabricated fork
+    /// that means nothing, unlike the cross-process case this format
+    /// tolerates on purpose.
+    ///
+    /// This is a thread-based test rather than a structural one: since
+    /// the fix makes the whole "read tip, write, become tip" sequence
+    /// one held lock, the two threads are fully serialized by
+    /// construction and this test is deterministic post-fix (not
+    /// flaky) — there is no longer a window where they could interleave
+    /// mid-operation. It is the direct expression of the invariant:
+    /// after both appends land, no two events may share a parent.
+    #[test]
+    fn concurrent_appends_to_one_session_do_not_fork() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        let store = std::sync::Arc::new(store);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|i| {
+                let store = std::sync::Arc::clone(&store);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .append_message("s1", &ChatMessage::user(format!("msg{i}")))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let events = store.events("s1").expect("the session exists");
+        assert_eq!(events.len(), 2, "both appends must land: {events:?}");
+        let parents: std::collections::HashSet<Option<uuid::Uuid>> =
+            events.iter().map(|e| e.parent).collect();
+        assert_eq!(
+            parents.len(),
+            2,
+            "each event must have a distinct parent — a shared parent means \
+             a fabricated fork: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e.parent.is_none()),
+            "exactly one event is the session's first: {events:?}"
+        );
     }
 }
