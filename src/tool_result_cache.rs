@@ -12,6 +12,15 @@
 //! Losing this cache is survivable. A missing result is replaced with a
 //! placeholder that keeps the history valid; the model can call the tool
 //! again if it needs to.
+//!
+//! **Not yet wired into `run_llm_turn`.** Tool calls are not persisted
+//! at all today — `run_llm_turn` skips both `tool_use` and
+//! `tool_result` messages when appending to the session store, so
+//! nothing in the current request path ever calls `put`/`get` here.
+//! This cache, `StoredPart::ToolUse` and `StoredPart::ToolResultRef`
+//! exist for the replay design tracked as
+//! [#191](https://github.com/fluo10/sapphire-agent/issues/191), not for
+//! anything currently reachable.
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};

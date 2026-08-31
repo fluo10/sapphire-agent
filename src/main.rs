@@ -103,6 +103,32 @@ enum Command {
     },
 }
 
+/// Whether `meta`'s session counts toward `namespace`'s daily-log
+/// catch-up. Mirrors `Heartbeat::namespace_for_session`
+/// (`heartbeat.rs`): `/rpc`, `device-default`, and `acp` sessions carry
+/// their own resolved namespace in metadata — trust that directly,
+/// falling back to the default namespace for old files that predate
+/// the field. Every other channel (Matrix/Discord `"channel"`
+/// sessions) has no such field and resolves via
+/// `Config::namespace_for_room` instead.
+///
+/// Extracted to a named function (rather than inlined as a closure)
+/// so it can be unit-tested directly.
+fn daily_log_catchup_predicate(
+    meta: &session::SessionMeta,
+    config: &config::Config,
+    namespace: &str,
+) -> bool {
+    if meta.channel == "rpc" || meta.channel == "device-default" || meta.channel == "acp" {
+        meta.namespace
+            .as_deref()
+            .unwrap_or(config::DEFAULT_NAMESPACE_NAME)
+            == namespace
+    } else {
+        config.namespace_for_room(&meta.room_id) == namespace
+    }
+}
+
 /// One-word tag naming where a setting's effective value came from, for `verify`.
 fn layer_tag(
     provenance: &std::collections::BTreeMap<String, config_layer::Layer>,
@@ -577,29 +603,77 @@ async fn main() -> Result<()> {
             // list should not be showing Matrix conversations. Tool
             // results are kept in a workspace-external, content-addressed
             // cache rather than inline, for the same reason images are.
-            let tool_result_cache = tool_result_cache::ToolResultCache::open(
-                tool_result_cache::ToolResultCache::default_dir().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no platform cache directory is resolvable for the tool-result cache"
-                    )
-                })?,
-            )?;
+            //
+            // Resolves once at startup, degrading to `None` on a missing
+            // platform cache dir or an open failure (e.g. read-only
+            // `~/.cache` / `%LOCALAPPDATA%`) rather than aborting startup
+            // — mirrors `image_cache` above. A daemon whose whole design
+            // premise is that losing a cache is survivable must not make
+            // its boot path the one place where it isn't: this cache
+            // being unavailable would otherwise stop `/rpc`, Matrix,
+            // Discord and voice too, in every deployment, even ones that
+            // never use ACP. `None` costs less than it looks here: the
+            // request path does not persist `tool_use`/`tool_result`
+            // messages at all yet (#191), so nothing in production
+            // reaches this cache regardless; `AcpSessionStore::store_part`
+            // degrades a tool result it is asked to cache to an
+            // unrecoverable marker instead of failing the append.
+            let tool_result_cache: Option<Arc<tool_result_cache::ToolResultCache>> =
+                match tool_result_cache::ToolResultCache::default_dir() {
+                    Some(dir) => match tool_result_cache::ToolResultCache::open(dir.clone()) {
+                        Ok(cache) => {
+                            tracing::info!("Tool-result cache opened at {dir:?}");
+                            Some(cache)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Tool-result cache open failed ({e:?}); tool results will not be cached"
+                            );
+                            None
+                        }
+                    },
+                    None => {
+                        tracing::warn!(
+                            "No platform cache dir resolvable; tool-result cache disabled"
+                        );
+                        None
+                    }
+                };
             let acp_session_store = Arc::new(acp_session::AcpSessionStore::new(
                 sessions_base.clone(),
                 tool_result_cache,
             ));
 
             // ── Intra-day digest cache (workspace-external, store-agnostic) ─
-            // Same directory family as the tool-result cache above. Keyed
-            // by session id alone, not ACP-specific, so #189 can reuse it
-            // for `/rpc` sessions later.
-            let digest_cache = digest_cache::DigestCache::open(
-                digest_cache::DigestCache::default_dir().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no platform cache directory is resolvable for the digest cache"
-                    )
-                })?,
-            )?;
+            // Same directory family as the tool-result cache above, and
+            // the same degrade-not-abort treatment — a session must
+            // still load and every transport must still serve even
+            // without a place to cache "today's digest." `None` costs
+            // the ACP cross-session "today" block (`ServeState::digest_cache`'s
+            // doc) and makes the digest sweep skip its tick entirely
+            // (`spawn_acp_digest_sweep`); the daily log, built from each
+            // session's own events rather than from the digest, is
+            // unaffected. Keyed by session id alone, not ACP-specific,
+            // so #189 can reuse it for `/rpc` sessions later.
+            let digest_cache: Option<Arc<digest_cache::DigestCache>> =
+                match digest_cache::DigestCache::default_dir() {
+                    Some(dir) => match digest_cache::DigestCache::open(dir.clone()) {
+                        Ok(cache) => {
+                            tracing::info!("Digest cache opened at {dir:?}");
+                            Some(cache)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Digest cache open failed ({e:?}); today's cross-session digest will be unavailable"
+                            );
+                            None
+                        }
+                    },
+                    None => {
+                        tracing::warn!("No platform cache dir resolvable; digest cache disabled");
+                        None
+                    }
+                };
 
             let serve_state = Arc::new(serve::ServeState::new(
                 config.clone(),
@@ -669,10 +743,7 @@ async fn main() -> Result<()> {
                     let cfg_for_predicate = config.clone();
                     let ns_for_predicate = ns.clone();
                     let predicate = move |meta: &session::SessionMeta| -> bool {
-                        if meta.channel == "rpc" {
-                            return ns_for_predicate == config::DEFAULT_NAMESPACE_NAME;
-                        }
-                        cfg_for_predicate.namespace_for_room(&meta.room_id) == ns_for_predicate
+                        daily_log_catchup_predicate(meta, &cfg_for_predicate, &ns_for_predicate)
                     };
                     catchup_pending_daily_logs(
                         &channel_session_store,
@@ -781,7 +852,7 @@ async fn main() -> Result<()> {
                                 &cross_device_store_for_loop,
                                 &device_default_store_for_loop,
                                 Some(&serve_state_for_loop.acp_session_store),
-                                Some(&serve_state_for_loop.digest_cache),
+                                serve_state_for_loop.digest_cache.as_deref(),
                                 &agent_for_loop,
                             )
                             .await;
@@ -799,7 +870,7 @@ async fn main() -> Result<()> {
                         &cross_device_session_store,
                         &device_default_session_store,
                         Some(&serve_state.acp_session_store),
-                        Some(&serve_state.digest_cache),
+                        serve_state.digest_cache.as_deref(),
                         &agent,
                     )
                     .await;
@@ -1290,6 +1361,44 @@ fn migrate_pre_namespace_layout(workspace_dir: &std::path::Path) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn acp_meta(namespace: &str) -> session::SessionMeta {
+        session::SessionMeta {
+            session_id: "s1".to_string(),
+            // ACP sessions have no room; project_meta sets this empty
+            // for real (acp_session.rs), so an empty room_id must not
+            // accidentally make the predicate fall through to
+            // room-derived namespace resolution.
+            room_id: String::new(),
+            thread_id: None,
+            channel: "acp".to_string(),
+            created_at: chrono::Utc::now(),
+            public_id: None,
+            namespace: Some(namespace.to_string()),
+            project: None,
+            device_id: None,
+            room_profile: None,
+            title: None,
+        }
+    }
+
+    #[test]
+    fn acp_session_is_excluded_by_a_predicate_for_a_different_namespace() {
+        let config = config::Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
+        let meta = acp_meta("work");
+        assert!(!daily_log_catchup_predicate(
+            &meta,
+            &config,
+            config::DEFAULT_NAMESPACE_NAME
+        ));
+    }
+
+    #[test]
+    fn acp_session_is_included_by_a_predicate_for_its_own_namespace() {
+        let config = config::Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
+        let meta = acp_meta("work");
+        assert!(daily_log_catchup_predicate(&meta, &config, "work"));
+    }
 
     #[test]
     fn device_add_requires_a_name() {

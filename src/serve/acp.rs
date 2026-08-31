@@ -23,9 +23,11 @@
 //! text, hands the turn to [`super::run_llm_turn`] — the same executor
 //! behind `/rpc`, voice and A2A — and translates that turn's progress back
 //! into `session/update` notifications. There is deliberately no second
-//! tool loop, history handling or persistence on this path, so an editor's
-//! conversation lands in the same session store, under the same memory
-//! namespace and system prompt, as every other transport's.
+//! tool loop or history handling on this path. Persistence, though,
+//! lands in `acp_session_store`, ACP's own store — separate from every
+//! other transport's `SessionStore` (see `acp_session.rs`'s module doc
+//! for why) — while still writing under the same memory namespace and
+//! system prompt as every other transport's.
 //!
 //! A turn does *not* run in the handler that received it. The SDK's request
 //! callbacks hold its dispatch loop, which parses no further frame on the
@@ -1073,10 +1075,11 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         .join("\n");
 
                     // Everything past this point belongs to `run_llm_turn`:
-                    // history, the tool loop, persistence and the memory
-                    // namespace all come from the shared executor, so an
-                    // editor's conversation lands in the same session store,
-                    // with the same system prompt, as `/rpc` and A2A.
+                    // history, the tool loop and the memory namespace all
+                    // come from the shared executor. Persistence still
+                    // routes to ACP's own `acp_session_store`, separate
+                    // from `/rpc` and A2A's `SessionStore` — but under the
+                    // same memory namespace and system prompt as either.
                     let session_id = req.session_id.clone();
                     let progress = Arc::new(AcpProgress::new(
                         session_id.clone(),
@@ -1667,8 +1670,9 @@ mod tests {
     /// `result.stopReason` or `error`).
     ///
     /// The session id is returned rather than discarded so callers can
-    /// assert against *that* session in the shared store, instead of
-    /// against whatever session happens to be the only one there.
+    /// assert against *that* session — most now in `acp_session_store`,
+    /// ACP's own store — instead of against whatever session happens to
+    /// be the only one there.
     ///
     /// `conversation` cannot be used here: it filters frames down to one
     /// request id and would drop exactly the notifications under test,
@@ -1800,11 +1804,14 @@ mod tests {
         assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
     }
 
-    /// A prompt turn must land in the same session store as every other
-    /// transport: `session/prompt` delegates to `run_llm_turn`, so the
-    /// user message and the reply are in the session's history afterwards.
+    /// A prompt turn's history reaches `run_llm_turn`'s in-memory
+    /// `state.sessions` map, keyed by the exact session id the agent
+    /// handed back in `session/new`'s reply: `session/prompt` delegates
+    /// to `run_llm_turn`, so the user message and the reply are in
+    /// `state.sessions` afterwards, not lost or filed under a different
+    /// id.
     #[tokio::test]
-    async fn prompt_history_lands_in_the_shared_session_store() {
+    async fn a_prompt_turns_history_lands_under_its_own_session_id() {
         let state = ServeState::for_test_scripted(
             true,
             vec![crate::provider::ChatResponse {
@@ -1834,10 +1841,11 @@ mod tests {
         assert_eq!(texts, vec!["hi", "hello from the agent"], "got {texts:?}");
     }
 
-    /// `session/new`'s `cwd` is carried until the session is first
-    /// persisted, then lands in the header line. `session/list` will have
-    /// nothing else to filter a project by, so if this regresses the
-    /// listing is always empty.
+    /// `session/new` writes the session's header — `cwd` included —
+    /// eagerly, before any turn runs: `AcpSessionStore` has no
+    /// lazy-create path, so this is what makes the session appendable
+    /// at all. `session/list` will have nothing else to filter a
+    /// project by, so if this regresses the listing is always empty.
     #[tokio::test]
     async fn a_new_sessions_cwd_reaches_the_store() {
         let state = ServeState::for_test_scripted(

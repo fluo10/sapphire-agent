@@ -193,22 +193,25 @@ conversation into the editor before answering the request, or to
 session is a real one afterwards — prompting it continues the existing
 history rather than starting a fresh conversation.
 
-**A tool call's result is cached outside the workspace, addressed by
-hash.** It is written to `<cache_dir>/sapphire-agent/tool-results/<sha256>`,
-and the JSONL keeps only the hash. A second, separate cache holds one
-intra-day digest per session — "what this session has covered today" — at
-`<cache_dir>/sapphire-agent/digests/<session_id>.json`, overwritten in
-place rather than appended to. Losing either is survivable, in different
-ways:
+**A per-session digest is cached outside the workspace, addressed by
+session id.** `<cache_dir>/sapphire-agent/digests/<session_id>.json`
+holds one intra-day digest per session — "what this session has covered
+today" — overwritten in place rather than appended to. Losing it costs
+only today's cross-session block — the block other rooms' system prompts
+use to see what this session has been doing today. It is not the durable
+record: the daily log is, built from the session's own events rather than
+from the digest.
 
-- **A missing tool result** degrades that `tool_result` to a placeholder
-  sentence on reload. The `tool_use`/`tool_result` pairing the API
-  validates stays intact, so the session still loads and the model can
-  call the tool again if it needs the content.
-- **A missing digest** costs only today's cross-session block — the block
-  other rooms' system prompts use to see what this session has been doing
-  today. It is not the durable record: the daily log is, built from the
-  session's own events rather than from the digest.
+A second, similarly workspace-external location,
+`<cache_dir>/sapphire-agent/tool-results/<sha256>`, is a content-addressed
+cache meant to hold a tool call's result by hash — but **nothing writes to
+it today.** Tool calls are not persisted at all (see "A loaded session's
+tool calls are not replayed" below), so `run_llm_turn` never reaches the
+code that would populate or read this cache. `ToolResultCache`,
+`StoredPart::ToolUse` and `StoredPart::ToolResultRef` are real types that
+exist for the replay design tracked as
+[#191](https://github.com/fluo10/sapphire-agent/issues/191), not for
+anything currently in the request path.
 
 Both caches sit outside the workspace for the same reason: `<workspace>/sessions`
 is in the retrieve search index, and a digest that is rewritten as the
@@ -225,9 +228,9 @@ MCP sessions still do not reach the daily log —
 [#189](https://github.com/fluo10/sapphire-agent/issues/189).
 
 **Tool calls are not restored on replay.** See "A loaded session's tool
-calls are not replayed" below — the replay path projects only text parts
-out of the stored history, not `tool_use`/`tool_result` parts, even though
-the JSONL keeps enough of both to resume the conversation with the model.
+calls are not replayed" below — `tool_use` and `tool_result` messages are
+not persisted to the JSONL at all (not merely skipped on replay), so
+reloading a session restores what was said but not what was done.
 
 **Opening the same session on two connections at once is not safe to
 prompt from both.** Nothing stops a second Zed window — or any other ACP
@@ -275,12 +278,16 @@ whole turn.
   the API returns, so neither `session/update: usage_update` nor
   `PromptResponse.usage` is sent, and the editor cannot show what a turn
   cost or how full the context is.
-- **A loaded session's tool calls are not replayed.** `session/load`'s
-  replay projects only text parts out of the stored history. The JSONL does
-  keep a tool call's name, input and (by hash, via the tool-result cache)
-  its result — enough for the model to resume the conversation — but the
-  replay path does not forward any of it to the editor. A restored
-  conversation shows what was said, not what the agent did.
+- **Tool calls are not persisted, so a loaded session's tool calls are not
+  replayed.** `run_llm_turn` does not write `tool_use` or `tool_result`
+  messages to the JSONL at all — only text messages are. `session/load`'s
+  replay is a direct consequence: there is nothing beyond text parts in the
+  stored history to project to the editor. A restored conversation shows
+  what was said, not what the agent did. Wiring this up needs a replay
+  design (what a stale tool result even means to resend to the model) and
+  is tracked as [#191](https://github.com/fluo10/sapphire-agent/issues/191);
+  `ToolResultCache`, `StoredPart::ToolUse` and `StoredPart::ToolResultRef`
+  already exist for it but have no production caller yet.
 
 ### Configuring `websocat` in Zed
 

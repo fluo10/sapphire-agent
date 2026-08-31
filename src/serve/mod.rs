@@ -152,7 +152,13 @@ pub struct ServeState {
     /// Intra-day digest cache, workspace-external and store-agnostic.
     /// Keyed by session id alone, so it currently backs `acp_session_store`
     /// and is ready for `/rpc` (#189) without a shape change.
-    pub(crate) digest_cache: Arc<DigestCache>,
+    ///
+    /// `None` when the cache directory could not be opened at startup
+    /// (read-only or missing `~/.cache` / `%LOCALAPPDATA%`). Degrades
+    /// rather than aborting startup: every digest write becomes a
+    /// no-op (logged), and the ACP digest sweep skips its tick
+    /// entirely — a session must still load and serve without one.
+    pub(crate) digest_cache: Option<Arc<DigestCache>>,
 }
 
 impl ServeState {
@@ -173,7 +179,7 @@ impl ServeState {
         image_cache: Option<Arc<crate::image_cache::ImageCache>>,
         device_auth: Arc<crate::device_auth::DeviceAuth>,
         acp_session_store: Arc<AcpSessionStore>,
-        digest_cache: Arc<DigestCache>,
+        digest_cache: Option<Arc<DigestCache>>,
     ) -> Self {
         // Scan once on startup: each MCP session's first-line meta
         // carries `namespace` + `project`, so this reproduces the
@@ -311,6 +317,34 @@ impl ServeState {
             None => self.registry.background_provider(&self.config),
         }
     }
+
+    /// Provider that should serve `session_id`'s ACP digest sweep,
+    /// resolved from the session's own **namespace** rather than
+    /// `provider_for_session`'s `session_room_profiles` pin.
+    ///
+    /// `session_room_profiles` is only populated while a connection in
+    /// *this* process has held the session; the digest sweep enumerates
+    /// every ACP session on disk (`sessions_needing_digest` ->
+    /// `all_session_ids`), including ones never opened this process
+    /// (e.g. after a restart). Falling through to
+    /// `provider_for_session` for those would silently resolve the
+    /// *global* background provider instead of the namespace's —
+    /// exactly the cross-namespace leak namespace-pinning exists to
+    /// prevent.
+    ///
+    /// The store header carries the namespace durably, so this reads
+    /// it from `acp_session_store.summary` and resolves through
+    /// `background_provider_for_namespace`, the same namespace-aware
+    /// call `Heartbeat::provider_for_namespace` uses. Falls back to
+    /// `provider_for_session` only when the summary can't be read.
+    pub(crate) async fn provider_for_acp_session(&self, session_id: &str) -> Arc<dyn Provider> {
+        match self.acp_session_store.summary(session_id) {
+            Some(summary) => self
+                .registry
+                .background_provider_for_namespace(&self.config, &summary.header.namespace),
+            None => self.provider_for_session(session_id).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -422,10 +456,13 @@ pub async fn run(
 /// digest block in their system prompt.
 ///
 /// This used to also append a `SummaryLine` for the next process to
-/// resume from. It no longer does: a session's history is restored from
-/// its own events, and a tool result that has fallen out of the cache
-/// degrades to a placeholder — cheaper and more faithful than paying
-/// for a model call that throws the turn structure away.
+/// resume from — for `/rpc` and device-default sessions as well as ACP
+/// ones. It no longer does, for any of them: the persisted text history
+/// is complete on its own, so a summary would only be a second, staler
+/// answer to a question the events already answer. Dropping it is
+/// harmless in fact, not just in principle — `SummaryLine` from the
+/// `/rpc` and device-default stores is read by nobody today (`load_all`
+/// reads the channel store; `load_session_full` reads the mcp store).
 ///
 /// ACP sessions are included, but routed differently: they write
 /// through `state.digest_cache` rather than
@@ -451,8 +488,15 @@ async fn digest_all_sessions(state: &Arc<ServeState>) {
         match generate_summary(&*provider, &messages).await {
             Ok(summary) if !summary.trim().is_empty() => {
                 if is_acp.contains(&session_id) {
-                    if let Err(e) = state.digest_cache.put(&session_id, &summary, None) {
-                        warn!("Failed to cache shutdown digest for {session_id}: {e}");
+                    match &state.digest_cache {
+                        Some(cache) => {
+                            if let Err(e) = cache.put(&session_id, &summary, None) {
+                                warn!("Failed to cache shutdown digest for {session_id}: {e}");
+                            }
+                        }
+                        None => warn!(
+                            "Digest cache unavailable; dropping shutdown digest for {session_id}"
+                        ),
                     }
                 } else if let Err(e) = state.store_for_session(&session_id).append_intraday_digest(
                     &session_id,
@@ -484,13 +528,19 @@ pub(crate) fn spawn_acp_digest_sweep(state: Arc<ServeState>) {
         let period = std::time::Duration::from_secs(1800);
         loop {
             tokio::time::sleep(period).await;
+            // No cache to check freshness against and nowhere to write
+            // a refreshed digest — skip this tick entirely rather than
+            // failing. The unavailable cache was already logged once
+            // at startup; a daemon meant to run indefinitely without
+            // one shouldn't repeat that warning every half hour.
+            let Some(cache) = state.digest_cache.as_ref() else {
+                continue;
+            };
             let today = chrono::Local::now().date_naive();
             let boundary = state.config.day_boundary_hour;
-            let due = state.acp_session_store.sessions_needing_digest(
-                &state.digest_cache,
-                today,
-                boundary,
-            );
+            let due = state
+                .acp_session_store
+                .sessions_needing_digest(cache, today, boundary);
             for session_id in due {
                 let Some(messages) = state.acp_session_store.history(&session_id) else {
                     continue;
@@ -498,10 +548,10 @@ pub(crate) fn spawn_acp_digest_sweep(state: Arc<ServeState>) {
                 if messages.len() < 2 {
                     continue;
                 }
-                let provider = state.provider_for_session(&session_id).await;
+                let provider = state.provider_for_acp_session(&session_id).await;
                 match generate_summary(&*provider, &messages).await {
                     Ok(summary) if !summary.trim().is_empty() => {
-                        if let Err(e) = state.digest_cache.put(&session_id, &summary, None) {
+                        if let Err(e) = cache.put(&session_id, &summary, None) {
                             warn!("Failed to cache ACP digest for {session_id}: {e}");
                         }
                     }
@@ -2854,9 +2904,9 @@ rooms    = []
             crate::tool_result_cache::ToolResultCache::open(base.join("tool-results")).unwrap();
         let acp_session_store = Arc::new(AcpSessionStore::new(
             base.join("sessions"),
-            tool_result_cache,
+            Some(tool_result_cache),
         ));
-        let digest_cache = DigestCache::open(base.join("digests")).unwrap();
+        let digest_cache = Some(DigestCache::open(base.join("digests")).unwrap());
 
         Arc::new(Self {
             config,
@@ -3240,6 +3290,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.text.as_deref(), Some("scripted reply"));
+    }
+
+    /// The ACP digest sweep enumerates every session on disk, including
+    /// ones never opened in this process — `session_room_profiles` (the
+    /// in-memory pin `provider_for_session` reads) has no entry for
+    /// those, so falling through to `provider_for_session` would
+    /// silently resolve the *global* background provider instead of
+    /// the session's own namespace's. `provider_for_acp_session` must
+    /// instead read the namespace from the store header and resolve
+    /// through `background_provider_for_namespace`, exactly as
+    /// `Heartbeat::provider_for_namespace` does.
+    #[tokio::test]
+    async fn provider_for_acp_session_resolves_by_the_sessions_own_namespace() {
+        let mut state = ServeState::for_test(true);
+        {
+            let state_mut = Arc::get_mut(&mut state).expect("sole owner before first clone");
+            state_mut.config.memory_namespaces.insert(
+                "work".to_string(),
+                crate::config::MemoryNamespaceConfig {
+                    include: Vec::new(),
+                    background_profile: Some("work-bg".to_string()),
+                },
+            );
+            state_mut.config.profiles.insert(
+                "work-bg".to_string(),
+                crate::config::ProfileConfig {
+                    provider: "work-provider".to_string(),
+                    fallback_provider: None,
+                },
+            );
+            let registry_mut =
+                Arc::get_mut(&mut state_mut.registry).expect("registry has no other owners yet");
+            registry_mut.insert_test(
+                "work-provider",
+                Arc::new(StubProvider::new(vec![crate::provider::ChatResponse {
+                    text: Some("work namespace reply".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                }])),
+            );
+        }
+
+        // A session on disk with header namespace "work", never opened
+        // in this process — exactly the post-restart shape the digest
+        // sweep sees when it enumerates `all_session_ids()`.
+        state
+            .acp_session_store
+            .create("s-work", "work", "/p")
+            .unwrap();
+        assert!(
+            !state
+                .session_room_profiles
+                .lock()
+                .await
+                .contains_key("s-work"),
+            "session_room_profiles must have no entry for a session never opened this process"
+        );
+
+        let provider = state.provider_for_acp_session("s-work").await;
+        let resp = provider
+            .chat(None, &[ChatMessage::user("hi")], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.text.as_deref(),
+            Some("work namespace reply"),
+            "must resolve the 'work' namespace's own background provider, not the \
+             global default `provider_for_session` would fall back to"
+        );
+    }
+
+    /// The fallback path: a session id with no summary at all (e.g.
+    /// `history()`/`summary()` returned `None` for a transient read
+    /// failure) must still resolve *some* provider rather than panic,
+    /// by falling through to `provider_for_session`.
+    #[tokio::test]
+    async fn provider_for_acp_session_falls_back_when_the_summary_is_missing() {
+        let state = ServeState::for_test(true);
+        let provider = state.provider_for_acp_session("no-such-session").await;
+        let resp = provider
+            .chat(None, &[ChatMessage::user("hi")], None)
+            .await
+            .unwrap();
+        assert_eq!(resp.text.as_deref(), Some("ok"));
     }
 
     #[tokio::test]

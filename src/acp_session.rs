@@ -127,7 +127,14 @@ enum Line {
 
 pub struct AcpSessionStore {
     base_dir: PathBuf,
-    cache: Arc<ToolResultCache>,
+    /// `None` when the tool-result cache directory could not be opened
+    /// at startup (read-only or missing `~/.cache` / `%LOCALAPPDATA%`).
+    /// Degrades rather than making the whole store unusable: a session
+    /// must still load. See `store_part`'s `None` arm for what this
+    /// costs — currently nothing reachable in production, since
+    /// `run_llm_turn` does not persist `tool_use`/`tool_result` at all
+    /// yet (issue #191).
+    cache: Option<Arc<ToolResultCache>>,
     /// `session_id` → the id of the last event written.
     ///
     /// An append needs its parent, and re-reading the whole file to
@@ -137,7 +144,7 @@ pub struct AcpSessionStore {
 }
 
 impl AcpSessionStore {
-    pub fn new(base_dir: PathBuf, cache: Arc<ToolResultCache>) -> Self {
+    pub fn new(base_dir: PathBuf, cache: Option<Arc<ToolResultCache>>) -> Self {
         Self {
             base_dir,
             cache,
@@ -288,9 +295,23 @@ impl AcpSessionStore {
             ContentPart::ToolResult {
                 tool_use_id,
                 content,
-            } => StoredPart::ToolResultRef {
-                tool_use_id: tool_use_id.clone(),
-                sha256: self.cache.put(content)?,
+            } => match &self.cache {
+                Some(cache) => StoredPart::ToolResultRef {
+                    tool_use_id: tool_use_id.clone(),
+                    sha256: cache.put(content)?,
+                },
+                // No cache to put the content in — record the same
+                // "vanished" marker a cache-hit miss would produce on
+                // reload, rather than failing the whole append. The
+                // `tool_use`/`tool_result` pairing the API validates
+                // still stays intact.
+                None => {
+                    warn!(
+                        "Tool-result cache unavailable; storing '{tool_use_id}' as an \
+                         unrecoverable marker"
+                    );
+                    StoredPart::Other
+                }
             },
             // Images are not carried by this version. Recorded as a
             // marker rather than dropped, so a message that was only an
@@ -479,10 +500,13 @@ impl AcpSessionStore {
             } => ContentPart::ToolResult {
                 tool_use_id: tool_use_id.clone(),
                 // A miss is expected, not exceptional: the cache lives
-                // outside the workspace and is not synced.
+                // outside the workspace and is not synced. No cache at
+                // all (failed to open at startup) is just a permanent
+                // miss for every hash.
                 content: self
                     .cache
-                    .get(sha256)
+                    .as_ref()
+                    .and_then(|cache| cache.get(sha256))
                     .unwrap_or_else(|| MISSING_RESULT.to_string()),
             },
             StoredPart::Other => {
@@ -673,11 +697,26 @@ impl AcpSessionStore {
         out
     }
 
-    /// Local dates on which this store has at least one message, so
-    /// daily-log catch-up knows which days to generate.
-    pub fn session_dates(&self, boundary_hour: u8) -> Vec<NaiveDate> {
+    /// Local dates on which this store has at least one message from a
+    /// session `predicate` accepts, so daily-log catch-up knows which
+    /// days are pending *for its own namespace*. Without this filter
+    /// every namespace's catch-up would see every other namespace's
+    /// ACP dates as pending too: `generate_daily_log` would then find
+    /// no in-namespace sessions for that date, write nothing, and the
+    /// date would stay pending forever — re-walked on every startup
+    /// and catch-up tick.
+    pub fn session_dates<F>(&self, boundary_hour: u8, predicate: F) -> Vec<NaiveDate>
+    where
+        F: Fn(&SessionMeta) -> bool,
+    {
         let mut dates = std::collections::HashSet::new();
         for session_id in self.all_session_ids() {
+            let Some(summary) = self.summary(&session_id) else {
+                continue;
+            };
+            if !predicate(&self.project_meta(&summary)) {
+                continue;
+            }
             let Some(events) = self.events(&session_id) else {
                 continue;
             };
@@ -707,7 +746,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
         let cache = crate::tool_result_cache::ToolResultCache::open(cache_dir).unwrap();
-        let store = AcpSessionStore::new(dir.path().join("sessions"), cache);
+        let store = AcpSessionStore::new(dir.path().join("sessions"), Some(cache));
+        (dir, store)
+    }
+
+    /// A store whose tool-result cache failed to open — the degraded
+    /// shape `AcpSessionStore::new` must still function under.
+    fn store_without_cache() -> (tempfile::TempDir, AcpSessionStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AcpSessionStore::new(dir.path().join("sessions"), None);
         (dir, store)
     }
 
@@ -801,6 +848,33 @@ mod tests {
             "the content must live in the cache, not the log: {raw}"
         );
         assert!(raw.contains("tool_result_ref"), "got {raw}");
+        drop(dir);
+    }
+
+    /// A cache that failed to open at startup must degrade the store,
+    /// not break it: a session must still be creatable and a tool
+    /// result still appendable (as an unrecoverable marker) rather than
+    /// erroring the whole turn.
+    #[test]
+    fn a_tool_result_appends_cleanly_when_the_cache_is_unavailable() {
+        let (dir, store) = store_without_cache();
+        store.create("s1", "default", "/p").unwrap();
+        let result = store.append_message(
+            "s1",
+            &ChatMessage {
+                role: Role::User,
+                parts: vec![ContentPart::ToolResult {
+                    tool_use_id: "c1".to_string(),
+                    content: "a very long file listing".to_string(),
+                }],
+                input_kind: None,
+                user_id: None,
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "appending must not fail just because the cache is unavailable: {result:?}"
+        );
         drop(dir);
     }
 
@@ -1262,6 +1336,35 @@ mod tests {
         store.append_message("s1", &ChatMessage::user("x")).unwrap();
 
         let today = chrono::Local::now().date_naive();
-        assert_eq!(store.session_dates(4), vec![today]);
+        assert_eq!(store.session_dates(4, |_meta| true), vec![today]);
+    }
+
+    /// A date that only has messages in another namespace's ACP session
+    /// must not be reported pending for this namespace — otherwise every
+    /// namespace's catch-up sees every other namespace's dates as
+    /// pending forever (`generate_daily_log` finds nothing in-namespace,
+    /// writes nothing, and the phantom date is re-walked every tick).
+    #[test]
+    fn session_dates_excludes_a_date_that_belongs_only_to_another_namespace() {
+        let (_d, store) = store();
+        store.create("s-default", "default", "/p").unwrap();
+        store
+            .append_message("s-default", &ChatMessage::user("x"))
+            .unwrap();
+        store.create("s-work", "work", "/p").unwrap();
+        store
+            .append_message("s-work", &ChatMessage::user("y"))
+            .unwrap();
+
+        let today = chrono::Local::now().date_naive();
+        let default_dates =
+            store.session_dates(4, |meta| meta.namespace.as_deref() == Some("default"));
+        assert_eq!(default_dates, vec![today]);
+
+        let work_dates = store.session_dates(4, |meta| meta.namespace.as_deref() == Some("work"));
+        assert_eq!(work_dates, vec![today]);
+
+        let ghost_dates = store.session_dates(4, |meta| meta.namespace.as_deref() == Some("ghost"));
+        assert!(ghost_dates.is_empty());
     }
 }

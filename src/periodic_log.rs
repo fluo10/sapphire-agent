@@ -233,10 +233,16 @@ where
     F: Fn(&crate::session::SessionMeta) -> bool,
 {
     let today = crate::session::local_date_for_timestamp(Local::now(), boundary_hour);
-    let mut dates = session_store.all_session_dates_filtered(boundary_hour, room_predicate);
+    let mut dates = Vec::new();
+    // Borrow `room_predicate` for the ACP side first — `&F` also
+    // satisfies `Fn(&SessionMeta) -> bool` — then move it into the
+    // channel-store call below. Without this filter, every namespace's
+    // catch-up would see every other namespace's ACP dates as pending
+    // (see `AcpSessionStore::session_dates`'s doc).
     if let Some(acp) = acp_store {
-        dates.extend(acp.session_dates(boundary_hour));
+        dates.extend(acp.session_dates(boundary_hour, &room_predicate));
     }
+    dates.extend(session_store.all_session_dates_filtered(boundary_hour, room_predicate));
     dates.sort();
     dates.dedup();
     dates.retain(|&date| {
@@ -1716,7 +1722,7 @@ mod tests {
         let tool_result_cache =
             crate::tool_result_cache::ToolResultCache::open(td.path().join("tool-results"))
                 .unwrap();
-        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), tool_result_cache);
+        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), Some(tool_result_cache));
         let digest_cache = DigestCache::open(td.path().join("digests")).unwrap();
 
         acp_store.create("s1", "work", "/p").unwrap();
@@ -1778,7 +1784,7 @@ mod tests {
         let tool_result_cache =
             crate::tool_result_cache::ToolResultCache::open(td.path().join("tool-results"))
                 .unwrap();
-        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), tool_result_cache);
+        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), Some(tool_result_cache));
         (channel_store, acp_store)
     }
 
@@ -2015,6 +2021,64 @@ mod tests {
             pending.iter().filter(|&&d| d == shared_day).count(),
             1,
             "a date both stores know about must appear exactly once, not twice: {pending:?}"
+        );
+    }
+
+    /// A date that only has messages in another namespace's ACP session
+    /// must not be reported pending for this namespace. Before this was
+    /// fixed, `pending_daily_dates` pulled every ACP date unfiltered, so
+    /// `generate_daily_log` would find no in-namespace sessions for that
+    /// date, write nothing, and the phantom date would stay pending
+    /// forever — re-walked on every startup and catch-up tick.
+    #[test]
+    fn pending_daily_dates_does_not_leak_another_namespaces_acp_date() {
+        let td = make_tempdir();
+        let (channel_store, acp_store) = merge_test_stores(&td);
+        let boundary_hour = 4u8;
+
+        // `pending_daily_dates` only reports dates strictly before
+        // today (today's own log isn't due yet), so the message must
+        // be backdated for this to exercise the "pending" path at all.
+        let today = crate::session::local_date_for_timestamp(Local::now(), boundary_hour);
+        let (yesterday_start, _) =
+            crate::session::day_window(today - Duration::days(1), boundary_hour);
+        acp_store.create("work-only", "work", "/p").unwrap();
+        backdate_acp_message(
+            &acp_store,
+            "work-only",
+            yesterday_start + Duration::hours(1),
+            "work stuff",
+        );
+
+        let default_predicate = |meta: &SessionMeta| meta.namespace.as_deref() == Some("default");
+        let pending = pending_daily_dates(
+            &channel_store,
+            Some(&acp_store),
+            td.path(),
+            "default",
+            boundary_hour,
+            default_predicate,
+        );
+
+        assert!(
+            pending.is_empty(),
+            "a date belonging only to the 'work' namespace's ACP session must not be \
+             pending for 'default': {pending:?}"
+        );
+
+        let work_predicate = |meta: &SessionMeta| meta.namespace.as_deref() == Some("work");
+        let work_pending = pending_daily_dates(
+            &channel_store,
+            Some(&acp_store),
+            td.path(),
+            "work",
+            boundary_hour,
+            work_predicate,
+        );
+        assert_eq!(
+            work_pending.len(),
+            1,
+            "the 'work' namespace's own predicate must still see its date: {work_pending:?}"
         );
     }
 }
