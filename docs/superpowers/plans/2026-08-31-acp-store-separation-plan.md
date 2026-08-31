@@ -1570,6 +1570,14 @@ git commit -m "refactor(acp): serve ACP sessions from their own store"
 - Consumes: Task 2 の `SessionHeader` / `Event` / `EventBody`、Task 4 の `digest_all_sessions`
 - Produces: `DigestCache::open(PathBuf) -> Result<Arc<Self>>`、`DigestCache::default_dir() -> Option<PathBuf>`、`DigestCache::put(&self, session_id: &str, digest: &str, since: Option<DateTime<Utc>>) -> Result<()>`、`DigestCache::get(&self, session_id: &str) -> Option<IntradayDigestLine>`、`DigestCache::prune_before(&self, cutoff: DateTime<Utc>) -> usize`、`AcpSessionStore::intraday_digests_for_day(&self, date, boundary_hour, cache: &DigestCache) -> Vec<(SessionMeta, IntradayDigestLine)>`、`AcpSessionStore::sessions_needing_digest(&self, cache: &DigestCache, date: NaiveDate, boundary_hour: u8) -> Vec<String>`
 
+#### Task 5 の後で前提が一つ変わっている
+
+Task 5 は `AcpSessionStore::header` と `is_closed` を削除した——`summary()` が
+`SessionHeader` と `is_closed` の両方を含む上位互換で、実際に呼ぶ側がいなかったため。
+**したがってこの Task は `header()` ではなく `summary()` を使う。** `summary()` は
+`title` も返すので、`project_meta` がイベントを走査してタイトルを拾う必要も無くなり、
+ファイルの読み出しが1回で済む。
+
 #### ダイジェストをストアのイベントにしない理由
 
 **セッション JSONL は retrieve の索引に入っている。** `SessionStore.base_dir` は
@@ -1947,13 +1955,10 @@ impl AcpSessionStore {
             if digest.digest_at < day_start || digest.digest_at >= day_end {
                 continue;
             }
-            let Some(header) = self.header(&session_id) else {
+            let Some(summary) = self.summary(&session_id) else {
                 continue;
             };
-            let Some(events) = self.events(&session_id) else {
-                continue;
-            };
-            out.push((self.project_meta(&header, &events), digest));
+            out.push((self.project_meta(&summary), digest));
         }
         out.sort_by_key(|(meta, _)| meta.created_at);
         out
@@ -2008,11 +2013,8 @@ impl AcpSessionStore {
     /// builders share. `channel` is `"acp"` so those builders can route
     /// on it the way they already route on `"rpc"` and
     /// `"device-default"`.
-    fn project_meta(&self, header: &SessionHeader, events: &[Event]) -> SessionMeta {
-        let title = events.iter().rev().find_map(|e| match &e.body {
-            EventBody::Title { title } => Some(title.clone()),
-            _ => None,
-        });
+    fn project_meta(&self, summary: &SessionSummary) -> SessionMeta {
+        let header = &summary.header;
         SessionMeta {
             session_id: header.session_id.clone(),
             // ACP has no rooms. Empty rather than synthetic, so a
@@ -2027,7 +2029,7 @@ impl AcpSessionStore {
             project: None,
             device_id: None,
             room_profile: None,
-            title,
+            title: summary.title.clone(),
         }
     }
 
@@ -2315,7 +2317,7 @@ impl AcpSessionStore {
         let (day_start, day_end) = crate::session::day_window(date, boundary_hour);
         let mut out = Vec::new();
         for session_id in self.all_session_ids() {
-            let Some(header) = self.header(&session_id) else {
+            let Some(summary) = self.summary(&session_id) else {
                 continue;
             };
             let Some(events) = self.events(&session_id) else {
@@ -2353,7 +2355,7 @@ impl AcpSessionStore {
             if messages.is_empty() {
                 continue;
             }
-            out.push((self.project_meta(&header, &events), messages));
+            out.push((self.project_meta(&summary), messages));
         }
         out.sort_by_key(|(meta, _)| meta.created_at);
         out
