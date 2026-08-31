@@ -869,7 +869,9 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
                         let update = match message.role {
                             crate::provider::Role::User => SessionUpdate::UserMessageChunk(chunk),
-                            _ => SessionUpdate::AgentMessageChunk(chunk),
+                            crate::provider::Role::Assistant => {
+                                SessionUpdate::AgentMessageChunk(chunk)
+                            }
                         };
                         if let Err(e) = connection.send_notification(SessionNotification::new(
                             req.session_id.clone(),
