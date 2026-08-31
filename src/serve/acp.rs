@@ -531,6 +531,28 @@ fn mode_state() -> SessionModeState {
     )
 }
 
+/// Count this connection as holding `id`, warning when another
+/// connection already does.
+///
+/// Shared by `adopt_session` (`session/load`, `session/resume`) and
+/// `session/new` — every path that hands a connection a session must
+/// count it, since the decrement in `serve_connection` walks every
+/// session a connection's map holds and expects each to have been
+/// counted on the way in.
+async fn count_session_open(state: &Arc<ServeState>, id: &str) {
+    let mut open = state.open_acp_sessions.lock().await;
+    let count = open.entry(id.to_string()).or_insert(0);
+    *count += 1;
+    if *count > 1 {
+        warn!(
+            "ACP: session {id} is now open on {count} connections. Concurrent prompts on \
+             one session are not history-safe: run_llm_turn clones the history at the top \
+             and writes it back whole, so the last turn to finish wins in memory while both \
+             have already appended to the transcript."
+        );
+    }
+}
+
 /// Validate an existing session id and adopt it onto this connection.
 ///
 /// Shared by `session/load` and `session/resume`, which differ only in
@@ -576,6 +598,7 @@ async fn adopt_session(
             mode: crate::tools::policy::SessionMode::Default,
         },
     );
+    count_session_open(state, &id).await;
     Ok(id)
 }
 
@@ -689,6 +712,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     );
 
                     let session_id = SessionId::new(agent_session_id.clone());
+                    count_session_open(&state, &agent_session_id).await;
                     sessions.inner.lock().await.insert(
                         session_id.clone(),
                         AcpSession {
@@ -1182,6 +1206,29 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
         )
         .connect_to(lines_transport(socket, connection_cancel.clone()))
         .await;
+
+    // Release every session this connection held. Missing this would turn
+    // `open_acp_sessions` into a leak that warns forever: the next
+    // connection to load the same session would find a stale count already
+    // above one and warn about a collision that no longer exists.
+    {
+        let held: Vec<String> = sessions
+            .inner
+            .lock()
+            .await
+            .values()
+            .map(|s| s.agent_session_id.clone())
+            .collect();
+        let mut open = state.open_acp_sessions.lock().await;
+        for id in held {
+            if let Some(count) = open.get_mut(&id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    open.remove(&id);
+                }
+            }
+        }
+    }
 
     // Belt and braces, and known to be so. By the time this runs the socket
     // has gone, so `cancel_when_exhausted` has already fired the token, and
@@ -3141,6 +3188,164 @@ mod tests {
         assert!(
             !reply["result"]["agentCapabilities"]["sessionCapabilities"]["resume"].is_null(),
             "got {reply}"
+        );
+    }
+
+    /// A file too old to say whose it is refuses the same way an unknown
+    /// or another namespace's session does. `session/list` already omits
+    /// these (`list_omits_sessions_with_no_namespace`); `load` must not
+    /// let a client reach one directly by id either — an unknown owner is
+    /// not the same as "mine".
+    #[tokio::test]
+    async fn load_refuses_a_session_with_no_namespace() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.cross_device_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let mine = store
+            .create_session(&("r-mine".to_string(), None), "rpc", &ours)
+            .unwrap();
+
+        // A legacy meta line: no `namespace` key at all. Same technique as
+        // `list_omits_sessions_with_no_namespace`, since `create_session`
+        // always records one.
+        let legacy_dir = store
+            .absolute_path_for(&mine)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let legacy_id = "00000000-0000-7000-8000-00000000dead";
+        let legacy = legacy_dir.join(format!("{legacy_id}.jsonl"));
+        std::fs::write(
+            &legacy,
+            format!(
+                "{}\n",
+                serde_json::json!({"meta": {
+                    "session_id": legacy_id,
+                    "room_id": "r-legacy",
+                    "thread_id": null,
+                    "channel": "rpc",
+                    "created_at": "2020-01-01T00:00:00Z"
+                }})
+            ),
+        )
+        .unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(
+            &addr,
+            vec![initialize_request(0), load_request(1, legacy_id)],
+        )
+        .await;
+        assert_eq!(replies[1]["error"]["code"], -32602, "got {}", replies[1]);
+    }
+
+    /// Two connections can now hold the same session, which makes the
+    /// history race in `run_llm_turn` reachable across connections
+    /// rather than only within one. The race is not fixed here — this
+    /// only makes hitting it observable, because a corrupted transcript
+    /// with no log line is undebuggable.
+    #[tokio::test]
+    async fn opening_a_session_twice_is_counted() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.cross_device_session_store);
+        let counts = Arc::clone(&state.open_acp_sessions);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = store
+            .create_session(&("r".to_string(), None), "rpc", &ours)
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let mut a = connect(&addr).await;
+        let mut b = connect(&addr).await;
+        for ws in [&mut a, &mut b] {
+            for request in [initialize_request(0), load_request(1, &sid)] {
+                ws.send(Message::Text(request.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            loop {
+                let Message::Text(t) = next_frame(ws).await else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["id"] == 1 {
+                    assert!(v["error"].is_null(), "load failed: {v}");
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            counts.lock().await.get(&sid).copied(),
+            Some(2),
+            "both connections should be counted as holding the session"
+        );
+    }
+
+    /// The other half of the counter: a connection that goes away must
+    /// release every session it held. Skipping this would turn
+    /// `open_acp_sessions` into a leak — the next `session/load` for a
+    /// session whose real owner disconnected long ago would find a
+    /// stale count still above one and warn about a collision that no
+    /// longer exists.
+    #[tokio::test]
+    async fn closing_a_connection_releases_its_sessions() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.cross_device_session_store);
+        let counts = Arc::clone(&state.open_acp_sessions);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = store
+            .create_session(&("r".to_string(), None), "rpc", &ours)
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), load_request(1, &sid)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 1 {
+                assert!(v["error"].is_null(), "load failed: {v}");
+                break;
+            }
+        }
+        assert_eq!(
+            counts.lock().await.get(&sid).copied(),
+            Some(1),
+            "load should have registered the session as open"
+        );
+
+        ws.send(Message::Close(None)).await.unwrap();
+        drop(ws);
+
+        let released = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if counts.lock().await.get(&sid).is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "timed out waiting for the closed connection to release its session"
         );
     }
 }

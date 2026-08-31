@@ -135,6 +135,16 @@ pub struct ServeState {
     /// Bearer token -> device -> room profile. Shared with ambient ingest so
     /// there is exactly one answer to "who is this token" in the process.
     pub(crate) device_auth: Arc<crate::device_auth::DeviceAuth>,
+    /// How many live ACP connections hold each session.
+    ///
+    /// `session/load` lets two editors open one conversation. The
+    /// history race in `run_llm_turn` — clone at the top, write the
+    /// whole vector back at the end — then becomes reachable across
+    /// connections instead of only within one. Fixing it needs a
+    /// per-session lock around a whole turn, which is a separate job;
+    /// this makes hitting it visible in the log, because a transcript
+    /// that diverged with nothing written down cannot be debugged.
+    pub(crate) open_acp_sessions: Arc<tokio::sync::Mutex<HashMap<String, usize>>>,
 }
 
 impl ServeState {
@@ -197,6 +207,7 @@ impl ServeState {
             voice_subscribers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             image_cache,
             device_auth,
+            open_acp_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -2754,6 +2765,7 @@ rooms    = []
             image_cache: None,
             voice_subscribers: Default::default(),
             device_auth,
+            open_acp_sessions: Default::default(),
         })
     }
 }

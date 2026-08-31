@@ -165,14 +165,55 @@ and `file_write` is an edit, which a channel may perform without being asked —
 so trusting that path would let a chat message write itself a task that runs a
 command on the next tick.
 
+### Loading past sessions
+
+Zed's session picker lists this token's own conversations: `session/list`
+returns every open session under the connecting device's room profile, and
+Zed can further narrow it to the project directory it has open (`cwd`).
+Picking one hands it to `session/load`, which replays the stored
+conversation into the editor before answering the request, or to
+`session/resume`, which does the same without the replay. Either way the
+session is a real one afterwards — prompting it continues the existing
+history rather than starting a fresh conversation.
+
+**Sessions from before this feature, and any created over `/rpc`, have no
+recorded `cwd`.** The project filter matches on `cwd`, so these sessions
+never show up in a project-filtered list — only in an unfiltered one.
+`cwd` is recorded once, from `session/new`'s own field, at the moment a
+session is first created; there is no way to backfill it onto a session
+that already exists.
+
+**Tool calls are not restored on replay.** See "A loaded session's tool
+calls are not replayed" below — the JSONL transcript a replay reads from
+never recorded a tool call's name, input or result in the first place, for
+the same reason it never recorded usage.
+
+**Opening the same session on two connections at once is not safe to
+prompt from both.** Nothing stops a second Zed window — or any other ACP
+client — from loading a session that is already open elsewhere, but
+`run_llm_turn` clones a session's history at the start of a turn and
+writes the whole vector back at the end. Two turns racing on one session
+are last-writer-wins in memory, while both have already appended their own
+messages to the on-disk transcript, so the two views diverge. Loading does
+not create this race — `/rpc` and the voice heartbeat could already reach
+it with two prompts on one connection — it makes it reachable *across*
+connections too. It is not fixed here: a `session/load` or
+`session/resume` that lands on an already-open session logs a `session
+{id} is now open on N connections` warning, so a divergence at least
+leaves a trace, but the fix itself needs a per-session lock held across a
+whole turn.
+
 ### Known limitations
 
 - **Replies are not streamed token by token.** `Provider::chat` returns a
   complete response, not a stream, so the whole reply arrives as a single
   chunk at the end of the turn. Tool calls *do* still appear progressively as
   they run.
-- **No session resumption.** A dropped connection ends the session. ACP v1
-  has no resumption mechanism, and `session/load` is not implemented.
+- **No automatic reconnection.** A dropped connection does not resume on
+  its own — ACP v1 has no mechanism for the editor to reconnect
+  transparently. The conversation is not lost, though: reopen it through
+  `session/load` or `session/resume` from Zed's session picker, see
+  "Loading past sessions" above.
 - **Tool calls reach the editor as a bare name.** No arguments and no results
   are sent — the shared turn executor reports only a tool's id and name — so
   Zed shows "shell" rather than the command it ran or what came back. The one
@@ -193,6 +234,11 @@ command on the next tick.
   the API returns, so neither `session/update: usage_update` nor
   `PromptResponse.usage` is sent, and the editor cannot show what a turn
   cost or how full the context is.
+- **A loaded session's tool calls are not replayed.** `session/load`
+  reconstructs only user and assistant text from the JSONL transcript — it
+  never recorded a tool call's name, input or result, so there is nothing
+  to replay it from. A restored conversation shows what was said, not what
+  the agent did.
 
 ### Configuring `websocat` in Zed
 
