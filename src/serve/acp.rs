@@ -573,7 +573,7 @@ async fn adopt_session(
         .to_string();
     let refuse = || Error::invalid_params().data("no such session is available on this connection");
 
-    let Some((meta, _closed)) = state.cross_device_session_store.session_header(&id) else {
+    let Some((meta, closed)) = state.cross_device_session_store.session_header(&id) else {
         return Err(refuse());
     };
     if meta.namespace.as_deref() != Some(namespace.as_str()) {
@@ -581,6 +581,13 @@ async fn adopt_session(
             "ACP: refused adopting {id}: it belongs to namespace {:?}, not {namespace}",
             meta.namespace
         );
+        return Err(refuse());
+    }
+    if closed {
+        // Symmetric with `session/list`, which excludes closed sessions:
+        // an archived conversation must be unreachable by id the same way
+        // it is unlisted, not just invisible in the picker. Same refusal
+        // as the other two cases, so the trio stays indistinguishable.
         return Err(refuse());
     }
 
@@ -3049,6 +3056,43 @@ mod tests {
         assert_eq!(
             replies[1]["error"], replies[2]["error"],
             "the two refusals differ"
+        );
+    }
+
+    /// `session/list` excludes a closed session so it drops out of the
+    /// picker, but `session/load` took an id directly. If load still
+    /// honoured it, an archived conversation would be gone from the list
+    /// yet reachable and appendable by anyone who kept its id — and the
+    /// two refusal paths would no longer be the only way in, breaking the
+    /// "cannot enumerate ids" property the identical wording exists for.
+    #[tokio::test]
+    async fn load_refuses_a_closed_session() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.cross_device_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = store
+            .create_session(&("r".to_string(), None), "rpc", &ours)
+            .unwrap();
+        store.close_session(&sid).unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(
+            &addr,
+            vec![
+                initialize_request(0),
+                load_request(1, &sid),
+                load_request(2, "01900000-0000-7000-8000-000000000000"),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            replies[1]["error"], replies[2]["error"],
+            "a closed session must refuse the same way an unknown one does, got {}",
+            replies[1]
         );
     }
 
