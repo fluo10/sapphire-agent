@@ -59,12 +59,13 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, CurrentModeUpdate, Error,
     InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities,
-    SessionId, SessionInfo, SessionListCapabilities, SessionMode as AcpSessionMode,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, TextContent, ToolCall as AcpToolCall, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent, ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields,
 };
 use agent_client_protocol::{
     Agent, Client, ConnectionTo, Lines, on_receive_notification, on_receive_request,
@@ -99,9 +100,15 @@ struct AcpSession {
     /// because a later phase needs it as the default working directory for
     /// client-side terminals (`terminal/create`); until then it is inert.
     ///
-    /// Written straight through to `pending_cwd` today; read here by
-    /// `session/load` in a later task, which is why the attribute is
-    /// still needed. Remove it when that reader lands.
+    /// Written straight through to `pending_cwd` on `session/new`, and
+    /// recorded the same way by `session/load` — which does NOT feed it
+    /// back into the store: `SessionStore::ensure_session` only writes a
+    /// session's cwd on first creation, so a loaded session's recorded
+    /// cwd cannot be updated through this field, and no code should try.
+    ///
+    /// Still nothing reads this field back out of the struct (a future
+    /// `terminal/create` handler is the intended reader, per the module
+    /// doc), so the attribute stays until that lands.
     #[allow(dead_code)]
     cwd: PathBuf,
     /// Cancellation tokens for the turns *currently in flight* on this
@@ -508,6 +515,21 @@ where
     )
 }
 
+/// The mode list every session starts with.
+///
+/// A loaded session starts in `default` like a new one: the mode is a
+/// statement about how the editor wants the agent to behave right now,
+/// not a property of the conversation, so it is not persisted.
+fn mode_state() -> SessionModeState {
+    SessionModeState::new(
+        crate::tools::policy::SessionMode::Default.id(),
+        crate::tools::policy::SessionMode::ALL
+            .into_iter()
+            .map(|m| AcpSessionMode::new(m.id(), m.name()).description(m.description()))
+            .collect(),
+    )
+}
+
 /// Drive one ACP connection until the peer goes away.
 async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_name: String) {
     let sessions = Arc::new(AcpSessions::default());
@@ -551,14 +573,13 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     ProtocolVersion::V1
                 };
 
-                // `loadSession` is false because `session/load` is not
-                // implemented. `authMethods` is empty because the bearer token
-                // checked above already authenticated the peer, so ACP never
-                // sees an unauthenticated client.
+                // `authMethods` is empty because the bearer token checked
+                // above already authenticated the peer, so ACP never sees
+                // an unauthenticated client.
                 responder.respond(
                     InitializeResponse::new(version).agent_capabilities(
                         AgentCapabilities::new()
-                            .load_session(false)
+                            .load_session(true)
                             .session_capabilities(
                                 SessionCapabilities::new().list(SessionListCapabilities::new()),
                             ),
@@ -633,17 +654,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     // the one that asks. `NewSessionResponse.modes` is a
                     // plain `Option` in the schema, with no capability
                     // gating it, so `initialize` needs no change.
-                    let modes = SessionModeState::new(
-                        crate::tools::policy::SessionMode::Default.id(),
-                        crate::tools::policy::SessionMode::ALL
-                            .into_iter()
-                            .map(|m| {
-                                AcpSessionMode::new(m.id(), m.name()).description(m.description())
-                            })
-                            .collect(),
-                    );
-
-                    responder.respond(NewSessionResponse::new(session_id).modes(modes))
+                    responder.respond(NewSessionResponse::new(session_id).modes(mode_state()))
                 }
             },
             on_receive_request!(),
@@ -702,6 +713,94 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     // cursor earns its keep when a namespace holds
                     // thousands of sessions, and none does yet.
                     responder.respond(ListSessionsResponse::new(sessions))
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let sessions = Arc::clone(&sessions);
+                let state = Arc::clone(&state);
+                let profile_name = profile_name.clone();
+                async move |req: LoadSessionRequest, responder, connection: ConnectionTo<Client>| {
+                    let id = req.session_id.to_string();
+                    let namespace = state
+                        .config
+                        .namespace_for_room_profile(&profile_name)
+                        .to_string();
+                    let store = Arc::clone(&state.cross_device_session_store);
+
+                    // One refusal for both "no such session" and "not
+                    // yours" — and one that does not echo the id back,
+                    // since two requests differing only in id would
+                    // otherwise produce two different messages, which is
+                    // exactly the enumeration this is meant to prevent.
+                    let refuse = || {
+                        Error::invalid_params()
+                            .data("no such session is available on this connection")
+                    };
+                    let Some((meta, _closed)) = store.session_header(&id) else {
+                        return responder.respond_with_error(refuse());
+                    };
+                    if meta.namespace.as_deref() != Some(namespace.as_str()) {
+                        warn!(
+                            "ACP: refused session/load for {id}: it belongs to namespace {:?}, \
+                             not {namespace}",
+                            meta.namespace
+                        );
+                        return responder.respond_with_error(refuse());
+                    }
+
+                    // Register the EXISTING id rather than minting one.
+                    // `run_llm_turn` hydrates history from the store for
+                    // an id it has not seen, so continuing the
+                    // conversation needs nothing further.
+                    state
+                        .session_room_profiles
+                        .lock()
+                        .await
+                        .insert(id.clone(), profile_name.clone());
+                    sessions.inner.lock().await.insert(
+                        req.session_id.clone(),
+                        AcpSession {
+                            agent_session_id: id.clone(),
+                            cwd: req.cwd.clone(),
+                            turns: HashMap::new(),
+                            mode: crate::tools::policy::SessionMode::Default,
+                        },
+                    );
+
+                    // Replay BEFORE answering: the ACP specification
+                    // orders it that way, and a client that got the
+                    // reply first would render an empty thread and then
+                    // watch messages appear underneath it.
+                    for message in store.load_session(&id).unwrap_or_default() {
+                        let text: String = message
+                            .parts
+                            .iter()
+                            .filter_map(|part| match part {
+                                crate::provider::ContentPart::Text(t) => Some(t.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+                        let update = match message.role {
+                            crate::provider::Role::User => SessionUpdate::UserMessageChunk(chunk),
+                            _ => SessionUpdate::AgentMessageChunk(chunk),
+                        };
+                        if let Err(e) = connection.send_notification(SessionNotification::new(
+                            req.session_id.clone(),
+                            update,
+                        )) {
+                            warn!("ACP: dropped a replay update for {id}: {e}");
+                        }
+                    }
+
+                    responder.respond(LoadSessionResponse::new().modes(mode_state()))
                 }
             },
             on_receive_request!(),
@@ -1199,7 +1298,7 @@ mod tests {
         assert_eq!(resp["id"], 0);
         let result = &resp["result"];
         assert_eq!(result["protocolVersion"], 1);
-        assert_eq!(result["agentCapabilities"]["loadSession"], false);
+        assert_eq!(result["agentCapabilities"]["loadSession"], true);
         assert_eq!(
             result["authMethods"],
             serde_json::json!([]),
@@ -2656,5 +2755,184 @@ mod tests {
             !reply["result"]["agentCapabilities"]["sessionCapabilities"]["list"].is_null(),
             "got {reply}"
         );
+    }
+
+    fn load_request(id: i64, session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "session/load",
+            "params": { "sessionId": session_id, "cwd": test_cwd(), "mcpServers": [] }
+        })
+    }
+
+    /// Loading replays the conversation as session/update notifications,
+    /// and does so BEFORE answering — a client that got the reply first
+    /// would render an empty thread and then have messages appear under
+    /// it.
+    #[tokio::test]
+    async fn load_replays_the_conversation_before_replying() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.cross_device_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = store
+            .create_session(&("r".to_string(), None), "rpc", &ours)
+            .unwrap();
+        store
+            .append(&sid, &crate::provider::ChatMessage::user("first"))
+            .unwrap();
+        store
+            .append(&sid, &crate::provider::ChatMessage::assistant("second"))
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), load_request(1, &sid)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        let mut replayed: Vec<(String, String)> = Vec::new();
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["method"] == "session/update" {
+                let u = &v["params"]["update"];
+                replayed.push((
+                    u["sessionUpdate"].as_str().unwrap().to_string(),
+                    u["content"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                ));
+            } else if v["id"] == 1 {
+                assert!(v["error"].is_null(), "load failed: {v}");
+                break;
+            }
+        }
+
+        assert_eq!(
+            replayed,
+            vec![
+                ("user_message_chunk".to_string(), "first".to_string()),
+                ("agent_message_chunk".to_string(), "second".to_string()),
+            ],
+            "the replay must arrive in order, before the reply"
+        );
+    }
+
+    /// The boundary that filtering the list cannot provide: `load` takes
+    /// an id directly, so a session that never appears in any list is
+    /// still reachable by anyone who learns its id.
+    #[tokio::test]
+    async fn load_refuses_another_namespaces_session() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.cross_device_session_store);
+        let theirs = store
+            .create_session(&("r".to_string(), None), "rpc", "someone-else")
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let replies =
+            conversation(&addr, vec![initialize_request(0), load_request(1, &theirs)]).await;
+        assert_eq!(replies[1]["error"]["code"], -32602, "got {}", replies[1]);
+    }
+
+    /// The two refusals must be indistinguishable. If "not yours" reads
+    /// differently from "no such session", the pair enumerates ids.
+    #[tokio::test]
+    async fn an_unknown_and_a_forbidden_session_look_the_same() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.cross_device_session_store);
+        let theirs = store
+            .create_session(&("r".to_string(), None), "rpc", "someone-else")
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(
+            &addr,
+            vec![
+                initialize_request(0),
+                load_request(1, &theirs),
+                load_request(2, "01900000-0000-7000-8000-000000000000"),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            replies[1]["error"], replies[2]["error"],
+            "the two refusals differ"
+        );
+    }
+
+    /// A loaded session is a real session: prompting it continues the
+    /// conversation rather than starting a new one. This is what proves
+    /// the adapter registered the *existing* id, not a fresh one.
+    #[tokio::test]
+    async fn a_loaded_session_continues_its_history() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![crate::provider::ChatResponse {
+                text: Some("third".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let store = Arc::clone(&state.cross_device_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = store
+            .create_session(&("r".to_string(), None), "rpc", &ours)
+            .unwrap();
+        store
+            .append(&sid, &crate::provider::ChatMessage::user("first"))
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let mut ws = connect(&addr).await;
+        for request in [
+            initialize_request(0),
+            load_request(1, &sid),
+            prompt_request(2, &sid, text_prompt("second")),
+        ] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 2 {
+                assert_eq!(v["result"]["stopReason"], "end_turn", "got {v}");
+                break;
+            }
+        }
+
+        let history = store.load_session(&sid).expect("the session still exists");
+        let texts: Vec<String> = history
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                crate::provider::ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["first", "second", "third"], "got {texts:?}");
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_loading() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let addr = spawn(state).await;
+        let reply = roundtrip(&addr, initialize_request(0)).await;
+        assert_eq!(reply["result"]["agentCapabilities"]["loadSession"], true);
     }
 }
