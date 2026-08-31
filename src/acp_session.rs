@@ -400,6 +400,82 @@ impl AcpSessionStore {
             is_closed,
         })
     }
+
+    /// The conversation as the model should see it.
+    ///
+    /// Walks the parent chain rather than trusting file order, because
+    /// file order is only accidentally right: it agrees with the chain
+    /// for a session one process wrote, and says nothing useful for one
+    /// that was synced or merged.
+    pub fn history(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+        let events = self.events(session_id)?;
+
+        // parent -> children, so the walk is a lookup rather than a scan.
+        let mut children: HashMap<Option<Uuid>, Vec<&Event>> = HashMap::new();
+        for event in &events {
+            children.entry(event.parent).or_default().push(event);
+        }
+
+        let mut out = Vec::new();
+        let mut cursor = None;
+        let mut seen = 0usize;
+        loop {
+            let Some(next) = children.get(&cursor) else {
+                break;
+            };
+            if next.len() > 1 {
+                warn!(
+                    "ACP session {session_id}: {} events share one parent; taking the first branch. Two writers appended to this session and there is no merge story yet.",
+                    next.len()
+                );
+            }
+            let event = next[0];
+            if let EventBody::Message { role, parts } = &event.body {
+                out.push(ChatMessage {
+                    role: role.clone(),
+                    parts: parts.iter().map(|p| self.load_part(p)).collect(),
+                    input_kind: None,
+                    user_id: None,
+                });
+            }
+            cursor = Some(event.id);
+
+            // A hand-edited or partially-synced file could contain a
+            // cycle. The chain cannot be longer than the file.
+            seen += 1;
+            if seen > events.len() {
+                warn!("ACP session {session_id}: the parent chain cycles; stopping");
+                break;
+            }
+        }
+        Some(out)
+    }
+
+    fn load_part(&self, part: &StoredPart) -> ContentPart {
+        match part {
+            StoredPart::Text(t) => ContentPart::Text(t.clone()),
+            StoredPart::ToolUse { id, name, input } => ContentPart::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            },
+            StoredPart::ToolResultRef {
+                tool_use_id,
+                sha256,
+            } => ContentPart::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                // A miss is expected, not exceptional: the cache lives
+                // outside the workspace and is not synced.
+                content: self
+                    .cache
+                    .get(sha256)
+                    .unwrap_or_else(|| MISSING_RESULT.to_string()),
+            },
+            StoredPart::Other => {
+                ContentPart::Text("[a message part that this version does not store]".to_string())
+            }
+        }
+    }
 }
 
 /// One row of the session list.
@@ -608,5 +684,154 @@ mod tests {
             events.iter().any(|e| e.parent.is_none()),
             "exactly one event is the session's first: {events:?}"
         );
+    }
+
+    #[test]
+    fn history_comes_back_in_chain_order() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &ChatMessage::user("one")).unwrap();
+        store.append_message("s1", &ChatMessage::assistant("two")).unwrap();
+        store.append_title("s1", "ignored by history").unwrap();
+        store.append_message("s1", &ChatMessage::user("three")).unwrap();
+
+        let history = store.history("s1").expect("the session exists");
+        let texts: Vec<&str> = history
+            .iter()
+            .filter_map(|m| match m.parts.first() {
+                Some(ContentPart::Text(t)) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["one", "two", "three"]);
+    }
+
+    /// A tool result survives a round trip through the cache.
+    #[test]
+    fn a_cached_tool_result_is_restored_whole() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store
+            .append_message("s1", &tool_result_message("c1", "the original output"))
+            .unwrap();
+
+        let history = store.history("s1").unwrap();
+        assert_eq!(
+            history[0].parts[0],
+            ContentPart::ToolResult {
+                tool_use_id: "c1".to_string(),
+                content: "the original output".to_string(),
+            }
+        );
+    }
+
+    /// The whole reason a resume summary is unnecessary: a lost result
+    /// degrades to a sentence, and the `tool_use`/`tool_result` pairing
+    /// the API validates stays intact. Losing the cache must never make
+    /// a session unloadable.
+    #[test]
+    fn a_lost_tool_result_becomes_a_placeholder_rather_than_an_error() {
+        let (dir, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store
+            .append_message("s1", &tool_result_message("c1", "gone tomorrow"))
+            .unwrap();
+
+        // Simulate the cache being cleared between runs.
+        std::fs::remove_dir_all(dir.path().join("cache")).unwrap();
+
+        let history = store.history("s1").expect("the session still loads");
+        assert_eq!(
+            history[0].parts[0],
+            ContentPart::ToolResult {
+                tool_use_id: "c1".to_string(),
+                content: MISSING_RESULT.to_string(),
+            },
+            "the pairing must survive even though the content did not"
+        );
+    }
+
+    /// Two events claiming the same parent means two writers appended to
+    /// one session — the divergence the parent chain exists to catch.
+    /// Until there is a merge story, take the first branch and say so
+    /// rather than interleaving two conversations by timestamp.
+    #[test]
+    fn a_branch_is_reported_and_the_first_child_is_taken() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &ChatMessage::user("root")).unwrap();
+
+        // Hand-write a second child of the root to forge a divergence.
+        let root = store.events("s1").unwrap()[0].id;
+        let path = store.path_for_test("s1");
+        let forged = serde_json::json!({
+            "kind": "message",
+            "id": Uuid::now_v7(),
+            "parent": root,
+            "at": Utc::now(),
+            "role": "user",
+            "parts": [{"text": "the other branch"}],
+        });
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{forged}").unwrap();
+        drop(f);
+
+        // The legitimate continuation, appended after the forgery, is
+        // the file's *last* line but the root's *second* child.
+        store.append_message("s1", &ChatMessage::user("mine")).unwrap();
+
+        let history = store.history("s1").expect("a branched session still loads");
+        let texts: Vec<&str> = history
+            .iter()
+            .filter_map(|m| match m.parts.first() {
+                Some(ContentPart::Text(t)) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["root", "the other branch"],
+            "one branch, not both interleaved"
+        );
+    }
+
+    /// An event whose parent is not in the file — a truncated sync, a
+    /// hand-edit — must not silently drop the rest of the conversation
+    /// or spin. Everything reachable from the root is returned.
+    #[test]
+    fn an_orphan_event_is_skipped_rather_than_ending_the_walk() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &ChatMessage::user("root")).unwrap();
+
+        let path = store.path_for_test("s1");
+        let orphan = serde_json::json!({
+            "kind": "message",
+            "id": Uuid::now_v7(),
+            "parent": Uuid::now_v7(),
+            "at": Utc::now(),
+            "role": "user",
+            "parts": [{"text": "unreachable"}],
+        });
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{orphan}").unwrap();
+        drop(f);
+
+        let history = store.history("s1").expect("the session still loads");
+        assert_eq!(history.len(), 1, "the orphan is not reachable from the root");
+    }
+
+    fn tool_result_message(tool_use_id: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::User,
+            parts: vec![ContentPart::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: content.to_string(),
+            }],
+            input_kind: None,
+            user_id: None,
+        }
     }
 }
