@@ -97,6 +97,10 @@ struct AcpSession {
     /// exists, or otherwise treat it as a local path. It is recorded now
     /// because a later phase needs it as the default working directory for
     /// client-side terminals (`terminal/create`); until then it is inert.
+    ///
+    /// Written straight through to `pending_cwd` today; read here by
+    /// `session/load` in a later task, which is why the attribute is
+    /// still needed. Remove it when that reader lands.
     #[allow(dead_code)]
     cwd: PathBuf,
     /// Cancellation tokens for the turns *currently in flight* on this
@@ -597,6 +601,14 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         .lock()
                         .await
                         .insert(agent_session_id.clone(), profile_name.clone());
+
+                    // The file does not exist yet — `ensure_session`
+                    // creates it on the first turn — so the cwd waits in
+                    // `pending_cwd` until then.
+                    state.pending_cwd.lock().await.insert(
+                        agent_session_id.clone(),
+                        req.cwd.to_string_lossy().to_string(),
+                    );
 
                     let session_id = SessionId::new(agent_session_id.clone());
                     sessions.inner.lock().await.insert(
@@ -1515,6 +1527,32 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["hi", "hello from the agent"], "got {texts:?}");
+    }
+
+    /// `session/new`'s `cwd` is carried until the session is first
+    /// persisted, then lands in the meta line. `session/list` will have
+    /// nothing else to filter a project by, so if this regresses the
+    /// listing is always empty.
+    #[tokio::test]
+    async fn a_new_sessions_cwd_reaches_the_store() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![crate::provider::ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let store = Arc::clone(&state.cross_device_session_store);
+        let addr = spawn(state).await;
+
+        let (session_id, _updates, _reply) = drive(&addr, text_prompt("hi")).await;
+
+        let meta = store
+            .session_header(&session_id)
+            .map(|(m, _)| m)
+            .expect("the turn persisted the session");
+        assert_eq!(meta.cwd.as_deref(), Some(test_cwd()));
     }
 
     /// Zed sends every `@file` mention as a `resource_link` block, which
