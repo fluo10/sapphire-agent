@@ -223,6 +223,7 @@ pub fn daily_stems_in_current_iso_week_before(today: NaiveDate) -> Vec<String> {
 /// Callers compute it from `Config::namespace_for_room`.
 pub fn pending_daily_dates<F>(
     session_store: &SessionStore,
+    acp_store: Option<&AcpSessionStore>,
     workspace_dir: &Path,
     namespace: &str,
     boundary_hour: u8,
@@ -233,6 +234,11 @@ where
 {
     let today = crate::session::local_date_for_timestamp(Local::now(), boundary_hour);
     let mut dates = session_store.all_session_dates_filtered(boundary_hour, room_predicate);
+    if let Some(acp) = acp_store {
+        dates.extend(acp.session_dates(boundary_hour));
+    }
+    dates.sort();
+    dates.dedup();
     dates.retain(|&date| {
         date < today
             && !log_abs_path(workspace_dir, namespace, LogKind::Daily, &daily_stem(date)).exists()
@@ -249,6 +255,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub async fn generate_daily_log<F>(
     session_store: &SessionStore,
+    acp_store: Option<&AcpSessionStore>,
     provider: &dyn Provider,
     ws_state: &Arc<Mutex<WorkspaceState>>,
     workspace_dir: &Path,
@@ -260,7 +267,16 @@ pub async fn generate_daily_log<F>(
 where
     F: Fn(&crate::session::SessionMeta) -> bool,
 {
-    let sessions = session_store.sessions_for_day_filtered(date, boundary_hour, room_predicate);
+    let mut sessions =
+        session_store.sessions_for_day_filtered(date, boundary_hour, &room_predicate);
+    if let Some(acp) = acp_store {
+        sessions.extend(
+            acp.sessions_for_day(date, boundary_hour)
+                .into_iter()
+                .filter(|(meta, _)| room_predicate(meta)),
+        );
+    }
+    sessions.sort_by_key(|(meta, _)| meta.created_at);
     let stem = daily_stem(date);
     let has_existing = read_body(workspace_dir, namespace, LogKind::Daily, &stem)
         .is_some_and(|b| !b.trim().is_empty());
@@ -857,8 +873,10 @@ pub async fn catchup_missing_daily_digests(
 /// Errors are logged but not propagated so startup is not blocked.
 /// Returns the number of logs successfully generated, so callers can decide
 /// whether to invalidate downstream caches.
+#[allow(clippy::too_many_arguments)]
 pub async fn catchup_pending_daily_logs<F>(
     session_store: &SessionStore,
+    acp_store: Option<&AcpSessionStore>,
     provider: &dyn Provider,
     ws_state: &Arc<Mutex<WorkspaceState>>,
     workspace_dir: &Path,
@@ -871,6 +889,7 @@ where
 {
     let pending = pending_daily_dates(
         session_store,
+        acp_store,
         workspace_dir,
         namespace,
         boundary_hour,
@@ -888,6 +907,7 @@ where
     for date in pending {
         match generate_daily_log(
             session_store,
+            acp_store,
             provider,
             ws_state,
             workspace_dir,

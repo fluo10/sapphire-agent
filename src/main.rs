@@ -676,6 +676,7 @@ async fn main() -> Result<()> {
                     };
                     catchup_pending_daily_logs(
                         &channel_session_store,
+                        Some(&serve_state.acp_session_store),
                         provider.as_ref(),
                         &ws_state,
                         &workspace_dir,

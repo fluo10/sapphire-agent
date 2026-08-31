@@ -18,7 +18,7 @@
 //! produce ids that sort wrongly against each other.
 
 use crate::provider::{ChatMessage, ContentPart, Role};
-use crate::session::{IntradayDigestLine, SessionMeta};
+use crate::session::{IntradayDigestLine, SessionMeta, StoredMessage};
 use crate::tool_result_cache::ToolResultCache;
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -613,6 +613,91 @@ impl AcpSessionStore {
     }
 }
 
+impl AcpSessionStore {
+    /// This store's sessions for one local day, in the shape
+    /// `format_sessions` reads.
+    ///
+    /// Only text is projected. A tool result whose content has fallen
+    /// out of the cache would otherwise write its placeholder sentence
+    /// into a permanent, searchable record — and the daily log is a
+    /// narrative of what was said, not a transcript of what was read.
+    pub fn sessions_for_day(
+        &self,
+        date: NaiveDate,
+        boundary_hour: u8,
+    ) -> Vec<(SessionMeta, Vec<StoredMessage>)> {
+        let (day_start, day_end) = crate::session::day_window(date, boundary_hour);
+        let mut out = Vec::new();
+        for session_id in self.all_session_ids() {
+            let Some(summary) = self.summary(&session_id) else {
+                continue;
+            };
+            let Some(events) = self.events(&session_id) else {
+                continue;
+            };
+            let messages: Vec<StoredMessage> = events
+                .iter()
+                .filter(|e| e.at >= day_start && e.at < day_end)
+                .filter_map(|e| match &e.body {
+                    EventBody::Message { role, parts } => {
+                        let text: Vec<ContentPart> = parts
+                            .iter()
+                            .filter_map(|p| match p {
+                                StoredPart::Text(t) if !t.trim().is_empty() => {
+                                    Some(ContentPart::Text(t.clone()))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if text.is_empty() {
+                            return None;
+                        }
+                        Some(StoredMessage {
+                            timestamp: e.at,
+                            role: role.clone(),
+                            parts: text,
+                            input_kind: None,
+                            user_id: None,
+                            report_meta: None,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            if messages.is_empty() {
+                continue;
+            }
+            out.push((self.project_meta(&summary), messages));
+        }
+        out.sort_by_key(|(meta, _)| meta.created_at);
+        out
+    }
+
+    /// Local dates on which this store has at least one message, so
+    /// daily-log catch-up knows which days to generate.
+    pub fn session_dates(&self, boundary_hour: u8) -> Vec<NaiveDate> {
+        let mut dates = std::collections::HashSet::new();
+        for session_id in self.all_session_ids() {
+            let Some(events) = self.events(&session_id) else {
+                continue;
+            };
+            for event in events {
+                if !matches!(event.body, EventBody::Message { .. }) {
+                    continue;
+                }
+                let local = event.at.with_timezone(&chrono::Local);
+                dates.insert(crate::session::local_date_for_timestamp(
+                    local,
+                    boundary_hour,
+                ));
+            }
+        }
+        let mut sorted: Vec<NaiveDate> = dates.into_iter().collect();
+        sorted.sort();
+        sorted
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,5 +1196,72 @@ mod tests {
                 .sessions_needing_digest(&cache, tomorrow, 4)
                 .is_empty()
         );
+    }
+
+    /// The daily log is the durable record — the one that stays in the
+    /// workspace and stays searchable. An ACP session has to reach it.
+    #[test]
+    fn a_days_conversation_projects_into_the_daily_log_shape() {
+        let (_d, store) = store();
+        store.create("s1", "work", "/p").unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("what broke?"))
+            .unwrap();
+        store
+            .append_message("s1", &ChatMessage::assistant("the parser"))
+            .unwrap();
+        store.append_title("s1", "parser hunt").unwrap();
+
+        let today = chrono::Local::now().date_naive();
+        let sessions = store.sessions_for_day(today, 4);
+        assert_eq!(sessions.len(), 1);
+        let (meta, messages) = &sessions[0];
+        assert_eq!(meta.session_id, "s1");
+        assert_eq!(meta.channel, "acp");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(
+            messages[0].parts[0],
+            ContentPart::Text("what broke?".to_string())
+        );
+    }
+
+    /// A tool result that has fallen out of the cache must not put a
+    /// placeholder sentence into the permanent record. The daily log
+    /// wants what was said, and `format_sessions` keeps only text parts —
+    /// so tool traffic should not be projected at all.
+    #[test]
+    fn tool_traffic_is_left_out_of_the_daily_log_projection() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store
+            .append_message("s1", &tool_result_message("c1", "a big file listing"))
+            .unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("thanks"))
+            .unwrap();
+
+        let today = chrono::Local::now().date_naive();
+        let (_, messages) = store.sessions_for_day(today, 4).remove(0);
+        let texts: Vec<&str> = messages
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["thanks"]);
+    }
+
+    #[test]
+    fn session_dates_lists_the_days_that_have_messages() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &ChatMessage::user("x")).unwrap();
+
+        let today = chrono::Local::now().date_naive();
+        assert_eq!(store.session_dates(4), vec![today]);
     }
 }

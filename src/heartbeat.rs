@@ -73,7 +73,7 @@ impl Heartbeat {
     /// meta — trust that first, falling back to the default namespace
     /// for old files that predate the field.
     fn namespace_for_session(&self, meta: &crate::session::SessionMeta) -> String {
-        if meta.channel == "device-default" || meta.channel == "rpc" {
+        if meta.channel == "device-default" || meta.channel == "rpc" || meta.channel == "acp" {
             meta.namespace
                 .clone()
                 .unwrap_or_else(|| crate::config::DEFAULT_NAMESPACE_NAME.to_string())
@@ -126,6 +126,7 @@ impl Heartbeat {
                 };
                 total += catchup_pending_daily_logs(
                     &self.session_store,
+                    self.serve_state.as_ref().map(|s| &*s.acp_session_store),
                     provider.as_ref(),
                     &self.ws_state,
                     &self.workspace_dir,
@@ -206,6 +207,7 @@ impl Heartbeat {
                     };
                     match generate_daily_log(
                         &self.session_store,
+                        self.serve_state.as_ref().map(|s| &*s.acp_session_store),
                         provider.as_ref(),
                         &self.ws_state,
                         &self.workspace_dir,
@@ -216,7 +218,21 @@ impl Heartbeat {
                     )
                     .await
                     {
-                        Ok(true) => any_generated = true,
+                        Ok(true) => {
+                            any_generated = true;
+                            // The permanent record for that day now
+                            // exists, so the digests that were standing
+                            // in for it can go.
+                            if let Some(cache) = self.serve_state.as_ref().map(|s| &s.digest_cache)
+                            {
+                                let (_, day_end) =
+                                    crate::session::day_window(yesterday, self.day_boundary_hour);
+                                let removed = cache.prune_before(day_end);
+                                if removed > 0 {
+                                    info!("Pruned {removed} digest(s) covered by the daily log");
+                                }
+                            }
+                        }
                         Ok(false) => {}
                         Err(e) => warn!(
                             "Heartbeat: failed to generate daily log for {yesterday} in '{ns}': {e:#}"

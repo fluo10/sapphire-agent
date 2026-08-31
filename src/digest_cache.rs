@@ -135,10 +135,6 @@ impl DigestCache {
     /// Drop every entry digested before `cutoff`. Called once the daily
     /// log for that day has been written — the digest has done its job
     /// and the permanent record has taken over. Returns how many went.
-    ///
-    /// No production caller yet — the daily-log flow wires this up in a
-    /// follow-up task — hence the `allow`.
-    #[allow(dead_code)]
     pub fn prune_before(&self, cutoff: DateTime<Utc>) -> usize {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return 0;
