@@ -164,6 +164,15 @@ impl AcpSessionStore {
         self.find(session_id).expect("the session exists")
     }
 
+    /// Absolute path of an existing session's file, for callers that
+    /// need to read raw bytes (e.g. `mtime` for `updated_at`) rather than
+    /// going through the store's own accessors. Mirrors the old
+    /// `SessionStore::absolute_path_for`, which `session/list` used the
+    /// same way.
+    pub fn absolute_path_for(&self, session_id: &str) -> Option<PathBuf> {
+        self.find(session_id)
+    }
+
     pub fn create(&self, session_id: &str, namespace: &str, cwd: &str) -> Result<()> {
         let path = self.path(session_id, namespace);
         if let Some(parent) = path.parent() {
@@ -197,11 +206,18 @@ impl AcpSessionStore {
     /// tip" sequence is now one atomic step. Reading the file to find a
     /// lazy tip happens while the lock is held too — `events()` never
     /// touches `tips`, so this cannot deadlock.
-    fn append_line(&self, session_id: &str, id: Uuid, body: impl FnOnce(Option<Uuid>) -> Line) -> Result<()> {
+    fn append_line(
+        &self,
+        session_id: &str,
+        id: Uuid,
+        body: impl FnOnce(Option<Uuid>) -> Line,
+    ) -> Result<()> {
         let mut tips = self.tips.lock().unwrap();
         let parent = match tips.get(session_id) {
             Some(tip) => Some(*tip),
-            None => self.events(session_id).and_then(|evs| evs.last().map(|e| e.id)),
+            None => self
+                .events(session_id)
+                .and_then(|evs| evs.last().map(|e| e.id)),
         };
         let path = self
             .find(session_id)
@@ -291,13 +307,6 @@ impl AcpSessionStore {
         )
     }
 
-    pub fn header(&self, session_id: &str) -> Option<SessionHeader> {
-        self.lines(session_id)?.into_iter().find_map(|l| match l {
-            Line::Header(h) => Some(h),
-            _ => None,
-        })
-    }
-
     /// Every event in the order the file holds them.
     ///
     /// File order, not chain order — Task 3's reader is what walks the
@@ -341,12 +350,6 @@ impl AcpSessionStore {
                 })
                 .collect(),
         )
-    }
-
-    pub fn is_closed(&self, session_id: &str) -> bool {
-        self.events(session_id)
-            .map(|evs| evs.iter().any(|e| matches!(e.body, EventBody::Closed)))
-            .unwrap_or(false)
     }
 
     /// What the listing needs about one session, oldest first.
@@ -506,11 +509,11 @@ mod tests {
         let (_d, store) = store();
         store.create("s1", "default", "/home/u/project").unwrap();
 
-        let h = store.header("s1").expect("the session exists");
-        assert_eq!(h.session_id, "s1");
-        assert_eq!(h.namespace, "default");
-        assert_eq!(h.cwd, "/home/u/project");
-        assert!(!store.is_closed("s1"));
+        let summary = store.summary("s1").expect("the session exists");
+        assert_eq!(summary.header.session_id, "s1");
+        assert_eq!(summary.header.namespace, "default");
+        assert_eq!(summary.header.cwd, "/home/u/project");
+        assert!(!summary.is_closed);
     }
 
     /// The first event has no parent; every later one points at the
@@ -521,8 +524,12 @@ mod tests {
     fn the_parent_chain_records_append_order() {
         let (_d, store) = store();
         store.create("s1", "default", "/p").unwrap();
-        store.append_message("s1", &ChatMessage::user("one")).unwrap();
-        store.append_message("s1", &ChatMessage::assistant("two")).unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("one"))
+            .unwrap();
+        store
+            .append_message("s1", &ChatMessage::assistant("two"))
+            .unwrap();
         store.append_title("s1", "a title").unwrap();
 
         let events = store.events("s1").expect("the session exists");
@@ -554,7 +561,7 @@ mod tests {
         store.append_message("s1", &ChatMessage::user("x")).unwrap();
         store.close("s1").unwrap();
 
-        assert!(store.is_closed("s1"));
+        assert!(store.summary("s1").unwrap().is_closed);
         let events = store.events("s1").unwrap();
         assert_eq!(events.len(), 2);
         assert!(matches!(events[1].body, EventBody::Closed));
@@ -616,7 +623,9 @@ mod tests {
         let (_d, store) = store();
         store.create("empty", "default", "/p").unwrap();
         store.create("used", "default", "/p").unwrap();
-        store.append_message("used", &ChatMessage::user("hi")).unwrap();
+        store
+            .append_message("used", &ChatMessage::user("hi"))
+            .unwrap();
         store.append_title("used", "greetings").unwrap();
 
         let by_id: std::collections::HashMap<String, SessionSummary> = store
@@ -690,10 +699,16 @@ mod tests {
     fn history_comes_back_in_chain_order() {
         let (_d, store) = store();
         store.create("s1", "default", "/p").unwrap();
-        store.append_message("s1", &ChatMessage::user("one")).unwrap();
-        store.append_message("s1", &ChatMessage::assistant("two")).unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("one"))
+            .unwrap();
+        store
+            .append_message("s1", &ChatMessage::assistant("two"))
+            .unwrap();
         store.append_title("s1", "ignored by history").unwrap();
-        store.append_message("s1", &ChatMessage::user("three")).unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("three"))
+            .unwrap();
 
         let history = store.history("s1").expect("the session exists");
         let texts: Vec<&str> = history
@@ -759,7 +774,9 @@ mod tests {
     fn a_branch_is_reported_and_the_first_child_is_taken() {
         let (_d, store) = store();
         store.create("s1", "default", "/p").unwrap();
-        store.append_message("s1", &ChatMessage::user("root")).unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("root"))
+            .unwrap();
 
         // Hand-write a second child of the root to forge a divergence.
         let root = store.events("s1").unwrap()[0].id;
@@ -772,14 +789,19 @@ mod tests {
             "role": "user",
             "parts": [{"text": "the other branch"}],
         });
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         use std::io::Write as _;
         writeln!(f, "{forged}").unwrap();
         drop(f);
 
         // The legitimate continuation, appended after the forgery, is
         // the file's *last* line but the root's *second* child.
-        store.append_message("s1", &ChatMessage::user("mine")).unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("mine"))
+            .unwrap();
 
         let history = store.history("s1").expect("a branched session still loads");
         let texts: Vec<&str> = history
@@ -803,7 +825,9 @@ mod tests {
     fn an_orphan_event_is_skipped_rather_than_ending_the_walk() {
         let (_d, store) = store();
         store.create("s1", "default", "/p").unwrap();
-        store.append_message("s1", &ChatMessage::user("root")).unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("root"))
+            .unwrap();
 
         let path = store.path_for_test("s1");
         let orphan = serde_json::json!({
@@ -814,13 +838,20 @@ mod tests {
             "role": "user",
             "parts": [{"text": "unreachable"}],
         });
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         use std::io::Write as _;
         writeln!(f, "{orphan}").unwrap();
         drop(f);
 
         let history = store.history("s1").expect("the session still loads");
-        assert_eq!(history.len(), 1, "the orphan is not reachable from the root");
+        assert_eq!(
+            history.len(),
+            1,
+            "the orphan is not reachable from the root"
+        );
     }
 
     fn tool_result_message(tool_use_id: &str, content: &str) -> ChatMessage {

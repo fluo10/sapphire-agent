@@ -76,17 +76,6 @@ pub struct SessionMeta {
     /// every other kind.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub room_profile: Option<String>,
-    /// The client's workspace root for this session, when one was
-    /// reported. Only ACP sets it: `session/new` and `session/load`
-    /// carry a `cwd`, and `SessionInfo.cwd` is required when the editor
-    /// lists sessions.
-    ///
-    /// `None` for every other path — `/rpc`, voice, chat — and for every
-    /// file written before this field existed. `session/list` treats
-    /// `None` as "belongs to no project", so those sessions are absent
-    /// when the editor filters by `cwd` and present when it does not.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub cwd: Option<String>,
     /// Short auto-generated title, populated from a later `session_title` line.
     #[serde(skip)]
     pub title: Option<String>,
@@ -380,7 +369,6 @@ impl SessionStore {
             project: None,
             device_id: None,
             room_profile: None,
-            cwd: None,
             title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta })?;
@@ -605,34 +593,6 @@ impl SessionStore {
         )
     }
 
-    /// This session's metadata and whether it has been closed.
-    ///
-    /// `session/load` needs the namespace before it decides whether the
-    /// caller may open the session at all. The closed flag rides along
-    /// because the only way to get either is to read the file, and
-    /// splitting them into two methods would read it twice.
-    pub fn session_header(&self, session_id: &str) -> Option<(SessionMeta, bool)> {
-        let path = self.resolve_path(session_id)?;
-        load_session_file(&path).map(|(meta, _, is_closed, _)| (meta, is_closed))
-    }
-
-    /// Every session's metadata and closed flag, oldest first.
-    ///
-    /// `list_sessions` drops the closed flag, and `session/list` has to
-    /// exclude archived conversations — so this is the same walk keeping
-    /// the one field that was being thrown away.
-    pub fn list_session_headers(&self) -> Vec<(SessionMeta, bool)> {
-        let mut headers: Vec<(SessionMeta, bool)> =
-            collect_session_files(&self.base_dir, self.kind)
-                .into_iter()
-                .filter_map(|p| {
-                    load_session_file(&p).map(|(meta, _, is_closed, _)| (meta, is_closed))
-                })
-                .collect();
-        headers.sort_by_key(|(m, _)| m.created_at);
-        headers
-    }
-
     /// Load a session preserving wall-clock timestamps and
     /// `report_meta` provenance, alongside the latest `SummaryLine`
     /// if one has been written. Used by `recall_memory`: the summary
@@ -672,7 +632,6 @@ impl SessionStore {
             project: Some(project.to_string()),
             device_id: None,
             room_profile: None,
-            cwd: None,
             title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta })?;
@@ -729,7 +688,6 @@ impl SessionStore {
         channel: &str,
         public_id_override: Option<String>,
         namespace: &str,
-        cwd: Option<String>,
     ) -> anyhow::Result<Option<String>> {
         if let Some(existing) = self.resolve_path(session_id) {
             // Return existing public_id if the file already existed
@@ -756,7 +714,6 @@ impl SessionStore {
             project: None,
             device_id: None,
             room_profile: None,
-            cwd,
             title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta })?;
@@ -836,7 +793,6 @@ impl SessionStore {
             project: None,
             device_id: Some(device_id.to_string()),
             room_profile: Some(room_profile.to_string()),
-            cwd: None,
             title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta })?;
@@ -1491,7 +1447,6 @@ mod tests {
             project: None,
             device_id: Some("device-a".to_string()),
             room_profile: Some("default".to_string()),
-            cwd: None,
             title: None,
         };
         let line = serde_json::to_string(&MetaLine { meta: stale_meta }).unwrap();
@@ -1504,83 +1459,5 @@ mod tests {
             stale_id, fresh,
             "yesterday's session must not be picked up; daily rotation depends on it"
         );
-    }
-
-    // ── cwd + session_header (ACP session/load) ──────────────────────────
-
-    /// `cwd` はメタ行に載り、読み戻せる。ACP の `session/list` が
-    /// `SessionInfo.cwd` を埋めるために要る。
-    #[test]
-    fn cwd_round_trips_through_the_meta_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(dir.path().to_path_buf(), "rpc");
-        let key: ConversationKey = ("s-cwd".to_string(), None);
-
-        store
-            .ensure_session(
-                "s-cwd",
-                &key,
-                "rpc",
-                None,
-                "default",
-                Some("/home/u/project".to_string()),
-            )
-            .unwrap();
-
-        let (meta, closed) = store.session_header("s-cwd").expect("the session exists");
-        assert!(!closed, "a fresh session is not closed");
-        assert_eq!(meta.cwd.as_deref(), Some("/home/u/project"));
-        assert_eq!(meta.namespace.as_deref(), Some("default"));
-    }
-
-    /// `cwd` を渡さない経路（/rpc、voice、チャット）は `None` のまま。
-    /// このフィールド以前に作られたファイルも同じ形になる。
-    #[test]
-    fn a_session_without_a_cwd_reads_back_as_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(dir.path().to_path_buf(), "rpc");
-        let key: ConversationKey = ("s-nocwd".to_string(), None);
-
-        store
-            .ensure_session("s-nocwd", &key, "rpc", None, "default", None)
-            .unwrap();
-
-        assert_eq!(store.session_header("s-nocwd").unwrap().0.cwd, None);
-    }
-
-    /// 知らない id には `None`。`session/load` はこれを「拒否」に
-    /// 変換する。
-    #[test]
-    fn session_header_is_none_for_an_unknown_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(dir.path().to_path_buf(), "rpc");
-        assert!(store.session_header("no-such-session").is_none());
-    }
-
-    /// Every session comes back, oldest first, each paired with its
-    /// closed flag — `session/list` needs both without re-reading files.
-    #[test]
-    fn list_session_headers_returns_every_session_oldest_first_with_closed_flags() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(dir.path().to_path_buf(), "rpc");
-        let key_a: ConversationKey = ("s-a".to_string(), None);
-        let key_b: ConversationKey = ("s-b".to_string(), None);
-
-        store
-            .ensure_session("s-a", &key_a, "rpc", None, "default", None)
-            .unwrap();
-        store
-            .ensure_session("s-b", &key_b, "rpc", None, "default", None)
-            .unwrap();
-        store.close_session("s-a").unwrap();
-
-        let headers = store.list_session_headers();
-        assert_eq!(headers.len(), 2);
-        let by_id: HashMap<String, bool> = headers
-            .into_iter()
-            .map(|(meta, closed)| (meta.session_id, closed))
-            .collect();
-        assert_eq!(by_id.get("s-a"), Some(&true), "s-a was closed");
-        assert_eq!(by_id.get("s-b"), Some(&false), "s-b is still open");
     }
 }

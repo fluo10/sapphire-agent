@@ -102,11 +102,11 @@ struct AcpSession {
     /// because a later phase needs it as the default working directory for
     /// client-side terminals (`terminal/create`); until then it is inert.
     ///
-    /// Written straight through to `pending_cwd` on `session/new`, and
-    /// recorded the same way by `session/load` — which does NOT feed it
-    /// back into the store: `SessionStore::ensure_session` only writes a
-    /// session's cwd on first creation, so a loaded session's recorded
-    /// cwd cannot be updated through this field, and no code should try.
+    /// Recorded straight from `req.cwd` on both `session/new` and
+    /// `session/load`/`session/resume` — which does NOT feed it back into
+    /// the store: `AcpSessionStore::create` only writes a session's cwd
+    /// once, at creation, so a loaded session's recorded cwd here cannot
+    /// be used to update the stored one, and no code should try.
     ///
     /// Still nothing reads this field back out of the struct (a future
     /// `terminal/create` handler is the intended reader, per the module
@@ -574,17 +574,17 @@ async fn adopt_session(
         .to_string();
     let refuse = || Error::invalid_params().data("no such session is available on this connection");
 
-    let Some((meta, closed)) = state.cross_device_session_store.session_header(&id) else {
+    let Some(summary) = state.acp_session_store.summary(&id) else {
         return Err(refuse());
     };
-    if meta.namespace.as_deref() != Some(namespace.as_str()) {
+    if summary.header.namespace != namespace {
         warn!(
-            "ACP: refused adopting {id}: it belongs to namespace {:?}, not {namespace}",
-            meta.namespace
+            "ACP: refused adopting {id}: it belongs to namespace {}, not {namespace}",
+            summary.header.namespace
         );
         return Err(refuse());
     }
-    if closed {
+    if summary.is_closed {
         // Symmetric with `session/list`, which excludes closed sessions:
         // an archived conversation must be unreachable by id the same way
         // it is unlisted, not just invisible in the picker. Same refusal
@@ -597,6 +597,7 @@ async fn adopt_session(
         .lock()
         .await
         .insert(id.clone(), profile_name.to_string());
+    state.acp_sessions.lock().await.insert(id.clone());
     let already_held = sessions
         .inner
         .lock()
@@ -725,13 +726,34 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         .await
                         .insert(agent_session_id.clone(), profile_name.clone());
 
-                    // The file does not exist yet — `ensure_session`
-                    // creates it on the first turn — so the cwd waits in
-                    // `pending_cwd` until then.
-                    state.pending_cwd.lock().await.insert(
-                        agent_session_id.clone(),
-                        req.cwd.to_string_lossy().to_string(),
-                    );
+                    // Write the session's header now, rather than leaving
+                    // the cwd to wait for a first turn: `AcpSessionStore`
+                    // has no lazy-create path the way the old `/rpc` store
+                    // did (`append_*` requires the file to already exist),
+                    // so this is what makes the session appendable at all.
+                    // Registering it in `acp_sessions` is what makes
+                    // `run_llm_turn` route this session's history and
+                    // messages through that store instead of `/rpc`'s.
+                    let namespace = state
+                        .config
+                        .namespace_for_room_profile(&profile_name)
+                        .to_string();
+                    let cwd_string = req.cwd.to_string_lossy().to_string();
+                    if let Err(e) =
+                        state
+                            .acp_session_store
+                            .create(&agent_session_id, &namespace, &cwd_string)
+                    {
+                        warn!(
+                            "ACP: failed to create the session store entry for {agent_session_id}: {e}"
+                        );
+                        return responder.respond_with_internal_error(e.to_string());
+                    }
+                    state
+                        .acp_sessions
+                        .lock()
+                        .await
+                        .insert(agent_session_id.clone());
 
                     let session_id = SessionId::new(agent_session_id.clone());
                     count_session_open(&state, &agent_session_id).await;
@@ -765,56 +787,43 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         .config
                         .namespace_for_room_profile(&profile_name)
                         .to_string();
-                    let store = Arc::clone(&state.cross_device_session_store);
+                    let store = Arc::clone(&state.acp_session_store);
                     let wanted_cwd = req.cwd.as_ref().map(|c| c.to_string_lossy().to_string());
 
                     let sessions: Vec<SessionInfo> = store
-                        .list_session_headers()
+                        .list_summaries(&namespace)
                         .into_iter()
+                        // An editor opens a thread on every panel open, so
+                        // most sessions are created and never typed into —
+                        // those are not conversations to show.
+                        .filter(|summary| summary.has_messages)
                         // A closed session is archived, not current.
-                        .filter(|(_, is_closed)| !is_closed)
-                        .map(|(meta, _)| meta)
-                        .filter(|meta| {
-                            // Three filters, and the namespace one is a
-                            // boundary rather than a convenience. A file
-                            // too old to name its namespace is not shown:
-                            // an unknown owner is not the same as "mine".
-                            meta.namespace.as_deref() == Some(namespace.as_str())
+                        .filter(|summary| !summary.is_closed)
+                        .filter(|summary| {
+                            // `list_summaries` already scopes by namespace
+                            // directory, but the boundary is checked here
+                            // too on purpose: it is what `session/load`
+                            // also enforces, and the redundancy is
+                            // deliberate defense in depth rather than an
+                            // oversight.
+                            summary.header.namespace == namespace
                         })
-                        .filter(|meta| match &wanted_cwd {
-                            Some(wanted) => meta.cwd.as_deref() == Some(wanted.as_str()),
+                        .filter(|summary| match &wanted_cwd {
+                            Some(wanted) => &summary.header.cwd == wanted,
                             None => true,
                         })
-                        .filter_map(|meta| {
-                            let path = store.absolute_path_for(&meta.session_id)?;
-                            let updated_at = std::fs::metadata(&path)
-                                .and_then(|m| m.modified())
-                                .ok()
+                        .map(|summary| {
+                            let updated_at = store
+                                .absolute_path_for(&summary.header.session_id)
+                                .and_then(|path| std::fs::metadata(&path).and_then(|m| m.modified()).ok())
                                 .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
-                            let cwd = meta
-                                .cwd
-                                .as_deref()
-                                .map(PathBuf::from)
-                                // No client ever reported a cwd for this
-                                // session — it predates the field, or it
-                                // came in over /rpc, voice or chat.
-                                // `SessionInfo.cwd` is required and must
-                                // be absolute, so an empty path would be
-                                // a contract violation dressed up as a
-                                // null. The agent's own workspace root is
-                                // both absolute and true: the
-                                // conversation belongs to the agent, not
-                                // to an editor project. An editor
-                                // filtering by its project directory
-                                // therefore will not match it, which is
-                                // the intended behaviour for these
-                                // sessions.
-                                .unwrap_or_else(|| state.workspace.root());
-                            let mut info =
-                                SessionInfo::new(SessionId::new(meta.session_id.clone()), cwd);
-                            info = info.title(meta.title.clone());
+                            let mut info = SessionInfo::new(
+                                SessionId::new(summary.header.session_id.clone()),
+                                PathBuf::from(&summary.header.cwd),
+                            );
+                            info = info.title(summary.title.clone());
                             info = info.updated_at(updated_at);
-                            Some(info)
+                            info
                         })
                         .collect();
 
@@ -848,13 +857,13 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         Ok(id) => id,
                         Err(e) => return responder.respond_with_error(e),
                     };
-                    let store = Arc::clone(&state.cross_device_session_store);
+                    let store = Arc::clone(&state.acp_session_store);
 
                     // Replay BEFORE answering: the ACP specification
                     // orders it that way, and a client that got the
                     // reply first would render an empty thread and then
                     // watch messages appear underneath it.
-                    for message in store.load_session(&id).unwrap_or_default() {
+                    for message in store.history(&id).unwrap_or_default() {
                         let text: String = message
                             .parts
                             .iter()
@@ -1243,21 +1252,39 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
             .values()
             .map(|s| s.agent_session_id.clone())
             .collect();
-        let mut open = state.open_acp_sessions.lock().await;
-        let mut pending_cwd = state.pending_cwd.lock().await;
-        for id in held {
-            if let Some(count) = open.get_mut(&id) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    open.remove(&id);
+        {
+            let mut open = state.open_acp_sessions.lock().await;
+            for id in &held {
+                if let Some(count) = open.get_mut(id) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        open.remove(id);
+                    }
                 }
             }
-            // A session created here but never prompted left its cwd
-            // waiting in `pending_cwd` for a first turn that will now
-            // never come. Safe to remove unconditionally: any run that
-            // did reach `ensure_session` already took its own entry out,
-            // so this is a no-op for those and a leak fix for the rest.
-            pending_cwd.remove(&id);
+        }
+
+        // `AcpSessionStore` has no lazy-create path — unlike the old
+        // `pending_cwd` design, `session/new` now writes the header
+        // eagerly (see that handler), which is what makes the session
+        // appendable at all. The cost is that a panel an editor opened
+        // and never typed into now leaves a real, empty file behind
+        // instead of nothing. Closing it here is the equivalent of the
+        // cleanup `pending_cwd.remove` used to do: harmless either way
+        // (`session/list` already hides anything with no messages), and
+        // it additionally forecloses reopening that exact empty id by
+        // `session/load`, matching how an archived conversation already
+        // behaves. Skipped for anything with real messages, or already
+        // closed, so an adopted, in-progress conversation is never
+        // touched by a peer connection going away.
+        for id in &held {
+            if let Some(summary) = state.acp_session_store.summary(id)
+                && !summary.has_messages
+                && !summary.is_closed
+                && let Err(e) = state.acp_session_store.close(id)
+            {
+                warn!("ACP: failed to close an abandoned, never-prompted session {id}: {e}");
+            }
         }
     }
 
@@ -1833,7 +1860,7 @@ mod tests {
     }
 
     /// `session/new`'s `cwd` is carried until the session is first
-    /// persisted, then lands in the meta line. `session/list` will have
+    /// persisted, then lands in the header line. `session/list` will have
     /// nothing else to filter a project by, so if this regresses the
     /// listing is always empty.
     #[tokio::test]
@@ -1846,16 +1873,15 @@ mod tests {
                 stop_reason: None,
             }],
         );
-        let store = Arc::clone(&state.cross_device_session_store);
+        let store = Arc::clone(&state.acp_session_store);
         let addr = spawn(state).await;
 
         let (session_id, _updates, _reply) = drive(&addr, text_prompt("hi")).await;
 
-        let meta = store
-            .session_header(&session_id)
-            .map(|(m, _)| m)
-            .expect("the turn persisted the session");
-        assert_eq!(meta.cwd.as_deref(), Some(test_cwd()));
+        let summary = store
+            .summary(&session_id)
+            .expect("session/new persisted the session's header");
+        assert_eq!(summary.header.cwd, test_cwd());
     }
 
     /// Zed sends every `@file` mention as a `resource_link` block, which
@@ -2697,23 +2723,23 @@ mod tests {
     }
 
     /// The boundary. A token pinned to one room profile must not see
-    /// another profile's conversations, and a file too old to say which
-    /// namespace it belongs to is not shown either — an unknown owner is
-    /// not the same as "mine".
+    /// another profile's conversations.
     #[tokio::test]
     async fn list_only_returns_this_namespaces_sessions() {
         let state = ServeState::for_test_scripted(true, Vec::new());
-        let store = Arc::clone(&state.cross_device_session_store);
+        let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
             .namespace_for_room_profile("developer")
             .to_string();
 
-        let mine = store
-            .create_session(&("r-mine".to_string(), None), "rpc", &ours)
+        store.create("mine", &ours, "/p").unwrap();
+        store
+            .append_message("mine", &crate::provider::ChatMessage::user("hi"))
             .unwrap();
-        let theirs = store
-            .create_session(&("r-theirs".to_string(), None), "rpc", "someone-else")
+        store.create("theirs", "someone-else", "/p").unwrap();
+        store
+            .append_message("theirs", &crate::provider::ChatMessage::user("hi"))
             .unwrap();
 
         let addr = spawn(state).await;
@@ -2725,48 +2751,51 @@ mod tests {
             .iter()
             .map(|s| s["sessionId"].as_str().unwrap())
             .collect();
-        assert!(ids.contains(&mine.as_str()), "got {ids:?}");
+        assert!(ids.contains(&"mine"), "got {ids:?}");
         assert!(
-            !ids.contains(&theirs.as_str()),
+            !ids.contains(&"theirs"),
             "another namespace leaked into the list: {ids:?}"
         );
         assert_eq!(replies[1]["result"]["nextCursor"], serde_json::Value::Null);
     }
 
-    /// A file written before `namespace` existed cannot say whose it is.
-    /// An unknown owner is not the same as "mine", so it is not listed.
-    /// Written by hand because `create_session` always records one.
+    /// A header line that fails to parse cannot say whose it is — the same
+    /// property `main`'s `SessionStore` protects with an optional
+    /// `namespace`, but `AcpSessionStore`'s `SessionHeader.namespace` is a
+    /// required field, so the equivalent of "written before namespace
+    /// existed" is a header the type cannot even deserialize. An unknown
+    /// owner is not the same as "mine", so it is not listed either way.
     #[tokio::test]
-    async fn list_omits_sessions_with_no_namespace() {
+    async fn list_omits_sessions_with_an_unparseable_header() {
         let state = ServeState::for_test_scripted(true, Vec::new());
-        let store = Arc::clone(&state.cross_device_session_store);
+        let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
             .namespace_for_room_profile("developer")
             .to_string();
-        let mine = store
-            .create_session(&("r-mine".to_string(), None), "rpc", &ours)
+        store.create("mine", &ours, "/p").unwrap();
+        store
+            .append_message("mine", &crate::provider::ChatMessage::user("hi"))
             .unwrap();
 
-        // A legacy meta line: no `namespace` key at all.
-        let legacy_dir = store
-            .absolute_path_for(&mine)
+        // Hand-written: a "header" line missing the `namespace` field
+        // `SessionHeader` requires, so it fails to deserialize.
+        let dir = store
+            .absolute_path_for("mine")
             .unwrap()
             .parent()
             .unwrap()
             .to_path_buf();
-        let legacy = legacy_dir.join("00000000-0000-7000-8000-00000000dead.jsonl");
         std::fs::write(
-            &legacy,
+            dir.join("broken.jsonl"),
             format!(
                 "{}\n",
-                serde_json::json!({"meta": {
-                    "session_id": "00000000-0000-7000-8000-00000000dead",
-                    "room_id": "r-legacy",
-                    "thread_id": null,
-                    "channel": "rpc",
+                serde_json::json!({
+                    "kind": "header",
+                    "session_id": "broken",
+                    "cwd": "/p",
                     "created_at": "2020-01-01T00:00:00Z"
-                }})
+                })
             ),
         )
         .unwrap();
@@ -2782,8 +2811,8 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec![mine.as_str()],
-            "a namespace-less file leaked: {ids:?}"
+            vec!["mine"],
+            "an unparseable header must not leak into the list: {ids:?}"
         );
     }
 
@@ -2793,19 +2822,21 @@ mod tests {
     #[tokio::test]
     async fn list_omits_closed_sessions() {
         let state = ServeState::for_test_scripted(true, Vec::new());
-        let store = Arc::clone(&state.cross_device_session_store);
+        let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
             .namespace_for_room_profile("developer")
             .to_string();
 
-        let open = store
-            .create_session(&("r-open".to_string(), None), "rpc", &ours)
+        store.create("open", &ours, "/p").unwrap();
+        store
+            .append_message("open", &crate::provider::ChatMessage::user("hi"))
             .unwrap();
-        let closed = store
-            .create_session(&("r-closed".to_string(), None), "rpc", &ours)
+        store.create("closed", &ours, "/p").unwrap();
+        store
+            .append_message("closed", &crate::provider::ChatMessage::user("hi"))
             .unwrap();
-        store.close_session(&closed).unwrap();
+        store.close("closed").unwrap();
 
         let addr = spawn(state).await;
         let replies = conversation(&addr, vec![initialize_request(0), list_request(1, None)]).await;
@@ -2816,45 +2847,31 @@ mod tests {
             .iter()
             .map(|s| s["sessionId"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec![open.as_str()], "got {ids:?}");
+        assert_eq!(ids, vec!["open"], "got {ids:?}");
     }
 
-    /// The editor filters by project. A session with no recorded cwd
-    /// belongs to no project, so it is absent when a cwd is asked for
-    /// and present when one is not — which is how conversations from
-    /// before cwd was recorded stay reachable.
+    /// The editor filters by project: an exact match against the recorded
+    /// `cwd`. `AcpSessionStore`'s `cwd` is a required field — every ACP
+    /// session reports one at `session/new` — so unlike the old shared
+    /// store there is no "no cwd" case left to test here.
     #[tokio::test]
     async fn list_honours_the_cwd_filter() {
         let state = ServeState::for_test_scripted(true, Vec::new());
-        let store = Arc::clone(&state.cross_device_session_store);
+        let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
             .namespace_for_room_profile("developer")
             .to_string();
 
-        let no_cwd = store
-            .create_session(&("r-nocwd".to_string(), None), "rpc", &ours)
-            .unwrap();
-        let here = store
-            .ensure_session(
-                "s-here",
-                &("r-here".to_string(), None),
-                "rpc",
-                None,
-                &ours,
-                Some("/projects/here".to_string()),
-            )
-            .map(|_| "s-here".to_string())
+        store.create("here", &ours, "/projects/here").unwrap();
+        store
+            .append_message("here", &crate::provider::ChatMessage::user("hi"))
             .unwrap();
         store
-            .ensure_session(
-                "s-elsewhere",
-                &("r-elsewhere".to_string(), None),
-                "rpc",
-                None,
-                &ours,
-                Some("/projects/elsewhere".to_string()),
-            )
+            .create("elsewhere", &ours, "/projects/elsewhere")
+            .unwrap();
+        store
+            .append_message("elsewhere", &crate::provider::ChatMessage::user("hi"))
             .unwrap();
 
         let addr = spawn(state).await;
@@ -2877,73 +2894,15 @@ mod tests {
                 .collect()
         };
 
-        assert_eq!(ids(&replies[1]), vec![here.clone()], "filtered by cwd");
-        let all = ids(&replies[2]);
-        assert!(
-            all.contains(&no_cwd),
-            "unfiltered must include the cwd-less session: {all:?}"
-        );
-        assert_eq!(all.len(), 3, "got {all:?}");
-    }
-
-    /// A session with no client-reported cwd (it predates the field, or
-    /// came in over `/rpc`, voice or chat) still has to report an
-    /// absolute path: `SessionInfo.cwd` is required and the schema
-    /// documents it as absolute, so an empty string would be a contract
-    /// violation dressed up as a null. The agent's own workspace root
-    /// stands in for it — true, because the conversation belongs to the
-    /// agent rather than to any editor project — which is also why it
-    /// must never match a project-scoped `cwd` filter.
-    #[tokio::test]
-    async fn list_reports_the_workspace_root_for_a_session_with_no_cwd() {
-        let state = ServeState::for_test_scripted(true, Vec::new());
-        let store = Arc::clone(&state.cross_device_session_store);
-        let ours = state
-            .config
-            .namespace_for_room_profile("developer")
-            .to_string();
-        let workspace_root = state.workspace.root();
-
-        let no_cwd = store
-            .create_session(&("r-nocwd".to_string(), None), "rpc", &ours)
-            .unwrap();
-
-        let addr = spawn(state).await;
-        let replies = conversation(
-            &addr,
-            vec![
-                initialize_request(0),
-                list_request(1, None),
-                list_request(2, Some("/projects/elsewhere")),
-            ],
-        )
-        .await;
-
-        let session = |r: &serde_json::Value| -> Option<serde_json::Value> {
-            r["result"]["sessions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|s| s["sessionId"].as_str() == Some(no_cwd.as_str()))
-                .cloned()
-        };
-
-        let unfiltered = session(&replies[1]).expect("present when no cwd is requested");
-        let reported_cwd = unfiltered["cwd"].as_str().expect("cwd is a string");
-        assert!(
-            std::path::Path::new(reported_cwd).is_absolute(),
-            "got {reported_cwd:?}"
-        );
         assert_eq!(
-            PathBuf::from(reported_cwd),
-            workspace_root,
-            "must be the agent's own workspace root"
+            ids(&replies[1]),
+            vec!["here".to_string()],
+            "filtered by cwd"
         );
-
-        assert!(
-            session(&replies[2]).is_none(),
-            "absent when the request filters by an unrelated project directory"
-        );
+        let all = ids(&replies[2]);
+        assert!(all.contains(&"here".to_string()), "got {all:?}");
+        assert!(all.contains(&"elsewhere".to_string()), "got {all:?}");
+        assert_eq!(all.len(), 2, "unfiltered must include both, got {all:?}");
     }
 
     #[tokio::test]
@@ -2971,19 +2930,18 @@ mod tests {
     #[tokio::test]
     async fn load_replays_the_conversation_before_replying() {
         let state = ServeState::for_test_scripted(true, Vec::new());
-        let store = Arc::clone(&state.cross_device_session_store);
+        let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
             .namespace_for_room_profile("developer")
             .to_string();
-        let sid = store
-            .create_session(&("r".to_string(), None), "rpc", &ours)
+        let sid = "sess-replay".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
+        store
+            .append_message(&sid, &crate::provider::ChatMessage::user("first"))
             .unwrap();
         store
-            .append(&sid, &crate::provider::ChatMessage::user("first"))
-            .unwrap();
-        store
-            .append(&sid, &crate::provider::ChatMessage::assistant("second"))
+            .append_message(&sid, &crate::provider::ChatMessage::assistant("second"))
             .unwrap();
 
         let addr = spawn(state).await;
@@ -3031,10 +2989,9 @@ mod tests {
     #[tokio::test]
     async fn load_refuses_another_namespaces_session() {
         let state = ServeState::for_test_scripted(true, Vec::new());
-        let store = Arc::clone(&state.cross_device_session_store);
-        let theirs = store
-            .create_session(&("r".to_string(), None), "rpc", "someone-else")
-            .unwrap();
+        let store = Arc::clone(&state.acp_session_store);
+        let theirs = "theirs".to_string();
+        store.create(&theirs, "someone-else", "/p").unwrap();
 
         let addr = spawn(state).await;
         let replies =
@@ -3047,10 +3004,9 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_and_a_forbidden_session_look_the_same() {
         let state = ServeState::for_test_scripted(true, Vec::new());
-        let store = Arc::clone(&state.cross_device_session_store);
-        let theirs = store
-            .create_session(&("r".to_string(), None), "rpc", "someone-else")
-            .unwrap();
+        let store = Arc::clone(&state.acp_session_store);
+        let theirs = "theirs".to_string();
+        store.create(&theirs, "someone-else", "/p").unwrap();
 
         let addr = spawn(state).await;
         let replies = conversation(
@@ -3078,15 +3034,14 @@ mod tests {
     #[tokio::test]
     async fn load_refuses_a_closed_session() {
         let state = ServeState::for_test_scripted(true, Vec::new());
-        let store = Arc::clone(&state.cross_device_session_store);
+        let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
             .namespace_for_room_profile("developer")
             .to_string();
-        let sid = store
-            .create_session(&("r".to_string(), None), "rpc", &ours)
-            .unwrap();
-        store.close_session(&sid).unwrap();
+        let sid = "sess-closed".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
+        store.close(&sid).unwrap();
 
         let addr = spawn(state).await;
         let replies = conversation(
@@ -3119,16 +3074,15 @@ mod tests {
                 stop_reason: None,
             }],
         );
-        let store = Arc::clone(&state.cross_device_session_store);
+        let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
             .namespace_for_room_profile("developer")
             .to_string();
-        let sid = store
-            .create_session(&("r".to_string(), None), "rpc", &ours)
-            .unwrap();
+        let sid = "sess-continues".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
         store
-            .append(&sid, &crate::provider::ChatMessage::user("first"))
+            .append_message(&sid, &crate::provider::ChatMessage::user("first"))
             .unwrap();
 
         let addr = spawn(state).await;
@@ -3153,7 +3107,7 @@ mod tests {
             }
         }
 
-        let history = store.load_session(&sid).expect("the session still exists");
+        let history = store.history(&sid).expect("the session still exists");
         let texts: Vec<String> = history
             .iter()
             .flat_map(|m| &m.parts)
@@ -3193,16 +3147,15 @@ mod tests {
                 stop_reason: None,
             }],
         );
-        let store = Arc::clone(&state.cross_device_session_store);
+        let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
             .namespace_for_room_profile("developer")
             .to_string();
-        let sid = store
-            .create_session(&("r".to_string(), None), "rpc", &ours)
-            .unwrap();
+        let sid = "sess-resume".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
         store
-            .append(&sid, &crate::provider::ChatMessage::user("first"))
+            .append_message(&sid, &crate::provider::ChatMessage::user("first"))
             .unwrap();
 
         let addr = spawn(state).await;
@@ -3244,7 +3197,7 @@ mod tests {
                 break;
             }
         }
-        let history = store.load_session(&sid).unwrap();
+        let history = store.history(&sid).unwrap();
         assert!(history.len() >= 3, "the resumed session kept its history");
     }
 
@@ -3259,45 +3212,42 @@ mod tests {
         );
     }
 
-    /// A file too old to say whose it is refuses the same way an unknown
-    /// or another namespace's session does. `session/list` already omits
-    /// these (`list_omits_sessions_with_no_namespace`); `load` must not
-    /// let a client reach one directly by id either — an unknown owner is
-    /// not the same as "mine".
+    /// A header line too broken to say whose it is refuses the same way an
+    /// unknown or another namespace's session does. `session/list` already
+    /// omits these (`list_omits_sessions_with_an_unparseable_header`);
+    /// `load` must not let a client reach one directly by id either — an
+    /// unknown owner is not the same as "mine".
     #[tokio::test]
-    async fn load_refuses_a_session_with_no_namespace() {
+    async fn load_refuses_a_session_with_an_unparseable_header() {
         let state = ServeState::for_test_scripted(true, Vec::new());
-        let store = Arc::clone(&state.cross_device_session_store);
+        let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
             .namespace_for_room_profile("developer")
             .to_string();
-        let mine = store
-            .create_session(&("r-mine".to_string(), None), "rpc", &ours)
-            .unwrap();
+        let mine = "mine".to_string();
+        store.create(&mine, &ours, "/p").unwrap();
 
-        // A legacy meta line: no `namespace` key at all. Same technique as
-        // `list_omits_sessions_with_no_namespace`, since `create_session`
-        // always records one.
-        let legacy_dir = store
+        // Same technique as `list_omits_sessions_with_an_unparseable_header`:
+        // a "header" line missing the `namespace` field `SessionHeader`
+        // requires, so `summary()` cannot see it at all.
+        let dir = store
             .absolute_path_for(&mine)
             .unwrap()
             .parent()
             .unwrap()
             .to_path_buf();
-        let legacy_id = "00000000-0000-7000-8000-00000000dead";
-        let legacy = legacy_dir.join(format!("{legacy_id}.jsonl"));
+        let broken_id = "broken";
         std::fs::write(
-            &legacy,
+            dir.join(format!("{broken_id}.jsonl")),
             format!(
                 "{}\n",
-                serde_json::json!({"meta": {
-                    "session_id": legacy_id,
-                    "room_id": "r-legacy",
-                    "thread_id": null,
-                    "channel": "rpc",
+                serde_json::json!({
+                    "kind": "header",
+                    "session_id": broken_id,
+                    "cwd": "/p",
                     "created_at": "2020-01-01T00:00:00Z"
-                }})
+                })
             ),
         )
         .unwrap();
@@ -3305,7 +3255,7 @@ mod tests {
         let addr = spawn(state).await;
         let replies = conversation(
             &addr,
-            vec![initialize_request(0), load_request(1, legacy_id)],
+            vec![initialize_request(0), load_request(1, broken_id)],
         )
         .await;
         assert_eq!(replies[1]["error"]["code"], -32602, "got {}", replies[1]);
@@ -3319,15 +3269,14 @@ mod tests {
     #[tokio::test]
     async fn opening_a_session_twice_is_counted() {
         let state = ServeState::for_test_scripted(true, Vec::new());
-        let store = Arc::clone(&state.cross_device_session_store);
+        let store = Arc::clone(&state.acp_session_store);
         let counts = Arc::clone(&state.open_acp_sessions);
         let ours = state
             .config
             .namespace_for_room_profile("developer")
             .to_string();
-        let sid = store
-            .create_session(&("r".to_string(), None), "rpc", &ours)
-            .unwrap();
+        let sid = "sess-twice".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
 
         let addr = spawn(state).await;
         let mut a = connect(&addr).await;
@@ -3369,15 +3318,14 @@ mod tests {
     #[tokio::test]
     async fn readopting_a_session_on_the_same_connection_is_not_double_counted() {
         let state = ServeState::for_test_scripted(true, Vec::new());
-        let store = Arc::clone(&state.cross_device_session_store);
+        let store = Arc::clone(&state.acp_session_store);
         let counts = Arc::clone(&state.open_acp_sessions);
         let ours = state
             .config
             .namespace_for_room_profile("developer")
             .to_string();
-        let sid = store
-            .create_session(&("r".to_string(), None), "rpc", &ours)
-            .unwrap();
+        let sid = "sess-readopt".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
 
         let addr = spawn(state).await;
         let mut ws = connect(&addr).await;
@@ -3436,15 +3384,14 @@ mod tests {
     #[tokio::test]
     async fn closing_a_connection_releases_its_sessions() {
         let state = ServeState::for_test_scripted(true, Vec::new());
-        let store = Arc::clone(&state.cross_device_session_store);
+        let store = Arc::clone(&state.acp_session_store);
         let counts = Arc::clone(&state.open_acp_sessions);
         let ours = state
             .config
             .namespace_for_room_profile("developer")
             .to_string();
-        let sid = store
-            .create_session(&("r".to_string(), None), "rpc", &ours)
-            .unwrap();
+        let sid = "sess-close-conn".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
 
         let addr = spawn(state).await;
         let mut ws = connect(&addr).await;

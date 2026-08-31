@@ -97,15 +97,6 @@ pub struct ServeState {
     /// that quitting without sending anything leaves no empty file behind.
     /// Maps internal UUID → reserved public_id (grain-id).
     pub(crate) pending_sessions: tokio::sync::Mutex<HashMap<String, String>>,
-    /// The client `cwd` for a session that has been created but not yet
-    /// written to disk.
-    ///
-    /// `session/new` mints an id and nothing else; the JSONL file is
-    /// created lazily by `ensure_session` on the first turn. The cwd
-    /// arrives at `session/new` and is needed at `ensure_session`, so it
-    /// waits here in between — the same shape `pending_sessions` uses to
-    /// carry a reserved public_id across the same gap.
-    pub(crate) pending_cwd: tokio::sync::Mutex<HashMap<String, String>>,
     /// Per-session room_profile pin from `initialize`. Sessions absent
     /// from this map fall through to the background provider. Not
     /// persisted across restarts — clients must re-pass `room_profile`
@@ -213,7 +204,6 @@ impl ServeState {
             mcp_project_index: tokio::sync::Mutex::new(mcp_index),
             sessions: tokio::sync::Mutex::new(HashMap::new()),
             pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
-            pending_cwd: tokio::sync::Mutex::new(HashMap::new()),
             session_room_profiles: tokio::sync::Mutex::new(HashMap::new()),
             session_room_metadata: tokio::sync::Mutex::new(HashMap::new()),
             voice,
@@ -1992,16 +1982,8 @@ pub(crate) async fn run_llm_turn(
     let key: ConversationKey = (session_id.clone(), None);
     if !is_acp && Arc::ptr_eq(&store, &state.cross_device_session_store) {
         let pending_pub_id = state.pending_sessions.lock().await.remove(&session_id);
-        let pending_cwd = state.pending_cwd.lock().await.remove(&session_id);
         if let Err(e) = store
-            .ensure_session(
-                &session_id,
-                &key,
-                "rpc",
-                pending_pub_id,
-                &namespace,
-                pending_cwd,
-            )
+            .ensure_session(&session_id, &key, "rpc", pending_pub_id, &namespace)
             .map(|_| ())
         {
             warn!("Failed to ensure session file: {e}");
@@ -2033,7 +2015,10 @@ pub(crate) async fn run_llm_turn(
     //    bytes for the provider call while JSONL gets a hash marker.
     history.push(user_msg.clone());
     if is_acp {
-        if let Err(e) = state.acp_session_store.append_message(&session_id, &user_msg) {
+        if let Err(e) = state
+            .acp_session_store
+            .append_message(&session_id, &user_msg)
+        {
             warn!("Failed to persist user message: {e}");
         }
     } else if let Err(e) = store.append(&session_id, &user_msg) {
@@ -2078,9 +2063,7 @@ pub(crate) async fn run_llm_turn(
                 // reload, so a stored summary would only be a second,
                 // staler answer to a question the events already
                 // answer. Compression stays an in-memory optimisation.
-                if !is_acp
-                    && let Err(e) = store.append_summary(&session_id, &result.summary)
-                {
+                if !is_acp && let Err(e) = store.append_summary(&session_id, &result.summary) {
                     warn!("Failed to persist compaction summary: {e}");
                 }
             }
@@ -2836,7 +2819,6 @@ rooms    = []
             mcp_project_index: Default::default(),
             sessions: Default::default(),
             pending_sessions: Default::default(),
-            pending_cwd: Default::default(),
             session_room_profiles: Default::default(),
             session_room_metadata: Default::default(),
             voice: None,
@@ -3035,7 +3017,10 @@ mod tests {
             "the user message is in the ACP store"
         );
         assert!(
-            state.cross_device_session_store.load_session(&sid).is_none(),
+            state
+                .cross_device_session_store
+                .load_session(&sid)
+                .is_none(),
             "the /rpc store must not have been touched"
         );
     }
@@ -3057,7 +3042,10 @@ mod tests {
         .await;
 
         assert!(
-            state.cross_device_session_store.load_session(&sid).is_some(),
+            state
+                .cross_device_session_store
+                .load_session(&sid)
+                .is_some(),
             "the /rpc store still receives non-ACP sessions"
         );
     }
