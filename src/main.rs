@@ -569,6 +569,23 @@ async fn main() -> Result<()> {
                 ambient_routes = Some(routes);
             }
 
+            // ── ACP session store (sessions/<namespace>/acp/) ───────────────
+            // Separate from `cross_device_session_store`: ACP is an
+            // externally-defined standard that will drift from the
+            // format we chose for ourselves, and an editor's thread
+            // list should not be showing Matrix conversations. Tool
+            // results are kept in a workspace-external, content-addressed
+            // cache rather than inline, for the same reason images are.
+            let tool_result_cache = tool_result_cache::ToolResultCache::open(
+                tool_result_cache::ToolResultCache::default_dir().ok_or_else(|| {
+                    anyhow::anyhow!("no platform cache directory is resolvable for the tool-result cache")
+                })?,
+            )?;
+            let acp_session_store = Arc::new(acp_session::AcpSessionStore::new(
+                sessions_base.clone(),
+                tool_result_cache,
+            ));
+
             let serve_state = Arc::new(serve::ServeState::new(
                 config.clone(),
                 Arc::clone(&registry),
@@ -580,6 +597,7 @@ async fn main() -> Result<()> {
                 voice_providers,
                 image_cache.clone(),
                 Arc::clone(&device_auth),
+                acp_session_store,
             ));
             // Wire serve_state into the timer manager so voice-origin
             // timers can push fire messages back to their satellite.

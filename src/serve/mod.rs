@@ -14,6 +14,7 @@ pub mod acp;
 pub mod acp_permissions;
 pub mod mcp;
 
+use crate::acp_session::AcpSessionStore;
 use crate::channel::RoomInfo;
 use crate::config::Config;
 use crate::context_compression::{generate_summary, maybe_compress};
@@ -31,7 +32,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -145,6 +146,17 @@ pub struct ServeState {
     /// this makes hitting it visible in the log, because a transcript
     /// that diverged with nothing written down cannot be debugged.
     pub(crate) open_acp_sessions: Arc<tokio::sync::Mutex<HashMap<String, usize>>>,
+    /// Sessions an ACP client owns. Separate from the `/rpc` store
+    /// because ACP is an externally-defined standard that will drift
+    /// from the format we chose for ourselves.
+    pub(crate) acp_session_store: Arc<AcpSessionStore>,
+    /// Which session ids belong to ACP.
+    ///
+    /// Registered by the ACP adapter at `session/new` and on adopt.
+    /// A set rather than a field on the session, because `run_llm_turn`
+    /// is reached from several transports and only one of them knows
+    /// the answer.
+    pub(crate) acp_sessions: tokio::sync::Mutex<HashSet<String>>,
 }
 
 impl ServeState {
@@ -164,6 +176,7 @@ impl ServeState {
         voice: Option<Arc<VoiceProviders>>,
         image_cache: Option<Arc<crate::image_cache::ImageCache>>,
         device_auth: Arc<crate::device_auth::DeviceAuth>,
+        acp_session_store: Arc<AcpSessionStore>,
     ) -> Self {
         // Scan once on startup: each MCP session's first-line meta
         // carries `namespace` + `project`, so this reproduces the
@@ -208,7 +221,17 @@ impl ServeState {
             image_cache,
             device_auth,
             open_acp_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            acp_session_store,
+            acp_sessions: tokio::sync::Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Whether `session_id` belongs to an ACP client, and so should be
+    /// persisted through `acp_session_store` instead of the `/rpc`
+    /// store. Registered by the ACP adapter at `session/new` and on
+    /// adopt.
+    pub(crate) async fn is_acp(&self, session_id: &str) -> bool {
+        self.acp_sessions.lock().await.contains(session_id)
     }
 
     /// Pick the [`SessionStore`] that owns `session_id`. Device-default
@@ -392,18 +415,31 @@ pub async fn run(
             info!("HTTP server shutting down...");
         })
         .await?;
-    summarize_all_sessions(&shutdown_state).await;
+    digest_all_sessions(&shutdown_state).await;
     Ok(())
 }
 
-/// Summarize every in-memory API session and append a `SummaryLine` so the
-/// next process can recover context without replaying raw history.
-async fn summarize_all_sessions(state: &Arc<ServeState>) {
+/// Publish "what this session covered today" for every in-memory API
+/// session, so other rooms can pick it up through the cross-session
+/// digest block in their system prompt.
+///
+/// This used to also append a `SummaryLine` for the next process to
+/// resume from. It no longer does: a session's history is restored from
+/// its own events, and a tool result that has fallen out of the cache
+/// degrades to a placeholder — cheaper and more faithful than paying
+/// for a model call that throws the turn structure away.
+///
+/// ACP sessions are excluded here, not because they don't get digested,
+/// but because this function writes through `SessionStore::append_intraday_digest`,
+/// which the ACP store does not have. Their digest generation is added
+/// separately, writing through the ACP store instead.
+async fn digest_all_sessions(state: &Arc<ServeState>) {
     let snapshot: Vec<(String, Vec<ChatMessage>)> = {
         let sessions = state.sessions.lock().await;
+        let acp = state.acp_sessions.lock().await;
         sessions
             .iter()
-            .filter(|(_, msgs)| msgs.len() >= 2)
+            .filter(|(sid, msgs)| msgs.len() >= 2 && !acp.contains(*sid))
             .map(|(sid, msgs)| (sid.clone(), msgs.clone()))
             .collect()
     };
@@ -411,7 +447,7 @@ async fn summarize_all_sessions(state: &Arc<ServeState>) {
         return;
     }
     info!(
-        "Graceful shutdown: summarizing {} RPC session(s)",
+        "Graceful shutdown: digesting {} RPC session(s)",
         snapshot.len()
     );
     for (session_id, messages) in snapshot {
@@ -419,15 +455,12 @@ async fn summarize_all_sessions(state: &Arc<ServeState>) {
         let store = state.store_for_session(&session_id);
         match generate_summary(&*provider, &messages).await {
             Ok(summary) if !summary.trim().is_empty() => {
-                if let Err(e) = store.append_summary(&session_id, &summary) {
-                    warn!("Failed to persist shutdown summary for {session_id}: {e}");
-                }
                 if let Err(e) = store.append_intraday_digest(&session_id, &summary, None) {
                     warn!("Failed to persist shutdown intra-day digest for {session_id}: {e}");
                 }
             }
-            Ok(_) => warn!("Shutdown summary for {session_id} was empty; skipping"),
-            Err(e) => warn!("Shutdown summary generation failed for {session_id}: {e:#}"),
+            Ok(_) => warn!("Shutdown digest for {session_id} was empty; skipping"),
+            Err(e) => warn!("Shutdown digest generation failed for {session_id}: {e:#}"),
         }
     }
 }
@@ -1484,10 +1517,15 @@ async fn run_voice_turn_from_text_sse(
         let reply = reply_text.clone();
         tokio::spawn(async move {
             let p = state2.provider_for_session(&sid).await;
-            if let Some(title) = generate_session_title(&*p, &user_text, &reply).await
-                && let Err(e) = state2.store_for_session(&sid).set_title(&sid, &title)
-            {
-                warn!("Failed to store session title: {e}");
+            if let Some(title) = generate_session_title(&*p, &user_text, &reply).await {
+                let result = if state2.is_acp(&sid).await {
+                    state2.acp_session_store.append_title(&sid, &title)
+                } else {
+                    state2.store_for_session(&sid).set_title(&sid, &title)
+                };
+                if let Err(e) = result {
+                    warn!("Failed to store session title: {e}");
+                }
             }
         });
     }
@@ -1907,13 +1945,23 @@ pub(crate) async fn run_llm_turn(
     // Pick the right store up front so every persistence call in this
     // turn lands in the same place (device-default vs cross-device).
     let store = Arc::clone(state.store_for_session(&session_id));
+    let is_acp = state.is_acp(&session_id).await;
 
     // 1. Load or lazy-hydrate in-memory history
     let mut history: Vec<ChatMessage> = {
         let mut sessions = state.sessions.lock().await;
         sessions
             .entry(session_id.clone())
-            .or_insert_with(|| store.load_session(&session_id).unwrap_or_default())
+            .or_insert_with(|| {
+                if is_acp {
+                    state
+                        .acp_session_store
+                        .history(&session_id)
+                        .unwrap_or_default()
+                } else {
+                    store.load_session(&session_id).unwrap_or_default()
+                }
+            })
             .clone()
     };
     let was_first_turn = history.is_empty();
@@ -1942,7 +1990,7 @@ pub(crate) async fn run_llm_turn(
     // no-op. Skip it to avoid synthesising a spurious grain-id
     // public_id that device-default sessions don't need.
     let key: ConversationKey = (session_id.clone(), None);
-    if Arc::ptr_eq(&store, &state.cross_device_session_store) {
+    if !is_acp && Arc::ptr_eq(&store, &state.cross_device_session_store) {
         let pending_pub_id = state.pending_sessions.lock().await.remove(&session_id);
         let pending_cwd = state.pending_cwd.lock().await.remove(&session_id);
         if let Err(e) = store
@@ -1984,7 +2032,11 @@ pub(crate) async fn run_llm_turn(
     //    `SessionStore::append` so the in-memory history keeps full image
     //    bytes for the provider call while JSONL gets a hash marker.
     history.push(user_msg.clone());
-    if let Err(e) = store.append(&session_id, &user_msg) {
+    if is_acp {
+        if let Err(e) = state.acp_session_store.append_message(&session_id, &user_msg) {
+            warn!("Failed to persist user message: {e}");
+        }
+    } else if let Err(e) = store.append(&session_id, &user_msg) {
         warn!("Failed to persist user message: {e}");
     }
 
@@ -2021,7 +2073,14 @@ pub(crate) async fn run_llm_turn(
         match maybe_compress(&*provider, system.as_deref(), &history, compression_config).await {
             Ok(Some(result)) => {
                 history = result.compressed;
-                if let Err(e) = store.append_summary(&session_id, &result.summary) {
+                // ACP sessions do not persist a compaction summary: the
+                // full event history is re-read from the store on
+                // reload, so a stored summary would only be a second,
+                // staler answer to a question the events already
+                // answer. Compression stays an in-memory optimisation.
+                if !is_acp
+                    && let Err(e) = store.append_summary(&session_id, &result.summary)
+                {
                     warn!("Failed to persist compaction summary: {e}");
                 }
             }
@@ -2058,7 +2117,11 @@ pub(crate) async fn run_llm_turn(
                 let text = resp.text.unwrap_or_default();
                 let msg = ChatMessage::assistant(&text);
                 history.push(msg.clone());
-                if let Err(e) = store.append(&session_id, &msg) {
+                if is_acp {
+                    if let Err(e) = state.acp_session_store.append_message(&session_id, &msg) {
+                        warn!("Failed to persist assistant message: {e}");
+                    }
+                } else if let Err(e) = store.append(&session_id, &msg) {
                     warn!("Failed to persist assistant message: {e}");
                 }
                 if !text.is_empty() {
@@ -2261,10 +2324,15 @@ async fn run_turn(
         let user_msg = user_message.clone();
         tokio::spawn(async move {
             let p = state2.provider_for_session(&sid).await;
-            if let Some(title) = generate_session_title(&*p, &user_msg, &text).await
-                && let Err(e) = state2.store_for_session(&sid).set_title(&sid, &title)
-            {
-                warn!("Failed to store session title: {e}");
+            if let Some(title) = generate_session_title(&*p, &user_msg, &text).await {
+                let result = if state2.is_acp(&sid).await {
+                    state2.acp_session_store.append_title(&sid, &title)
+                } else {
+                    state2.store_for_session(&sid).set_title(&sid, &title)
+                };
+                if let Err(e) = result {
+                    warn!("Failed to store session title: {e}");
+                }
             }
         });
     }
@@ -2738,6 +2806,16 @@ rooms    = []
         // background provider resolves the built-in "anthropic" key.
         let registry = ProviderRegistry::for_test(&["anthropic", "stub"], Arc::new(provider));
 
+        // Same base directory as the cross-device store above: the ACP
+        // store puts itself in an `acp/` subtree per namespace, so
+        // sharing `base.join("sessions")` doesn't collide with `rpc/`.
+        let tool_result_cache =
+            crate::tool_result_cache::ToolResultCache::open(base.join("tool-results")).unwrap();
+        let acp_session_store = Arc::new(AcpSessionStore::new(
+            base.join("sessions"),
+            tool_result_cache,
+        ));
+
         Arc::new(Self {
             config,
             registry: Arc::new(registry),
@@ -2766,6 +2844,8 @@ rooms    = []
             voice_subscribers: Default::default(),
             device_auth,
             open_acp_sessions: Default::default(),
+            acp_session_store,
+            acp_sessions: Default::default(),
         })
     }
 }
@@ -2917,6 +2997,68 @@ mod tests {
         assert!(
             ran.load(std::sync::atomic::Ordering::SeqCst),
             "a trusted origin must have executed it"
+        );
+    }
+
+    /// An ACP session's messages go to the ACP store, and the shared
+    /// `/rpc` store never sees them. This is the whole point of the
+    /// branch: an editor's thread list should not be showing Matrix
+    /// conversations, and the two formats must be free to drift.
+    #[tokio::test]
+    async fn an_acp_session_persists_to_the_acp_store() {
+        let state = ServeState::for_test(true);
+        let sid = "acp-1".to_string();
+        state.acp_sessions.lock().await.insert(sid.clone());
+        state
+            .acp_session_store
+            .create(&sid, "default", "/work")
+            .unwrap();
+
+        run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("hello"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        let history = state
+            .acp_session_store
+            .history(&sid)
+            .expect("the ACP store has the session");
+        assert!(
+            history.iter().any(|m| matches!(
+                m.parts.first(),
+                Some(ContentPart::Text(t)) if t == "hello"
+            )),
+            "the user message is in the ACP store"
+        );
+        assert!(
+            state.cross_device_session_store.load_session(&sid).is_none(),
+            "the /rpc store must not have been touched"
+        );
+    }
+
+    /// A session nobody registered as ACP still behaves exactly as it
+    /// did — the `/rpc` path is unchanged by this branch.
+    #[tokio::test]
+    async fn an_rpc_session_still_persists_to_the_rpc_store() {
+        let state = ServeState::for_test(true);
+        let sid = "rpc-1".to_string();
+
+        run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("hello"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert!(
+            state.cross_device_session_store.load_session(&sid).is_some(),
+            "the /rpc store still receives non-ACP sessions"
         );
     }
 
