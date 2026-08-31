@@ -12,6 +12,7 @@ mod config;
 mod config_layer;
 mod context_compression;
 mod device_auth;
+mod digest_cache;
 mod frontmatter;
 mod heartbeat;
 mod heartbeat_config;
@@ -586,6 +587,16 @@ async fn main() -> Result<()> {
                 tool_result_cache,
             ));
 
+            // ── Intra-day digest cache (workspace-external, store-agnostic) ─
+            // Same directory family as the tool-result cache above. Keyed
+            // by session id alone, not ACP-specific, so #189 can reuse it
+            // for `/rpc` sessions later.
+            let digest_cache = digest_cache::DigestCache::open(
+                digest_cache::DigestCache::default_dir().ok_or_else(|| {
+                    anyhow::anyhow!("no platform cache directory is resolvable for the digest cache")
+                })?,
+            )?;
+
             let serve_state = Arc::new(serve::ServeState::new(
                 config.clone(),
                 Arc::clone(&registry),
@@ -598,6 +609,7 @@ async fn main() -> Result<()> {
                 image_cache.clone(),
                 Arc::clone(&device_auth),
                 acp_session_store,
+                digest_cache,
             ));
             // Wire serve_state into the timer manager so voice-origin
             // timers can push fire messages back to their satellite.
@@ -741,6 +753,7 @@ async fn main() -> Result<()> {
                     let cross_device_store_for_loop = Arc::clone(&cross_device_session_store);
                     let device_default_store_for_loop = Arc::clone(&device_default_session_store);
                     let agent_for_loop = Arc::clone(&agent);
+                    let serve_state_for_loop = Arc::clone(&serve_state);
                     tokio::spawn(async move {
                         let mut tick = tokio::time::interval(dur);
                         tick.tick().await; // skip immediate fire
@@ -762,6 +775,8 @@ async fn main() -> Result<()> {
                                 &channel_store_for_loop,
                                 &cross_device_store_for_loop,
                                 &device_default_store_for_loop,
+                                Some(&serve_state_for_loop.acp_session_store),
+                                Some(&serve_state_for_loop.digest_cache),
                                 &agent_for_loop,
                             )
                             .await;
@@ -778,6 +793,8 @@ async fn main() -> Result<()> {
                         &channel_session_store,
                         &cross_device_session_store,
                         &device_default_session_store,
+                        Some(&serve_state.acp_session_store),
+                        Some(&serve_state.digest_cache),
                         &agent,
                     )
                     .await;
@@ -856,6 +873,7 @@ async fn main() -> Result<()> {
 /// Cheap when there are no fresh digests: each store walks `sessions/*`
 /// once with an mtime pre-filter that rejects files untouched before
 /// today's local-day window.
+#[allow(clippy::too_many_arguments)]
 async fn rebuild_today_digests(
     config: &Config,
     workspace: &Arc<Workspace>,
@@ -863,6 +881,8 @@ async fn rebuild_today_digests(
     channel_store: &Arc<SessionStore>,
     cross_device_store: &Arc<SessionStore>,
     device_default_store: &Arc<SessionStore>,
+    acp_store: Option<&acp_session::AcpSessionStore>,
+    digest_cache: Option<&digest_cache::DigestCache>,
     agent: &Arc<Agent>,
 ) {
     let today = session::local_date_for_timestamp(chrono::Local::now(), config.day_boundary_hour);
@@ -875,6 +895,8 @@ async fn rebuild_today_digests(
         channel_store,
         Some(cross_device_store.as_ref()),
         Some(device_default_store.as_ref()),
+        acp_store,
+        digest_cache,
         |room_id: &str| cfg.namespace_for_room(room_id).to_string(),
     );
     let had_content = !map.is_empty();

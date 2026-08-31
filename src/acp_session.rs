@@ -18,9 +18,10 @@
 //! produce ids that sort wrongly against each other.
 
 use crate::provider::{ChatMessage, ContentPart, Role};
+use crate::session::{IntradayDigestLine, SessionMeta};
 use crate::tool_result_cache::ToolResultCache;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
@@ -501,6 +502,117 @@ pub struct SessionSummary {
     pub is_closed: bool,
 }
 
+impl AcpSessionStore {
+    /// Today's digest per session, in the vocabulary the cross-session
+    /// digest builder already speaks.
+    ///
+    /// The text comes from `cache`; everything around it comes from the
+    /// session's header. The projection is read-only and deliberate:
+    /// `build_today_digest_for_namespace` is shared with four other
+    /// stores, and teaching it a second shape would spread this store's
+    /// format into code with no business knowing it.
+    pub fn intraday_digests_for_day(
+        &self,
+        date: NaiveDate,
+        boundary_hour: u8,
+        cache: &crate::digest_cache::DigestCache,
+    ) -> Vec<(SessionMeta, IntradayDigestLine)> {
+        let (day_start, day_end) = crate::session::day_window(date, boundary_hour);
+        let mut out = Vec::new();
+        for session_id in self.all_session_ids() {
+            let Some(digest) = cache.get(&session_id) else {
+                continue;
+            };
+            if digest.digest_at < day_start || digest.digest_at >= day_end {
+                continue;
+            }
+            let Some(summary) = self.summary(&session_id) else {
+                continue;
+            };
+            out.push((self.project_meta(&summary), digest));
+        }
+        out.sort_by_key(|(meta, _)| meta.created_at);
+        out
+    }
+
+    /// Sessions whose newest message post-dates their cached digest, and
+    /// which said something inside `date`'s window.
+    ///
+    /// Deliberately not an idle threshold. The sweep runs on a fixed
+    /// cadence, so the only question worth asking is whether anything
+    /// was added since last time — which makes the next update time
+    /// predictable instead of a function of when the user stopped
+    /// typing. Both sides of the comparison are durable (a cache file
+    /// and a session event), so a restart does not reset the schedule.
+    pub fn sessions_needing_digest(
+        &self,
+        cache: &crate::digest_cache::DigestCache,
+        date: NaiveDate,
+        boundary_hour: u8,
+    ) -> Vec<String> {
+        let (day_start, day_end) = crate::session::day_window(date, boundary_hour);
+        let mut due = Vec::new();
+        for session_id in self.all_session_ids() {
+            let Some(events) = self.events(&session_id) else {
+                continue;
+            };
+            let last_message = events
+                .iter()
+                .filter(|e| matches!(e.body, EventBody::Message { .. }))
+                .map(|e| e.at)
+                .last();
+            let Some(last_message) = last_message else {
+                continue;
+            };
+            // Said nothing today: its day is already written up.
+            if last_message < day_start || last_message >= day_end {
+                continue;
+            }
+            if cache
+                .get(&session_id)
+                .is_some_and(|d| d.digest_at >= last_message)
+            {
+                continue;
+            }
+            due.push(session_id);
+        }
+        due.sort();
+        due
+    }
+
+    /// This store's sessions in the vocabulary the log and digest
+    /// builders share. `channel` is `"acp"` so those builders can route
+    /// on it the way they already route on `"rpc"` and
+    /// `"device-default"`.
+    fn project_meta(&self, summary: &SessionSummary) -> SessionMeta {
+        let header = &summary.header;
+        SessionMeta {
+            session_id: header.session_id.clone(),
+            // ACP has no rooms. Empty rather than synthetic, so a
+            // room-derived namespace lookup can never accidentally
+            // match one.
+            room_id: String::new(),
+            thread_id: None,
+            channel: "acp".to_string(),
+            created_at: header.created_at,
+            public_id: None,
+            namespace: Some(header.namespace.clone()),
+            project: None,
+            device_id: None,
+            room_profile: None,
+            title: summary.title.clone(),
+        }
+    }
+
+    /// Every session id this store holds, across namespaces.
+    fn all_session_ids(&self) -> Vec<String> {
+        crate::session::collect_session_files(&self.base_dir, KIND)
+            .into_iter()
+            .filter_map(|p| Some(p.file_stem()?.to_str()?.to_string()))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,5 +986,111 @@ mod tests {
             input_kind: None,
             user_id: None,
         }
+    }
+
+    fn digest_cache(dir: &tempfile::TempDir) -> Arc<crate::digest_cache::DigestCache> {
+        crate::digest_cache::DigestCache::open(dir.path().join("digests")).unwrap()
+    }
+
+    /// The digest's text comes from the cache; its namespace, title and
+    /// creation time come from the store's header. Neither side
+    /// duplicates the other, which is what makes an external cache
+    /// affordable here.
+    #[test]
+    fn a_digest_is_joined_against_the_stores_header() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
+        store.create("s1", "work", "/p").unwrap();
+        store.append_message("s1", &ChatMessage::user("did a thing")).unwrap();
+        store.append_title("s1", "parser hunt").unwrap();
+        cache.put("s1", "we fixed the parser", None).unwrap();
+
+        let today = chrono::Local::now().date_naive();
+        let found = store.intraday_digests_for_day(today, 4, &cache);
+        assert_eq!(found.len(), 1);
+        let (meta, digest) = &found[0];
+        assert_eq!(digest.digest, "we fixed the parser");
+        assert_eq!(meta.session_id, "s1");
+        assert_eq!(
+            meta.channel, "acp",
+            "the projection says which store this came from — \
+             build_today_digest_for_namespace routes on it"
+        );
+        assert_eq!(meta.namespace.as_deref(), Some("work"));
+        assert_eq!(meta.title.as_deref(), Some("parser hunt"));
+    }
+
+    /// Losing the cache must not lose the session.
+    #[test]
+    fn a_session_with_no_cached_digest_is_simply_absent() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
+        store.create("s1", "work", "/p").unwrap();
+        store.append_message("s1", &ChatMessage::user("x")).unwrap();
+
+        let today = chrono::Local::now().date_naive();
+        assert!(store.intraday_digests_for_day(today, 4, &cache).is_empty());
+        assert!(store.history("s1").is_some(), "the session still loads");
+    }
+
+    /// The scheduling rule, stated as a test: a session whose newest
+    /// message post-dates its cached digest is due for a new one. Not
+    /// "has been idle for N minutes" — the sweep runs on a fixed
+    /// cadence, so the only question is whether anything was added.
+    #[test]
+    fn a_session_with_events_newer_than_its_digest_is_due() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
+        store.create("s1", "default", "/p").unwrap();
+        cache
+            .put_at("s1", "covered up to here", None, Utc::now() - chrono::Duration::hours(1))
+            .unwrap();
+        store.append_message("s1", &ChatMessage::user("something new")).unwrap();
+
+        let today = chrono::Local::now().date_naive();
+        assert_eq!(
+            store.sessions_needing_digest(&cache, today, 4),
+            vec!["s1".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_session_with_nothing_new_since_its_digest_is_not_due() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
+        store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &ChatMessage::user("said something")).unwrap();
+        cache.put("s1", "covered", None).unwrap();
+
+        let today = chrono::Local::now().date_naive();
+        assert!(store.sessions_needing_digest(&cache, today, 4).is_empty());
+    }
+
+    #[test]
+    fn a_never_digested_session_with_messages_is_due() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
+        store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &ChatMessage::user("first words")).unwrap();
+
+        let today = chrono::Local::now().date_naive();
+        assert_eq!(
+            store.sessions_needing_digest(&cache, today, 4),
+            vec!["s1".to_string()]
+        );
+    }
+
+    /// A session that has said nothing today is not resurrected. Its
+    /// day has been written up already; digesting it now would file old
+    /// work under today.
+    #[test]
+    fn a_session_with_no_messages_today_is_not_due() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
+        store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &ChatMessage::user("old news")).unwrap();
+
+        let tomorrow = chrono::Local::now().date_naive() + chrono::Duration::days(1);
+        assert!(store.sessions_needing_digest(&cache, tomorrow, 4).is_empty());
     }
 }

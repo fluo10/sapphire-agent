@@ -18,6 +18,7 @@ use crate::acp_session::AcpSessionStore;
 use crate::channel::RoomInfo;
 use crate::config::Config;
 use crate::context_compression::{generate_summary, maybe_compress};
+use crate::digest_cache::DigestCache;
 use crate::provider::registry::ProviderRegistry;
 use crate::provider::{ChatMessage, ContentPart, Provider, UserInputKind};
 use crate::session::{ConversationKey, SessionStore};
@@ -148,6 +149,10 @@ pub struct ServeState {
     /// is reached from several transports and only one of them knows
     /// the answer.
     pub(crate) acp_sessions: tokio::sync::Mutex<HashSet<String>>,
+    /// Intra-day digest cache, workspace-external and store-agnostic.
+    /// Keyed by session id alone, so it currently backs `acp_session_store`
+    /// and is ready for `/rpc` (#189) without a shape change.
+    pub(crate) digest_cache: Arc<DigestCache>,
 }
 
 impl ServeState {
@@ -168,6 +173,7 @@ impl ServeState {
         image_cache: Option<Arc<crate::image_cache::ImageCache>>,
         device_auth: Arc<crate::device_auth::DeviceAuth>,
         acp_session_store: Arc<AcpSessionStore>,
+        digest_cache: Arc<DigestCache>,
     ) -> Self {
         // Scan once on startup: each MCP session's first-line meta
         // carries `namespace` + `project`, so this reproduces the
@@ -213,6 +219,7 @@ impl ServeState {
             open_acp_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             acp_session_store,
             acp_sessions: tokio::sync::Mutex::new(HashSet::new()),
+            digest_cache,
         }
     }
 
@@ -397,6 +404,7 @@ pub async fn run(
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("sapphire-agent: API server listening on http://{addr}");
     let shutdown_state = Arc::clone(&state);
+    spawn_acp_digest_sweep(Arc::clone(&state));
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             if let Err(e) = tokio::signal::ctrl_c().await {
@@ -419,33 +427,40 @@ pub async fn run(
 /// degrades to a placeholder — cheaper and more faithful than paying
 /// for a model call that throws the turn structure away.
 ///
-/// ACP sessions are excluded here, not because they don't get digested,
-/// but because this function writes through `SessionStore::append_intraday_digest`,
-/// which the ACP store does not have. Their digest generation is added
-/// separately, writing through the ACP store instead.
+/// ACP sessions are included, but routed differently: they write
+/// through `state.digest_cache` rather than
+/// `SessionStore::append_intraday_digest`, which the ACP store does not
+/// have.
 async fn digest_all_sessions(state: &Arc<ServeState>) {
-    let snapshot: Vec<(String, Vec<ChatMessage>)> = {
+    let (snapshot, is_acp): (Vec<(String, Vec<ChatMessage>)>, HashSet<String>) = {
         let sessions = state.sessions.lock().await;
         let acp = state.acp_sessions.lock().await;
-        sessions
+        let snapshot = sessions
             .iter()
-            .filter(|(sid, msgs)| msgs.len() >= 2 && !acp.contains(*sid))
+            .filter(|(_, msgs)| msgs.len() >= 2)
             .map(|(sid, msgs)| (sid.clone(), msgs.clone()))
-            .collect()
+            .collect();
+        (snapshot, acp.clone())
     };
     if snapshot.is_empty() {
         return;
     }
     info!(
-        "Graceful shutdown: digesting {} RPC session(s)",
+        "Graceful shutdown: digesting {} session(s)",
         snapshot.len()
     );
     for (session_id, messages) in snapshot {
         let provider = state.provider_for_session(&session_id).await;
-        let store = state.store_for_session(&session_id);
         match generate_summary(&*provider, &messages).await {
             Ok(summary) if !summary.trim().is_empty() => {
-                if let Err(e) = store.append_intraday_digest(&session_id, &summary, None) {
+                if is_acp.contains(&session_id) {
+                    if let Err(e) = state.digest_cache.put(&session_id, &summary, None) {
+                        warn!("Failed to cache shutdown digest for {session_id}: {e}");
+                    }
+                } else if let Err(e) = state
+                    .store_for_session(&session_id)
+                    .append_intraday_digest(&session_id, &summary, None)
+                {
                     warn!("Failed to persist shutdown intra-day digest for {session_id}: {e}");
                 }
             }
@@ -453,6 +468,47 @@ async fn digest_all_sessions(state: &Arc<ServeState>) {
             Err(e) => warn!("Shutdown digest generation failed for {session_id}: {e:#}"),
         }
     }
+}
+
+/// Refresh the digest of every ACP session that has grown since it was
+/// last digested.
+///
+/// A fixed cadence rather than an idle timer: the next refresh is at a
+/// time the user can predict, and a long agent turn does not decide
+/// when it happens. Sessions with nothing new are skipped, so a quiet
+/// half hour costs one directory walk and no model calls.
+pub(crate) fn spawn_acp_digest_sweep(state: Arc<ServeState>) {
+    tokio::spawn(async move {
+        let period = std::time::Duration::from_secs(1800);
+        loop {
+            tokio::time::sleep(period).await;
+            let today = chrono::Local::now().date_naive();
+            let boundary = state.config.day_boundary_hour;
+            let due = state.acp_session_store.sessions_needing_digest(
+                &state.digest_cache,
+                today,
+                boundary,
+            );
+            for session_id in due {
+                let Some(messages) = state.acp_session_store.history(&session_id) else {
+                    continue;
+                };
+                if messages.len() < 2 {
+                    continue;
+                }
+                let provider = state.provider_for_session(&session_id).await;
+                match generate_summary(&*provider, &messages).await {
+                    Ok(summary) if !summary.trim().is_empty() => {
+                        if let Err(e) = state.digest_cache.put(&session_id, &summary, None) {
+                            warn!("Failed to cache ACP digest for {session_id}: {e}");
+                        }
+                    }
+                    Ok(_) => warn!("ACP digest for {session_id} was empty; skipping"),
+                    Err(e) => warn!("ACP digest generation failed for {session_id}: {e:#}"),
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2798,6 +2854,7 @@ rooms    = []
             base.join("sessions"),
             tool_result_cache,
         ));
+        let digest_cache = DigestCache::open(base.join("digests")).unwrap();
 
         Arc::new(Self {
             config,
@@ -2828,6 +2885,7 @@ rooms    = []
             open_acp_sessions: Default::default(),
             acp_session_store,
             acp_sessions: Default::default(),
+            digest_cache,
         })
     }
 }
