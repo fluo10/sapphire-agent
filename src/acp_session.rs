@@ -256,6 +256,16 @@ impl AcpSessionStore {
         })
     }
 
+    /// ACP exposes no close-or-delete operation yet, so nothing in
+    /// production ever writes a `Closed` event — the read path's refusal
+    /// of a closed session (`adopt_session` in `src/serve/acp.rs`) is
+    /// defensive, ahead of there being any way to produce one. This is
+    /// compiled only for the tests that exercise that refusal path,
+    /// which is why it is `#[cfg(test)]` rather than a real store method
+    /// right now: once a real close/delete request lands, its handler
+    /// becomes this method's production caller and the attribute comes
+    /// off.
+    #[cfg(test)]
     pub fn close(&self, session_id: &str) -> Result<()> {
         let id = Uuid::now_v7();
         self.append_line(session_id, id, move |parent| Line::Closed {

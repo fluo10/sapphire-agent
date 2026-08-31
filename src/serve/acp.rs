@@ -1252,38 +1252,13 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
             .values()
             .map(|s| s.agent_session_id.clone())
             .collect();
-        {
-            let mut open = state.open_acp_sessions.lock().await;
-            for id in &held {
-                if let Some(count) = open.get_mut(id) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        open.remove(id);
-                    }
+        let mut open = state.open_acp_sessions.lock().await;
+        for id in held {
+            if let Some(count) = open.get_mut(&id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    open.remove(&id);
                 }
-            }
-        }
-
-        // `AcpSessionStore` has no lazy-create path — unlike the old
-        // `pending_cwd` design, `session/new` now writes the header
-        // eagerly (see that handler), which is what makes the session
-        // appendable at all. The cost is that a panel an editor opened
-        // and never typed into now leaves a real, empty file behind
-        // instead of nothing. Closing it here is the equivalent of the
-        // cleanup `pending_cwd.remove` used to do: harmless either way
-        // (`session/list` already hides anything with no messages), and
-        // it additionally forecloses reopening that exact empty id by
-        // `session/load`, matching how an archived conversation already
-        // behaves. Skipped for anything with real messages, or already
-        // closed, so an adopted, in-progress conversation is never
-        // touched by a peer connection going away.
-        for id in &held {
-            if let Some(summary) = state.acp_session_store.summary(id)
-                && !summary.has_messages
-                && !summary.is_closed
-                && let Err(e) = state.acp_session_store.close(id)
-            {
-                warn!("ACP: failed to close an abandoned, never-prompted session {id}: {e}");
             }
         }
     }
@@ -2720,6 +2695,76 @@ mod tests {
         serde_json::json!({
             "jsonrpc": "2.0", "id": id, "method": "session/list", "params": params
         })
+    }
+
+    /// `initialize` then an unfiltered `session/list` on a fresh
+    /// connection, returning just the session ids in the reply's order.
+    async fn list_session_ids(addr: &str) -> Vec<String> {
+        let replies = conversation(addr, vec![initialize_request(0), list_request(1, None)]).await;
+        replies[1]["result"]["sessions"]
+            .as_array()
+            .expect("sessions is an array")
+            .iter()
+            .map(|s| s["sessionId"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The listing shows ACP sessions and nothing else. An editor's
+    /// thread list must not contain the user's Matrix/`/rpc` conversations
+    /// — that mixing is what this whole branch exists to undo. Unlike the
+    /// other `list_*` tests below, this one puts a real entry in
+    /// `cross_device_session_store` and asserts it does NOT leak through,
+    /// so an edit that made `session/list` read the shared store again
+    /// (instead of `acp_session_store`) would fail it even though every
+    /// other list test only ever populates the ACP store.
+    #[tokio::test]
+    async fn the_listing_shows_only_acp_sessions() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+
+        state
+            .acp_session_store
+            .create("acp-1", &ours, "/work")
+            .unwrap();
+        state
+            .acp_session_store
+            .append_message("acp-1", &crate::provider::ChatMessage::user("hi"))
+            .unwrap();
+
+        // A conversation from the shared store, which must not appear.
+        state
+            .cross_device_session_store
+            .ensure_session("rpc-1", &("rpc-1".to_string(), None), "rpc", None, &ours)
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let ids = list_session_ids(&addr).await;
+        assert_eq!(ids, vec!["acp-1".to_string()], "got {ids:?}");
+    }
+
+    /// A thread the editor opened and never typed into is not a
+    /// conversation. Zed calls `session/new` on every panel open, so
+    /// listing those would bury the real ones.
+    #[tokio::test]
+    async fn an_empty_session_is_not_listed() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        state
+            .acp_session_store
+            .create("never-used", &ours, "/work")
+            .unwrap();
+
+        let addr = spawn(state).await;
+        assert!(
+            list_session_ids(&addr).await.is_empty(),
+            "an unprompted session must not be listed"
+        );
     }
 
     /// The boundary. A token pinned to one room profile must not see
