@@ -589,16 +589,30 @@ async fn adopt_session(
         .lock()
         .await
         .insert(id.clone(), profile_name.to_string());
-    sessions.inner.lock().await.insert(
-        session_id.clone(),
-        AcpSession {
-            agent_session_id: id.clone(),
-            cwd,
-            turns: HashMap::new(),
-            mode: crate::tools::policy::SessionMode::Default,
-        },
-    );
-    count_session_open(state, &id).await;
+    let already_held = sessions
+        .inner
+        .lock()
+        .await
+        .insert(
+            session_id.clone(),
+            AcpSession {
+                agent_session_id: id.clone(),
+                cwd,
+                turns: HashMap::new(),
+                mode: crate::tools::policy::SessionMode::Default,
+            },
+        )
+        .is_some();
+    if !already_held {
+        // Count holders, not adoptions. Re-adopting a session this
+        // connection already has — a `load` then a `resume`, or a
+        // client retry over the same socket — replaces the map entry
+        // rather than adding one, and teardown subtracts one per entry.
+        // Incrementing anyway would leave a phantom holder behind after
+        // every real one had gone, and the next connection to open the
+        // session would be warned about a peer that no longer exists.
+        count_session_open(state, &id).await;
+    }
     Ok(id)
 }
 
@@ -3286,6 +3300,76 @@ mod tests {
             counts.lock().await.get(&sid).copied(),
             Some(2),
             "both connections should be counted as holding the session"
+        );
+    }
+
+    /// The bug the review caught: re-adopting a session this connection
+    /// already holds — `session/load` then `session/resume` on the same
+    /// socket, the realistic shape of a client retry — must not count as
+    /// a second holder. `sessions.inner.insert` overwrites the existing
+    /// entry rather than adding one, so if the increment ran
+    /// unconditionally the count would drift to 2 while only one
+    /// connection actually holds it, and that phantom entry would
+    /// outlive the connection: teardown only removes one holder per
+    /// entry still in the map, leaving 1 forever.
+    #[tokio::test]
+    async fn readopting_a_session_on_the_same_connection_is_not_double_counted() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.cross_device_session_store);
+        let counts = Arc::clone(&state.open_acp_sessions);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = store
+            .create_session(&("r".to_string(), None), "rpc", &ours)
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let mut ws = connect(&addr).await;
+        for request in [
+            initialize_request(0),
+            load_request(1, &sid),
+            resume_request(2, &sid),
+        ] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+            loop {
+                let Message::Text(t) = next_frame(&mut ws).await else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["id"] == request["id"] {
+                    assert!(v["error"].is_null(), "adopting failed: {v}");
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            counts.lock().await.get(&sid).copied(),
+            Some(1),
+            "the same connection re-adopting its own session must not be \
+             counted as a second holder"
+        );
+
+        ws.send(Message::Close(None)).await.unwrap();
+        drop(ws);
+
+        let released = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if counts.lock().await.get(&sid).is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "timed out waiting for the closed connection to release its session — a \
+             phantom holder left the entry stuck above 0"
         );
     }
 
