@@ -61,10 +61,11 @@ use agent_client_protocol::schema::v1::{
     InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
     PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities, SessionId,
-    SessionInfo, SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
+    ResumeSessionResponse, SessionCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
+    SessionResumeCapabilities, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
+    StopReason, TextContent, ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields,
 };
 use agent_client_protocol::{
@@ -530,6 +531,54 @@ fn mode_state() -> SessionModeState {
     )
 }
 
+/// Validate an existing session id and adopt it onto this connection.
+///
+/// Shared by `session/load` and `session/resume`, which differ only in
+/// whether they replay afterwards. `Err` carries the refusal to answer
+/// with — one wording for both "no such session" and "not yours", so
+/// the pair cannot be used to enumerate ids.
+async fn adopt_session(
+    state: &Arc<ServeState>,
+    sessions: &Arc<AcpSessions>,
+    profile_name: &str,
+    session_id: &SessionId,
+    cwd: PathBuf,
+) -> Result<String, Error> {
+    let id = session_id.to_string();
+    let namespace = state
+        .config
+        .namespace_for_room_profile(profile_name)
+        .to_string();
+    let refuse = || Error::invalid_params().data("no such session is available on this connection");
+
+    let Some((meta, _closed)) = state.cross_device_session_store.session_header(&id) else {
+        return Err(refuse());
+    };
+    if meta.namespace.as_deref() != Some(namespace.as_str()) {
+        warn!(
+            "ACP: refused adopting {id}: it belongs to namespace {:?}, not {namespace}",
+            meta.namespace
+        );
+        return Err(refuse());
+    }
+
+    state
+        .session_room_profiles
+        .lock()
+        .await
+        .insert(id.clone(), profile_name.to_string());
+    sessions.inner.lock().await.insert(
+        session_id.clone(),
+        AcpSession {
+            agent_session_id: id.clone(),
+            cwd,
+            turns: HashMap::new(),
+            mode: crate::tools::policy::SessionMode::Default,
+        },
+    );
+    Ok(id)
+}
+
 /// Drive one ACP connection until the peer goes away.
 async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_name: String) {
     let sessions = Arc::new(AcpSessions::default());
@@ -581,7 +630,9 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         AgentCapabilities::new()
                             .load_session(true)
                             .session_capabilities(
-                                SessionCapabilities::new().list(SessionListCapabilities::new()),
+                                SessionCapabilities::new()
+                                    .list(SessionListCapabilities::new())
+                                    .resume(SessionResumeCapabilities::new()),
                             ),
                     ),
                 )
@@ -735,52 +786,23 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                 let state = Arc::clone(&state);
                 let profile_name = profile_name.clone();
                 async move |req: LoadSessionRequest, responder, connection: ConnectionTo<Client>| {
-                    let id = req.session_id.to_string();
-                    let namespace = state
-                        .config
-                        .namespace_for_room_profile(&profile_name)
-                        .to_string();
+                    // Validation and adoption are shared with
+                    // `session/resume` — see `adopt_session`. `load`'s
+                    // own job starts after that: replaying the history
+                    // the resumed session already has.
+                    let id = match adopt_session(
+                        &state,
+                        &sessions,
+                        &profile_name,
+                        &req.session_id,
+                        req.cwd.clone(),
+                    )
+                    .await
+                    {
+                        Ok(id) => id,
+                        Err(e) => return responder.respond_with_error(e),
+                    };
                     let store = Arc::clone(&state.cross_device_session_store);
-
-                    // One refusal for both "no such session" and "not
-                    // yours" — and one that does not echo the id back,
-                    // since two requests differing only in id would
-                    // otherwise produce two different messages, which is
-                    // exactly the enumeration this is meant to prevent.
-                    let refuse = || {
-                        Error::invalid_params()
-                            .data("no such session is available on this connection")
-                    };
-                    let Some((meta, _closed)) = store.session_header(&id) else {
-                        return responder.respond_with_error(refuse());
-                    };
-                    if meta.namespace.as_deref() != Some(namespace.as_str()) {
-                        warn!(
-                            "ACP: refused session/load for {id}: it belongs to namespace {:?}, \
-                             not {namespace}",
-                            meta.namespace
-                        );
-                        return responder.respond_with_error(refuse());
-                    }
-
-                    // Register the EXISTING id rather than minting one.
-                    // `run_llm_turn` hydrates history from the store for
-                    // an id it has not seen, so continuing the
-                    // conversation needs nothing further.
-                    state
-                        .session_room_profiles
-                        .lock()
-                        .await
-                        .insert(id.clone(), profile_name.clone());
-                    sessions.inner.lock().await.insert(
-                        req.session_id.clone(),
-                        AcpSession {
-                            agent_session_id: id.clone(),
-                            cwd: req.cwd.clone(),
-                            turns: HashMap::new(),
-                            mode: crate::tools::policy::SessionMode::Default,
-                        },
-                    );
 
                     // Replay BEFORE answering: the ACP specification
                     // orders it that way, and a client that got the
@@ -813,6 +835,34 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     }
 
                     responder.respond(LoadSessionResponse::new().modes(mode_state()))
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let sessions = Arc::clone(&sessions);
+                let state = Arc::clone(&state);
+                let profile_name = profile_name.clone();
+                async move |req: ResumeSessionRequest, responder, _connection| {
+                    // Same adoption as `load`, no replay. The ACP
+                    // specification frames `resume` as the fallback for
+                    // agents that cannot load at all; offered here so a
+                    // client can skip redrawing a long conversation.
+                    match adopt_session(
+                        &state,
+                        &sessions,
+                        &profile_name,
+                        &req.session_id,
+                        req.cwd.clone(),
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            responder.respond(ResumeSessionResponse::new().modes(mode_state()))
+                        }
+                        Err(e) => responder.respond_with_error(e),
+                    }
                 }
             },
             on_receive_request!(),
@@ -3006,5 +3056,91 @@ mod tests {
         let addr = spawn(state).await;
         let reply = roundtrip(&addr, initialize_request(0)).await;
         assert_eq!(reply["result"]["agentCapabilities"]["loadSession"], true);
+    }
+
+    fn resume_request(id: i64, session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "session/resume",
+            "params": { "sessionId": session_id, "cwd": test_cwd(), "mcpServers": [] }
+        })
+    }
+
+    /// `resume` is `load` without the replay — for a client that wants
+    /// the session back without paying to redraw a long conversation.
+    /// It must still continue the history.
+    #[tokio::test]
+    async fn resume_continues_without_replaying() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![crate::provider::ChatResponse {
+                text: Some("second".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let store = Arc::clone(&state.cross_device_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = store
+            .create_session(&("r".to_string(), None), "rpc", &ours)
+            .unwrap();
+        store
+            .append(&sid, &crate::provider::ChatMessage::user("first"))
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), resume_request(1, &sid)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        let mut updates_before_reply = 0usize;
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["method"] == "session/update" {
+                updates_before_reply += 1;
+            } else if v["id"] == 1 {
+                assert!(v["error"].is_null(), "resume failed: {v}");
+                break;
+            }
+        }
+        assert_eq!(updates_before_reply, 0, "resume must not replay");
+
+        // ...and the history is still there for the next turn.
+        ws.send(Message::Text(
+            prompt_request(2, &sid, text_prompt("x")).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 2 {
+                assert_eq!(v["result"]["stopReason"], "end_turn", "got {v}");
+                break;
+            }
+        }
+        let history = store.load_session(&sid).unwrap();
+        assert!(history.len() >= 3, "the resumed session kept its history");
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_resume() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let addr = spawn(state).await;
+        let reply = roundtrip(&addr, initialize_request(0)).await;
+        assert!(
+            !reply["result"]["agentCapabilities"]["sessionCapabilities"]["resume"].is_null(),
+            "got {reply}"
+        );
     }
 }
