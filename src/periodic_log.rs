@@ -1670,8 +1670,7 @@ mod tests {
         let tool_result_cache =
             crate::tool_result_cache::ToolResultCache::open(td.path().join("tool-results"))
                 .unwrap();
-        let acp_store =
-            AcpSessionStore::new(sessions_base.join("acp"), tool_result_cache);
+        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), tool_result_cache);
         let digest_cache = DigestCache::open(td.path().join("digests")).unwrap();
 
         acp_store.create("s1", "work", "/p").unwrap();

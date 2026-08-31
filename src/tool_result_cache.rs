@@ -111,7 +111,10 @@ mod tests {
     fn an_absent_hash_is_none_rather_than_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let cache = ToolResultCache::open(dir.path().to_path_buf()).unwrap();
-        assert_eq!(cache.get("0000000000000000000000000000000000000000000000000000000000000000"), None);
+        assert_eq!(
+            cache.get("0000000000000000000000000000000000000000000000000000000000000000"),
+            None
+        );
     }
 
     /// Non-UTF8 on disk is corruption, not a panic.

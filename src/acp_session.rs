@@ -560,7 +560,7 @@ impl AcpSessionStore {
                 .iter()
                 .filter(|e| matches!(e.body, EventBody::Message { .. }))
                 .map(|e| e.at)
-                .last();
+                .next_back();
             let Some(last_message) = last_message else {
                 continue;
             };
@@ -1001,7 +1001,9 @@ mod tests {
         let (dir, store) = store();
         let cache = digest_cache(&dir);
         store.create("s1", "work", "/p").unwrap();
-        store.append_message("s1", &ChatMessage::user("did a thing")).unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("did a thing"))
+            .unwrap();
         store.append_title("s1", "parser hunt").unwrap();
         cache.put("s1", "we fixed the parser", None).unwrap();
 
@@ -1043,9 +1045,16 @@ mod tests {
         let cache = digest_cache(&dir);
         store.create("s1", "default", "/p").unwrap();
         cache
-            .put_at("s1", "covered up to here", None, Utc::now() - chrono::Duration::hours(1))
+            .put_at(
+                "s1",
+                "covered up to here",
+                None,
+                Utc::now() - chrono::Duration::hours(1),
+            )
             .unwrap();
-        store.append_message("s1", &ChatMessage::user("something new")).unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("something new"))
+            .unwrap();
 
         let today = chrono::Local::now().date_naive();
         assert_eq!(
@@ -1059,7 +1068,9 @@ mod tests {
         let (dir, store) = store();
         let cache = digest_cache(&dir);
         store.create("s1", "default", "/p").unwrap();
-        store.append_message("s1", &ChatMessage::user("said something")).unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("said something"))
+            .unwrap();
         cache.put("s1", "covered", None).unwrap();
 
         let today = chrono::Local::now().date_naive();
@@ -1071,7 +1082,9 @@ mod tests {
         let (dir, store) = store();
         let cache = digest_cache(&dir);
         store.create("s1", "default", "/p").unwrap();
-        store.append_message("s1", &ChatMessage::user("first words")).unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("first words"))
+            .unwrap();
 
         let today = chrono::Local::now().date_naive();
         assert_eq!(
@@ -1088,9 +1101,15 @@ mod tests {
         let (dir, store) = store();
         let cache = digest_cache(&dir);
         store.create("s1", "default", "/p").unwrap();
-        store.append_message("s1", &ChatMessage::user("old news")).unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("old news"))
+            .unwrap();
 
         let tomorrow = chrono::Local::now().date_naive() + chrono::Duration::days(1);
-        assert!(store.sessions_needing_digest(&cache, tomorrow, 4).is_empty());
+        assert!(
+            store
+                .sessions_needing_digest(&cache, tomorrow, 4)
+                .is_empty()
+        );
     }
 }

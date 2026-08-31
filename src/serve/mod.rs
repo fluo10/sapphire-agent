@@ -445,10 +445,7 @@ async fn digest_all_sessions(state: &Arc<ServeState>) {
     if snapshot.is_empty() {
         return;
     }
-    info!(
-        "Graceful shutdown: digesting {} session(s)",
-        snapshot.len()
-    );
+    info!("Graceful shutdown: digesting {} session(s)", snapshot.len());
     for (session_id, messages) in snapshot {
         let provider = state.provider_for_session(&session_id).await;
         match generate_summary(&*provider, &messages).await {
@@ -457,10 +454,11 @@ async fn digest_all_sessions(state: &Arc<ServeState>) {
                     if let Err(e) = state.digest_cache.put(&session_id, &summary, None) {
                         warn!("Failed to cache shutdown digest for {session_id}: {e}");
                     }
-                } else if let Err(e) = state
-                    .store_for_session(&session_id)
-                    .append_intraday_digest(&session_id, &summary, None)
-                {
+                } else if let Err(e) = state.store_for_session(&session_id).append_intraday_digest(
+                    &session_id,
+                    &summary,
+                    None,
+                ) {
                     warn!("Failed to persist shutdown intra-day digest for {session_id}: {e}");
                 }
             }
@@ -473,10 +471,14 @@ async fn digest_all_sessions(state: &Arc<ServeState>) {
 /// Refresh the digest of every ACP session that has grown since it was
 /// last digested.
 ///
-/// A fixed cadence rather than an idle timer: the next refresh is at a
-/// time the user can predict, and a long agent turn does not decide
-/// when it happens. Sessions with nothing new are skipped, so a quiet
-/// half hour costs one directory walk and no model calls.
+/// A rolling half-hour from process start, not an idle timer and not
+/// wall-clock-aligned: the loop just sleeps 1800s and checks again, so
+/// the exact refresh time drifts with whenever the process happened to
+/// start. What matters is that a long agent turn cannot decide when a
+/// digest happens the way an idle-timeout would — the cadence depends
+/// only on the clock, not on when the user stopped typing. Sessions
+/// with nothing new are skipped, so a quiet half hour costs one
+/// directory walk and no model calls.
 pub(crate) fn spawn_acp_digest_sweep(state: Arc<ServeState>) {
     tokio::spawn(async move {
         let period = std::time::Duration::from_secs(1800);

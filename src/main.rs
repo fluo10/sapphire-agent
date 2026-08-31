@@ -17,7 +17,6 @@ mod frontmatter;
 mod heartbeat;
 mod heartbeat_config;
 mod image_cache;
-mod tool_result_cache;
 mod mcp_client;
 mod memory_compaction;
 mod periodic_log;
@@ -25,6 +24,7 @@ mod provider;
 mod serve;
 mod session;
 mod timer;
+mod tool_result_cache;
 mod tools;
 mod voice;
 mod workspace;
@@ -579,7 +579,9 @@ async fn main() -> Result<()> {
             // cache rather than inline, for the same reason images are.
             let tool_result_cache = tool_result_cache::ToolResultCache::open(
                 tool_result_cache::ToolResultCache::default_dir().ok_or_else(|| {
-                    anyhow::anyhow!("no platform cache directory is resolvable for the tool-result cache")
+                    anyhow::anyhow!(
+                        "no platform cache directory is resolvable for the tool-result cache"
+                    )
                 })?,
             )?;
             let acp_session_store = Arc::new(acp_session::AcpSessionStore::new(
@@ -593,7 +595,9 @@ async fn main() -> Result<()> {
             // for `/rpc` sessions later.
             let digest_cache = digest_cache::DigestCache::open(
                 digest_cache::DigestCache::default_dir().ok_or_else(|| {
-                    anyhow::anyhow!("no platform cache directory is resolvable for the digest cache")
+                    anyhow::anyhow!(
+                        "no platform cache directory is resolvable for the digest cache"
+                    )
                 })?,
             )?;
 

@@ -21,6 +21,7 @@ use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::session::IntradayDigestLine;
 
@@ -40,12 +41,43 @@ impl DigestCache {
         dirs::cache_dir().map(|d| d.join("sapphire-agent").join("digests"))
     }
 
+    /// Reserved DOS device names. Matched case-insensitively against the
+    /// whole session id, because Windows treats `CON`, `CON.txt`,
+    /// `con`, etc. as the same reserved device regardless of case or
+    /// extension, for any path that isn't `\\?\`-prefixed — an
+    /// allow-listed charset alone doesn't exclude these, since every
+    /// character in `"CON"` is an ordinary ASCII letter. Unlike the
+    /// open-ended "Windows filename quirks" this guard would otherwise
+    /// have to keep growing to cover, this is the complete, closed,
+    /// decades-stable set Win32 documents — there is nothing left to
+    /// discover here, which is what makes an explicit list safe.
+    const RESERVED_WINDOWS_NAMES: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+
     /// Session ids reach here from a transport, so they are not trusted
     /// to be filenames.
+    ///
+    /// Allow-listed by charset rather than deny-listed by pattern: ACP
+    /// session ids are UUIDs, so requiring ASCII alphanumerics, `-`, and
+    /// `_` costs nothing and closes every open-ended unsafe case in one
+    /// pass — traversal (`..`, `/`, `\`), absolute and drive-relative
+    /// paths, and the trailing dots/spaces Windows silently strips
+    /// (making `"foo."` and `"foo"` collide). That charset does *not*
+    /// exclude reserved DOS device names on its own (`"CON"` is three
+    /// ordinary letters), so those get their own check against the
+    /// fixed, complete list above — a closed enumeration, not the kind
+    /// of open-ended deny-list that keeps needing another entry.
     fn path_for(&self, session_id: &str) -> Result<PathBuf> {
+        let is_reserved = Self::RESERVED_WINDOWS_NAMES
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(session_id));
         if session_id.is_empty()
-            || session_id.contains(['/', '\\', ':'])
-            || session_id.contains("..")
+            || is_reserved
+            || !session_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
             bail!("session id '{session_id}' is not usable as a cache filename");
         }
@@ -58,6 +90,15 @@ impl DigestCache {
 
     /// `put` with an explicit timestamp. Exists so tests can place an
     /// entry on either side of a prune cutoff.
+    ///
+    /// Writes to a sibling temp file and renames it over the target
+    /// rather than writing in place. A direct `fs::write` opens with
+    /// truncate, so a `prune_before` (or `get`) racing this call could
+    /// observe the file between the truncate and the write — empty or
+    /// partial, either way unparseable. A rename within one directory
+    /// is atomic on both Unix and Windows, so no reader ever sees
+    /// anything but the old content or the new content, never a
+    /// half-written one.
     pub fn put_at(
         &self,
         session_id: &str,
@@ -71,7 +112,11 @@ impl DigestCache {
             digest: digest.to_string(),
             since,
         };
-        std::fs::write(&path, serde_json::to_string(&line)?)?;
+        let tmp_path = self
+            .dir
+            .join(format!("{session_id}.json.{}.tmp", Uuid::now_v7()));
+        std::fs::write(&tmp_path, serde_json::to_string(&line)?)?;
+        std::fs::rename(&tmp_path, &path)?;
         Ok(())
     }
 
@@ -90,6 +135,10 @@ impl DigestCache {
     /// Drop every entry digested before `cutoff`. Called once the daily
     /// log for that day has been written — the digest has done its job
     /// and the permanent record has taken over. Returns how many went.
+    ///
+    /// No production caller yet — the daily-log flow wires this up in a
+    /// follow-up task — hence the `allow`.
+    #[allow(dead_code)]
     pub fn prune_before(&self, cutoff: DateTime<Utc>) -> usize {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return 0;
@@ -101,8 +150,12 @@ impl DigestCache {
                 .ok()
                 .and_then(|t| serde_json::from_str::<IntradayDigestLine>(&t).ok())
                 .map(|line| line.digest_at < cutoff)
-                // Unreadable entries are useless anyway.
-                .unwrap_or(true);
+                // An entry that fails to parse is corrupt or mid-write
+                // (a `put` races this scan), not provably stale — do
+                // not delete it. `get()` already treats it as a miss,
+                // and the next `put` for that session id overwrites it,
+                // so leaving it costs nothing but a wasted file.
+                .unwrap_or(false);
             if stale && std::fs::remove_file(&path).is_ok() {
                 removed += 1;
             }
@@ -151,7 +204,12 @@ mod tests {
         cache.put("old", "yesterday's work", None).unwrap();
         let cutoff = Utc::now() + chrono::Duration::seconds(1);
         cache
-            .put_at("fresh", "today's work", None, cutoff + chrono::Duration::hours(1))
+            .put_at(
+                "fresh",
+                "today's work",
+                None,
+                cutoff + chrono::Duration::hours(1),
+            )
             .unwrap();
 
         assert_eq!(cache.prune_before(cutoff), 1);
@@ -170,6 +228,31 @@ mod tests {
         assert!(cache.get("../escape").is_none());
     }
 
+    /// `CON`, `NUL`, `COM1`, etc. are reserved DOS device names on
+    /// Windows — `dir.join("CON.json")` resolves to the device, not a
+    /// file in the cache directory, regardless of case or extension.
+    /// The allow-list rejects them without needing to know their names.
+    #[test]
+    fn a_reserved_windows_device_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DigestCache::open(dir.path().to_path_buf()).unwrap();
+
+        assert!(cache.put("CON", "nope", None).is_err());
+        assert!(cache.put("con", "nope", None).is_err());
+        assert!(cache.get("CON").is_none());
+    }
+
+    /// Windows silently strips trailing dots and spaces from a
+    /// filename, so `"foo."` and `"foo"` would otherwise collide.
+    #[test]
+    fn a_trailing_dot_or_space_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DigestCache::open(dir.path().to_path_buf()).unwrap();
+
+        assert!(cache.put("foo.", "nope", None).is_err());
+        assert!(cache.put("foo ", "nope", None).is_err());
+    }
+
     /// Corruption is a miss, not a panic — the whole point of a cache.
     #[test]
     fn an_unparseable_entry_is_a_miss() {
@@ -177,5 +260,22 @@ mod tests {
         let cache = DigestCache::open(dir.path().to_path_buf()).unwrap();
         std::fs::write(dir.path().join("s1.json"), "{ not json").unwrap();
         assert!(cache.get("s1").is_none());
+    }
+
+    /// A prune racing a concurrent `put` on the same session could see
+    /// the file mid-write and fail to parse it — that must not be
+    /// treated as "stale", or a legitimate in-flight write gets deleted
+    /// out from under its writer. An unparseable entry is left alone;
+    /// it costs nothing but a wasted file, and the next successful
+    /// `put` overwrites it.
+    #[test]
+    fn an_unparseable_entry_survives_a_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DigestCache::open(dir.path().to_path_buf()).unwrap();
+        std::fs::write(dir.path().join("s1.json"), "{ not json").unwrap();
+
+        let cutoff = Utc::now() + chrono::Duration::days(1);
+        assert_eq!(cache.prune_before(cutoff), 0);
+        assert!(dir.path().join("s1.json").exists());
     }
 }
