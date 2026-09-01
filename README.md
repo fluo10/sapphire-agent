@@ -204,14 +204,24 @@ from the digest.
 
 A second, similarly workspace-external location,
 `<cache_dir>/sapphire-agent/tool-results/<sha256>`, is a content-addressed
-cache meant to hold a tool call's result by hash — but **nothing writes to
-it today.** Tool calls are not persisted at all (see "A loaded session's
-tool calls are not replayed" below), so `run_llm_turn` never reaches the
-code that would populate or read this cache. `ToolResultCache`,
-`StoredPart::ToolUse` and `StoredPart::ToolResultRef` are real types that
-exist for the replay design tracked as
-[#191](https://github.com/fluo10/sapphire-agent/issues/191), not for
-anything currently in the request path.
+cache holding a tool call's result by hash — the JSONL itself stores only
+the tool name, its input, and the result's hash, not the result body. An
+ACP session's `tool_use` and `tool_result` messages are persisted (see
+"Tool calls are persisted for ACP sessions" below); every other transport
+still is not.
+
+**Losing the cache degrades a session rather than breaking it.** Delete
+the directory, or lose an entry to a write failure, and the session still
+loads: the missing result is rendered as a placeholder, but the `tool_use`
+/ `tool_result` pair itself is kept intact. That pairing is not optional —
+the Anthropic API rejects a history where a `tool_use` has no matching
+`tool_result` in the very next message — so `history()` also repairs an
+orphan it finds on read: a `tool_use` whose `tool_result` append never
+made it to disk (a cache write that failed, or the process dying between
+the two appends) gets a synthesised placeholder result spliced in
+immediately after the message that carries it. This repair is read-side
+only — it is never written back to the store, so a later read repeats it
+if the underlying orphan is still there.
 
 Both caches sit outside the workspace for the same reason: `<workspace>/sessions`
 is in the retrieve search index, and a digest that is rewritten as the
@@ -227,10 +237,17 @@ newest message postdates their cached digest. `/rpc`, device-default and
 MCP sessions still do not reach the daily log —
 [#189](https://github.com/fluo10/sapphire-agent/issues/189).
 
-**Tool calls are not restored on replay.** See "A loaded session's tool
-calls are not replayed" below — `tool_use` and `tool_result` messages are
-not persisted to the JSONL at all (not merely skipped on replay), so
-reloading a session restores what was said but not what was done.
+**Tool calls are persisted for ACP sessions.** `run_llm_turn` writes
+`tool_use` and `tool_result` messages to the ACP session's JSONL (see
+"A second, similarly workspace-external location" above for what the
+JSONL stores versus the result cache). `/rpc`, device-default and MCP
+sessions do not — their line format has no reference form for a result,
+so writing one raw would put the content in the workspace and the
+retrieve index, which is exactly what the ACP store's external cache
+exists to avoid ([#194](https://github.com/fluo10/sapphire-agent/issues/194)).
+Reloading an ACP session therefore restores what the agent did as well
+as what was said — but the editor does not currently render it: see
+"A loaded session's tool calls are not shown in the editor" below.
 
 **Opening the same session on two connections at once is not safe to
 prompt from both.** Nothing stops a second Zed window — or any other ACP
@@ -278,16 +295,26 @@ whole turn.
   the API returns, so neither `session/update: usage_update` nor
   `PromptResponse.usage` is sent, and the editor cannot show what a turn
   cost or how full the context is.
-- **Tool calls are not persisted, so a loaded session's tool calls are not
-  replayed.** `run_llm_turn` does not write `tool_use` or `tool_result`
-  messages to the JSONL at all — only text messages are. `session/load`'s
-  replay is a direct consequence: there is nothing beyond text parts in the
-  stored history to project to the editor. A restored conversation shows
-  what was said, not what the agent did. Wiring this up needs a replay
-  design (what a stale tool result even means to resend to the model) and
-  is tracked as [#191](https://github.com/fluo10/sapphire-agent/issues/191);
-  `ToolResultCache`, `StoredPart::ToolUse` and `StoredPart::ToolResultRef`
-  already exist for it but have no production caller yet.
+- **`/rpc`, device-default and MCP sessions still do not persist tool
+  calls.** Only ACP sessions write `tool_use` / `tool_result` to their
+  JSONL; the other transports' line format has no reference form for a
+  result, so a reload of one of those restores what was said but not what
+  was done. Tracked as [#194](https://github.com/fluo10/sapphire-agent/issues/194).
+- **A loaded session's tool calls are not shown in the editor.** Even for
+  an ACP session, whose `tool_use` / `tool_result` pairs are on disk and
+  do reach the model on the next turn, `session/load`'s replay only
+  projects text parts to `session/update` notifications — tool calls in
+  the stored history are silently skipped rather than rendered. The
+  model sees them; the editor's thread view does not. Tracked as
+  [#192](https://github.com/fluo10/sapphire-agent/issues/192).
+- **Tool output is capped at 50,000 characters** (roughly 20,000 from the
+  head, 30,000 from the tail, with a marker spliced in between) — this
+  applies to every tool, on every transport, not only the shell tool over
+  ACP; `ToolSet::execute` is the one path both `/acp` and the
+  Matrix/Discord turn executor call through. The head, tail and marker
+  budgets are sized to sum to the cap exactly, so applying the truncation
+  to an already-truncated result is a no-op rather than cutting again and
+  nesting markers.
 
 ### Configuring `websocat` in Zed
 
