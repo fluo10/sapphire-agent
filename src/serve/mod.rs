@@ -2267,6 +2267,42 @@ impl TurnPersistence {
     }
 }
 
+/// What a delegating tool needs to run a nested conversation.
+///
+/// Carried the same way the ACP client handle is (`tools::acp_client`),
+/// and for the same reason: `Tool::execute` receives only its JSON
+/// input, and threading a turn through the `Tool` trait would touch
+/// every tool for the benefit of one.
+pub(crate) struct TurnContext {
+    pub state: Arc<ServeState>,
+    pub provider: Arc<dyn Provider>,
+    pub progress: Arc<dyn TurnHost>,
+    pub visible_specs: Vec<ToolSpec>,
+    pub timer_origin: Option<crate::timer::TimerOrigin>,
+}
+
+tokio::task_local! {
+    static TURN_CONTEXT_TL: Arc<TurnContext>;
+}
+
+/// Run `fut` with a [`TurnContext`] reachable from `current_turn_context`.
+pub(crate) fn scope_turn_context<F: std::future::Future>(
+    ctx: Arc<TurnContext>,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    TURN_CONTEXT_TL.scope(ctx, fut)
+}
+
+/// The context for the turn currently executing a tool call, if there is
+/// one.
+///
+/// `None` outside `scope_turn_context` — which is what makes
+/// `tools::subagent::SubagentTool` refuse on any path that is not a live
+/// turn, rather than reaching for a model and a host that do not exist.
+pub(crate) fn current_turn_context() -> Option<Arc<TurnContext>> {
+    TURN_CONTEXT_TL.try_with(Arc::clone).ok()
+}
+
 /// One model conversation run to completion: call the model, run the
 /// tools it asks for, repeat until it stops asking.
 ///
@@ -2480,12 +2516,27 @@ impl TurnLoop<'_> {
                     // client-side tools refusing there rather than reaching
                     // for a connection that does not exist.
                     let acp_client = progress.acp_client();
+                    // What `tools::subagent::SubagentTool` needs to run a
+                    // nested conversation, scoped around every call this
+                    // round the same way the timer/ACP task-locals are —
+                    // see `TurnContext`. Built once per round rather than
+                    // per call: it is the same for every permitted call in
+                    // this round, and `visible_specs` cloning `tool_specs`
+                    // once here is cheaper than doing it per call.
+                    let turn_ctx = Arc::new(TurnContext {
+                        state: Arc::clone(self.state),
+                        provider: Arc::clone(self.provider),
+                        progress: Arc::clone(progress),
+                        visible_specs: tool_specs.to_vec(),
+                        timer_origin: timer_origin.clone(),
+                    });
                     let mut results: Vec<(String, crate::tools::ToolOutput)> =
                         futures_util::future::join_all(permitted.into_iter().map(|c| {
                             let tools = Arc::clone(&tools);
                             let ns = ns.clone();
                             let origin = timer_origin.clone();
                             let client = acp_client.clone();
+                            let turn_ctx = Arc::clone(&turn_ctx);
                             async move {
                                 let fut = crate::tools::workspace_tools::scope_memory_namespace(
                                     ns,
@@ -2496,14 +2547,22 @@ impl TurnLoop<'_> {
                                         (c.id, output)
                                     },
                                 );
-                                // Both scopes have to wrap execution: the
-                                // timer tool reads one task-local and the
-                                // client-side tools read the other, and
-                                // either missing breaks that set of tools.
-                                // Each arm awaits in place rather than
-                                // boxing a common future type, the same way
-                                // the single-scope version of this match did
-                                // before the client scope was added.
+                                // A subagent's own tool calls need the turn
+                                // context too — nested here rather than
+                                // constructed fresh inside `SubagentTool`,
+                                // so `current_turn_context()` is available
+                                // to any tool this round, not just the one
+                                // named `subagent`.
+                                let fut = scope_turn_context(turn_ctx, fut);
+                                // Both remaining scopes have to wrap
+                                // execution too: the timer tool reads one
+                                // task-local and the client-side tools read
+                                // the other, and either missing breaks that
+                                // set of tools. Each arm awaits in place
+                                // rather than boxing a common future type,
+                                // the same way the single-scope version of
+                                // this match did before the client scope
+                                // was added.
                                 match (origin, client) {
                                     (Some(o), Some(c)) => {
                                         crate::timer::scope_timer_origin(
@@ -3544,6 +3603,245 @@ mod tests {
         assert!(
             ran.load(std::sync::atomic::Ordering::SeqCst),
             "a trusted origin must have executed it"
+        );
+    }
+
+    /// A subagent runs under the parent's `Origin`, so it cannot do
+    /// what the parent was refused. Anything else would make "ask a
+    /// subagent" a way around the permission gate.
+    ///
+    /// `subagent` itself is `ToolKind::Other`, which the policy table
+    /// groups with `Execute` in the same "risky" bucket in every origin
+    /// (see `crate::tools::policy::decide`) — so an origin that
+    /// auto-denies `Execute` (`Origin::Channel`) would auto-deny the
+    /// top-level `subagent` call too, before delegation ever ran, which
+    /// would make the test pass without exercising `SubagentTool` at
+    /// all. `Origin::Acp(SessionMode::Default)` sends every risky call
+    /// through `approve` instead of denying it outright, so this test
+    /// can let the top-level `subagent` call through while having the
+    /// very same `approve` reject the nested `risky` call — proving the
+    /// nested call is judged by the *parent's* host, not a laxer one
+    /// standing in for it.
+    #[tokio::test]
+    async fn a_subagent_is_judged_by_the_parents_origin() {
+        use crate::tools::policy::{Approval, Origin, SessionMode};
+
+        /// Approves everything except a tool named `risky` — modeling a
+        /// human who would say yes to delegating but no to the risky
+        /// command itself, however it is asked. The subagent's nested
+        /// call reaches this exact same `approve`, so if the risky call
+        /// were judged by anything other than the parent's own host it
+        /// would not be rejected here.
+        struct AskExceptRiskyHost;
+        #[async_trait::async_trait]
+        impl TurnHost for AskExceptRiskyHost {
+            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_end(&self, _id: &str, _name: &str) {}
+            async fn turn_error(&self, _message: &str) {}
+            fn origin(&self) -> Origin {
+                Origin::Acp(SessionMode::Default)
+            }
+            async fn approve(
+                &self,
+                call: &crate::provider::ToolCall,
+                _kind: crate::tools::ToolKind,
+            ) -> Approval {
+                if call.name == "risky" {
+                    Approval::RejectOnce
+                } else {
+                    Approval::AllowOnce
+                }
+            }
+        }
+
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                // Parent round 1: delegate to the subagent.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "delegator", "prompt": "run it"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 1: try the Execute-kind tool the
+                // parent itself could not run under this host.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "sub-call-1".to_string(),
+                        name: "risky".to_string(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 2: give up after the refusal.
+                crate::provider::ChatResponse {
+                    text: Some("could not run it".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+                // Parent round 2.
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        let risky = RiskyTool::new();
+        let ran = risky.ran_flag();
+        state.tools.register_tool(Box::new(risky)).await;
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
+                crate::agents::AgentDef {
+                    name: "delegator".to_string(),
+                    description: "Delegates a risky call.".to_string(),
+                    tools: Some(vec!["risky".to_string()]),
+                    prompt: "You are a delegator.".to_string(),
+                },
+            ])))
+            .await;
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-subagent-origin".to_string(),
+            ChatMessage::user("delegate it"),
+            Arc::new(AskExceptRiskyHost) as Arc<dyn TurnHost>,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the subagent must be judged by the parent's own host — the \
+             same `approve` that let delegation through must also be the \
+             one the nested 'risky' call is judged by, and it rejects \
+             that call by name"
+        );
+    }
+
+    /// The isolation, asserted rather than assumed: what the subagent
+    /// said to itself must not reach the parent's history or its store.
+    /// Only the final answer comes back, as the tool's result.
+    #[tokio::test]
+    async fn a_subagents_conversation_does_not_reach_the_parent() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                // Parent round 1: delegate.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "investigator", "prompt": "go investigate"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 1: an intermediate tool call whose
+                // result carries a string unique to this test. Deliberately
+                // no accompanying text — `TurnLoop::run` folds a round's
+                // narration text into the final answer it returns
+                // (`accumulated_text`), so any text here would legitimately
+                // reach the parent as part of "the final answer" and would
+                // not test isolation at all. A tool call's own result,
+                // by contrast, lives only in the subagent's local,
+                // never-persisted `history`.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "sub-call-1".to_string(),
+                        name: "echo".to_string(),
+                        input: json!({"text": "SUBAGENT_SECRET_MUSING"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 2: its final answer.
+                crate::provider::ChatResponse {
+                    text: Some("FINAL ANSWER: 42".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+                // Parent round 2.
+                crate::provider::ChatResponse {
+                    text: Some("relayed".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
+                crate::agents::AgentDef {
+                    name: "investigator".to_string(),
+                    description: "Investigates something.".to_string(),
+                    tools: Some(vec!["echo".to_string()]),
+                    prompt: "You are an investigator.".to_string(),
+                },
+            ])))
+            .await;
+
+        let sid = "acp-subagent-isolation".to_string();
+        state.acp_sessions.lock().await.insert(sid.clone());
+        state
+            .acp_session_store
+            .create(&sid, "default", "/work")
+            .unwrap();
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("delegate it"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("relayed"));
+
+        // Whether any message in `history` mentions `needle` anywhere in
+        // its parts — text, a tool call's input, or a tool result.
+        fn history_mentions(history: &[ChatMessage], needle: &str) -> bool {
+            history.iter().any(|m| {
+                m.parts.iter().any(|p| match p {
+                    ContentPart::Text(t) => t.contains(needle),
+                    ContentPart::ToolUse { input, .. } => input.to_string().contains(needle),
+                    ContentPart::ToolResult { content, .. } => content.contains(needle),
+                    _ => false,
+                })
+            })
+        }
+
+        let mem_guard = state.sessions.lock().await;
+        let mem_history = mem_guard.get(&sid).expect("the parent session exists");
+        assert!(
+            !history_mentions(mem_history, "SUBAGENT_SECRET_MUSING"),
+            "the subagent's own intermediate tool traffic must not reach \
+             the parent's in-memory history"
+        );
+
+        let acp_history = state
+            .acp_session_store
+            .history(&sid)
+            .expect("the ACP store has the session");
+        assert!(
+            !history_mentions(&acp_history, "SUBAGENT_SECRET_MUSING"),
+            "the subagent's own intermediate tool traffic must not reach \
+             the parent's ACP store"
+        );
+        assert!(
+            history_mentions(&acp_history, "FINAL ANSWER: 42"),
+            "only the subagent's final answer should reach the parent, as \
+             the tool's own result"
         );
     }
 

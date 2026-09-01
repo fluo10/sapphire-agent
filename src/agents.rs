@@ -13,7 +13,6 @@ use std::path::Path;
 use tracing::warn;
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // consumed by Task 3: subagent tool
 struct AgentMeta {
     description: String,
     #[serde(default)]
@@ -21,7 +20,6 @@ struct AgentMeta {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // consumed by Task 3: subagent tool
 pub struct AgentDef {
     /// The file stem — what the model passes as `agent`.
     pub name: String,
@@ -36,7 +34,6 @@ pub struct AgentDef {
 /// Load every definition under `dir`, skipping the ones that cannot be
 /// read. A missing directory is no agents, not an error: an operator
 /// who has not created any is in a normal state.
-#[allow(dead_code)] // consumed by Task 3: subagent tool
 pub fn load_agents_dir(dir: &Path) -> Vec<AgentDef> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -69,7 +66,6 @@ pub fn load_agents_dir(dir: &Path) -> Vec<AgentDef> {
     out
 }
 
-#[allow(dead_code)] // consumed by Task 3: subagent tool
 fn parse_agent(name: String, raw: &str) -> Option<AgentDef> {
     let (fm, body) = crate::frontmatter::split(raw)?;
     let meta: AgentMeta = match serde_yaml::from_str(fm) {

@@ -46,7 +46,12 @@ pub fn scope_memory_namespace<F: std::future::Future>(
 
 /// The namespace this turn's tool calls should read/write under. Falls
 /// back to `"default"` when called outside a `scope_memory_namespace`.
-fn current_memory_namespace() -> String {
+///
+/// `pub(crate)` rather than private: `tools::subagent` reads it too, so
+/// a subagent's own memory-tool calls land in the same namespace as the
+/// conversation that delegated to it, the same way `scope_memory_namespace`
+/// already scopes every other tool call in a turn.
+pub(crate) fn current_memory_namespace() -> String {
     MEMORY_NAMESPACE_TL
         .try_with(|s| s.clone())
         .unwrap_or_else(|_| crate::config::DEFAULT_NAMESPACE_NAME.to_string())
