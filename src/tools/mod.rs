@@ -462,7 +462,12 @@ mod truncation_tests {
     /// the tail is where a failing command's error is.
     #[test]
     fn both_ends_survive_truncation() {
-        let s = format!("{}{}{}", "H".repeat(30_000), "M".repeat(60_000), "T".repeat(30_000));
+        let s = format!(
+            "{}{}{}",
+            "H".repeat(30_000),
+            "M".repeat(60_000),
+            "T".repeat(30_000)
+        );
         let out = truncate_output(&s);
         assert!(out.starts_with('H'), "the head is kept");
         assert!(out.ends_with('T'), "the tail is kept");
@@ -493,7 +498,11 @@ mod truncation_tests {
     #[test]
     fn truncating_an_already_truncated_result_changes_nothing() {
         let once = truncate_output(&"x".repeat(200_000));
-        assert!(once.len() <= 50_000, "the cap is a cap: {} bytes", once.len());
+        assert!(
+            once.len() <= 50_000,
+            "the cap is a cap: {} bytes",
+            once.len()
+        );
         assert_eq!(truncate_output(&once), once);
         assert_eq!(once.matches("chars truncated").count(), 1);
     }

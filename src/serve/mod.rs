@@ -2239,8 +2239,7 @@ pub(crate) async fn run_llm_turn(
                 // content into the workspace and the retrieve index —
                 // which is exactly what the ACP store's external cache
                 // exists to avoid.
-                if is_acp
-                    && let Err(e) = state.acp_session_store.append_message(&session_id, &msg)
+                if is_acp && let Err(e) = state.acp_session_store.append_message(&session_id, &msg)
                 {
                     warn!("Failed to persist a tool_use message: {e}");
                 }
@@ -3581,28 +3580,36 @@ mod tests {
         .await;
 
         let history = state.acp_session_store.history(&sid).expect("the session");
-        let uses: Vec<&str> = history
-            .iter()
-            .flat_map(|m| m.parts.iter())
-            .filter_map(|p| match p {
-                ContentPart::ToolUse { id, .. } => Some(id.as_str()),
-                _ => None,
-            })
-            .collect();
-        let results: Vec<&str> = history
-            .iter()
-            .flat_map(|m| m.parts.iter())
-            .filter_map(|p| match p {
-                ContentPart::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-                _ => None,
-            })
-            .collect();
 
-        assert_eq!(uses, vec!["call-1"], "the tool_use was persisted");
-        assert_eq!(
-            uses, results,
-            "every tool_use has its matching tool_result, in order — an \
-             unpaired one is rejected by the API on reload"
+        // Filtering into two id lists and comparing them would pass
+        // even if the two messages landed in the wrong order (or if the
+        // append sites were swapped) — with one call, both lists come
+        // out as `["call-1"]` regardless of which side wrote first.
+        // Locate each by its *position* in the message sequence instead,
+        // so the assertion actually pins the order on disk.
+        let use_at = history
+            .iter()
+            .position(|m| {
+                m.parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::ToolUse { id, .. } if id == "call-1"))
+            })
+            .expect("the tool_use was persisted");
+        let result_at = history
+            .iter()
+            .position(|m| {
+                m.parts.iter().any(|p| {
+                    matches!(p, ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == "call-1")
+                })
+            })
+            .expect("the matching tool_result was persisted");
+
+        assert!(
+            use_at < result_at,
+            "the tool_use (message {use_at}) must land before its tool_result \
+             (message {result_at}) on disk — a tool_use with no matching \
+             tool_result, or one in the wrong order, is rejected by the API \
+             on reload"
         );
     }
 

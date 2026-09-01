@@ -497,6 +497,53 @@ impl AcpSessionStore {
                 break;
             }
         }
+
+        // A `tool_use` can end up on disk without its `tool_result` —
+        // the second `append_message` failed (the cache write erred),
+        // the process died between the two appends, a sync landed only
+        // half the pair. The write side already warns and moves on
+        // rather than losing the turn; left uncorrected here, the gap
+        // it leaves is worse than a lost message, because the Anthropic
+        // API rejects the *whole* conversation on reload, not just the
+        // orphaned call — the session becomes permanently unloadable.
+        // Synthesise the missing half instead of dropping the `tool_use`:
+        // dropping would erase the fact that the agent attempted the
+        // call, and `MISSING_RESULT` is exactly the shape a cache miss
+        // already produces, so the model sees nothing it doesn't already
+        // know how to handle.
+        let tool_use_ids: Vec<String> = out
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let answered: std::collections::HashSet<String> = out
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let orphan_results: Vec<ContentPart> = tool_use_ids
+            .into_iter()
+            .filter(|id| !answered.contains(id))
+            .map(|tool_use_id| ContentPart::ToolResult {
+                tool_use_id,
+                content: MISSING_RESULT.to_string(),
+            })
+            .collect();
+        if !orphan_results.is_empty() {
+            out.push(ChatMessage {
+                role: Role::User,
+                parts: orphan_results,
+                input_kind: None,
+                user_id: None,
+            });
+        }
+
         Some(out)
     }
 
@@ -936,7 +983,10 @@ mod tests {
         let (_d, store) = store_without_cache();
         store.create("s1", "default", "/p").unwrap();
         store
-            .append_message("s1", &tool_result_message("c1", "content that cannot be cached"))
+            .append_message(
+                "s1",
+                &tool_result_message("c1", "content that cannot be cached"),
+            )
             .unwrap();
 
         let history = store.history("s1").expect("the session loads");
@@ -1249,6 +1299,89 @@ mod tests {
             history.len(),
             1,
             "the orphan is not reachable from the root"
+        );
+    }
+
+    /// The read-side fix for the write side's warn-and-continue: an
+    /// `append_message` for a `tool_result` can fail after its
+    /// `tool_use` sibling already landed, or the process can die between
+    /// the two. Either way, a `tool_use` with nothing answering it must
+    /// not brick the session — `history()` closes the gap itself rather
+    /// than handing the API an unpaired call on reload.
+    #[test]
+    fn an_unanswered_tool_use_gets_a_synthesised_result() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("run it"))
+            .unwrap();
+
+        // Hand-write a `tool_use` with no matching `tool_result` after
+        // it — standing in for a crash or a failed cache write between
+        // the two appends `run_llm_turn` makes.
+        let parent = store.events("s1").unwrap()[0].id;
+        let path = store.path_for_test("s1");
+        let orphan_use = serde_json::json!({
+            "kind": "message",
+            "id": Uuid::now_v7(),
+            "parent": parent,
+            "at": Utc::now(),
+            "role": "assistant",
+            "parts": [{"tool_use": {"id": "call-1", "name": "risky", "input": {}}}],
+        });
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{orphan_use}").unwrap();
+        drop(f);
+
+        let history = store.history("s1").expect("the session still loads");
+        let last = history.last().expect("a synthesised message was appended");
+        assert_eq!(
+            last.parts,
+            vec![ContentPart::ToolResult {
+                tool_use_id: "call-1".to_string(),
+                content: MISSING_RESULT.to_string(),
+            }],
+            "the unanswered tool_use gets a placeholder result so the \
+             pairing holds on reload"
+        );
+    }
+
+    /// The fix above must only fire on a genuine gap — a session whose
+    /// `tool_use`/`tool_result` pair is already complete gains nothing.
+    #[test]
+    fn a_complete_pair_gains_no_synthesised_result() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store
+            .append_message(
+                "s1",
+                &ChatMessage::assistant_with_tools(
+                    None,
+                    vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "risky".to_string(),
+                        input: serde_json::json!({}),
+                    }],
+                ),
+            )
+            .unwrap();
+        store
+            .append_message("s1", &tool_result_message("call-1", "the real output"))
+            .unwrap();
+
+        let history = store.history("s1").expect("the session loads");
+        let result_count = history
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter(|p| matches!(p, ContentPart::ToolResult { .. }))
+            .count();
+        assert_eq!(
+            result_count, 1,
+            "no extra result should be synthesised when the pairing is already complete"
         );
     }
 
