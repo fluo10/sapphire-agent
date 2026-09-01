@@ -2120,7 +2120,12 @@ pub(crate) struct LlmTurnOutcome {
 ///   write-back at the end never runs. So a cancelled prompt is invisible to
 ///   the next turn's in-memory model context, yet present in `list_sessions`
 ///   and after a restart; a compaction summary can be persisted and then
-///   thrown away, and will be produced again next turn.
+///   thrown away, and will be produced again next turn. For an ACP session,
+///   the same is true of `tool_use` and `tool_result`: each is appended as
+///   it happens, so a drop between the two leaves exactly the gap
+///   `AcpSessionStore::history`'s positional repair exists to close on the
+///   next read — an orphaned `tool_use` gets a synthesised placeholder
+///   result spliced in right after it.
 /// - Tool futures in flight are dropped too. `ShellTool` therefore sets
 ///   `kill_on_drop(true)` (`src/tools/builtin_tools.rs`) — without it a
 ///   cancelled turn left a shell command running against the workspace.
@@ -2330,10 +2335,19 @@ pub(crate) async fn run_llm_turn(
                 // content into the workspace and the retrieve index —
                 // which is exactly what the ACP store's external cache
                 // exists to avoid.
-                if is_acp && let Err(e) = state.acp_session_store.append_message(&session_id, &msg)
-                {
-                    warn!("Failed to persist a tool_use message: {e}");
-                }
+                //
+                // Whether this append actually landed is captured and
+                // carried down to the `tool_result` append below: the
+                // two must not be skipped independently of each other
+                // (see the comment there for why).
+                let tool_use_persisted = !is_acp
+                    || match state.acp_session_store.append_message(&session_id, &msg) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            warn!("Failed to persist a tool_use message: {e}");
+                            false
+                        }
+                    };
 
                 // Notify client of each tool starting
                 for call in &tool_calls {
@@ -2436,11 +2450,20 @@ pub(crate) async fn run_llm_turn(
                 }
                 let result_msg = ChatMessage::tool_results_with_images(text_results, images);
                 history.push(result_msg.clone());
-                // Must follow the `tool_use` append above and must not
-                // be skipped independently of it: a `tool_use` with no
-                // matching `tool_result` is rejected by the API, so a
-                // half-persisted pair is worse than neither.
+                // Gated on `tool_use_persisted`: this append must not run
+                // independently of the `tool_use` append above. If that
+                // one failed, the tip on disk is still the user message,
+                // so appending the result here would chain it directly
+                // onto that user message — a `tool_result` with no
+                // `tool_use` anywhere before it, which is just as
+                // rejected by the API as the reverse gap, and unlike the
+                // in-memory `history` (which is correct either way and
+                // gets scrubbed/reloaded next turn) would brick the
+                // on-disk session forever. A half-persisted pair is worse
+                // than neither, so skip this append too rather than
+                // leaving only the result on disk.
                 if is_acp
+                    && tool_use_persisted
                     && let Err(e) = state
                         .acp_session_store
                         .append_message(&session_id, &result_msg)
@@ -3057,6 +3080,7 @@ rooms    = []
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp_session::{EventBody, StoredPart};
     use crate::provider::{Role, UserInputKind};
 
     /// A refused tool still gets a `tool_result`, and the turn carries
@@ -3701,6 +3725,148 @@ mod tests {
              (message {result_at}) on disk — a tool_use with no matching \
              tool_result, or one in the wrong order, is rejected by the API \
              on reload"
+        );
+    }
+
+    /// A tool that puts the session's JSONL back on the way an
+    /// interrupted write would find it, timed to land between the two
+    /// appends `run_llm_turn` makes around a tool call. Exists only to
+    /// make the `tool_use` append fail while leaving the `tool_result`
+    /// append able to *succeed if attempted* — the one way to tell a
+    /// gated implementation from an ungated one that merely fails twice
+    /// for the same reason.
+    struct RestoringTool {
+        spec: crate::provider::ToolSpec,
+        moved_away: std::path::PathBuf,
+        real_path: std::path::PathBuf,
+    }
+
+    impl RestoringTool {
+        fn new(moved_away: std::path::PathBuf, real_path: std::path::PathBuf) -> Self {
+            Self {
+                spec: crate::provider::ToolSpec {
+                    name: "risky".into(),
+                    description: "Pretend to run a command.".into(),
+                    input_schema: json!({ "type": "object", "properties": {} }),
+                },
+                moved_away,
+                real_path,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for RestoringTool {
+        fn spec(&self) -> &crate::provider::ToolSpec {
+            &self.spec
+        }
+
+        fn kind(&self) -> crate::tools::ToolKind {
+            crate::tools::ToolKind::Execute
+        }
+
+        async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
+            std::fs::rename(&self.moved_away, &self.real_path)
+                .expect("restoring the session file mid-tool-call");
+            Ok("ran".to_string())
+        }
+    }
+
+    /// Fix 1: the write side's two `tool_use`/`tool_result` appends
+    /// "must not be skipped independently" of each other. This pins
+    /// that the code actually enforces it, not just says it in a
+    /// comment.
+    ///
+    /// The session's file is moved out of the way before the turn
+    /// starts, so the `tool_use` append fails (the store can't find the
+    /// session). The tool itself — `RestoringTool` — puts the file back
+    /// mid-turn, between the `tool_use` append (already failed) and the
+    /// `tool_result` append (yet to come). An ungated implementation
+    /// would find the file present again and happily append the
+    /// `tool_result` on its own — landing exactly the bricking bug this
+    /// fix exists for: a `tool_result` chained straight onto the user
+    /// message, with no `tool_use` anywhere before it. The fix must
+    /// skip that second append too.
+    #[tokio::test]
+    async fn a_failed_tool_use_append_suppresses_the_tool_result_append_too() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "risky".to_string(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        let sid = "acp-tool-use-failure".to_string();
+        state.acp_sessions.lock().await.insert(sid.clone());
+        state
+            .acp_session_store
+            .create(&sid, "default", "/work")
+            .unwrap();
+
+        let real_path = state.acp_session_store.path_for_test(&sid);
+        let moved_away = real_path.with_extension("jsonl.moved");
+        std::fs::rename(&real_path, &moved_away).unwrap();
+
+        state
+            .tools
+            .register_tool(Box::new(RestoringTool::new(
+                moved_away.clone(),
+                real_path.clone(),
+            )))
+            .await;
+
+        run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("run it"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        // `events()` reads the raw, un-repaired file — unlike
+        // `history()`, which would (correctly, per Fix 2) drop a stray
+        // `tool_result` with nothing before it on the way out and so
+        // could pass here even without the write-side gate this test
+        // is actually about. Reading raw is what makes this a test of
+        // Fix 1 rather than an accidental re-test of Fix 2's cleanup.
+        let events = state
+            .acp_session_store
+            .events(&sid)
+            .expect("the file exists again — the tool put it back");
+
+        let has_use = events.iter().any(|e| match &e.body {
+            EventBody::Message { parts, .. } => parts
+                .iter()
+                .any(|p| matches!(p, StoredPart::ToolUse { id, .. } if id == "call-1")),
+            _ => false,
+        });
+        let has_result = events.iter().any(|e| match &e.body {
+            EventBody::Message { parts, .. } => parts
+                .iter()
+                .any(|p| matches!(p, StoredPart::ToolResultRef { tool_use_id, .. } if tool_use_id == "call-1")),
+            _ => false,
+        });
+        assert!(!has_use, "the tool_use append failed and must stay absent");
+        assert!(
+            !has_result,
+            "a tool_result with no tool_use before it must never reach disk — \
+             the second append should have been gated on the first one's \
+             success, even though the file was available again by the time \
+             it would have run"
         );
     }
 

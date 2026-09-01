@@ -205,10 +205,14 @@ from the digest.
 A second, similarly workspace-external location,
 `<cache_dir>/sapphire-agent/tool-results/<sha256>`, is a content-addressed
 cache holding a tool call's result by hash — the JSONL itself stores only
-the tool name, its input, and the result's hash, not the result body. An
-ACP session's `tool_use` and `tool_result` messages are persisted (see
-"Tool calls are persisted for ACP sessions" below); every other transport
-still is not.
+the tool name, the result's hash, not the result body, and the input as
+given. The input has nowhere to be hashed out to the way a result does, so
+it goes into the JSONL directly; one that serialises past the same 50,000
+byte cap is elided to a small marker object on the way to disk rather than
+stored, so a single oversized call cannot put its raw content into the
+(indexed) workspace. An ACP session's `tool_use` and `tool_result` messages
+are persisted (see "Tool calls are persisted for ACP sessions" below);
+every other transport still is not.
 
 **Losing the cache degrades a session rather than breaking it.** Delete
 the directory, or lose an entry to a write failure, and the session still
@@ -244,10 +248,14 @@ JSONL stores versus the result cache). `/rpc`, device-default and MCP
 sessions do not — their line format has no reference form for a result,
 so writing one raw would put the content in the workspace and the
 retrieve index, which is exactly what the ACP store's external cache
-exists to avoid ([#194](https://github.com/fluo10/sapphire-agent/issues/194)).
-Reloading an ACP session therefore restores what the agent did as well
-as what was said — but the editor does not currently render it: see
-"A loaded session's tool calls are not shown in the editor" below.
+exists to avoid for results ([#194](https://github.com/fluo10/sapphire-agent/issues/194)).
+That protection is only for results, though — a tool *input* has no
+hash-and-cache indirection, so it lands in the JSONL directly, bounded
+rather than eliminated: capped at the same 50,000-byte limit, and
+elided to a marker object above it. Reloading an ACP session therefore
+restores what the agent did as well as what was said — but the editor
+does not currently render it: see "A loaded session's tool calls are
+not shown in the editor" below.
 
 **Opening the same session on two connections at once is not safe to
 prompt from both.** Nothing stops a second Zed window — or any other ACP
@@ -307,7 +315,7 @@ whole turn.
   the stored history are silently skipped rather than rendered. The
   model sees them; the editor's thread view does not. Tracked as
   [#192](https://github.com/fluo10/sapphire-agent/issues/192).
-- **Tool output is capped at 50,000 characters** (roughly 20,000 from the
+- **Tool output is capped at 50,000 bytes** (roughly 20,000 from the
   head, 30,000 from the tail, with a marker spliced in between) — this
   applies to every tool, on every transport, not only the shell tool over
   ACP; `ToolSet::execute` is the one path both `/acp` and the

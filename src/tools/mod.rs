@@ -290,7 +290,14 @@ pub async fn default_tool_set(
     tool_set
 }
 
-/// Cap a tool result at 50 000 chars, keeping head + tail.
+/// The cap shared by `truncate_output` (tool *results*) and
+/// `AcpSessionStore::store_part` (tool *inputs* — see Fix 4/#194): both
+/// bound what a single tool call can put into memory, the model's
+/// input, and an indexed on-disk file. Kept as one constant so the two
+/// call sites cannot drift apart.
+pub(crate) const OUTPUT_CAP_BYTES: usize = 50_000;
+
+/// Cap a tool result at 50 000 bytes, keeping head + tail.
 ///
 /// Applied at `ToolSet::execute` rather than inside each tool, because
 /// that is the one place every builtin and every MCP tool's output
@@ -311,9 +318,14 @@ pub async fn default_tool_set(
 /// top) exceeded the cap, which meant a second pass cut again and
 /// nested the markers — harmless only for as long as truncation
 /// happened in exactly one place, which is what this change ends.
+///
+/// The cap and the marker are both byte counts, not character counts —
+/// the mechanism has to be byte-based to actually bound memory and disk
+/// usage. For CJK text, where a character is 3 bytes, the effective
+/// cap is roughly a third of the number that appears here.
 pub(crate) fn truncate_output(s: &str) -> String {
-    const MAX: usize = 50_000;
-    // Room for `\n\n[... 1234567 chars truncated ...]\n\n`, generously.
+    const MAX: usize = OUTPUT_CAP_BYTES;
+    // Room for `\n\n[... 1234567 bytes truncated ...]\n\n`, generously.
     const MARKER_BUDGET: usize = 200;
     const HEAD: usize = 19_920;
     const TAIL: usize = MAX - MARKER_BUDGET - HEAD;
@@ -324,7 +336,7 @@ pub(crate) fn truncate_output(s: &str) -> String {
     let head_end = s.floor_char_boundary(HEAD);
     let tail_start = s.floor_char_boundary(s.len() - TAIL);
     format!(
-        "{}\n\n[... {} chars truncated ...]\n\n{}",
+        "{}\n\n[... {} bytes truncated ...]\n\n{}",
         &s[..head_end],
         tail_start - head_end,
         &s[tail_start..]
@@ -455,7 +467,7 @@ mod truncation_tests {
             out.len() < s.len(),
             "a 120k result must not come back whole"
         );
-        assert!(out.contains("chars truncated"), "got {}", &out[..80]);
+        assert!(out.contains("bytes truncated"), "got {}", &out[..80]);
     }
 
     /// Head and tail are both kept: the head is where a file's shape is,
@@ -480,12 +492,18 @@ mod truncation_tests {
     /// Cutting at a byte index inside a multi-byte character would
     /// panic. `floor_char_boundary` is what prevents it, so a result
     /// that is entirely multi-byte is the case worth pinning.
+    ///
+    /// A leading ASCII byte is prepended so the fixed-width 3-byte `日`
+    /// characters no longer line up with HEAD (19 920) and the tail
+    /// start — both multiples of 3 for a bare repeated character, so
+    /// naive byte indexing would land on a boundary anyway and the test
+    /// would pass for the wrong reason.
     #[test]
     fn a_multibyte_result_is_cut_on_a_character_boundary() {
-        let s = "日".repeat(60_000); // 3 bytes each — well past the cap
+        let s = format!("x{}", "日".repeat(60_000)); // well past the cap
         let out = truncate_output(&s);
-        assert!(out.contains("chars truncated"));
-        assert!(out.starts_with('日') && out.ends_with('日'));
+        assert!(out.contains("bytes truncated"));
+        assert!(out.starts_with('x') && out.ends_with('日'));
     }
 
     /// The cap has to be a cap: a result that has already been cut must
@@ -504,6 +522,66 @@ mod truncation_tests {
             once.len()
         );
         assert_eq!(truncate_output(&once), once);
-        assert_eq!(once.matches("chars truncated").count(), 1);
+        assert_eq!(once.matches("bytes truncated").count(), 1);
+    }
+
+    /// A stub tool that always returns a huge result, standing in for
+    /// e.g. `file_read` on a large file. Modeled on `RiskyTool` in
+    /// `src/serve/mod.rs`.
+    struct HugeOutputTool {
+        spec: ToolSpec,
+    }
+
+    impl HugeOutputTool {
+        fn new() -> Self {
+            Self {
+                spec: ToolSpec {
+                    name: "huge_output".into(),
+                    description: "Always returns a huge result.".into(),
+                    input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                },
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for HugeOutputTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
+            Ok("y".repeat(120_000))
+        }
+    }
+
+    /// The regression this suite exists to catch: every test above calls
+    /// `truncate_output` directly, so deleting the call site at
+    /// `ToolSet::execute` (this function, not the helper) would leave
+    /// the whole module green while silently reverting the cap on the
+    /// one path every tool result actually travels through.
+    #[tokio::test]
+    async fn tool_set_execute_applies_the_cap() {
+        let tool_set = ToolSet::new(vec![Box::new(HugeOutputTool::new())], Vec::new());
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "huge_output".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let output = tool_set.execute(&call).await;
+
+        assert!(
+            output.text.len() <= 50_000,
+            "ToolSet::execute must cap the output itself, not rely on the \
+             tool to do it: got {} bytes",
+            output.text.len()
+        );
+        assert_eq!(
+            output.text.matches("bytes truncated").count(),
+            1,
+            "exactly one truncation marker: {}",
+            &output.text[..200.min(output.text.len())]
+        );
     }
 }
