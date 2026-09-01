@@ -103,19 +103,40 @@ pub trait AcpClient: Send + Sync {
     /// socket would kill a user's build over a network blip.
     async fn release_terminal(&self, terminal: &TerminalHandle) -> anyhow::Result<()>;
 
-    /// Terminal handles this client's session currently has open —
-    /// started but not yet released — in the order they were tracked.
+    /// Atomically check this session's terminal cap and, if under it,
+    /// reserve the slot — in one lock span, so the check and the
+    /// reservation cannot be separated by another call.
     ///
-    /// `client_tools::ClientShellStart` reads this to decide whether
-    /// the session is already at the cap *before* asking the client to
-    /// create anything, which is what keeps a refused call from
-    /// reaching the wire at all.
-    async fn tracked_terminals(&self) -> Vec<TerminalHandle>;
+    /// Replaces the old pattern of reading the session's currently held
+    /// handles and deciding, separately, whether to call
+    /// [`create_terminal`](AcpClient::create_terminal) based on what it
+    /// saw: `run_llm_turn` executes a turn's permitted tool calls
+    /// concurrently (`futures_util::future::join_all`), so one
+    /// assistant message with N `client_shell_start` (or `client_shell`)
+    /// calls had all N read the count before any of them wrote it back
+    /// — the cap was bypassable within a single turn. Reserving
+    /// atomically here closes that gap.
+    ///
+    /// On success the slot is held until [`track_terminal`] resolves it
+    /// into a real handle. If the subsequent `create_terminal` call
+    /// fails, the caller must free the reservation by calling
+    /// [`untrack_terminal`](AcpClient::untrack_terminal) with
+    /// [`reserved_terminal_placeholder`] — otherwise the slot leaks.
+    ///
+    /// On refusal, returns the handles currently held (never including
+    /// another in-flight reservation, which is not a real handle the
+    /// model could act on) so the caller can still name what is held in
+    /// its refusal message.
+    async fn try_reserve_terminal_slot(&self) -> Result<(), Vec<TerminalHandle>>;
 
     /// Record that `handle` now belongs to this client's session, so
-    /// it counts against the cap and shows up in `tracked_terminals`
-    /// until [`untrack_terminal`](AcpClient::untrack_terminal) drops
-    /// it.
+    /// it counts against the cap until
+    /// [`untrack_terminal`](AcpClient::untrack_terminal) drops it.
+    ///
+    /// If a reservation from [`try_reserve_terminal_slot`] is still
+    /// outstanding for this session, this resolves (consumes) one of
+    /// them atomically in the same lock span, rather than adding a
+    /// second slot's worth of count for what was already reserved.
     async fn track_terminal(&self, handle: TerminalHandle);
 
     /// Drop `handle` from this client's session tracking.
@@ -126,8 +147,28 @@ pub trait AcpClient: Send + Sync {
     /// is nothing left to release, only bookkeeping to correct so a
     /// handle the client has already forgotten stops counting against
     /// the cap.
+    ///
+    /// Also used to release a reservation that never turned into a real
+    /// terminal — pass [`reserved_terminal_placeholder`] when
+    /// `create_terminal` fails after a successful
+    /// `try_reserve_terminal_slot`. Removes at most one matching entry
+    /// (never every entry with that value), so releasing one
+    /// placeholder reservation cannot also free a sibling reservation
+    /// still in flight.
     async fn untrack_terminal(&self, handle: &TerminalHandle);
 }
+
+/// The value [`AcpClient::try_reserve_terminal_slot`] pushes in place of
+/// a real handle to hold a session's slot for the duration of the
+/// `create_terminal` round trip. Never a real client-issued id — reused
+/// here so [`AcpClient::untrack_terminal`] can free a reservation that
+/// never turned into a terminal, using the same removal path as a real
+/// handle.
+pub(crate) fn reserved_terminal_placeholder() -> TerminalHandle {
+    TerminalHandle(RESERVED_TERMINAL_MARKER.to_string())
+}
+
+pub(crate) const RESERVED_TERMINAL_MARKER: &str = "\0reserved-terminal-slot";
 
 tokio::task_local! {
     static ACP_CLIENT_TL: Arc<dyn AcpClient>;
@@ -195,6 +236,14 @@ pub(crate) mod tests {
         /// answers "no such terminal" to a kill/release the same way
         /// `output_error` simulates it for a read.
         kill_error: Mutex<Option<String>>,
+        /// Set by [`FakeClient::make_wait_fail_with`]:
+        /// `wait_for_terminal_exit` returns this as an error instead of
+        /// resolving, simulating a client mid-reconnect answering the
+        /// RPC with an error while the command it asked about is still
+        /// running. Checked before `exit_never_returns` so a test can
+        /// pick exactly one of the two `wait_for_terminal_exit`
+        /// behaviours.
+        wait_error: Mutex<Option<String>>,
         /// The session id this fake's terminal tracking is keyed
         /// under, and the registry it tracks in. Plain fields rather
         /// than `Mutex`-wrapped: both are set once, by direct field
@@ -239,6 +288,13 @@ pub(crate) mod tests {
         pub(crate) fn make_kill_fail_with(&self, message: &str) {
             *self.kill_error.lock().unwrap() = Some(message.to_string());
         }
+
+        /// Make `wait_for_terminal_exit` fail with `message` instead of
+        /// resolving, as if the client's connection dropped mid-RPC
+        /// while the command it was asked about kept running.
+        pub(crate) fn make_wait_fail_with(&self, message: &str) {
+            *self.wait_error.lock().unwrap() = Some(message.to_string());
+        }
     }
 
     #[async_trait::async_trait]
@@ -279,6 +335,16 @@ pub(crate) mod tests {
                 cwd.map(|s| s.to_string()),
                 output_byte_limit,
             ));
+            // A real `create_terminal` is a JSON-RPC round trip to the
+            // editor, which genuinely suspends the caller. Yielding here
+            // reproduces that suspension so a concurrency test can
+            // actually interleave sibling calls between this client's
+            // `try_reserve_terminal_slot` and its `track_terminal` — a
+            // fake that resolved synchronously would never give a
+            // sibling call a chance to run in between, and a cap-bypass
+            // test built on it would pass even against the old, buggy
+            // read-then-write code.
+            tokio::task::yield_now().await;
             let id = if *self.distinct_handles.lock().unwrap() {
                 let mut next = self.next_handle.lock().unwrap();
                 *next += 1;
@@ -295,6 +361,9 @@ pub(crate) mod tests {
             Ok(TerminalOutput::default())
         }
         async fn wait_for_terminal_exit(&self, _t: &TerminalHandle) -> anyhow::Result<ExitStatus> {
+            if let Some(message) = self.wait_error.lock().unwrap().clone() {
+                return Err(anyhow::anyhow!(message));
+            }
             if *self.exit_never_returns.lock().unwrap() {
                 // Never resolves — see `make_exit_never_return`.
                 std::future::pending::<()>().await;
@@ -315,26 +384,33 @@ pub(crate) mod tests {
             }
             Ok(())
         }
-        async fn tracked_terminals(&self) -> Vec<TerminalHandle> {
-            self.terminals
-                .lock()
-                .await
-                .get(&self.terminal_session)
-                .cloned()
-                .unwrap_or_default()
+        async fn try_reserve_terminal_slot(&self) -> Result<(), Vec<TerminalHandle>> {
+            let mut registry = self.terminals.lock().await;
+            let held = registry.entry(self.terminal_session.clone()).or_default();
+            if held.len() >= crate::tools::client_tools::MAX_TERMINALS_PER_SESSION {
+                return Err(held
+                    .iter()
+                    .filter(|h| h.0 != RESERVED_TERMINAL_MARKER)
+                    .cloned()
+                    .collect());
+            }
+            held.push(reserved_terminal_placeholder());
+            Ok(())
         }
         async fn track_terminal(&self, handle: TerminalHandle) {
-            self.terminals
-                .lock()
-                .await
-                .entry(self.terminal_session.clone())
-                .or_default()
-                .push(handle);
+            let mut registry = self.terminals.lock().await;
+            let held = registry.entry(self.terminal_session.clone()).or_default();
+            if let Some(pos) = held.iter().position(|h| h.0 == RESERVED_TERMINAL_MARKER) {
+                held.remove(pos);
+            }
+            held.push(handle);
         }
         async fn untrack_terminal(&self, handle: &TerminalHandle) {
             let mut registry = self.terminals.lock().await;
             if let Some(held) = registry.get_mut(&self.terminal_session) {
-                held.retain(|h| h != handle);
+                if let Some(pos) = held.iter().position(|h| h == handle) {
+                    held.remove(pos);
+                }
                 if held.is_empty() {
                     registry.remove(&self.terminal_session);
                 }

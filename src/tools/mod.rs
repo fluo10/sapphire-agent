@@ -102,11 +102,6 @@ impl ToolSet {
         }
     }
 
-    /// Return a snapshot of the current tool specs.
-    pub async fn specs(&self) -> Vec<ToolSpec> {
-        self.inner.read().await.specs.clone()
-    }
-
     /// The specs a particular turn should see.
     ///
     /// A tool the caller cannot use is worse than absent: the model

@@ -79,9 +79,14 @@ pub enum Origin {
     /// The heartbeat's chat leg arrives here too, because it shares
     /// `Agent::handle_message`. That is the right answer rather than an
     /// accident: heartbeat tasks are workspace files, and `file_write`
-    /// is an `Edit`, which this origin allows unasked — so a trusted
-    /// heartbeat would let a chat message write itself a task that runs
-    /// a command on the next tick.
+    /// is an `Edit`, which this origin allows unasked *when host access
+    /// is on* — so a trusted heartbeat would let a chat message write
+    /// itself a task that runs a command on the next tick. With host
+    /// access off (the default this crate ships), `host_tool_denied`
+    /// refuses `file_write` before `decide` is even consulted, so this
+    /// origin cannot reach it regardless of what `decide` says below —
+    /// but the conclusion (`Channel` must not be trusted with `Edit`)
+    /// still holds for anyone who turns host access on.
     Channel,
     /// `/rpc`, voice and `/a2a`: authenticated before the turn began,
     /// with no UI to ask through. Behaviour must not change for these.

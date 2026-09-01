@@ -2149,6 +2149,45 @@ pub(crate) struct LlmTurnOutcome {
     stop: TurnStop,
 }
 
+/// Which tools a turn's model may see.
+///
+/// The one function that decides this — `run_llm_turn` and its
+/// filtering tests both call it, rather than each building their own
+/// version of the same rule (see `ToolSet::specs_filtered`'s doc for
+/// why an unusable tool is worse than an absent one). Also called from
+/// `Agent::handle_message` (`src/agent.rs`) for Matrix/Discord turns,
+/// with every client-capability flag forced `false` — there is no ACP
+/// client on that path, so the client-side tools must never appear
+/// there either.
+///
+/// `client_file_read`/`client_file_write` are named directly rather
+/// than matched by prefix or `ToolKind`: a client can implement
+/// `fs/read_text_file` without `fs/write_text_file` (or vice versa),
+/// and this is where that independence has to be honored, or the
+/// capability this turn's editor recorded (`AcpSession::client_capabilities`,
+/// `src/serve/acp.rs`) was recorded for nothing.
+pub(crate) fn visible_tool_predicate(
+    host_access_enabled: bool,
+    has_client: bool,
+    client_fs_read: bool,
+    client_fs_write: bool,
+    client_terminal: bool,
+) -> impl Fn(&str) -> bool {
+    move |name: &str| {
+        if crate::tools::policy::host_tool_denied(name, host_access_enabled) {
+            return false;
+        }
+        match name {
+            "client_file_read" => has_client && client_fs_read,
+            "client_file_write" => has_client && client_fs_write,
+            "client_shell" | "client_shell_start" | "client_shell_output" | "client_shell_kill" => {
+                has_client && client_terminal
+            }
+            _ => true,
+        }
+    }
+}
+
 /// Execute one full LLM turn for an established session: hydrate history,
 /// run the tool-calling loop, persist user + assistant messages to JSONL,
 /// and report per-tool `tool_start` / `tool_end` progress through
@@ -2183,47 +2222,22 @@ pub(crate) struct LlmTurnOutcome {
 /// - Tool futures in flight are dropped too. `ShellTool` therefore sets
 ///   `kill_on_drop(true)` (`src/tools/builtin_tools.rs`) — without it a
 ///   cancelled turn left a shell command running against the workspace.
-///   Any tool added later that owns an external process, a lock or a
-///   partially-written file must be drop-safe for the same reason.
+///   `ClientShell` and `ClientShellStart` (`src/tools/client_tools.rs`)
+///   own a process on a different machine, which a drop cannot kill for
+///   them the way `kill_on_drop` kills a local child — so they are made
+///   drop-safe the other way: the terminal handle is written into
+///   `ServeState.acp_terminals` (a registry owned by `ServeState`, not
+///   by the tool future) immediately after `create_terminal` succeeds,
+///   before any later `.await` that this future's drop could land on.
+///   The command keeps running on the editor's machine either way — as
+///   it must, per this module's `AcpClient::release_terminal` doc — and
+///   the handle survives the drop for the model to find and act on next
+///   turn. Any tool added later that owns an external process, a lock
+///   or a partially-written file must be drop-safe for the same reason.
 ///
 /// Anything added to this function that must happen exactly once per turn
 /// needs to be written with that in mind: reaching the end of the body is
 /// not guaranteed.
-/// Which tools a turn's model may see.
-///
-/// The one function that decides this — `run_llm_turn` and its
-/// filtering tests both call it, rather than each building their own
-/// version of the same rule (see `ToolSet::specs_filtered`'s doc for
-/// why an unusable tool is worse than an absent one).
-///
-/// `client_file_read`/`client_file_write` are named directly rather
-/// than matched by prefix or `ToolKind`: a client can implement
-/// `fs/read_text_file` without `fs/write_text_file` (or vice versa),
-/// and this is where that independence has to be honored, or the
-/// capability this turn's editor recorded (`AcpSession::client_capabilities`,
-/// `src/serve/acp.rs`) was recorded for nothing.
-fn visible_tool_predicate(
-    host_access_enabled: bool,
-    has_client: bool,
-    client_fs_read: bool,
-    client_fs_write: bool,
-    client_terminal: bool,
-) -> impl Fn(&str) -> bool {
-    move |name: &str| {
-        if crate::tools::policy::host_tool_denied(name, host_access_enabled) {
-            return false;
-        }
-        match name {
-            "client_file_read" => has_client && client_fs_read,
-            "client_file_write" => has_client && client_fs_write,
-            "client_shell" | "client_shell_start" | "client_shell_output" | "client_shell_kill" => {
-                has_client && client_terminal
-            }
-            _ => true,
-        }
-    }
-}
-
 pub(crate) async fn run_llm_turn(
     state: Arc<ServeState>,
     session_id: String,

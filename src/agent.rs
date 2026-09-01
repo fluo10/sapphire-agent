@@ -805,8 +805,26 @@ impl Agent {
         if let Some(tools) = &self.tools {
             tools.refresh_if_needed().await;
         }
+        // Filtered the same way `run_llm_turn` filters an ACP turn's
+        // specs (see `visible_tool_predicate`'s doc): a Matrix/Discord
+        // turn has no ACP client, so every client-capability flag is
+        // forced `false` here, hiding all six client-side tools —
+        // which could otherwise only ever answer "no editor is
+        // connected" — while `host_access_enabled` still governs the
+        // seven host-machine tools exactly as it does on every other
+        // transport.
+        let host_access_enabled = self.config.tools.host_access.enabled;
         let tool_specs = match &self.tools {
-            Some(t) => Some(t.specs().await),
+            Some(t) => Some(
+                t.specs_filtered(crate::serve::visible_tool_predicate(
+                    host_access_enabled,
+                    false,
+                    false,
+                    false,
+                    false,
+                ))
+                .await,
+            ),
             None => None,
         };
 

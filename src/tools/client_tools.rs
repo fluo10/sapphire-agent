@@ -4,10 +4,13 @@
 //! `file_read`/`file_write` (`src/tools/builtin_tools.rs`) touch the
 //! machine this agent runs on. These two touch the machine the *editor*
 //! runs on, via `fs/read_text_file` and `fs/write_text_file` — see
-//! `crate::tools::acp_client`. Both machines can be present in the same
-//! turn's tool list only when the wrong one is impossible to reach for:
-//! outside an ACP session there is no client to ask, so both refuse
-//! rather than silently doing nothing.
+//! `crate::tools::acp_client`. Both sets can be offered in the same
+//! turn's tool list at once — with host access on, an ACP turn sees
+//! both `file_read` and `client_file_read`, both `shell` and
+//! `client_shell` — the tool descriptions are what disambiguate which
+//! machine each one reaches. Outside an ACP session there is no client
+//! to ask, so the client-side tools refuse rather than silently doing
+//! nothing.
 
 use crate::provider::ToolSpec;
 use crate::tools::acp_client::{ExitStatus, TerminalHandle, TerminalOutput, current_acp_client};
@@ -31,8 +34,8 @@ fn no_editor_error() -> anyhow::Error {
 /// Read a file on the machine the editor is running on.
 ///
 /// Distinct from `file_read`, which reads the machine the *agent* runs
-/// on. In an ACP session only this one is offered, so the model cannot
-/// pick the wrong machine.
+/// on. With host access on, an ACP turn may be offered both; the tool
+/// descriptions are what tell the model which machine each one reaches.
 pub struct ClientFileRead {
     spec: ToolSpec,
 }
@@ -111,8 +114,9 @@ impl Tool for ClientFileRead {
 /// Write a file on the machine the editor is running on.
 ///
 /// Distinct from `file_write`, which writes the machine the *agent*
-/// runs on. In an ACP session only this one is offered, so the model
-/// cannot pick the wrong machine.
+/// runs on. With host access on, an ACP turn may be offered both; the
+/// tool descriptions are what tell the model which machine each one
+/// reaches.
 pub struct ClientFileWrite {
     spec: ToolSpec,
 }
@@ -193,7 +197,7 @@ fn clamp_timeout(requested: Option<u64>) -> std::time::Duration {
     std::time::Duration::from_secs(
         requested
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
-            .min(MAX_TIMEOUT_SECS),
+            .clamp(1, MAX_TIMEOUT_SECS),
     )
 }
 
@@ -349,30 +353,80 @@ impl Tool for ClientShell {
         // below leaves a handle tracked, so without this a model
         // looping `client_shell` with a short `timeout_secs` could
         // accumulate unbounded live processes — see this tool's doc.
-        let held = client.tracked_terminals().await;
-        if held.len() >= MAX_TERMINALS_PER_SESSION {
-            return Err(cap_error(&held));
-        }
+        //
+        // Reserve-then-create, not read-then-write: `run_llm_turn` runs
+        // a turn's permitted calls concurrently, so one assistant
+        // message with several `client_shell`/`client_shell_start`
+        // calls must not let them all read the count before any of
+        // them wrote it back. `try_reserve_terminal_slot` does the
+        // check and the reservation in one lock span so that cannot
+        // happen. See its doc.
+        client
+            .try_reserve_terminal_slot()
+            .await
+            .map_err(|held| cap_error(&held))?;
 
-        let handle = client
+        let handle = match client
             .create_terminal(command, &args, cwd, Some(OUTPUT_CAP_BYTES as u64))
-            .await?;
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                // Nothing was created, so there is no handle to track —
+                // but the reservation above claimed a slot that must be
+                // freed, or the cap would permanently lose one seat.
+                client
+                    .untrack_terminal(&crate::tools::acp_client::reserved_terminal_placeholder())
+                    .await;
+                return Err(e);
+            }
+        };
+        // Tracked immediately, before anything that can fail or be
+        // dropped: a `wait_for_terminal_exit` error below, or this
+        // whole future being dropped mid-wait (turn cancellation), must
+        // not lose a command that is genuinely still running on the
+        // user's machine. This also resolves the reservation above into
+        // the real handle.
+        client.track_terminal(handle.clone()).await;
 
         match tokio::time::timeout(timeout, client.wait_for_terminal_exit(&handle)).await {
             Ok(status) => {
+                // On error, the handle stays tracked (already tracked
+                // above) rather than being lost — the command may still
+                // be running and a transient RPC error here is not
+                // proof otherwise. See `ClientShellOutput`'s doc for the
+                // same reasoning applied to polling.
                 let status = status?;
                 let output = client.terminal_output(&handle).await?;
-                client.release_terminal(&handle).await?;
-                Ok(format_finished(&output, &status))
+                match client.release_terminal(&handle).await {
+                    Ok(()) => {
+                        client.untrack_terminal(&handle).await;
+                        Ok(format_finished(&output, &status))
+                    }
+                    Err(e) => {
+                        // The command finished and its output was
+                        // already collected successfully — that must
+                        // not be thrown away just because the release
+                        // that follows failed. The handle is left
+                        // tracked (over-counting is recoverable; losing
+                        // a finished build's output is not), so the
+                        // model can retry `client_shell_kill` to free it.
+                        Ok(format!(
+                            "{}\n[warning: the command finished, but releasing terminal \
+                             {handle} failed: {e}. It may still be tracked; use \
+                             client_shell_kill to free it.]",
+                            format_finished(&output, &status)
+                        ))
+                    }
+                }
             }
             Err(_elapsed) => {
-                // The handle escapes this call still running, so it has
-                // to enter the same session-keyed tracking
-                // `client_shell_start` uses — otherwise it would count
-                // against nothing, `client_shell_start`'s cap would
-                // never see it, and the model would have no way to
-                // list it in order to clean it up.
-                client.track_terminal(handle.clone()).await;
+                // Already tracked above — the handle escapes this call
+                // still running, so it has to stay in the same
+                // session-keyed tracking `client_shell_start` uses,
+                // otherwise it would count against nothing, the cap
+                // would never see it, and the model would have no way
+                // to list it in order to clean it up.
                 Ok(format!(
                     "[timed out after {}s — the command is still running as terminal {handle}. \
                      It was not killed. Use client_shell_output to check on it, or \
@@ -503,14 +557,33 @@ impl Tool for ClientShellStart {
 
         let client = current_acp_client().ok_or_else(no_editor_error)?;
 
-        let held = client.tracked_terminals().await;
-        if held.len() >= MAX_TERMINALS_PER_SESSION {
-            return Err(cap_error(&held));
-        }
+        // Reserve-then-create, not read-then-write: see
+        // `AcpClient::try_reserve_terminal_slot`'s doc. `run_llm_turn`
+        // runs a turn's permitted calls concurrently, so one assistant
+        // message containing several `client_shell_start` blocks must
+        // not let them all read the count before any of them wrote it
+        // back — a real, reachable way to bypass the cap within one
+        // turn, not just across concurrent prompts.
+        client
+            .try_reserve_terminal_slot()
+            .await
+            .map_err(|held| cap_error(&held))?;
 
-        let handle = client
+        let handle = match client
             .create_terminal(command, &args, cwd, Some(OUTPUT_CAP_BYTES as u64))
-            .await?;
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                // Free the reservation — nothing was created, so there
+                // is no handle to track, but the claimed slot must not
+                // leak.
+                client
+                    .untrack_terminal(&crate::tools::acp_client::reserved_terminal_placeholder())
+                    .await;
+                return Err(e);
+            }
+        };
         client.track_terminal(handle.clone()).await;
         Ok(format!(
             "Started terminal {handle}. Use client_shell_output to check on it, or \
@@ -1238,6 +1311,134 @@ mod tests {
             fake.creates.lock().unwrap().len(),
             MAX_TERMINALS_PER_SESSION,
             "the refused one-shot call must not have reached the client either"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Final review, Fix 1 & Fix 2
+    // -----------------------------------------------------------------
+
+    /// Fix 1, item 1: a `wait_for_terminal_exit` error (the client
+    /// mid-reconnect, an RPC timeout) is not proof the command has
+    /// stopped — it is still running on the user's machine. The handle
+    /// must stay tracked so the model can still poll or kill it later;
+    /// losing it here is exactly the "under-counting loses a live
+    /// process" outcome the design rules out.
+    #[tokio::test]
+    async fn a_wait_for_exit_error_leaves_the_handle_tracked() {
+        let (state, fake) = shell_test_state().await;
+        fake.make_wait_fail_with("connection reset");
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+
+        let err = scope_acp_client(client, async {
+            ClientShell::new()
+                .execute(&json!({"command": "cargo", "args": ["build"]}))
+                .await
+                .unwrap_err()
+                .to_string()
+        })
+        .await;
+
+        assert!(err.contains("connection reset"), "got: {err}");
+        assert_eq!(
+            state
+                .acp_terminals
+                .lock()
+                .await
+                .get(TEST_SESSION_ID)
+                .map(Vec::len),
+            Some(1),
+            "a wait-for-exit error must not drop tracking — the command may still be running"
+        );
+    }
+
+    /// Fix 1, item 3: a `release_terminal` failure must not discard
+    /// output that was already collected successfully. A finished
+    /// build's output is real work; throwing it away because the
+    /// unrelated release call that follows failed would be worse than
+    /// reporting both.
+    #[tokio::test]
+    async fn a_release_error_still_returns_the_output_and_leaves_the_handle_tracked() {
+        let (state, fake) = shell_test_state().await;
+        // Also fails `kill_terminal`, but this path never calls it.
+        fake.make_kill_fail_with("no such terminal");
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+
+        let out = scope_acp_client(client, async {
+            ClientShell::new()
+                .execute(&json!({"command": "cargo", "args": ["build"]}))
+                .await
+                .unwrap()
+        })
+        .await;
+
+        assert!(
+            out.contains("[exit status unknown]"),
+            "the finished command's output must still be reported: {out}"
+        );
+        assert!(
+            out.contains("no such terminal"),
+            "the release failure must be surfaced too, not swallowed: {out}"
+        );
+        assert_eq!(
+            state
+                .acp_terminals
+                .lock()
+                .await
+                .get(TEST_SESSION_ID)
+                .map(Vec::len),
+            Some(1),
+            "the handle stays tracked — a release failure is not proof it actually freed"
+        );
+    }
+
+    /// Fix 2: `run_llm_turn` executes a turn's permitted tool calls
+    /// concurrently (`futures_util::future::join_all`, `src/serve/mod.rs`),
+    /// so one assistant message containing several `client_shell_start`
+    /// blocks runs them all at once against the same session. The old
+    /// code read `tracked_terminals()` and wrote `track_terminal()` as
+    /// two separate steps, so every concurrent call could read the
+    /// count before any of them wrote it back — bypassing the cap
+    /// within a single turn, not just across the (unsupported)
+    /// concurrent-prompts case. `try_reserve_terminal_slot` closes that
+    /// by making the check and the reservation one atomic step.
+    ///
+    /// `FakeClient::create_terminal` yields once (simulating the real
+    /// RPC round trip `AcpClientHandle::create_terminal` makes) so the
+    /// concurrent calls below actually interleave between their reserve
+    /// and their track step — without that, this test would pass even
+    /// against the old, buggy read-then-write code.
+    #[tokio::test]
+    async fn concurrent_starts_cannot_exceed_the_cap() {
+        let (state, fake) = shell_test_state().await;
+        fake.hand_out_distinct_handles();
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+
+        let attempts = MAX_TERMINALS_PER_SESSION + 4;
+        let inputs: Vec<serde_json::Value> = (0..attempts)
+            .map(|_| json!({"command": "sleep", "args": ["999"]}))
+            .collect();
+        let tool = ClientShellStart::new();
+
+        let outcomes = scope_acp_client(client, async {
+            futures_util::future::join_all(inputs.iter().map(|input| tool.execute(input))).await
+        })
+        .await;
+
+        let succeeded = outcomes.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            succeeded, MAX_TERMINALS_PER_SESSION,
+            "one turn's concurrent client_shell_start calls must not exceed the cap: {outcomes:?}"
+        );
+        assert_eq!(
+            state
+                .acp_terminals
+                .lock()
+                .await
+                .get(TEST_SESSION_ID)
+                .map(Vec::len),
+            Some(MAX_TERMINALS_PER_SESSION),
+            "the registry itself must never hold more than the cap, even transiently"
         );
     }
 }

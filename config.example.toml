@@ -280,9 +280,20 @@ system_prompt = "You are a helpful personal assistant."
 # ─────────────────────────────────────────────────────────────────────
 # Built-in tools and MCP client (optional)
 # ─────────────────────────────────────────────────────────────────────
-# The `[tools]` table configures the agent's own tool belt. Two
+# The `[tools]` table configures the agent's own tool belt. Three
 # concerns live here:
 #
+#   - `[tools.host_access]` — the switch that lets the agent touch its
+#     own filesystem and shell at all: `file_read`, `file_write`,
+#     `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`.
+#     `enabled = false` by default, for every origin — `/rpc`, voice,
+#     `/a2a`, Matrix/Discord and ACP alike — so those seven tools are
+#     simply absent from the tool list until this is turned on. Client-
+#     side tools that reach the *editor's* machine over ACP
+#     (`client_file_read`, `client_shell`, …) are unaffected either
+#     way. Running the agent in a container is the recommended way to
+#     turn this on, since it then bounds what "the agent's own
+#     filesystem" actually reaches.
 #   - `tavily_api_key` — enables the `web_search` tool. Omit to leave
 #     the tool unregistered.
 #   - `[[tools.mcp_servers]]` — outbound MCP client. Connects to
@@ -304,6 +315,9 @@ system_prompt = "You are a helpful personal assistant."
 #
 # [tools]
 # tavily_api_key = "tvly-..."
+#
+# [tools.host_access]
+# enabled = false
 #
 # # Example: HTTP transport to a remote MCP server.
 # [[tools.mcp_servers]]

@@ -512,8 +512,8 @@ struct AcpClientHandle {
     /// `create_terminal` falls back to it when called with `cwd: None`.
     cwd: PathBuf,
     /// Shared with `ServeState.acp_terminals` via [`AcpProgress::terminals`].
-    /// `tracked_terminals`/`track_terminal`/`untrack_terminal` below
-    /// key into it with `session_id.to_string()` — the same string
+    /// `try_reserve_terminal_slot`/`track_terminal`/`untrack_terminal`
+    /// below key into it with `session_id.to_string()` — the same string
     /// `AcpSession::agent_session_id` holds for this session, since a
     /// `SessionId` is minted from exactly that string.
     terminals: crate::tools::acp_client::TerminalRegistry,
@@ -622,28 +622,40 @@ impl crate::tools::acp_client::AcpClient for AcpClientHandle {
         Ok(())
     }
 
-    async fn tracked_terminals(&self) -> Vec<crate::tools::acp_client::TerminalHandle> {
-        self.terminals
-            .lock()
-            .await
-            .get(&self.session_id.to_string())
-            .cloned()
-            .unwrap_or_default()
+    async fn try_reserve_terminal_slot(
+        &self,
+    ) -> Result<(), Vec<crate::tools::acp_client::TerminalHandle>> {
+        let mut registry = self.terminals.lock().await;
+        let held = registry.entry(self.session_id.to_string()).or_default();
+        if held.len() >= crate::tools::client_tools::MAX_TERMINALS_PER_SESSION {
+            return Err(held
+                .iter()
+                .filter(|h| h.0 != crate::tools::acp_client::RESERVED_TERMINAL_MARKER)
+                .cloned()
+                .collect());
+        }
+        held.push(crate::tools::acp_client::reserved_terminal_placeholder());
+        Ok(())
     }
 
     async fn track_terminal(&self, handle: crate::tools::acp_client::TerminalHandle) {
-        self.terminals
-            .lock()
-            .await
-            .entry(self.session_id.to_string())
-            .or_default()
-            .push(handle);
+        let mut registry = self.terminals.lock().await;
+        let held = registry.entry(self.session_id.to_string()).or_default();
+        if let Some(pos) = held
+            .iter()
+            .position(|h| h.0 == crate::tools::acp_client::RESERVED_TERMINAL_MARKER)
+        {
+            held.remove(pos);
+        }
+        held.push(handle);
     }
 
     async fn untrack_terminal(&self, handle: &crate::tools::acp_client::TerminalHandle) {
         let mut registry = self.terminals.lock().await;
         if let Some(held) = registry.get_mut(&self.session_id.to_string()) {
-            held.retain(|h| h != handle);
+            if let Some(pos) = held.iter().position(|h| h == handle) {
+                held.remove(pos);
+            }
             if held.is_empty() {
                 registry.remove(&self.session_id.to_string());
             }

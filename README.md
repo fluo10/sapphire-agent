@@ -158,15 +158,22 @@ refused and can try another route.
 cannot call `shell` or any MCP tool at all. A chat turn is asynchronous, so
 holding one open waiting for a human could hang it for hours; and routing the
 question through the model would let it broker its own permission request.
-`/rpc`, the voice pipeline and `/a2a` are unchanged and still run everything.
+`/rpc`, the voice pipeline and `/a2a` are unchanged in how *this* gate treats
+them — they are still never asked. But none of the three can reach the seven
+host-machine tools either, once `[tools.host_access] enabled = false` (the
+default this crate ships): that gate applies to every origin, not just chat.
+See "The agent's own filesystem and shell are opt-in" below.
 
 **The heartbeat's chat leg counts as a channel.** A scheduled task under
 `<workspace>/heartbeat/` runs through the same path as a chat message when it
 replies to a room, so it cannot call `shell` or MCP tools either. This is
 deliberate rather than an oversight: heartbeat task bodies are workspace files,
-and `file_write` is an edit, which a channel may perform without being asked —
-so trusting that path would let a chat message write itself a task that runs a
-command on the next tick.
+and `file_write` is an edit, which a channel may perform without being asked
+*when host access is on* — so trusting that path would let a chat message
+write itself a task that runs a command on the next tick. With host access
+off (the default), `file_write` is one of the seven host-machine tools and is
+refused for every origin before this reasoning is even reached — but it still
+governs the moment host access is turned on.
 
 ### Client-side tools: whose machine
 
