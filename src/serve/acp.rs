@@ -112,10 +112,11 @@ struct AcpSession {
     /// once, at creation, so a loaded session's recorded cwd here cannot
     /// be used to update the stored one, and no code should try.
     ///
-    /// Still nothing reads this field back out of the struct (a future
-    /// `terminal/create` handler is the intended reader, per the module
-    /// doc), so the attribute stays until that lands.
-    #[allow(dead_code)]
+    /// Read at `session/prompt` time and copied onto the turn's
+    /// [`AcpProgress`] the same way `client_capabilities` is, so
+    /// `ClientShell` (`src/tools/client_tools.rs`) can default a
+    /// `terminal/create` call's working directory to it when the model
+    /// doesn't pass one.
     cwd: PathBuf,
     /// What the client declared it can do, from `initialize`'s
     /// `clientCapabilities`. Copied in from the connection-wide
@@ -202,8 +203,16 @@ struct AcpProgress {
     /// This turn's session's recorded `client_capabilities`
     /// ([`AcpSession::client_capabilities`]), copied in at construction
     /// time rather than looked up again mid-turn. `client_fs_caps`
-    /// reads `fs.read_text_file`/`fs.write_text_file` off this.
+    /// reads `fs.read_text_file`/`fs.write_text_file` off this, and
+    /// `client_terminal_cap` reads `terminal` off it the same way.
     client_capabilities: ClientCapabilities,
+    /// This turn's session's recorded [`AcpSession::cwd`], copied in at
+    /// construction time the same way `client_capabilities` is. Handed
+    /// to `AcpClientHandle` by `acp_client()` below, which is what lets
+    /// `ClientShell` default a terminal's working directory to the
+    /// session's without this struct exposing a bespoke `TurnHost`
+    /// accessor for it.
+    cwd: PathBuf,
 }
 
 /// The `(read, write)` pair `TurnHost::client_fs_caps` reports, pulled
@@ -223,6 +232,14 @@ fn fs_caps_from(caps: &ClientCapabilities) -> (bool, bool) {
     (caps.fs.read_text_file, caps.fs.write_text_file)
 }
 
+/// The flag `TurnHost::client_terminal_cap` reports, pulled out for the
+/// same reason as `fs_caps_from` above: a test can call it directly
+/// against a hand-built `ClientCapabilities` without constructing an
+/// `AcpProgress`.
+fn terminal_cap_from(caps: &ClientCapabilities) -> bool {
+    caps.terminal
+}
+
 impl AcpProgress {
     fn new(
         session_id: SessionId,
@@ -231,6 +248,7 @@ impl AcpProgress {
         mode: crate::tools::policy::SessionMode,
         permissions: Arc<super::acp_permissions::PermissionStore>,
         client_capabilities: ClientCapabilities,
+        cwd: PathBuf,
     ) -> Self {
         Self {
             session_id,
@@ -240,6 +258,7 @@ impl AcpProgress {
             mode,
             permissions,
             client_capabilities,
+            cwd,
         }
     }
 
@@ -317,6 +336,7 @@ impl super::TurnHost for AcpProgress {
         Some(Arc::new(AcpClientHandle {
             session_id: self.session_id.clone(),
             connection: self.connection.clone(),
+            cwd: self.cwd.clone(),
         }))
     }
 
@@ -325,6 +345,13 @@ impl super::TurnHost for AcpProgress {
     /// is pulled out rather than written here.
     fn client_fs_caps(&self) -> (bool, bool) {
         fs_caps_from(&self.client_capabilities)
+    }
+
+    /// Whether this turn's editor declared `terminal/*` support, via
+    /// `terminal_cap_from` — see that function's doc for why the read
+    /// is pulled out rather than written here.
+    fn client_terminal_cap(&self) -> bool {
+        terminal_cap_from(&self.client_capabilities)
     }
 
     /// Move a call from `Pending` to `InProgress`.
@@ -456,6 +483,9 @@ impl super::TurnHost for AcpProgress {
 struct AcpClientHandle {
     session_id: SessionId,
     connection: ConnectionTo<Client>,
+    /// This turn's session's cwd, copied in from [`AcpProgress::cwd`].
+    /// `create_terminal` falls back to it when called with `cwd: None`.
+    cwd: PathBuf,
 }
 
 #[async_trait::async_trait]
@@ -493,9 +523,13 @@ impl crate::tools::acp_client::AcpClient for AcpClientHandle {
         cwd: Option<&str>,
         output_byte_limit: Option<u64>,
     ) -> anyhow::Result<crate::tools::acp_client::TerminalHandle> {
+        // `cwd` is the model's explicit choice when given; absent that,
+        // the session's own cwd — never no cwd at all, since the
+        // session always has one.
+        let effective_cwd = cwd.map(PathBuf::from).unwrap_or_else(|| self.cwd.clone());
         let request = CreateTerminalRequest::new(self.session_id.clone(), command)
             .args(args.to_vec())
-            .cwd(cwd.map(PathBuf::from))
+            .cwd(Some(effective_cwd))
             .output_byte_limit(output_byte_limit);
         let response = self.connection.send_request(request).block_task().await?;
         Ok(crate::tools::acp_client::TerminalHandle(
@@ -1222,10 +1256,11 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                                 turn_cancel,
                                 session.mode,
                                 session.client_capabilities.clone(),
+                                session.cwd.clone(),
                             )
                         })
                     };
-                    let Some((agent_session_id, turn_cancel, mode, client_capabilities)) =
+                    let Some((agent_session_id, turn_cancel, mode, client_capabilities, cwd)) =
                         looked_up
                     else {
                         // Not created on the fly: a prompt naming a session
@@ -1294,6 +1329,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         mode,
                         Arc::clone(&state.permissions),
                         client_capabilities,
+                        cwd,
                     ));
 
                     // The turn runs OUTSIDE the dispatch loop, and the
@@ -3724,6 +3760,16 @@ mod tests {
         let write_only =
             ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true));
         assert_eq!(fs_caps_from(&write_only), (false, true));
+    }
+
+    /// `terminal_cap_from` must read the recorded flag, not return a
+    /// constant.
+    #[test]
+    fn terminal_cap_from_reads_the_recorded_flag() {
+        assert!(terminal_cap_from(&ClientCapabilities::new().terminal(true)));
+        assert!(!terminal_cap_from(
+            &ClientCapabilities::new().terminal(false)
+        ));
     }
 
     // `initialize_records_the_clients_capabilities` — deliberately not

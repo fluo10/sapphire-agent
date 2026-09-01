@@ -10,8 +10,8 @@
 //! rather than silently doing nothing.
 
 use crate::provider::ToolSpec;
-use crate::tools::acp_client::current_acp_client;
-use crate::tools::{Tool, ToolKind};
+use crate::tools::acp_client::{ExitStatus, TerminalOutput, current_acp_client};
+use crate::tools::{OUTPUT_CAP_BYTES, Tool, ToolKind};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::json;
@@ -174,6 +174,173 @@ impl Tool for ClientFileWrite {
     }
 }
 
+// ---------------------------------------------------------------------------
+// client_shell
+// ---------------------------------------------------------------------------
+
+/// The cap on how long the one-shot form waits. Past this the command
+/// keeps running and the caller gets its handle back instead of a
+/// result — see [`ClientShell`]'s doc for why releasing (which the ACP
+/// schema defines as killing) is wrong here.
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const MAX_TIMEOUT_SECS: u64 = 600;
+
+/// Clamp a requested timeout (seconds) to `(0, MAX_TIMEOUT_SECS]`,
+/// defaulting to `DEFAULT_TIMEOUT_SECS` when the caller didn't ask for
+/// one. Pulled out of `execute` so the cap can be tested directly
+/// instead of a test waiting out a real timeout.
+fn clamp_timeout(requested: Option<u64>) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        requested
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .min(MAX_TIMEOUT_SECS),
+    )
+}
+
+/// Render a finished command's output for the model: the (possibly
+/// truncated) text plus how it ended.
+fn format_finished(output: &TerminalOutput, status: &ExitStatus) -> String {
+    let mut out = output.output.clone();
+    if output.truncated {
+        out.push_str("\n[output truncated]");
+    }
+    match (&status.exit_code, &status.signal) {
+        (Some(code), _) => out.push_str(&format!("\n[exit code: {code}]")),
+        (None, Some(signal)) => out.push_str(&format!("\n[terminated by signal: {signal}]")),
+        (None, None) => out.push_str("\n[exit status unknown]"),
+    }
+    out
+}
+
+/// Run a command on the machine the editor is running on, and wait for
+/// it to finish — up to a timeout.
+///
+/// # A timed-out command is not killed
+///
+/// ACP's `terminal/release` kills the command it releases — the schema
+/// says so explicitly, the same way `terminal/kill` does. Releasing on
+/// timeout would therefore throw away a build that has already run for
+/// however long the timeout allowed, and for a non-idempotent command
+/// (`git push`, a migration, a script that writes files) a retry after
+/// that would run it a second time.
+///
+/// So on timeout this tool releases nothing. The terminal keeps
+/// running and the handle is handed back in the result text, so the
+/// model can poll it with `client_shell_output` or stop it with
+/// `client_shell_kill` (both land in a later task) — the decision to
+/// kill is left to the model or the human, never made here on their
+/// behalf. This is a deliberate departure from what the protocol's own
+/// `terminal/kill` doc suggests (kill on timeout and collect the
+/// output).
+///
+/// The one new risk this creates is the model reading a timeout as a
+/// failure and re-running the command — which for a non-idempotent
+/// command is exactly the outcome not-releasing was meant to avoid.
+/// The result text is worded so that misreading is not possible, and
+/// ends with an explicit instruction not to re-run.
+pub struct ClientShell {
+    spec: ToolSpec,
+}
+
+impl ClientShell {
+    pub fn new() -> Self {
+        Self {
+            spec: ToolSpec {
+                name: "client_shell".into(),
+                description: "Run a command on the machine the connected editor is \
+                    running on — NOT this agent's own machine. Use `shell` instead \
+                    for commands on the agent's machine. \
+                    Waits up to `timeout_secs` (default 120, max 600) for the \
+                    command to finish. If it finishes in time, returns its output, \
+                    exit status, and whether the output was truncated. If it does \
+                    NOT finish in time, the command is left running rather than \
+                    killed — the result names the terminal handle so it can be \
+                    checked or stopped later; do not re-run the command just \
+                    because this call timed out. \
+                    Only available inside an ACP session whose editor supports \
+                    `terminal/*`; refuses otherwise."
+                    .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The command to run (not a shell string — no pipes or redirection)."
+                        },
+                        "args": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Arguments to pass to the command."
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": "Working directory on the editor's machine. Defaults to the session's cwd."
+                        },
+                        "timeout_secs": {
+                            "type": "integer",
+                            "description": "Max seconds to wait for the command to finish before handing back a running handle instead (default: 120, max: 600).",
+                            "minimum": 1,
+                            "maximum": 600
+                        }
+                    },
+                    "required": ["command"]
+                }),
+            },
+        }
+    }
+}
+
+impl Default for ClientShell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for ClientShell {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Execute
+    }
+
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let command = input["command"].as_str().context("missing 'command'")?;
+        let args: Vec<String> = input["args"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cwd = input["cwd"].as_str();
+        let timeout = clamp_timeout(input["timeout_secs"].as_u64());
+
+        let client = current_acp_client().ok_or_else(no_editor_error)?;
+        let handle = client
+            .create_terminal(command, &args, cwd, Some(OUTPUT_CAP_BYTES as u64))
+            .await?;
+
+        match tokio::time::timeout(timeout, client.wait_for_terminal_exit(&handle)).await {
+            Ok(status) => {
+                let status = status?;
+                let output = client.terminal_output(&handle).await?;
+                client.release_terminal(&handle).await?;
+                Ok(format_finished(&output, &status))
+            }
+            Err(_elapsed) => Ok(format!(
+                "[timed out after {}s — the command is still running as terminal {handle}. \
+                 It was not killed. Use client_shell_output to check on it, or \
+                 client_shell_kill to stop it. Do not re-run the command.]",
+                timeout.as_secs()
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +424,102 @@ mod tests {
     fn the_kinds_match_what_the_permission_table_expects() {
         assert_eq!(ClientFileRead::new().kind(), ToolKind::Read);
         assert_eq!(ClientFileWrite::new().kind(), ToolKind::Edit);
+        assert_eq!(ClientShell::new().kind(), ToolKind::Execute);
+    }
+
+    /// Outside an ACP turn there is no editor to run a command on,
+    /// exactly as for the two file tools.
+    #[tokio::test]
+    async fn client_shell_refuses_without_a_client() {
+        let err = ClientShell::new()
+            .execute(&json!({"command": "ls", "args": []}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no editor"),
+            "the message should say why, got: {err}"
+        );
+    }
+
+    /// The whole point of the timeout: a build that outruns it keeps
+    /// running, and the model is handed the handle instead of a
+    /// corpse. Killing here would throw away the work and, for a
+    /// non-idempotent command, run it twice.
+    #[tokio::test]
+    async fn a_timed_out_command_is_not_killed_and_hands_back_its_handle() {
+        let fake = Arc::new(FakeClient::default());
+        fake.make_exit_never_return();
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+
+        let out = scope_acp_client(client, async {
+            ClientShell::new()
+                .execute(&json!({"command": "cargo", "args": ["test"], "timeout_secs": 1}))
+                .await
+                .unwrap()
+        })
+        .await;
+
+        assert!(out.contains("still running"), "got: {out}");
+        assert!(
+            out.contains("t1"),
+            "the handle must be in the result: {out}"
+        );
+        assert!(
+            fake.released.lock().unwrap().is_empty(),
+            "release kills the command — it must not be called on a timeout"
+        );
+        assert!(fake.killed.lock().unwrap().is_empty(), "nor kill");
+    }
+
+    #[tokio::test]
+    async fn a_command_that_finishes_in_time_is_released() {
+        let fake = Arc::new(FakeClient::default());
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+        scope_acp_client(client, async {
+            ClientShell::new()
+                .execute(&json!({"command": "ls", "args": []}))
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(
+            fake.released.lock().unwrap().len(),
+            1,
+            "the handle is freed"
+        );
+    }
+
+    /// The cap is handed to the client so the output is cut at the
+    /// source rather than shipped across the wire and cut here.
+    #[tokio::test]
+    async fn the_output_cap_is_passed_to_the_client() {
+        let fake = Arc::new(FakeClient::default());
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+        scope_acp_client(client, async {
+            ClientShell::new()
+                .execute(&json!({"command": "ls", "args": []}))
+                .await
+                .unwrap();
+        })
+        .await;
+        let (_, _, _, limit) = fake.creates.lock().unwrap()[0].clone();
+        assert_eq!(limit, Some(crate::tools::OUTPUT_CAP_BYTES as u64));
+    }
+
+    /// `clamp_timeout` is what `execute` calls to turn a requested
+    /// timeout into the duration it actually waits — testing it
+    /// directly avoids a test that waits out a real 600s timeout.
+    #[test]
+    fn the_timeout_is_capped_at_ten_minutes() {
+        assert_eq!(
+            clamp_timeout(Some(9999)),
+            std::time::Duration::from_secs(MAX_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            clamp_timeout(None),
+            std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS)
+        );
+        assert_eq!(clamp_timeout(Some(30)), std::time::Duration::from_secs(30));
     }
 }

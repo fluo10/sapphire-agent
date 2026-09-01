@@ -275,6 +275,7 @@ pub async fn default_tool_set(
         Box::new(ShellTool::new(workspace_root.clone())),
         Box::new(ClientFileRead::new()),
         Box::new(ClientFileWrite::new()),
+        Box::new(ClientShell::new()),
         Box::new(WeatherTool::new()),
         Box::new(TimerSetTool::new(Arc::clone(&timer_manager))),
         Box::new(TimerPresetTool::new(
@@ -410,6 +411,7 @@ mod tests {
         let want: Vec<(&str, ToolKind)> = vec![
             ("client_file_read", ToolKind::Read),
             ("client_file_write", ToolKind::Edit),
+            ("client_shell", ToolKind::Execute),
             ("dir_list", ToolKind::Search),
             ("dir_walk", ToolKind::Search),
             ("file_append", ToolKind::Edit),

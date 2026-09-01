@@ -1992,6 +1992,18 @@ pub(crate) trait TurnHost: Send + Sync {
         (false, false)
     }
 
+    /// Whether this turn's editor implements `terminal/*` — the
+    /// capability `client_shell` (`src/tools/client_tools.rs`) needs to
+    /// be worth offering at all. Same convention as `client_fs_caps`:
+    /// read off `AcpSession::client_capabilities` and exposed here so
+    /// `visible_tool_predicate` doesn't reach into ACP-specific state.
+    ///
+    /// `false` by default: every host with no editor on the other end
+    /// has nothing to ask this of.
+    fn client_terminal_cap(&self) -> bool {
+        false
+    }
+
     /// This call cleared the gate and is about to run.
     ///
     /// Separate from `tool_start`, which fires *before* the gate and so
@@ -2177,6 +2189,7 @@ fn visible_tool_predicate(
     has_client: bool,
     client_fs_read: bool,
     client_fs_write: bool,
+    client_terminal: bool,
 ) -> impl Fn(&str) -> bool {
     move |name: &str| {
         if crate::tools::policy::host_tool_denied(name, host_access_enabled) {
@@ -2185,6 +2198,7 @@ fn visible_tool_predicate(
         match name {
             "client_file_read" => has_client && client_fs_read,
             "client_file_write" => has_client && client_fs_write,
+            "client_shell" => has_client && client_terminal,
             _ => true,
         }
     }
@@ -2301,6 +2315,7 @@ pub(crate) async fn run_llm_turn(
     let host_access_enabled = state.config.tools.host_access.enabled;
     let has_client = progress.acp_client().is_some();
     let (client_fs_read, client_fs_write) = progress.client_fs_caps();
+    let client_terminal = progress.client_terminal_cap();
     let tool_specs = state
         .tools
         .specs_filtered(visible_tool_predicate(
@@ -2308,6 +2323,7 @@ pub(crate) async fn run_llm_turn(
             has_client,
             client_fs_read,
             client_fs_write,
+            client_terminal,
         ))
         .await;
     let compression_config = &state.config.compression;
@@ -4123,17 +4139,13 @@ mod tests {
     struct TestCaps {
         fs_read: bool,
         fs_write: bool,
-        /// Unread until Task 5's terminal-tool filtering test. Kept
-        /// here now so this task's tests match the brief's call sites
-        /// rather than a struct reshaped to omit it.
-        #[allow(dead_code)]
         terminal: bool,
     }
 
-    /// A `ToolSet` carrying a stand-in for every host tool plus the two
-    /// real client-side file tools, so "not offered" in the assertions
-    /// below means the predicate hid the name — not that it was never
-    /// registered in the first place.
+    /// A `ToolSet` carrying a stand-in for every host tool plus the
+    /// real client-side file and shell tools, so "not offered" in the
+    /// assertions below means the predicate hid the name — not that it
+    /// was never registered in the first place.
     fn client_filtering_test_set() -> ToolSet {
         let mut tools: Vec<Box<dyn crate::tools::Tool>> = crate::tools::policy::HOST_TOOLS
             .iter()
@@ -4141,6 +4153,7 @@ mod tests {
             .collect();
         tools.push(Box::new(crate::tools::client_tools::ClientFileRead::new()));
         tools.push(Box::new(crate::tools::client_tools::ClientFileWrite::new()));
+        tools.push(Box::new(crate::tools::client_tools::ClientShell::new()));
         ToolSet::new(tools, Vec::new())
     }
 
@@ -4154,6 +4167,7 @@ mod tests {
                 true,
                 caps.fs_read,
                 caps.fs_write,
+                caps.terminal,
             ))
             .await
             .into_iter()
@@ -4166,7 +4180,7 @@ mod tests {
     /// off-by-default setting.
     async fn tool_names_for_turn_without_a_client() -> Vec<String> {
         client_filtering_test_set()
-            .specs_filtered(visible_tool_predicate(false, false, false, false))
+            .specs_filtered(visible_tool_predicate(false, false, false, false, false))
             .await
             .into_iter()
             .map(|s| s.name.to_string())
@@ -4195,6 +4209,29 @@ mod tests {
         .await;
         assert!(!names.contains(&"client_file_read".to_string()));
         assert!(names.contains(&"client_file_write".to_string()));
+    }
+
+    /// `client_shell` is offered only when the editor declared
+    /// `terminal/*` support — the same independence the two file tools
+    /// get, just with one flag instead of two since ACP's `terminal`
+    /// capability isn't split into finer-grained bits.
+    #[tokio::test]
+    async fn the_terminal_tool_follows_its_own_capability_flag() {
+        let names = tool_names_for_turn(TestCaps {
+            fs_read: false,
+            fs_write: false,
+            terminal: true,
+        })
+        .await;
+        assert!(names.contains(&"client_shell".to_string()));
+
+        let names = tool_names_for_turn(TestCaps {
+            fs_read: false,
+            fs_write: false,
+            terminal: false,
+        })
+        .await;
+        assert!(!names.contains(&"client_shell".to_string()));
     }
 
     /// Matrix, Discord, `/rpc` and voice have no editor. Offering them a

@@ -22,11 +22,6 @@ use std::sync::Arc;
 /// parse or construct one except from what the client returned. The
 /// inner `String` is public only so tests (the fake client) can build
 /// one directly — a real handle is only ever the client's own value.
-// Nothing constructs one from live code yet — `FakeClient::create_terminal`
-// is the only constructor today, and it is itself unreachable until
-// Task 5's `ClientShell` calls `AcpClient::create_terminal`. Remove this
-// allow there.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalHandle(pub String);
 
@@ -36,18 +31,12 @@ impl std::fmt::Display for TerminalHandle {
     }
 }
 
-// Not constructed by any live call site until Task 5's `ClientShell` calls
-// `AcpClient::wait_for_terminal_exit`. Remove this allow there.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExitStatus {
     pub exit_code: Option<u32>,
     pub signal: Option<String>,
 }
 
-// Not constructed by any live call site until Task 5's `ClientShell` calls
-// `AcpClient::terminal_output`. Remove this allow there.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TerminalOutput {
     pub output: String,
@@ -74,9 +63,6 @@ pub trait AcpClient: Send + Sync {
 
     async fn write_text_file(&self, path: &str, content: &str) -> anyhow::Result<()>;
 
-    // No call site until Task 5's `ClientShell` calls this. Remove this
-    // allow there.
-    #[allow(dead_code)]
     async fn create_terminal(
         &self,
         command: &str,
@@ -85,14 +71,8 @@ pub trait AcpClient: Send + Sync {
         output_byte_limit: Option<u64>,
     ) -> anyhow::Result<TerminalHandle>;
 
-    // No call site until Task 5's `ClientShell` calls this. Remove this
-    // allow there.
-    #[allow(dead_code)]
     async fn terminal_output(&self, terminal: &TerminalHandle) -> anyhow::Result<TerminalOutput>;
 
-    // No call site until Task 5's `ClientShell` calls this. Remove this
-    // allow there.
-    #[allow(dead_code)]
     async fn wait_for_terminal_exit(&self, terminal: &TerminalHandle)
     -> anyhow::Result<ExitStatus>;
 
@@ -109,9 +89,6 @@ pub trait AcpClient: Send + Sync {
     /// invalidates the `TerminalId` afterwards. Nothing may call this
     /// just because a connection went away — releasing on a dropped
     /// socket would kill a user's build over a network blip.
-    // No call site until Task 5's `ClientShell` releases on the happy
-    // path. Remove this allow there.
-    #[allow(dead_code)]
     async fn release_terminal(&self, terminal: &TerminalHandle) -> anyhow::Result<()>;
 }
 
@@ -144,6 +121,10 @@ pub(crate) mod tests {
     /// One recorded call to `read_text_file`: `(path, line, limit)`.
     pub(crate) type ReadCall = (String, Option<u32>, Option<u32>);
 
+    /// One recorded call to `create_terminal`: `(command, args, cwd,
+    /// output_byte_limit)`.
+    pub(crate) type CreateCall = (String, Vec<String>, Option<String>, Option<u64>);
+
     /// A stand-in for the editor. Records what it was asked and answers
     /// from a script, so the tools can be driven without a socket.
     #[derive(Default)]
@@ -151,6 +132,24 @@ pub(crate) mod tests {
         pub reads: Mutex<Vec<ReadCall>>,
         pub writes: Mutex<Vec<(String, String)>>,
         pub read_answer: Mutex<Option<Result<String, String>>>,
+        pub creates: Mutex<Vec<CreateCall>>,
+        pub released: Mutex<Vec<TerminalHandle>>,
+        pub killed: Mutex<Vec<TerminalHandle>>,
+        /// Set by [`FakeClient::make_exit_never_return`]. When true,
+        /// `wait_for_terminal_exit` blocks forever instead of resolving
+        /// — the only way to make `ClientShell`'s
+        /// `tokio::time::timeout` race actually win on the timeout arm
+        /// without a test sleeping out a real wall-clock timeout.
+        exit_never_returns: Mutex<bool>,
+    }
+
+    impl FakeClient {
+        /// Make every future `wait_for_terminal_exit` call hang forever,
+        /// so a caller racing it against a timeout always sees the
+        /// timeout branch.
+        pub(crate) fn make_exit_never_return(&self) {
+            *self.exit_never_returns.lock().unwrap() = true;
+        }
     }
 
     #[async_trait::async_trait]
@@ -180,23 +179,35 @@ pub(crate) mod tests {
         }
         async fn create_terminal(
             &self,
-            _command: &str,
-            _args: &[String],
-            _cwd: Option<&str>,
-            _output_byte_limit: Option<u64>,
+            command: &str,
+            args: &[String],
+            cwd: Option<&str>,
+            output_byte_limit: Option<u64>,
         ) -> anyhow::Result<TerminalHandle> {
+            self.creates.lock().unwrap().push((
+                command.to_string(),
+                args.to_vec(),
+                cwd.map(|s| s.to_string()),
+                output_byte_limit,
+            ));
             Ok(TerminalHandle("t1".to_string()))
         }
         async fn terminal_output(&self, _t: &TerminalHandle) -> anyhow::Result<TerminalOutput> {
             Ok(TerminalOutput::default())
         }
         async fn wait_for_terminal_exit(&self, _t: &TerminalHandle) -> anyhow::Result<ExitStatus> {
+            if *self.exit_never_returns.lock().unwrap() {
+                // Never resolves — see `make_exit_never_return`.
+                std::future::pending::<()>().await;
+            }
             Ok(ExitStatus::default())
         }
-        async fn kill_terminal(&self, _t: &TerminalHandle) -> anyhow::Result<()> {
+        async fn kill_terminal(&self, t: &TerminalHandle) -> anyhow::Result<()> {
+            self.killed.lock().unwrap().push(t.clone());
             Ok(())
         }
-        async fn release_terminal(&self, _t: &TerminalHandle) -> anyhow::Result<()> {
+        async fn release_terminal(&self, t: &TerminalHandle) -> anyhow::Result<()> {
+            self.released.lock().unwrap().push(t.clone());
             Ok(())
         }
     }
