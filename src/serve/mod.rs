@@ -1968,6 +1968,16 @@ pub(crate) trait TurnHost: Send + Sync {
         crate::tools::policy::Origin::Trusted
     }
 
+    /// The editor on the other end, when there is one.
+    ///
+    /// `None` by default: `/rpc`, `/a2a`, Matrix, Discord and the voice
+    /// pipeline have no client machine to reach. The client-side tools
+    /// read this through a task-local and refuse when it is absent, so
+    /// a default of `None` is what keeps them ACP-only.
+    fn acp_client(&self) -> Option<Arc<dyn crate::tools::acp_client::AcpClient>> {
+        None
+    }
+
     /// This call cleared the gate and is about to run.
     ///
     /// Separate from `tool_start`, which fires *before* the gate and so
@@ -2425,11 +2435,17 @@ pub(crate) async fn run_llm_turn(
                 let tools = Arc::clone(&state.tools);
                 let ns = namespace.clone();
                 let timer_origin = timer_origin.clone();
+                // Read once per turn, same as `timer_origin`: `None` on
+                // every non-ACP transport, which is what keeps the
+                // client-side tools refusing there rather than reaching
+                // for a connection that does not exist.
+                let acp_client = progress.acp_client();
                 let mut results: Vec<(String, crate::tools::ToolOutput)> =
                     futures_util::future::join_all(permitted.into_iter().map(|c| {
                         let tools = Arc::clone(&tools);
                         let ns = ns.clone();
                         let origin = timer_origin.clone();
+                        let client = acp_client.clone();
                         async move {
                             let fut = crate::tools::workspace_tools::scope_memory_namespace(
                                 ns,
@@ -2440,9 +2456,27 @@ pub(crate) async fn run_llm_turn(
                                     (c.id, output)
                                 },
                             );
-                            match origin {
-                                Some(o) => crate::timer::scope_timer_origin(o, fut).await,
-                                None => fut.await,
+                            // Both scopes have to wrap execution: the
+                            // timer tool reads one task-local and the
+                            // client-side tools read the other, and
+                            // either missing breaks that set of tools.
+                            // Each arm awaits in place rather than
+                            // boxing a common future type, the same way
+                            // the single-scope version of this match did
+                            // before the client scope was added.
+                            match (origin, client) {
+                                (Some(o), Some(c)) => {
+                                    crate::timer::scope_timer_origin(
+                                        o,
+                                        crate::tools::acp_client::scope_acp_client(c, fut),
+                                    )
+                                    .await
+                                }
+                                (Some(o), None) => crate::timer::scope_timer_origin(o, fut).await,
+                                (None, Some(c)) => {
+                                    crate::tools::acp_client::scope_acp_client(c, fut).await
+                                }
+                                (None, None) => fut.await,
                             }
                         }
                     }))
