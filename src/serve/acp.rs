@@ -124,17 +124,10 @@ struct AcpSession {
     /// off the session it is running under rather than reaching back
     /// into connection state.
     ///
-    /// Nothing reads this back out of the struct yet — Task 4's
-    /// `ClientFileRead`/tool-list filtering is the intended reader.
-    /// The wire-level round trip that would exercise this (an
-    /// `initialize` naming a capability, then a `session/new`
-    /// inspecting what landed on the session) has no external
-    /// accessor to check it through today, since this struct and
-    /// `AcpSessions` live entirely inside `serve_connection`'s spawned
-    /// task; Task 4's tool-list filtering is where recording this
-    /// becomes observable, and that is where its test belongs. Remove
-    /// this allow once that lands.
-    #[allow(dead_code)]
+    /// Read at `session/prompt` time and copied onto the turn's
+    /// [`AcpProgress`], whose `client_fs_caps` is what makes the two
+    /// flags observable in `visible_tool_predicate`
+    /// (`src/serve/mod.rs`).
     client_capabilities: ClientCapabilities,
     /// Cancellation tokens for the turns *currently in flight* on this
     /// session, keyed by their connection-wide turn number.
@@ -206,6 +199,11 @@ struct AcpProgress {
     /// not change the rules under a call already being judged.
     mode: crate::tools::policy::SessionMode,
     permissions: Arc<super::acp_permissions::PermissionStore>,
+    /// This turn's session's recorded `client_capabilities`
+    /// ([`AcpSession::client_capabilities`]), copied in at construction
+    /// time rather than looked up again mid-turn. `client_fs_caps`
+    /// reads `fs.read_text_file`/`fs.write_text_file` off this.
+    client_capabilities: ClientCapabilities,
 }
 
 impl AcpProgress {
@@ -215,6 +213,7 @@ impl AcpProgress {
         profile: String,
         mode: crate::tools::policy::SessionMode,
         permissions: Arc<super::acp_permissions::PermissionStore>,
+        client_capabilities: ClientCapabilities,
     ) -> Self {
         Self {
             session_id,
@@ -223,6 +222,7 @@ impl AcpProgress {
             profile,
             mode,
             permissions,
+            client_capabilities,
         }
     }
 
@@ -301,6 +301,16 @@ impl super::TurnHost for AcpProgress {
             session_id: self.session_id.clone(),
             connection: self.connection.clone(),
         }))
+    }
+
+    /// Read straight off this turn's recorded `client_capabilities` —
+    /// the two flags independently, since a client can implement
+    /// `fs/read_text_file` without `fs/write_text_file` or vice versa.
+    fn client_fs_caps(&self) -> (bool, bool) {
+        (
+            self.client_capabilities.fs.read_text_file,
+            self.client_capabilities.fs.write_text_file,
+        )
     }
 
     /// Move a call from `Pending` to `InProgress`.
@@ -429,13 +439,6 @@ impl super::TurnHost for AcpProgress {
 /// (both fields are), so [`AcpProgress::acp_client`] hands out a fresh
 /// one rather than sharing state with the turn it was built from.
 #[derive(Clone)]
-// `-D warnings` without `--all-targets` (the CI gate) sees no reachable
-// caller into `AcpClient`'s methods yet: they're read here (`self.session_id`,
-// `self.connection`) but nothing in production code calls a method that
-// reads them, since `current_acp_client()` has no caller until Task 4's
-// `ClientFileRead`/`ClientFileWrite` reach for it. Remove this allow once
-// that lands.
-#[allow(dead_code)]
 struct AcpClientHandle {
     session_id: SessionId,
     connection: ConnectionTo<Client>,
@@ -1200,10 +1203,17 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         guard.get_mut(&req.session_id).map(|session| {
                             let turn_cancel = connection_cancel.child_token();
                             session.turns.insert(turn, turn_cancel.clone());
-                            (session.agent_session_id.clone(), turn_cancel, session.mode)
+                            (
+                                session.agent_session_id.clone(),
+                                turn_cancel,
+                                session.mode,
+                                session.client_capabilities.clone(),
+                            )
                         })
                     };
-                    let Some((agent_session_id, turn_cancel, mode)) = looked_up else {
+                    let Some((agent_session_id, turn_cancel, mode, client_capabilities)) =
+                        looked_up
+                    else {
                         // Not created on the fly: a prompt naming a session
                         // this connection never minted is a client bug, and
                         // starting one here would quietly open a second
@@ -1269,6 +1279,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         profile_name.clone(),
                         mode,
                         Arc::clone(&state.permissions),
+                        client_capabilities,
                     ));
 
                     // The turn runs OUTSIDE the dispatch loop, and the

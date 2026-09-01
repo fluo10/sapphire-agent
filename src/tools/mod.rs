@@ -1,6 +1,7 @@
 pub mod acp_client;
 pub mod ambient_tools;
 pub mod builtin_tools;
+pub mod client_tools;
 pub mod policy;
 pub mod timer_tools;
 pub mod workspace_tools;
@@ -246,6 +247,7 @@ pub async fn default_tool_set(
     timer_presets: Vec<crate::config::TimerPreset>,
 ) -> Arc<ToolSet> {
     use builtin_tools::*;
+    use client_tools::*;
     use timer_tools::*;
     use workspace_tools::*;
 
@@ -271,6 +273,8 @@ pub async fn default_tool_set(
         Box::new(DirListTool::new(Arc::clone(&state))),
         Box::new(DirWalkTool::new(Arc::clone(&state))),
         Box::new(ShellTool::new(workspace_root.clone())),
+        Box::new(ClientFileRead::new()),
+        Box::new(ClientFileWrite::new()),
         Box::new(WeatherTool::new()),
         Box::new(TimerSetTool::new(Arc::clone(&timer_manager))),
         Box::new(TimerPresetTool::new(
@@ -404,6 +408,8 @@ mod tests {
         let got_refs: Vec<(&str, ToolKind)> = got.iter().map(|(n, k)| (n.as_str(), *k)).collect();
 
         let want: Vec<(&str, ToolKind)> = vec![
+            ("client_file_read", ToolKind::Read),
+            ("client_file_write", ToolKind::Edit),
             ("dir_list", ToolKind::Search),
             ("dir_walk", ToolKind::Search),
             ("file_append", ToolKind::Edit),

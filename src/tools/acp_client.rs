@@ -65,9 +65,6 @@ pub struct TerminalOutput {
 /// those.
 #[async_trait::async_trait]
 pub trait AcpClient: Send + Sync {
-    // No call site until Task 4's `ClientFileRead` calls this. Remove this
-    // allow there.
-    #[allow(dead_code)]
     async fn read_text_file(
         &self,
         path: &str,
@@ -75,9 +72,6 @@ pub trait AcpClient: Send + Sync {
         limit: Option<u32>,
     ) -> anyhow::Result<String>;
 
-    // No call site until Task 4's `ClientFileWrite` calls this. Remove this
-    // allow there.
-    #[allow(dead_code)]
     async fn write_text_file(&self, path: &str, content: &str) -> anyhow::Result<()>;
 
     // No call site until Task 5's `ClientShell` calls this. Remove this
@@ -138,9 +132,6 @@ pub fn scope_acp_client<F: std::future::Future>(
 /// `None` on every non-ACP transport — `/rpc`, Matrix, Discord, voice —
 /// which is what makes the client tools refuse there rather than
 /// reaching for a connection that does not exist.
-// No call site outside this module's own tests until Task 4's
-// `ClientFileRead`/`ClientFileWrite` call this. Remove this allow there.
-#[allow(dead_code)]
 pub fn current_acp_client() -> Option<Arc<dyn AcpClient>> {
     ACP_CLIENT_TL.try_with(Arc::clone).ok()
 }
@@ -150,20 +141,15 @@ pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    /// One recorded call to `read_text_file`: `(path, line, limit)`.
+    pub(crate) type ReadCall = (String, Option<u32>, Option<u32>);
+
     /// A stand-in for the editor. Records what it was asked and answers
     /// from a script, so the tools can be driven without a socket.
     #[derive(Default)]
     pub(crate) struct FakeClient {
-        // Written by `read_text_file` but nothing reads it back until
-        // Task 4's tests assert on `fake.reads`. Remove this allow there.
-        #[allow(dead_code)]
-        pub reads: Mutex<Vec<(String, Option<u32>, Option<u32>)>>,
+        pub reads: Mutex<Vec<ReadCall>>,
         pub writes: Mutex<Vec<(String, String)>>,
-        // Set by Task 4's tests to script an error/answer from
-        // `read_text_file`; nothing reads it back today because nothing
-        // calls `read_text_file` yet. Remove this allow once Task 4
-        // lands.
-        #[allow(dead_code)]
         pub read_answer: Mutex<Option<Result<String, String>>>,
     }
 

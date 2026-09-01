@@ -1978,6 +1978,20 @@ pub(crate) trait TurnHost: Send + Sync {
         None
     }
 
+    /// The editor's declared file-system capabilities for this turn, as
+    /// `(read, write)`. A client can implement `fs/read_text_file`
+    /// without `fs/write_text_file` or vice versa, so the two are read
+    /// independently rather than folded into one "fs" bit — see
+    /// `visible_tool_predicate` and `client_tools::ClientFileRead`/
+    /// `ClientFileWrite`.
+    ///
+    /// `(false, false)` by default: every host with no editor on the
+    /// other end (`/rpc`, `/a2a`, Matrix, Discord, voice) has nothing
+    /// to ask this of.
+    fn client_fs_caps(&self) -> (bool, bool) {
+        (false, false)
+    }
+
     /// This call cleared the gate and is about to run.
     ///
     /// Separate from `tool_start`, which fires *before* the gate and so
@@ -2145,6 +2159,37 @@ pub(crate) struct LlmTurnOutcome {
 /// Anything added to this function that must happen exactly once per turn
 /// needs to be written with that in mind: reaching the end of the body is
 /// not guaranteed.
+/// Which tools a turn's model may see.
+///
+/// The one function that decides this — `run_llm_turn` and its
+/// filtering tests both call it, rather than each building their own
+/// version of the same rule (see `ToolSet::specs_filtered`'s doc for
+/// why an unusable tool is worse than an absent one).
+///
+/// `client_file_read`/`client_file_write` are named directly rather
+/// than matched by prefix or `ToolKind`: a client can implement
+/// `fs/read_text_file` without `fs/write_text_file` (or vice versa),
+/// and this is where that independence has to be honored, or the
+/// capability this turn's editor recorded (`AcpSession::client_capabilities`,
+/// `src/serve/acp.rs`) was recorded for nothing.
+fn visible_tool_predicate(
+    host_access_enabled: bool,
+    has_client: bool,
+    client_fs_read: bool,
+    client_fs_write: bool,
+) -> impl Fn(&str) -> bool {
+    move |name: &str| {
+        if crate::tools::policy::host_tool_denied(name, host_access_enabled) {
+            return false;
+        }
+        match name {
+            "client_file_read" => has_client && client_fs_read,
+            "client_file_write" => has_client && client_fs_write,
+            _ => true,
+        }
+    }
+}
+
 pub(crate) async fn run_llm_turn(
     state: Arc<ServeState>,
     session_id: String,
@@ -2250,12 +2295,20 @@ pub(crate) async fn run_llm_turn(
     // A tool the caller cannot use is worse than absent — see
     // `ToolSet::specs_filtered`. Host tools (the agent's own filesystem
     // and shell) are hidden from the list whenever the operator has not
-    // opted this deployment into host access; client-side tools add
-    // their own condition to this predicate in a later task.
+    // opted this deployment into host access; the two client-side file
+    // tools are hidden whenever there is no editor on the other end, or
+    // it did not declare the matching `fs` capability.
     let host_access_enabled = state.config.tools.host_access.enabled;
+    let has_client = progress.acp_client().is_some();
+    let (client_fs_read, client_fs_write) = progress.client_fs_caps();
     let tool_specs = state
         .tools
-        .specs_filtered(|name| !crate::tools::policy::host_tool_denied(name, host_access_enabled))
+        .specs_filtered(visible_tool_predicate(
+            host_access_enabled,
+            has_client,
+            client_fs_read,
+            client_fs_write,
+        ))
         .await;
     let compression_config = &state.config.compression;
     let mut accumulated_text: Vec<String> = Vec::new();
@@ -2864,6 +2917,37 @@ impl crate::tools::Tool for RiskyTool {
     async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
         self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok("ran".to_string())
+    }
+}
+
+/// A minimal named stub, for tests that only care whether a tool's name
+/// survives `specs_filtered` — not what it does. Used to stand in for
+/// the host tools (`crate::tools::policy::HOST_TOOLS`), which the
+/// filtering tests below need present in the set so "not offered"
+/// means the predicate hid them, not that they were never registered.
+#[cfg(test)]
+struct NamedStubTool(crate::provider::ToolSpec);
+
+#[cfg(test)]
+impl NamedStubTool {
+    fn new(name: &str) -> Self {
+        Self(crate::provider::ToolSpec {
+            name: name.to_string().into(),
+            description: String::new().into(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+        })
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::tools::Tool for NamedStubTool {
+    fn spec(&self) -> &crate::provider::ToolSpec {
+        &self.0
+    }
+
+    async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
+        Ok(String::new())
     }
 }
 
@@ -4023,5 +4107,118 @@ mod tests {
         assert_eq!(r.sessions, 0);
         assert_eq!(r.messages, 0);
         assert_eq!(r.largest, None);
+    }
+
+    // -----------------------------------------------------------------
+    // visible_tool_predicate — which tools a turn's model may see
+    // -----------------------------------------------------------------
+
+    /// What a hypothetical ACP turn's editor declared, for
+    /// `tool_names_for_turn`. Deliberately not `ClientCapabilities`
+    /// itself: these tests exercise `visible_tool_predicate`, the same
+    /// function `run_llm_turn` calls, not the wire-level plumbing that
+    /// fills `AcpSession::client_capabilities` in from `initialize` —
+    /// that plumbing has no test-visible seam of its own (see the
+    /// comment at the end of `src/serve/acp.rs`'s test module).
+    struct TestCaps {
+        fs_read: bool,
+        fs_write: bool,
+        /// Unread until Task 5's terminal-tool filtering test. Kept
+        /// here now so this task's tests match the brief's call sites
+        /// rather than a struct reshaped to omit it.
+        #[allow(dead_code)]
+        terminal: bool,
+    }
+
+    /// A `ToolSet` carrying a stand-in for every host tool plus the two
+    /// real client-side file tools, so "not offered" in the assertions
+    /// below means the predicate hid the name — not that it was never
+    /// registered in the first place.
+    fn client_filtering_test_set() -> ToolSet {
+        let mut tools: Vec<Box<dyn crate::tools::Tool>> = crate::tools::policy::HOST_TOOLS
+            .iter()
+            .map(|name| Box::new(NamedStubTool::new(name)) as Box<dyn crate::tools::Tool>)
+            .collect();
+        tools.push(Box::new(crate::tools::client_tools::ClientFileRead::new()));
+        tools.push(Box::new(crate::tools::client_tools::ClientFileWrite::new()));
+        ToolSet::new(tools, Vec::new())
+    }
+
+    /// The tool names an ACP turn with an editor declaring `caps` would
+    /// see. Host access stays off (the deployment default) — these
+    /// tests are about the client-side flags, not the host gate.
+    async fn tool_names_for_turn(caps: TestCaps) -> Vec<String> {
+        client_filtering_test_set()
+            .specs_filtered(visible_tool_predicate(
+                false,
+                true,
+                caps.fs_read,
+                caps.fs_write,
+            ))
+            .await
+            .into_iter()
+            .map(|s| s.name.to_string())
+            .collect()
+    }
+
+    /// The tool names a turn with no editor on the other end (`/rpc`,
+    /// Matrix, Discord, voice) would see, with host access left at its
+    /// off-by-default setting.
+    async fn tool_names_for_turn_without_a_client() -> Vec<String> {
+        client_filtering_test_set()
+            .specs_filtered(visible_tool_predicate(false, false, false, false))
+            .await
+            .into_iter()
+            .map(|s| s.name.to_string())
+            .collect()
+    }
+
+    /// A client that says it can read but not write gets exactly one of
+    /// the two file tools. Clients implement these independently, so
+    /// the two flags are read separately rather than as one "fs" bit.
+    #[tokio::test]
+    async fn the_two_fs_tools_follow_their_own_capability_flags() {
+        let names = tool_names_for_turn(TestCaps {
+            fs_read: true,
+            fs_write: false,
+            terminal: false,
+        })
+        .await;
+        assert!(names.contains(&"client_file_read".to_string()));
+        assert!(!names.contains(&"client_file_write".to_string()));
+
+        let names = tool_names_for_turn(TestCaps {
+            fs_read: false,
+            fs_write: true,
+            terminal: false,
+        })
+        .await;
+        assert!(!names.contains(&"client_file_read".to_string()));
+        assert!(names.contains(&"client_file_write".to_string()));
+    }
+
+    /// Matrix, Discord, `/rpc` and voice have no editor. Offering them a
+    /// tool that can only fail wastes a round trip and invites the model
+    /// to pick the wrong machine.
+    #[tokio::test]
+    async fn a_non_acp_turn_is_offered_no_client_tools() {
+        let names = tool_names_for_turn_without_a_client().await;
+        assert!(
+            !names.iter().any(|n| n.starts_with("client_")),
+            "got: {names:?}"
+        );
+    }
+
+    /// The host switch is off by default, so its seven tools are absent
+    /// from an ordinary turn's list entirely — not offered and refused.
+    #[tokio::test]
+    async fn host_tools_are_absent_when_host_access_is_off() {
+        let names = tool_names_for_turn_without_a_client().await;
+        for name in crate::tools::policy::HOST_TOOLS {
+            assert!(
+                !names.contains(&name.to_string()),
+                "{name} should be hidden"
+            );
+        }
     }
 }
