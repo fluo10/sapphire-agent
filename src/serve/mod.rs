@@ -159,6 +159,23 @@ pub struct ServeState {
     /// no-op (logged), and the ACP digest sweep skips its tick
     /// entirely — a session must still load and serve without one.
     pub(crate) digest_cache: Option<Arc<DigestCache>>,
+    /// Terminals the model started and has not cleaned up, per agent
+    /// session id.
+    ///
+    /// Keyed by session rather than by connection on purpose. ACP
+    /// terminals are addressed by `session_id`, a session outlives a
+    /// connection via `session/load`, and `terminal/release` kills the
+    /// command — so releasing these because a socket dropped would
+    /// kill a build over a network blip. Nothing here is cleaned up on
+    /// disconnect; see `acp::release_connection_sessions`'s doc.
+    ///
+    /// `Arc`-wrapped, unlike most maps on this struct: the `AcpClient`
+    /// each turn is handed (`AcpClientHandle` in `serve::acp`,
+    /// `FakeClient` in `tools::acp_client`'s tests) reads and writes
+    /// this same map directly, so `client_tools::ClientShellStart`'s
+    /// cap check can see it without `tools::client_tools` depending on
+    /// `ServeState` itself — see `TerminalRegistry`'s doc.
+    pub(crate) acp_terminals: crate::tools::acp_client::TerminalRegistry,
 }
 
 impl ServeState {
@@ -226,6 +243,7 @@ impl ServeState {
             acp_session_store,
             acp_sessions: tokio::sync::Mutex::new(HashSet::new()),
             digest_cache,
+            acp_terminals: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -2198,7 +2216,9 @@ fn visible_tool_predicate(
         match name {
             "client_file_read" => has_client && client_fs_read,
             "client_file_write" => has_client && client_fs_write,
-            "client_shell" => has_client && client_terminal,
+            "client_shell" | "client_shell_start" | "client_shell_output" | "client_shell_kill" => {
+                has_client && client_terminal
+            }
             _ => true,
         }
     }
@@ -3229,6 +3249,7 @@ rooms    = []
             acp_session_store,
             acp_sessions: Default::default(),
             digest_cache,
+            acp_terminals: Default::default(),
         })
     }
 }
@@ -4154,6 +4175,9 @@ mod tests {
         tools.push(Box::new(crate::tools::client_tools::ClientFileRead::new()));
         tools.push(Box::new(crate::tools::client_tools::ClientFileWrite::new()));
         tools.push(Box::new(crate::tools::client_tools::ClientShell::new()));
+        tools.push(Box::new(crate::tools::client_tools::ClientShellStart::new()));
+        tools.push(Box::new(crate::tools::client_tools::ClientShellOutput::new()));
+        tools.push(Box::new(crate::tools::client_tools::ClientShellKill::new()));
         ToolSet::new(tools, Vec::new())
     }
 
@@ -4217,13 +4241,22 @@ mod tests {
     /// capability isn't split into finer-grained bits.
     #[tokio::test]
     async fn the_terminal_tool_follows_its_own_capability_flag() {
+        let terminal_tools = [
+            "client_shell",
+            "client_shell_start",
+            "client_shell_output",
+            "client_shell_kill",
+        ];
+
         let names = tool_names_for_turn(TestCaps {
             fs_read: false,
             fs_write: false,
             terminal: true,
         })
         .await;
-        assert!(names.contains(&"client_shell".to_string()));
+        for tool in terminal_tools {
+            assert!(names.contains(&tool.to_string()), "missing {tool}: {names:?}");
+        }
 
         let names = tool_names_for_turn(TestCaps {
             fs_read: false,
@@ -4231,7 +4264,9 @@ mod tests {
             terminal: false,
         })
         .await;
-        assert!(!names.contains(&"client_shell".to_string()));
+        for tool in terminal_tools {
+            assert!(!names.contains(&tool.to_string()), "unexpected {tool}: {names:?}");
+        }
     }
 
     /// Matrix, Discord, `/rpc` and voice have no editor. Offering them a

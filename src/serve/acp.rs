@@ -213,6 +213,13 @@ struct AcpProgress {
     /// session's without this struct exposing a bespoke `TurnHost`
     /// accessor for it.
     cwd: PathBuf,
+    /// The whole host's terminal registry (`ServeState.acp_terminals`),
+    /// cloned in at construction time. Handed to `AcpClientHandle` by
+    /// `acp_client()` below, which is what lets the client-shell tools
+    /// (`src/tools/client_tools.rs`) track and cap terminals per
+    /// session without this struct or `AcpClientHandle` holding the
+    /// whole `ServeState`.
+    terminals: crate::tools::acp_client::TerminalRegistry,
 }
 
 /// The `(read, write)` pair `TurnHost::client_fs_caps` reports, pulled
@@ -255,6 +262,7 @@ fn effective_cwd(requested: Option<&str>, session_cwd: &Path) -> PathBuf {
 }
 
 impl AcpProgress {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         session_id: SessionId,
         connection: ConnectionTo<Client>,
@@ -263,6 +271,7 @@ impl AcpProgress {
         permissions: Arc<super::acp_permissions::PermissionStore>,
         client_capabilities: ClientCapabilities,
         cwd: PathBuf,
+        terminals: crate::tools::acp_client::TerminalRegistry,
     ) -> Self {
         Self {
             session_id,
@@ -273,6 +282,7 @@ impl AcpProgress {
             permissions,
             client_capabilities,
             cwd,
+            terminals,
         }
     }
 
@@ -351,6 +361,7 @@ impl super::TurnHost for AcpProgress {
             session_id: self.session_id.clone(),
             connection: self.connection.clone(),
             cwd: self.cwd.clone(),
+            terminals: Arc::clone(&self.terminals),
         }))
     }
 
@@ -500,6 +511,12 @@ struct AcpClientHandle {
     /// This turn's session's cwd, copied in from [`AcpProgress::cwd`].
     /// `create_terminal` falls back to it when called with `cwd: None`.
     cwd: PathBuf,
+    /// Shared with `ServeState.acp_terminals` via [`AcpProgress::terminals`].
+    /// `tracked_terminals`/`track_terminal`/`untrack_terminal` below
+    /// key into it with `session_id.to_string()` — the same string
+    /// `AcpSession::agent_session_id` holds for this session, since a
+    /// `SessionId` is minted from exactly that string.
+    terminals: crate::tools::acp_client::TerminalRegistry,
 }
 
 #[async_trait::async_trait]
@@ -603,6 +620,34 @@ impl crate::tools::acp_client::AcpClient for AcpClientHandle {
         );
         self.connection.send_request(request).block_task().await?;
         Ok(())
+    }
+
+    async fn tracked_terminals(&self) -> Vec<crate::tools::acp_client::TerminalHandle> {
+        self.terminals
+            .lock()
+            .await
+            .get(&self.session_id.to_string())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    async fn track_terminal(&self, handle: crate::tools::acp_client::TerminalHandle) {
+        self.terminals
+            .lock()
+            .await
+            .entry(self.session_id.to_string())
+            .or_default()
+            .push(handle);
+    }
+
+    async fn untrack_terminal(&self, handle: &crate::tools::acp_client::TerminalHandle) {
+        let mut registry = self.terminals.lock().await;
+        if let Some(held) = registry.get_mut(&self.session_id.to_string()) {
+            held.retain(|h| h != handle);
+            if held.is_empty() {
+                registry.remove(&self.session_id.to_string());
+            }
+        }
     }
 }
 
@@ -779,6 +824,33 @@ async fn count_session_open(state: &Arc<ServeState>, id: &str) {
              and writes it back whole, so the last turn to finish wins in memory while both \
              have already appended to the transcript."
         );
+    }
+}
+
+/// Release every session id a closing connection held: decrement
+/// `open_acp_sessions` for each, dropping the entry once its count
+/// reaches zero.
+///
+/// Called from `serve_connection`'s teardown, and from
+/// `client_tools`'s `simulate_connection_teardown` test helper — the
+/// same function both reach lets a test prove "closing a connection
+/// releases nothing in `acp_terminals`" against the real teardown
+/// code, rather than against a test's own idea of what teardown does.
+///
+/// Deliberately does **not** touch `acp_terminals`: `terminal/release`
+/// kills the command it releases, so freeing a terminal here because a
+/// socket dropped would kill a build over a network blip. The handles
+/// stay tracked against the session id, so a client that reconnects
+/// and reloads the session can still reach them.
+pub(crate) async fn release_connection_sessions(state: &Arc<ServeState>, held: Vec<String>) {
+    let mut open = state.open_acp_sessions.lock().await;
+    for id in held {
+        if let Some(count) = open.get_mut(&id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                open.remove(&id);
+            }
+        }
     }
 }
 
@@ -1340,6 +1412,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         Arc::clone(&state.permissions),
                         client_capabilities,
                         cwd,
+                        Arc::clone(&state.acp_terminals),
                     ));
 
                     // The turn runs OUTSIDE the dispatch loop, and the
@@ -1500,6 +1573,13 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
     // `open_acp_sessions` into a leak that warns forever: the next
     // connection to load the same session would find a stale count already
     // above one and warn about a collision that no longer exists.
+    //
+    // Terminals are deliberately NOT released here. `terminal/release`
+    // kills the command, and a dropped socket is not a reason to kill a
+    // build running on the user's machine. The handles stay tracked
+    // against the session, so a client that reconnects and loads the
+    // session can still reach them. See `release_connection_sessions`'s
+    // doc for the rest of the reasoning.
     {
         let held: Vec<String> = sessions
             .inner
@@ -1508,15 +1588,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
             .values()
             .map(|s| s.agent_session_id.clone())
             .collect();
-        let mut open = state.open_acp_sessions.lock().await;
-        for id in held {
-            if let Some(count) = open.get_mut(&id) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    open.remove(&id);
-                }
-            }
-        }
+        release_connection_sessions(&state, held).await;
     }
 
     // Belt and braces, and known to be so. By the time this runs the socket

@@ -14,6 +14,7 @@
 //! can be driven by a fake in tests, and so everything that knows about
 //! ACP's wire types stays inside `serve::acp`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// An opaque handle to a command running on the client's machine.
@@ -45,6 +46,20 @@ pub struct TerminalOutput {
     /// `None` while the command is still running.
     pub exit_status: Option<ExitStatus>,
 }
+
+/// The session-keyed store of terminals a session has started and not
+/// yet released.
+///
+/// `Arc`-wrapped so it can be shared between `ServeState.acp_terminals`
+/// (`src/serve/mod.rs`), the authoritative copy that outlives any one
+/// connection, and whichever [`AcpClient`] is tracking against it —
+/// `AcpClientHandle` (`src/serve/acp.rs`) for a real connection,
+/// `FakeClient` below for tests. `client_tools::ClientShellStart`'s cap
+/// check has to see every handle a session holds, including ones left
+/// behind by a connection other than the one asking, without this
+/// module depending on `ServeState` itself — hence the type living
+/// here rather than in `serve`.
+pub(crate) type TerminalRegistry = Arc<tokio::sync::Mutex<HashMap<String, Vec<TerminalHandle>>>>;
 
 /// What the editor can be asked to do on its own machine.
 ///
@@ -78,9 +93,6 @@ pub trait AcpClient: Send + Sync {
 
     /// Ends the command but keeps the handle usable, so the output can
     /// still be collected afterwards.
-    // No call site until Task 6's `ClientShellKill` calls this. Remove
-    // this allow there.
-    #[allow(dead_code)]
     async fn kill_terminal(&self, terminal: &TerminalHandle) -> anyhow::Result<()>;
 
     /// Frees the handle — **and kills the command if it is still
@@ -90,6 +102,31 @@ pub trait AcpClient: Send + Sync {
     /// just because a connection went away — releasing on a dropped
     /// socket would kill a user's build over a network blip.
     async fn release_terminal(&self, terminal: &TerminalHandle) -> anyhow::Result<()>;
+
+    /// Terminal handles this client's session currently has open —
+    /// started but not yet released — in the order they were tracked.
+    ///
+    /// `client_tools::ClientShellStart` reads this to decide whether
+    /// the session is already at the cap *before* asking the client to
+    /// create anything, which is what keeps a refused call from
+    /// reaching the wire at all.
+    async fn tracked_terminals(&self) -> Vec<TerminalHandle>;
+
+    /// Record that `handle` now belongs to this client's session, so
+    /// it counts against the cap and shows up in `tracked_terminals`
+    /// until [`untrack_terminal`](AcpClient::untrack_terminal) drops
+    /// it.
+    async fn track_terminal(&self, handle: TerminalHandle);
+
+    /// Drop `handle` from this client's session tracking.
+    ///
+    /// Not a release: called after a real `release_terminal`/
+    /// `kill_terminal`+`release_terminal` succeeds, and also when the
+    /// client reports the handle unknown — in that second case there
+    /// is nothing left to release, only bookkeeping to correct so a
+    /// handle the client has already forgotten stops counting against
+    /// the cap.
+    async fn untrack_terminal(&self, handle: &TerminalHandle);
 }
 
 tokio::task_local! {
@@ -141,6 +178,30 @@ pub(crate) mod tests {
         /// `tokio::time::timeout` race actually win on the timeout arm
         /// without a test sleeping out a real wall-clock timeout.
         exit_never_returns: Mutex<bool>,
+        /// Set by [`FakeClient::hand_out_distinct_handles`]. When true,
+        /// `create_terminal` hands back `t1`, `t2`, … in order instead
+        /// of always `t1` — needed by the cap test, which has to tell
+        /// the eight handles it holds apart.
+        distinct_handles: Mutex<bool>,
+        next_handle: Mutex<u32>,
+        /// Set by [`FakeClient::make_output_fail_with`]:
+        /// `terminal_output` returns this as an error instead of a
+        /// result, simulating a client that no longer recognises the
+        /// handle (e.g. after its own restart).
+        output_error: Mutex<Option<String>>,
+        /// The session id this fake's terminal tracking is keyed
+        /// under, and the registry it tracks in. Plain fields rather
+        /// than `Mutex`-wrapped: both are set once, by struct-update
+        /// syntax, before the value is wrapped in an `Arc` for use.
+        /// `client_tools`'s `shell_test_state` points `terminals` at
+        /// the same `Arc` a `ServeState` under test uses, so tracking
+        /// driven purely by calling this fake is visible on
+        /// `ServeState.acp_terminals` too. Every other test builds a
+        /// `FakeClient` with `..Default::default()`, which leaves an
+        /// empty, private registry — correct, self-contained cap
+        /// bookkeeping for tests that never look at a `ServeState`.
+        pub(crate) terminal_session: String,
+        pub(crate) terminals: TerminalRegistry,
     }
 
     impl FakeClient {
@@ -149,6 +210,18 @@ pub(crate) mod tests {
         /// timeout branch.
         pub(crate) fn make_exit_never_return(&self) {
             *self.exit_never_returns.lock().unwrap() = true;
+        }
+
+        /// Make `create_terminal` hand back sequential ids (`t1`, `t2`,
+        /// …) instead of always `t1`.
+        pub(crate) fn hand_out_distinct_handles(&self) {
+            *self.distinct_handles.lock().unwrap() = true;
+        }
+
+        /// Make `terminal_output` fail with `message`, as if the client
+        /// no longer recognised the handle.
+        pub(crate) fn make_output_fail_with(&self, message: &str) {
+            *self.output_error.lock().unwrap() = Some(message.to_string());
         }
     }
 
@@ -190,9 +263,19 @@ pub(crate) mod tests {
                 cwd.map(|s| s.to_string()),
                 output_byte_limit,
             ));
-            Ok(TerminalHandle("t1".to_string()))
+            let id = if *self.distinct_handles.lock().unwrap() {
+                let mut next = self.next_handle.lock().unwrap();
+                *next += 1;
+                format!("t{next}")
+            } else {
+                "t1".to_string()
+            };
+            Ok(TerminalHandle(id))
         }
         async fn terminal_output(&self, _t: &TerminalHandle) -> anyhow::Result<TerminalOutput> {
+            if let Some(message) = self.output_error.lock().unwrap().clone() {
+                return Err(anyhow::anyhow!(message));
+            }
             Ok(TerminalOutput::default())
         }
         async fn wait_for_terminal_exit(&self, _t: &TerminalHandle) -> anyhow::Result<ExitStatus> {
@@ -209,6 +292,31 @@ pub(crate) mod tests {
         async fn release_terminal(&self, t: &TerminalHandle) -> anyhow::Result<()> {
             self.released.lock().unwrap().push(t.clone());
             Ok(())
+        }
+        async fn tracked_terminals(&self) -> Vec<TerminalHandle> {
+            self.terminals
+                .lock()
+                .await
+                .get(&self.terminal_session)
+                .cloned()
+                .unwrap_or_default()
+        }
+        async fn track_terminal(&self, handle: TerminalHandle) {
+            self.terminals
+                .lock()
+                .await
+                .entry(self.terminal_session.clone())
+                .or_default()
+                .push(handle);
+        }
+        async fn untrack_terminal(&self, handle: &TerminalHandle) {
+            let mut registry = self.terminals.lock().await;
+            if let Some(held) = registry.get_mut(&self.terminal_session) {
+                held.retain(|h| h != handle);
+                if held.is_empty() {
+                    registry.remove(&self.terminal_session);
+                }
+            }
         }
     }
 
