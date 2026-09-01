@@ -189,17 +189,26 @@ pub(crate) mod tests {
         /// result, simulating a client that no longer recognises the
         /// handle (e.g. after its own restart).
         output_error: Mutex<Option<String>>,
+        /// Set by [`FakeClient::make_kill_fail_with`]: both
+        /// `kill_terminal` and `release_terminal` return this as an
+        /// error instead of succeeding, simulating a client that
+        /// answers "no such terminal" to a kill/release the same way
+        /// `output_error` simulates it for a read.
+        kill_error: Mutex<Option<String>>,
         /// The session id this fake's terminal tracking is keyed
         /// under, and the registry it tracks in. Plain fields rather
-        /// than `Mutex`-wrapped: both are set once, by struct-update
-        /// syntax, before the value is wrapped in an `Arc` for use.
-        /// `client_tools`'s `shell_test_state` points `terminals` at
-        /// the same `Arc` a `ServeState` under test uses, so tracking
-        /// driven purely by calling this fake is visible on
-        /// `ServeState.acp_terminals` too. Every other test builds a
-        /// `FakeClient` with `..Default::default()`, which leaves an
-        /// empty, private registry — correct, self-contained cap
-        /// bookkeeping for tests that never look at a `ServeState`.
+        /// than `Mutex`-wrapped: both are set once, by direct field
+        /// assignment on an owned, not-yet-`Arc`-wrapped value (struct-
+        /// update syntax needs every field visible at the call site,
+        /// including the private ones above, so it doesn't work from
+        /// outside this module). `client_tools`'s `shell_test_state`
+        /// points `terminals` at the same `Arc` a `ServeState` under
+        /// test uses, so tracking driven purely by calling this fake is
+        /// visible on `ServeState.acp_terminals` too. Every other test
+        /// builds a `FakeClient` with `..Default::default()` or
+        /// `FakeClient::default()` untouched, which leaves an empty,
+        /// private registry — correct, self-contained cap bookkeeping
+        /// for tests that never look at a `ServeState`.
         pub(crate) terminal_session: String,
         pub(crate) terminals: TerminalRegistry,
     }
@@ -222,6 +231,13 @@ pub(crate) mod tests {
         /// no longer recognised the handle.
         pub(crate) fn make_output_fail_with(&self, message: &str) {
             *self.output_error.lock().unwrap() = Some(message.to_string());
+        }
+
+        /// Make both `kill_terminal` and `release_terminal` fail with
+        /// `message`, as if the client no longer recognised the handle
+        /// by the time a kill reached it.
+        pub(crate) fn make_kill_fail_with(&self, message: &str) {
+            *self.kill_error.lock().unwrap() = Some(message.to_string());
         }
     }
 
@@ -287,10 +303,16 @@ pub(crate) mod tests {
         }
         async fn kill_terminal(&self, t: &TerminalHandle) -> anyhow::Result<()> {
             self.killed.lock().unwrap().push(t.clone());
+            if let Some(message) = self.kill_error.lock().unwrap().clone() {
+                return Err(anyhow::anyhow!(message));
+            }
             Ok(())
         }
         async fn release_terminal(&self, t: &TerminalHandle) -> anyhow::Result<()> {
             self.released.lock().unwrap().push(t.clone());
+            if let Some(message) = self.kill_error.lock().unwrap().clone() {
+                return Err(anyhow::anyhow!(message));
+            }
             Ok(())
         }
         async fn tracked_terminals(&self) -> Vec<TerminalHandle> {

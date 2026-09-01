@@ -248,6 +248,15 @@ fn format_finished(output: &TerminalOutput, status: &ExitStatus) -> String {
 /// command is exactly the outcome not-releasing was meant to avoid.
 /// The result text is worded so that misreading is not possible, and
 /// ends with an explicit instruction not to re-run.
+///
+/// # Also subject to the session's terminal cap
+///
+/// A timed-out call leaves a handle tracked (see above), so without a
+/// cap check here a model could loop `client_shell` with a short
+/// `timeout_secs` and accumulate unbounded live processes on the
+/// user's machine — exactly what `MAX_TERMINALS_PER_SESSION` exists to
+/// prevent. So `execute` checks the same cap `ClientShellStart` does,
+/// before calling `create_terminal`, and refuses the same way.
 pub struct ClientShell {
     spec: ToolSpec,
 }
@@ -257,7 +266,8 @@ impl ClientShell {
         Self {
             spec: ToolSpec {
                 name: "client_shell".into(),
-                description: "Run a command on the machine the connected editor is \
+                description: format!(
+                    "Run a command on the machine the connected editor is \
                     running on — NOT this agent's own machine. Use `shell` instead \
                     for commands on the agent's machine. \
                     Waits up to `timeout_secs` (default 120, max 600) for the \
@@ -266,10 +276,14 @@ impl ClientShell {
                     NOT finish in time, the command is left running rather than \
                     killed — the result names the terminal handle so it can be \
                     checked or stopped later; do not re-run the command just \
-                    because this call timed out. \
+                    because this call timed out. A session may hold at most \
+                    {MAX_TERMINALS_PER_SESSION} terminals at once, counting both \
+                    this tool's timed-out handles and client_shell_start's; \
+                    starting one past that is refused. \
                     Only available inside an ACP session whose editor supports \
                     `terminal/*`; refuses otherwise."
-                    .into(),
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -330,6 +344,16 @@ impl Tool for ClientShell {
         let timeout = clamp_timeout(input["timeout_secs"].as_u64());
 
         let client = current_acp_client().ok_or_else(no_editor_error)?;
+
+        // Same cap, same check, as `ClientShellStart`: a timed-out call
+        // below leaves a handle tracked, so without this a model
+        // looping `client_shell` with a short `timeout_secs` could
+        // accumulate unbounded live processes — see this tool's doc.
+        let held = client.tracked_terminals().await;
+        if held.len() >= MAX_TERMINALS_PER_SESSION {
+            return Err(cap_error(&held));
+        }
+
         let handle = client
             .create_terminal(command, &args, cwd, Some(OUTPUT_CAP_BYTES as u64))
             .await?;
@@ -411,17 +435,20 @@ impl ClientShellStart {
         Self {
             spec: ToolSpec {
                 name: "client_shell_start".into(),
-                description: "Start a long-running command on the machine the connected \
+                description: format!(
+                    "Start a long-running command on the machine the connected \
                     editor is running on — NOT this agent's own machine — and return \
                     immediately with a terminal handle instead of waiting for it to finish. \
                     Prefer this over `client_shell` for a command expected to keep running \
                     (a dev server, a watch task) or that may outlast a reasonable wait. \
                     Check on it with client_shell_output and stop it with client_shell_kill. \
-                    A session may hold at most 8 terminals at once; starting a ninth is \
-                    refused, naming the handles already held, until one is freed. \
+                    A session may hold at most {MAX_TERMINALS_PER_SESSION} terminals at \
+                    once; starting one more than that is refused, naming the handles \
+                    already held, until one is freed. \
                     Only available inside an ACP session whose editor supports \
                     `terminal/*`; refuses otherwise."
-                    .into(),
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -496,12 +523,23 @@ impl Tool for ClientShellStart {
 /// by a `client_shell` timeout): its output so far, whether it has
 /// finished, and its exit status if it has.
 ///
-/// A client that no longer recognises the handle — most likely after
-/// its own restart — answers `terminal_output` with an error rather
-/// than a result. There is nothing left to release in that case, only
-/// bookkeeping to correct, so the handle is dropped from tracking
-/// (never released) and the client's own words are passed on to the
-/// model.
+/// # An output error does NOT untrack the handle
+///
+/// The sanctioned reason to drop tracking without a release is "the
+/// client says this handle doesn't exist" — but a `terminal_output`
+/// error is not proof of that. A transient failure (the client
+/// mid-reconnect, a timed-out request) surfaces through the same `Err`
+/// as a genuinely unknown handle, and `AcpClient` gives no way to tell
+/// the two apart. Untracking on every error would silently drop a
+/// terminal that is still running: it stops counting against the cap
+/// and disappears from the listing the model is told to clean up from,
+/// with nothing left for the model to do about it.
+///
+/// So this tool leaves the handle tracked on any error and just
+/// reports the client's message. Over-counting is the recoverable
+/// direction — `client_shell_kill` untracks unconditionally (see its
+/// doc), so the model can always clear a handle it no longer needs by
+/// killing it, even if this tool keeps failing on it.
 pub struct ClientShellOutput {
     spec: ToolSpec,
 }
@@ -554,17 +592,11 @@ impl Tool for ClientShellOutput {
         let handle = TerminalHandle(terminal.to_string());
 
         let client = current_acp_client().ok_or_else(no_editor_error)?;
-        let output = match client.terminal_output(&handle).await {
-            Ok(output) => output,
-            Err(e) => {
-                // The client's answer, not a wire failure this tool
-                // invented: most likely the client no longer knows this
-                // handle (e.g. it restarted). Nothing to release, only
-                // the cap accounting to correct.
-                client.untrack_terminal(&handle).await;
-                return Err(e);
-            }
-        };
+        // Deliberately does NOT untrack on error — see this tool's doc.
+        // An error here could be transient rather than "this handle is
+        // truly gone," and untracking a terminal that is still running
+        // would be unrecoverable; leaving it tracked is not.
+        let output = client.terminal_output(&handle).await?;
 
         let mut out = output.output.clone();
         if output.truncated {
@@ -585,7 +617,22 @@ impl Tool for ClientShellOutput {
 /// valid, so a caller that stopped there would leak it against the cap
 /// forever. `release_terminal` — which the ACP schema defines as also
 /// killing the command, redundantly with the kill just sent — is what
-/// invalidates the handle and is the trigger to untrack it here.
+/// invalidates the handle on the client's side.
+///
+/// # Untracks unconditionally, even if `kill`/`release` error
+///
+/// This is the other half of `ClientShellOutput`'s asymmetry (see its
+/// doc): an output error leaves a handle tracked because untracking a
+/// terminal that might still be running is unrecoverable. A kill is
+/// the opposite case — it is the action the cap's own refusal message
+/// tells the model to take to free a slot, and a handle the client has
+/// genuinely forgotten would otherwise error here forever and jam that
+/// slot for good. So both wire calls are attempted and the handle is
+/// dropped from tracking regardless of whether either succeeded; only
+/// then does a real error from either call propagate to the model.
+/// Over-counting from here is recoverable (the model can call this
+/// tool again, or check with `client_shell_output`); a permanently
+/// stuck slot is not.
 pub struct ClientShellKill {
     spec: ToolSpec,
 }
@@ -595,12 +642,15 @@ impl ClientShellKill {
         Self {
             spec: ToolSpec {
                 name: "client_shell_kill".into(),
-                description: "Stop a command started with client_shell_start (or left \
+                description: format!(
+                    "Stop a command started with client_shell_start (or left \
                     running by a client_shell call that timed out) and free its terminal \
-                    handle. Use this to make room under the 8-terminal cap, or to give up \
-                    on a command that is no longer needed. Only available inside an ACP \
-                    session whose editor supports `terminal/*`; refuses otherwise."
-                    .into(),
+                    handle. Use this to make room under the {MAX_TERMINALS_PER_SESSION}-\
+                    terminal cap, or to give up on a command that is no longer needed. \
+                    Only available inside an ACP session whose editor supports \
+                    `terminal/*`; refuses otherwise."
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -637,9 +687,16 @@ impl Tool for ClientShellKill {
         let handle = TerminalHandle(terminal.to_string());
 
         let client = current_acp_client().ok_or_else(no_editor_error)?;
-        client.kill_terminal(&handle).await?;
-        client.release_terminal(&handle).await?;
+
+        // Both attempted before either `?` — see this tool's doc for
+        // why: a kill failure must not skip the release attempt, and
+        // the handle must come out of tracking even if both failed.
+        let kill = client.kill_terminal(&handle).await;
+        let release = client.release_terminal(&handle).await;
         client.untrack_terminal(&handle).await;
+        kill?;
+        release?;
+
         Ok(format!("Stopped and released terminal {handle}."))
     }
 }
@@ -992,19 +1049,27 @@ mod tests {
         );
     }
 
-    /// A handle the client has forgotten is dropped here too, so the
-    /// cap does not fill with ghosts after a client restart.
+    /// Review round 1, Finding 2: an output error alone is not proof the
+    /// client has forgotten the handle — it could be transient (a
+    /// reconnect, a timed-out request) — so it must not untrack a
+    /// terminal that might still be running. Only `client_shell_kill`
+    /// untracks unconditionally, because a handle the model explicitly
+    /// asked to kill is exactly the case the cap's refusal message
+    /// points the model at. This is a stronger pair than "an unknown
+    /// handle is dropped from tracking" was: it proves the asymmetry in
+    /// both directions, not just that *something* untracks eventually.
     #[tokio::test]
     async fn an_unknown_handle_is_dropped_from_tracking() {
         let (state, fake) = shell_test_state().await;
-        fake.make_output_fail_with("no such terminal");
         let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
 
-        let err = scope_acp_client(client, async {
+        let output_err = scope_acp_client(Arc::clone(&client), async {
             ClientShellStart::new()
                 .execute(&json!({"command": "sleep", "args": ["999"]}))
                 .await
                 .unwrap();
+
+            fake.make_output_fail_with("no such terminal");
             ClientShellOutput::new()
                 .execute(&json!({"terminal": "t1"}))
                 .await
@@ -1014,8 +1079,40 @@ mod tests {
         .await;
 
         assert!(
-            err.contains("no such terminal"),
-            "the client's words reach the model: {err}"
+            output_err.contains("no such terminal"),
+            "the client's words reach the model: {output_err}"
+        );
+        assert_eq!(
+            state
+                .acp_terminals
+                .lock()
+                .await
+                .get(TEST_SESSION_ID)
+                .map(Vec::len),
+            Some(1),
+            "an output error alone must not drop tracking — the terminal could still be \
+             running, and untracking it would lose it for good"
+        );
+        assert!(
+            fake.released.lock().unwrap().is_empty(),
+            "an output error must not release either — only a kill does that"
+        );
+
+        // Even a client that keeps saying "no such terminal" on kill
+        // and release must not leave the slot stuck forever.
+        fake.make_kill_fail_with("no such terminal");
+        let kill_err = scope_acp_client(client, async {
+            ClientShellKill::new()
+                .execute(&json!({"terminal": "t1"}))
+                .await
+                .unwrap_err()
+                .to_string()
+        })
+        .await;
+
+        assert!(
+            kill_err.contains("no such terminal"),
+            "the failure is still reported: {kill_err}"
         );
         assert!(
             state
@@ -1024,13 +1121,26 @@ mod tests {
                 .await
                 .get(TEST_SESSION_ID)
                 .is_none_or(Vec::is_empty),
-            "a handle the client disowns stops counting against the cap"
+            "but a kill frees the handle from tracking regardless of whether the client \
+             errors on it — otherwise the slot the cap points the model at could never \
+             be freed"
         );
     }
 
     /// The property this whole task is shaped around. `terminal/release`
     /// kills the command, so a dropped socket must not trigger one — a
     /// network blip would otherwise kill the user's build.
+    ///
+    /// What this does and does not fence: `release_connection_sessions`
+    /// takes only `&Arc<ServeState>` and a list of session ids — it has
+    /// no route to any `AcpClient` — so `fake.released`/`fake.killed`
+    /// staying empty is true by construction here and can never fail.
+    /// The load-bearing assertion is the last one: the handle is still
+    /// tracked after teardown. A release added to `serve_connection`'s
+    /// teardown *outside* `release_connection_sessions` (rather than
+    /// inside it) would not be caught by this test at all — only by
+    /// code review of that call site, or a wire-level test in
+    /// `src/serve/acp.rs`.
     #[tokio::test]
     async fn a_connection_ending_releases_nothing() {
         let (state, fake) = shell_test_state().await;
@@ -1092,6 +1202,42 @@ mod tests {
             Some(1),
             "a timed-out one-shot's handle must be tracked, or it escapes the cap and \
              the model can never see it to clean it up"
+        );
+    }
+
+    /// Review round 1, Finding 1: the one-shot path must respect the
+    /// same cap `client_shell_start` does. `ClientShell`'s timeout
+    /// branch tracks a handle (previous test), so without a cap check
+    /// on this path too, a model looping `client_shell` with a short
+    /// `timeout_secs` could accumulate live processes past the cap the
+    /// same way looping `client_shell_start` would — exactly what
+    /// `MAX_TERMINALS_PER_SESSION` exists to prevent.
+    #[tokio::test]
+    async fn the_one_shot_path_is_also_capped() {
+        let (_state, fake) = shell_test_state().await;
+        fake.hand_out_distinct_handles();
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+
+        let refusal = scope_acp_client(client, async {
+            for _ in 0..MAX_TERMINALS_PER_SESSION {
+                ClientShellStart::new()
+                    .execute(&json!({"command": "sleep", "args": ["999"]}))
+                    .await
+                    .unwrap();
+            }
+            ClientShell::new()
+                .execute(&json!({"command": "one", "args": ["too", "many"]}))
+                .await
+                .unwrap_err()
+                .to_string()
+        })
+        .await;
+
+        assert!(refusal.contains("t1"), "names a held handle: {refusal}");
+        assert_eq!(
+            fake.creates.lock().unwrap().len(),
+            MAX_TERMINALS_PER_SESSION,
+            "the refused one-shot call must not have reached the client either"
         );
     }
 }
