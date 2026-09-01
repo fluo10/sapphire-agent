@@ -20,7 +20,7 @@ use crate::config::Config;
 use crate::context_compression::{generate_summary, maybe_compress};
 use crate::digest_cache::DigestCache;
 use crate::provider::registry::ProviderRegistry;
-use crate::provider::{ChatMessage, ContentPart, Provider, UserInputKind};
+use crate::provider::{ChatMessage, ContentPart, Provider, ToolSpec, UserInputKind};
 use crate::session::{ConversationKey, SessionStore};
 use crate::tools::ToolSet;
 use crate::voice::VoiceProviders;
@@ -2188,6 +2188,388 @@ pub(crate) fn visible_tool_predicate(
     }
 }
 
+/// Where a turn's messages go — or that they go nowhere.
+///
+/// `Option<TurnPersistence>` rather than a `bool` on the loop: a
+/// subagent has no session, so there is no id to write to and no
+/// half-persisted state to reason about. Making the absence a shape
+/// rather than a flag means the loop cannot accidentally write to a
+/// session that does not exist.
+pub(crate) struct TurnPersistence {
+    store: Arc<SessionStore>,
+    acp_store: Arc<AcpSessionStore>,
+    session_id: String,
+    is_acp: bool,
+}
+
+impl TurnPersistence {
+    /// Append one message. Returns whether the caller may go on to
+    /// persist a message that must be paired with this one.
+    ///
+    /// `true` when nothing was written at all: there is no pairing to
+    /// break, so a `tool_result` must not be skipped just because its
+    /// `tool_use` was never a candidate for the store.
+    fn append_message(&self, msg: &ChatMessage) -> bool {
+        if self.is_acp {
+            match self.acp_store.append_message(&self.session_id, msg) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("Failed to persist a message: {e}");
+                    false
+                }
+            }
+        } else {
+            if let Err(e) = self.store.append(&self.session_id, msg) {
+                warn!("Failed to persist a message: {e}");
+            }
+            true
+        }
+    }
+
+    /// Append a `tool_use` or `tool_result` message. Returns whether the
+    /// caller may go on to persist a message that must be paired with
+    /// this one.
+    ///
+    /// ACP sessions persist tool traffic; the other stores do not (see
+    /// #194). Their line format has no reference form for a result, so
+    /// writing one raw would put the content into the workspace and the
+    /// retrieve index — which is exactly what the ACP store's external
+    /// cache exists to avoid. Unlike [`Self::append_message`], the
+    /// non-ACP branch writes nothing at all rather than falling back to
+    /// `store.append` — hence the separate method.
+    ///
+    /// `true` when nothing was written at all: there is no pairing to
+    /// break, so a `tool_result` must not be skipped just because its
+    /// `tool_use` was never a candidate for the store.
+    fn append_acp_only(&self, msg: &ChatMessage) -> bool {
+        if !self.is_acp {
+            return true;
+        }
+        match self.acp_store.append_message(&self.session_id, msg) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to persist a message: {e}");
+                false
+            }
+        }
+    }
+
+    /// Append a compaction summary. ACP sessions keep none — their
+    /// history is rebuilt from events on reload, so a stored summary
+    /// would be a second, staler answer to a question the events
+    /// already answer.
+    fn append_summary(&self, summary: &str) {
+        if !self.is_acp
+            && let Err(e) = self.store.append_summary(&self.session_id, summary)
+        {
+            warn!("Failed to persist compaction summary: {e}");
+        }
+    }
+}
+
+/// One model conversation run to completion: call the model, run the
+/// tools it asks for, repeat until it stops asking.
+///
+/// Extracted from `run_llm_turn` so a subagent can run the same loop
+/// without a session behind it. Everything session-shaped lives in
+/// `persistence`, which is `None` for a subagent — see
+/// `TurnPersistence`.
+///
+/// `namespace` is not session state either, but the loop needs it to
+/// scope the memory tool (`scope_memory_namespace`) for every tool call
+/// it executes, so it travels alongside the other per-turn inputs
+/// rather than through `persistence`.
+pub(crate) struct TurnLoop<'a> {
+    pub state: &'a Arc<ServeState>,
+    pub provider: &'a Arc<dyn Provider>,
+    pub system: Option<&'a str>,
+    pub tool_specs: &'a [ToolSpec],
+    pub progress: &'a Arc<dyn TurnHost>,
+    pub timer_origin: Option<crate::timer::TimerOrigin>,
+    pub namespace: String,
+    pub persistence: Option<&'a TurnPersistence>,
+}
+
+impl TurnLoop<'_> {
+    /// Run until the model stops calling tools, the round budget runs
+    /// out, or the provider fails. `history` is both the input and
+    /// where the conversation accumulates.
+    pub(crate) async fn run(self, history: &mut Vec<ChatMessage>) -> (Option<String>, TurnStop) {
+        let state = self.state;
+        let provider: &dyn Provider = &**self.provider;
+        let system = self.system;
+        let tool_specs = self.tool_specs;
+        let progress = self.progress;
+        let namespace = self.namespace;
+        // Read once per turn: `None` on every non-ACP transport, which
+        // is what keeps the client-side tools refusing there rather
+        // than reaching for a connection that does not exist.
+        let host_access_enabled = state.config.tools.host_access.enabled;
+        let compression_config = &state.config.compression;
+        let mut accumulated_text: Vec<String> = Vec::new();
+        let (final_text, stop) = loop {
+            let round = history
+                .iter()
+                .filter(|m| {
+                    m.parts
+                        .iter()
+                        .any(|p| matches!(p, ContentPart::ToolUse { .. }))
+                })
+                .count();
+
+            if round >= MAX_TOOL_ROUNDS {
+                warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS})");
+                // `None` for the text, as before — callers that predate ACP
+                // report this as a failed turn and must keep doing so — but the
+                // prose accumulated so far rides along on the stop reason for
+                // transports that can show partial work.
+                break (
+                    None,
+                    TurnStop::BudgetExhausted {
+                        partial_text: accumulated_text.join("\n\n"),
+                    },
+                );
+            }
+
+            // Check if context compression is needed
+            match maybe_compress(provider, system, history, compression_config).await {
+                Ok(Some(result)) => {
+                    *history = result.compressed;
+                    // ACP sessions do not persist a compaction summary: the
+                    // full event history is re-read from the store on
+                    // reload, so a stored summary would only be a second,
+                    // staler answer to a question the events already
+                    // answer. Compression stays an in-memory optimisation.
+                    if let Some(p) = self.persistence {
+                        p.append_summary(&result.summary);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Context compression failed, continuing with full history: {e}");
+                }
+            }
+
+            // Hydrate `ImageRef` parts from the image cache into full
+            // `Image` parts for the provider call. `Image` parts (just
+            // arrived this turn) and Text/Tool parts pass through;
+            // `ImageRef` parts are intentionally degraded to text markers
+            // so historical images aren't re-billed every turn (the cache
+            // still retains the bytes for an on-demand recall tool).
+            // After hydration, fold each user message's input modality
+            // into a textual prefix so the model knows when a body is a
+            // voice transcript (likely to contain STT errors).
+            let history_for_provider: Vec<ChatMessage> =
+                crate::image_cache::hydrate_history(history)
+                    .into_iter()
+                    .map(apply_input_kind_label)
+                    .collect();
+            let response = provider
+                .chat(system, &history_for_provider, Some(tool_specs))
+                .await;
+
+            match response {
+                Err(e) => {
+                    error!("Provider error: {e:#}");
+                    progress.turn_error(&e.to_string()).await;
+                    break (None, TurnStop::ProviderError);
+                }
+                Ok(resp) if !resp.has_tool_calls() => {
+                    let text = resp.text.unwrap_or_default();
+                    let msg = ChatMessage::assistant(&text);
+                    history.push(msg.clone());
+                    if let Some(p) = self.persistence {
+                        p.append_message(&msg);
+                    }
+                    if !text.is_empty() {
+                        accumulated_text.push(text);
+                    }
+                    break (Some(accumulated_text.join("\n\n")), TurnStop::Replied);
+                }
+                Ok(resp) => {
+                    let tool_calls = resp.tool_calls.clone();
+                    if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
+                        accumulated_text.push(t.clone());
+                    }
+                    let msg =
+                        ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
+                    history.push(msg.clone());
+                    // ACP sessions persist tool traffic; the other stores do
+                    // not (see #194). Their line format has no reference
+                    // form for a result, so writing one raw would put the
+                    // content into the workspace and the retrieve index —
+                    // which is exactly what the ACP store's external cache
+                    // exists to avoid.
+                    //
+                    // Whether this append actually landed is captured and
+                    // carried down to the `tool_result` append below: the
+                    // two must not be skipped independently of each other
+                    // (see the comment there for why).
+                    let tool_use_persisted =
+                        self.persistence.is_none_or(|p| p.append_acp_only(&msg));
+
+                    // Notify client of each tool starting
+                    for call in &tool_calls {
+                        progress.tool_start(&call.id, &call.name).await;
+                    }
+
+                    // Permission gate.
+                    //
+                    // Serial on purpose. `decide` is a cheap pure call, but
+                    // `approve` puts a dialog in front of a human, and
+                    // firing several at once would stack them on the poor
+                    // soul in the editor. Execution below stays concurrent.
+                    let kinds = self.state.tools.kinds().await;
+                    let origin = progress.origin();
+                    let mut permitted: Vec<crate::provider::ToolCall> = Vec::new();
+                    let mut refused: Vec<(String, String)> = Vec::new();
+                    for call in &tool_calls {
+                        use crate::tools::policy::{
+                            Decision, Refusal, host_tool_denied, kind_of, refusal_message,
+                        };
+
+                        // The host-machine gate sits in front of `decide`:
+                        // it is a fact about the deployment ("may this agent
+                        // touch its own disk at all"), not a row in the
+                        // origin/kind policy table — so it is checked, and
+                        // can refuse, before `decide` is even consulted.
+                        let refusal = if host_tool_denied(&call.name, host_access_enabled) {
+                            Some(refusal_message(&call.name, Refusal::Unavailable))
+                        } else {
+                            let kind = kind_of(&call.name, &kinds);
+                            let verdict = crate::tools::policy::decide(origin, kind);
+                            match verdict {
+                                Decision::Allow => None,
+                                Decision::Deny => {
+                                    Some(refusal_message(&call.name, Refusal::Unavailable))
+                                }
+                                Decision::Ask => {
+                                    if progress.approve(call, kind).await.allows() {
+                                        None
+                                    } else {
+                                        Some(refusal_message(&call.name, Refusal::UserDeclined))
+                                    }
+                                }
+                            }
+                        };
+
+                        match refusal {
+                            None => {
+                                // Every permitted call, not just an asked
+                                // one: a client that saw `tool_start` needs
+                                // to know this one is running rather than
+                                // still waiting on it.
+                                progress.tool_allowed(&call.id).await;
+                                permitted.push(call.clone());
+                            }
+                            Some(reason) => {
+                                info!("Refused tool {} (id={}): {reason}", call.name, call.id);
+                                refused.push((call.id.clone(), reason));
+                            }
+                        }
+                    }
+
+                    // Execute all tools concurrently — each call wrapped in
+                    // the session's memory namespace (task_local) so the
+                    // memory tool writes under `memory/<namespace>/...`.
+                    let tools = Arc::clone(&self.state.tools);
+                    let ns = namespace.clone();
+                    let timer_origin = self.timer_origin.clone();
+                    // Read once per turn, same as `timer_origin`: `None` on
+                    // every non-ACP transport, which is what keeps the
+                    // client-side tools refusing there rather than reaching
+                    // for a connection that does not exist.
+                    let acp_client = progress.acp_client();
+                    let mut results: Vec<(String, crate::tools::ToolOutput)> =
+                        futures_util::future::join_all(permitted.into_iter().map(|c| {
+                            let tools = Arc::clone(&tools);
+                            let ns = ns.clone();
+                            let origin = timer_origin.clone();
+                            let client = acp_client.clone();
+                            async move {
+                                let fut = crate::tools::workspace_tools::scope_memory_namespace(
+                                    ns,
+                                    async move {
+                                        info!("Executing tool: {} (id={})", c.name, c.id);
+                                        let output = tools.execute(&c).await;
+                                        info!("Tool {} done", c.name);
+                                        (c.id, output)
+                                    },
+                                );
+                                // Both scopes have to wrap execution: the
+                                // timer tool reads one task-local and the
+                                // client-side tools read the other, and
+                                // either missing breaks that set of tools.
+                                // Each arm awaits in place rather than
+                                // boxing a common future type, the same way
+                                // the single-scope version of this match did
+                                // before the client scope was added.
+                                match (origin, client) {
+                                    (Some(o), Some(c)) => {
+                                        crate::timer::scope_timer_origin(
+                                            o,
+                                            crate::tools::acp_client::scope_acp_client(c, fut),
+                                        )
+                                        .await
+                                    }
+                                    (Some(o), None) => {
+                                        crate::timer::scope_timer_origin(o, fut).await
+                                    }
+                                    (None, Some(c)) => {
+                                        crate::tools::acp_client::scope_acp_client(c, fut).await
+                                    }
+                                    (None, None) => fut.await,
+                                }
+                            }
+                        }))
+                        .await;
+
+                    // A refused call still owes the model a tool_result:
+                    // every tool_use in the assistant message must be
+                    // answered, and the reason is more useful to the model
+                    // than silence. The turn is NOT ended — the model may
+                    // have another route, and ACP's `Refusal` stop reason
+                    // means "the agent declined", which is a different
+                    // thing from "the user declined".
+                    for (id, reason) in refused {
+                        results.push((id, crate::tools::ToolOutput::from(reason)));
+                    }
+
+                    // Notify client of each tool completing
+                    for call in &tool_calls {
+                        progress.tool_end(&call.id, &call.name).await;
+                    }
+
+                    let mut text_results = Vec::with_capacity(results.len());
+                    let mut images = Vec::new();
+                    for (id, output) in results {
+                        text_results.push((id, output.text));
+                        images.extend(output.images);
+                    }
+                    let result_msg = ChatMessage::tool_results_with_images(text_results, images);
+                    history.push(result_msg.clone());
+                    // Gated on `tool_use_persisted`: this append must not run
+                    // independently of the `tool_use` append above. If that
+                    // one failed, the tip on disk is still the user message,
+                    // so appending the result here would chain it directly
+                    // onto that user message — a `tool_result` with no
+                    // `tool_use` anywhere before it, which is just as
+                    // rejected by the API as the reverse gap, and unlike the
+                    // in-memory `history` (which is correct either way and
+                    // gets scrubbed/reloaded next turn) would brick the
+                    // on-disk session forever. A half-persisted pair is worse
+                    // than neither, so skip this append too rather than
+                    // leaving only the result on disk.
+                    if tool_use_persisted && let Some(p) = self.persistence {
+                        p.append_acp_only(&result_msg);
+                    }
+                }
+            }
+        };
+        (final_text, stop)
+    }
+}
+
 /// Execute one full LLM turn for an established session: hydrate history,
 /// run the tool-calling loop, persist user + assistant messages to JSONL,
 /// and report per-tool `tool_start` / `tool_end` progress through
@@ -2360,278 +2742,24 @@ pub(crate) async fn run_llm_turn(
             client_terminal,
         ))
         .await;
-    let compression_config = &state.config.compression;
-    let mut accumulated_text: Vec<String> = Vec::new();
-    let (final_text, stop) = loop {
-        let round = history
-            .iter()
-            .filter(|m| {
-                m.parts
-                    .iter()
-                    .any(|p| matches!(p, ContentPart::ToolUse { .. }))
-            })
-            .count();
-
-        if round >= MAX_TOOL_ROUNDS {
-            warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS})");
-            // `None` for the text, as before — callers that predate ACP
-            // report this as a failed turn and must keep doing so — but the
-            // prose accumulated so far rides along on the stop reason for
-            // transports that can show partial work.
-            break (
-                None,
-                TurnStop::BudgetExhausted {
-                    partial_text: accumulated_text.join("\n\n"),
-                },
-            );
-        }
-
-        // Check if context compression is needed
-        match maybe_compress(&*provider, system.as_deref(), &history, compression_config).await {
-            Ok(Some(result)) => {
-                history = result.compressed;
-                // ACP sessions do not persist a compaction summary: the
-                // full event history is re-read from the store on
-                // reload, so a stored summary would only be a second,
-                // staler answer to a question the events already
-                // answer. Compression stays an in-memory optimisation.
-                if !is_acp && let Err(e) = store.append_summary(&session_id, &result.summary) {
-                    warn!("Failed to persist compaction summary: {e}");
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!("Context compression failed, continuing with full history: {e}");
-            }
-        }
-
-        // Hydrate `ImageRef` parts from the image cache into full
-        // `Image` parts for the provider call. `Image` parts (just
-        // arrived this turn) and Text/Tool parts pass through;
-        // `ImageRef` parts are intentionally degraded to text markers
-        // so historical images aren't re-billed every turn (the cache
-        // still retains the bytes for an on-demand recall tool).
-        // After hydration, fold each user message's input modality
-        // into a textual prefix so the model knows when a body is a
-        // voice transcript (likely to contain STT errors).
-        let history_for_provider: Vec<ChatMessage> = crate::image_cache::hydrate_history(&history)
-            .into_iter()
-            .map(apply_input_kind_label)
-            .collect();
-        let response = provider
-            .chat(system.as_deref(), &history_for_provider, Some(&tool_specs))
-            .await;
-
-        match response {
-            Err(e) => {
-                error!("Provider error: {e:#}");
-                progress.turn_error(&e.to_string()).await;
-                break (None, TurnStop::ProviderError);
-            }
-            Ok(resp) if !resp.has_tool_calls() => {
-                let text = resp.text.unwrap_or_default();
-                let msg = ChatMessage::assistant(&text);
-                history.push(msg.clone());
-                if is_acp {
-                    if let Err(e) = state.acp_session_store.append_message(&session_id, &msg) {
-                        warn!("Failed to persist assistant message: {e}");
-                    }
-                } else if let Err(e) = store.append(&session_id, &msg) {
-                    warn!("Failed to persist assistant message: {e}");
-                }
-                if !text.is_empty() {
-                    accumulated_text.push(text);
-                }
-                break (Some(accumulated_text.join("\n\n")), TurnStop::Replied);
-            }
-            Ok(resp) => {
-                let tool_calls = resp.tool_calls.clone();
-                if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
-                    accumulated_text.push(t.clone());
-                }
-                let msg = ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
-                history.push(msg.clone());
-                // ACP sessions persist tool traffic; the other stores do
-                // not (see #194). Their line format has no reference
-                // form for a result, so writing one raw would put the
-                // content into the workspace and the retrieve index —
-                // which is exactly what the ACP store's external cache
-                // exists to avoid.
-                //
-                // Whether this append actually landed is captured and
-                // carried down to the `tool_result` append below: the
-                // two must not be skipped independently of each other
-                // (see the comment there for why).
-                let tool_use_persisted = !is_acp
-                    || match state.acp_session_store.append_message(&session_id, &msg) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            warn!("Failed to persist a tool_use message: {e}");
-                            false
-                        }
-                    };
-
-                // Notify client of each tool starting
-                for call in &tool_calls {
-                    progress.tool_start(&call.id, &call.name).await;
-                }
-
-                // Permission gate.
-                //
-                // Serial on purpose. `decide` is a cheap pure call, but
-                // `approve` puts a dialog in front of a human, and
-                // firing several at once would stack them on the poor
-                // soul in the editor. Execution below stays concurrent.
-                let kinds = state.tools.kinds().await;
-                let origin = progress.origin();
-                let mut permitted: Vec<crate::provider::ToolCall> = Vec::new();
-                let mut refused: Vec<(String, String)> = Vec::new();
-                for call in &tool_calls {
-                    use crate::tools::policy::{
-                        Decision, Refusal, host_tool_denied, kind_of, refusal_message,
-                    };
-
-                    // The host-machine gate sits in front of `decide`:
-                    // it is a fact about the deployment ("may this agent
-                    // touch its own disk at all"), not a row in the
-                    // origin/kind policy table — so it is checked, and
-                    // can refuse, before `decide` is even consulted.
-                    let refusal = if host_tool_denied(&call.name, host_access_enabled) {
-                        Some(refusal_message(&call.name, Refusal::Unavailable))
-                    } else {
-                        let kind = kind_of(&call.name, &kinds);
-                        let verdict = crate::tools::policy::decide(origin, kind);
-                        match verdict {
-                            Decision::Allow => None,
-                            Decision::Deny => {
-                                Some(refusal_message(&call.name, Refusal::Unavailable))
-                            }
-                            Decision::Ask => {
-                                if progress.approve(call, kind).await.allows() {
-                                    None
-                                } else {
-                                    Some(refusal_message(&call.name, Refusal::UserDeclined))
-                                }
-                            }
-                        }
-                    };
-
-                    match refusal {
-                        None => {
-                            // Every permitted call, not just an asked
-                            // one: a client that saw `tool_start` needs
-                            // to know this one is running rather than
-                            // still waiting on it.
-                            progress.tool_allowed(&call.id).await;
-                            permitted.push(call.clone());
-                        }
-                        Some(reason) => {
-                            info!("Refused tool {} (id={}): {reason}", call.name, call.id);
-                            refused.push((call.id.clone(), reason));
-                        }
-                    }
-                }
-
-                // Execute all tools concurrently — each call wrapped in
-                // the session's memory namespace (task_local) so the
-                // memory tool writes under `memory/<namespace>/...`.
-                let tools = Arc::clone(&state.tools);
-                let ns = namespace.clone();
-                let timer_origin = timer_origin.clone();
-                // Read once per turn, same as `timer_origin`: `None` on
-                // every non-ACP transport, which is what keeps the
-                // client-side tools refusing there rather than reaching
-                // for a connection that does not exist.
-                let acp_client = progress.acp_client();
-                let mut results: Vec<(String, crate::tools::ToolOutput)> =
-                    futures_util::future::join_all(permitted.into_iter().map(|c| {
-                        let tools = Arc::clone(&tools);
-                        let ns = ns.clone();
-                        let origin = timer_origin.clone();
-                        let client = acp_client.clone();
-                        async move {
-                            let fut = crate::tools::workspace_tools::scope_memory_namespace(
-                                ns,
-                                async move {
-                                    info!("Executing tool: {} (id={})", c.name, c.id);
-                                    let output = tools.execute(&c).await;
-                                    info!("Tool {} done", c.name);
-                                    (c.id, output)
-                                },
-                            );
-                            // Both scopes have to wrap execution: the
-                            // timer tool reads one task-local and the
-                            // client-side tools read the other, and
-                            // either missing breaks that set of tools.
-                            // Each arm awaits in place rather than
-                            // boxing a common future type, the same way
-                            // the single-scope version of this match did
-                            // before the client scope was added.
-                            match (origin, client) {
-                                (Some(o), Some(c)) => {
-                                    crate::timer::scope_timer_origin(
-                                        o,
-                                        crate::tools::acp_client::scope_acp_client(c, fut),
-                                    )
-                                    .await
-                                }
-                                (Some(o), None) => crate::timer::scope_timer_origin(o, fut).await,
-                                (None, Some(c)) => {
-                                    crate::tools::acp_client::scope_acp_client(c, fut).await
-                                }
-                                (None, None) => fut.await,
-                            }
-                        }
-                    }))
-                    .await;
-
-                // A refused call still owes the model a tool_result:
-                // every tool_use in the assistant message must be
-                // answered, and the reason is more useful to the model
-                // than silence. The turn is NOT ended — the model may
-                // have another route, and ACP's `Refusal` stop reason
-                // means "the agent declined", which is a different
-                // thing from "the user declined".
-                for (id, reason) in refused {
-                    results.push((id, crate::tools::ToolOutput::from(reason)));
-                }
-
-                // Notify client of each tool completing
-                for call in &tool_calls {
-                    progress.tool_end(&call.id, &call.name).await;
-                }
-
-                let mut text_results = Vec::with_capacity(results.len());
-                let mut images = Vec::new();
-                for (id, output) in results {
-                    text_results.push((id, output.text));
-                    images.extend(output.images);
-                }
-                let result_msg = ChatMessage::tool_results_with_images(text_results, images);
-                history.push(result_msg.clone());
-                // Gated on `tool_use_persisted`: this append must not run
-                // independently of the `tool_use` append above. If that
-                // one failed, the tip on disk is still the user message,
-                // so appending the result here would chain it directly
-                // onto that user message — a `tool_result` with no
-                // `tool_use` anywhere before it, which is just as
-                // rejected by the API as the reverse gap, and unlike the
-                // in-memory `history` (which is correct either way and
-                // gets scrubbed/reloaded next turn) would brick the
-                // on-disk session forever. A half-persisted pair is worse
-                // than neither, so skip this append too rather than
-                // leaving only the result on disk.
-                if is_acp
-                    && tool_use_persisted
-                    && let Err(e) = state
-                        .acp_session_store
-                        .append_message(&session_id, &result_msg)
-                {
-                    warn!("Failed to persist a tool_result message: {e}");
-                }
-            }
-        }
+    let persistence = TurnPersistence {
+        store: Arc::clone(&store),
+        acp_store: Arc::clone(&state.acp_session_store),
+        session_id: session_id.clone(),
+        is_acp,
     };
+    let (final_text, stop) = TurnLoop {
+        state: &state,
+        provider: &provider,
+        system: system.as_deref(),
+        tool_specs: &tool_specs,
+        progress: &progress,
+        timer_origin,
+        namespace: namespace.clone(),
+        persistence: Some(&persistence),
+    }
+    .run(&mut history)
+    .await;
 
     // Scrub `Image` parts in the just-completed history into compact
     // `ImageRef` references backed by the workspace-external image
