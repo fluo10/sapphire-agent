@@ -75,6 +75,9 @@ pub trait AcpClient: Send + Sync {
         limit: Option<u32>,
     ) -> anyhow::Result<String>;
 
+    // No call site until Task 4's `ClientFileWrite` calls this. Remove this
+    // allow there.
+    #[allow(dead_code)]
     async fn write_text_file(&self, path: &str, content: &str) -> anyhow::Result<()>;
 
     // No call site until Task 5's `ClientShell` calls this. Remove this
@@ -135,6 +138,9 @@ pub fn scope_acp_client<F: std::future::Future>(
 /// `None` on every non-ACP transport — `/rpc`, Matrix, Discord, voice —
 /// which is what makes the client tools refuse there rather than
 /// reaching for a connection that does not exist.
+// No call site outside this module's own tests until Task 4's
+// `ClientFileRead`/`ClientFileWrite` call this. Remove this allow there.
+#[allow(dead_code)]
 pub fn current_acp_client() -> Option<Arc<dyn AcpClient>> {
     ACP_CLIENT_TL.try_with(Arc::clone).ok()
 }

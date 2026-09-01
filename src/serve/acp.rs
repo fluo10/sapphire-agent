@@ -57,7 +57,7 @@
 //!   next turn's model context but present in `list_sessions` and after a
 //!   restart. See the drop note on [`super::run_llm_turn`] itself.
 
-use super::{ServeState, TurnHost, extract_bearer};
+use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
@@ -429,6 +429,13 @@ impl super::TurnHost for AcpProgress {
 /// (both fields are), so [`AcpProgress::acp_client`] hands out a fresh
 /// one rather than sharing state with the turn it was built from.
 #[derive(Clone)]
+// `-D warnings` without `--all-targets` (the CI gate) sees no reachable
+// caller into `AcpClient`'s methods yet: they're read here (`self.session_id`,
+// `self.connection`) but nothing in production code calls a method that
+// reads them, since `current_acp_client()` has no caller until Task 4's
+// `ClientFileRead`/`ClientFileWrite` reach for it. Remove this allow once
+// that lands.
+#[allow(dead_code)]
 struct AcpClientHandle {
     session_id: SessionId,
     connection: ConnectionTo<Client>,
@@ -1462,7 +1469,11 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serve::{HangingChat, NullProgress};
+    // `TurnHost` is only needed here, for `.acp_client()` in
+    // `the_default_turn_host_offers_no_client` below — production code
+    // in this file calls it fully qualified as `super::TurnHost`
+    // instead, so importing it at module scope would be unused there.
+    use crate::serve::{HangingChat, NullProgress, TurnHost};
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
