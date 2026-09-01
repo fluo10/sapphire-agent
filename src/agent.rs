@@ -951,6 +951,7 @@ impl Agent {
                         crate::tools::policy::Origin::Channel,
                         &tool_calls,
                         &kinds,
+                        self.config.tools.host_access.enabled,
                     );
                     for (id, reason) in &refused {
                         info!("Refused tool call {id} on the channel path: {reason}");
@@ -1127,6 +1128,7 @@ fn read_session_date(path: &std::path::Path, boundary_hour: u8) -> NaiveDate {
 #[cfg(test)]
 mod tests {
     use crate::provider::ToolCall;
+    use crate::tools::ToolKind;
     use crate::tools::policy::{Origin, partition_without_asking};
     use sapphire_framework::workspace::{AppContext, Workspace, WorkspaceState};
     use std::sync::{Arc, Mutex};
@@ -1146,16 +1148,10 @@ mod tests {
         Arc::new(Mutex::new(WorkspaceState::open(ws).unwrap()))
     }
 
-    /// The channel path refuses `Execute` and `Other` outright. This is
-    /// the one behavioural change the permission work makes to an
-    /// existing transport: `shell` and every MCP tool stop being
-    /// reachable from Matrix and Discord, while everything the chat
-    /// bots actually use keeps working.
-    ///
-    /// Driven through the real `default_tool_set`, so it is the tools'
-    /// own declared kinds being judged, not a hand-written table.
-    #[tokio::test]
-    async fn the_channel_gate_refuses_shell_but_keeps_the_chat_tools() {
+    /// Six calls, run through the channel gate under both `host_access`
+    /// states. Shared by both phases below so the two assertions stay
+    /// about the same call list rather than drifting apart.
+    async fn channel_gate_test_calls() -> (Vec<ToolCall>, Vec<(String, ToolKind)>) {
         let tools = crate::tools::default_tool_set(
             test_workspace(),
             Some("test-tavily-key".to_string()),
@@ -1183,13 +1179,30 @@ mod tests {
         })
         .collect();
 
-        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds);
+        (calls, kinds)
+    }
+
+    /// `shell` (`Execute`) and `workspace_sync`/the MCP tool (`Other`)
+    /// are refused over chat regardless of `host_access` — that is
+    /// `decide`'s risky bucket, which the host switch does not touch.
+    /// `web_search`/`memory_add` (workspace-scoped, not host tools) keep
+    /// working either way. `file_read` is the one call that moves
+    /// between the two phases below: this test pins it with
+    /// `host_access` **on**, matching the pre-host-switch behaviour this
+    /// permission work otherwise preserves; the sibling test below pins
+    /// what changed.
+    #[tokio::test]
+    async fn the_channel_gate_refuses_shell_but_keeps_the_chat_tools() {
+        let (calls, kinds) = channel_gate_test_calls().await;
+
+        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds, true);
 
         let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             kept,
             vec!["web_search", "memory_add", "file_read"],
-            "the chat bots' own tools must keep working"
+            "the chat bots' own tools must keep working, and file_read is \
+             reachable once host access is on"
         );
 
         let name_of = |id: &str| {
@@ -1203,7 +1216,8 @@ mod tests {
         assert_eq!(
             blocked,
             vec!["shell", "workspace_sync", "mcp__somewhere__do_thing"],
-            "Execute and Other must not be reachable over chat"
+            "Execute and Other must not be reachable over chat even with host \
+             access on — the switch does not override the risky bucket"
         );
 
         // Every refusal names its tool, so the model can say which call
@@ -1216,6 +1230,55 @@ mod tests {
         // Every call is accounted for exactly once: the model is owed a
         // tool_result for each tool_use, and a call lost here would make
         // the next provider request fail rather than merely misbehave.
+        assert_eq!(permitted.len() + refused.len(), calls.len());
+    }
+
+    /// The hole this permission work closes: with `host_access` **off**
+    /// (the default), `file_read` — like the other six `HOST_TOOLS` —
+    /// is refused over chat too, not just `Execute`/`Other`. Before
+    /// this, `file_write`/`file_delete` (`Edit`/`Delete`) were reachable
+    /// from an unasked Discord message; `file_read` sits in the same
+    /// `HOST_TOOLS` list and is pinned here as the reachable proxy for
+    /// all of them. `shell`/`workspace_sync`/the MCP tool stay refused
+    /// for the unrelated, pre-existing reason (`Execute`/`Other`).
+    #[tokio::test]
+    async fn the_channel_gate_also_refuses_host_tools_when_host_access_is_off() {
+        let (calls, kinds) = channel_gate_test_calls().await;
+
+        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds, false);
+
+        let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["web_search", "memory_add"],
+            "only the non-host workspace tools survive with host access off"
+        );
+
+        let name_of = |id: &str| {
+            calls
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.name.clone())
+                .unwrap()
+        };
+        let blocked: Vec<String> = refused.iter().map(|(id, _)| name_of(id)).collect();
+        assert_eq!(
+            blocked,
+            vec![
+                "shell",
+                "file_read",
+                "workspace_sync",
+                "mcp__somewhere__do_thing"
+            ],
+            "file_read joins the refusal list; shell and Other are still \
+             refused for their own, unrelated reason"
+        );
+
+        for (id, reason) in &refused {
+            let name = name_of(id);
+            assert!(reason.contains(&name), "{reason} should name {name}");
+        }
+
         assert_eq!(permitted.len() + refused.len(), calls.len());
     }
 }

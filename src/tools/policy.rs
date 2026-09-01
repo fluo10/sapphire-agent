@@ -233,15 +233,30 @@ pub fn decide(origin: Origin, kind: ToolKind) -> Decision {
 /// `Origin::Channel` reaches this, and `decide` never returns `Ask` for
 /// it — but a later policy change that did must not silently open the
 /// channel path, so the unreachable case fails closed.
+///
+/// `host_access_enabled` is checked before `decide` for the same reason
+/// it is in `run_llm_turn`'s permission loop: it is a fact about the
+/// deployment, not a row in the origin/kind table, so a host tool never
+/// even reaches `decide` while it is off — including for a channel
+/// message, which has nobody to ask and would otherwise reach `Edit`/
+/// `Delete` tools like `file_write`/`file_delete` unasked.
 pub fn partition_without_asking(
     origin: Origin,
     calls: &[crate::provider::ToolCall],
     kinds: &[(String, ToolKind)],
+    host_access_enabled: bool,
 ) -> (Vec<crate::provider::ToolCall>, Vec<(String, String)>) {
     let mut permitted = Vec::with_capacity(calls.len());
     let mut refused = Vec::new();
 
     for call in calls {
+        if host_tool_denied(&call.name, host_access_enabled) {
+            refused.push((
+                call.id.clone(),
+                refusal_message(&call.name, Refusal::Unavailable),
+            ));
+            continue;
+        }
         match decide(origin, kind_of(&call.name, kinds)) {
             Decision::Allow => permitted.push(call.clone()),
             Decision::Deny | Decision::Ask => refused.push((
@@ -434,7 +449,7 @@ mod tests {
             call("c3", "mcp__x__y"),
         ];
 
-        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds);
+        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds, true);
 
         let kept: Vec<&str> = permitted.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(kept, vec!["c1"]);
@@ -442,6 +457,33 @@ mod tests {
         let refused_ids: Vec<&str> = refused.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(refused_ids, vec!["c2", "c3"]);
         assert!(refused[0].1.contains("shell"), "got {}", refused[0].1);
+    }
+
+    /// The host gate applies inside `partition_without_asking` too, not
+    /// just at `decide`/`host_tool_denied` in isolation — this is what
+    /// actually closes the channel path, since `Origin::Channel` has no
+    /// other gate in front of it.
+    #[test]
+    fn partition_without_asking_refuses_host_tools_when_host_access_is_off() {
+        let kinds = vec![("file_delete".to_string(), ToolKind::Delete)];
+        let calls = vec![call("c1", "file_delete")];
+
+        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds, false);
+
+        assert!(permitted.is_empty(), "host access is off by default");
+        assert_eq!(refused.len(), 1);
+        assert!(refused[0].1.contains("file_delete"), "got {}", refused[0].1);
+    }
+
+    #[test]
+    fn partition_without_asking_allows_host_tools_when_host_access_is_on() {
+        let kinds = vec![("file_delete".to_string(), ToolKind::Delete)];
+        let calls = vec![call("c1", "file_delete")];
+
+        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds, true);
+
+        assert_eq!(permitted.len(), 1);
+        assert!(refused.is_empty());
     }
 
     /// The seven tools that touch the agent's own machine. Off unless
@@ -498,7 +540,7 @@ mod tests {
         let kinds = vec![("shell".to_string(), ToolKind::Execute)];
         let calls = vec![call("c1", "shell")];
 
-        let (permitted, refused) = partition_without_asking(Origin::Trusted, &calls, &kinds);
+        let (permitted, refused) = partition_without_asking(Origin::Trusted, &calls, &kinds, true);
 
         assert_eq!(permitted.len(), 1);
         assert!(refused.is_empty());
@@ -514,7 +556,7 @@ mod tests {
         let calls = vec![call("c1", "shell")];
 
         let (permitted, refused) =
-            partition_without_asking(Origin::Acp(SessionMode::Default), &calls, &kinds);
+            partition_without_asking(Origin::Acp(SessionMode::Default), &calls, &kinds, true);
 
         assert!(permitted.is_empty(), "an Ask must not be treated as Allow");
         assert_eq!(refused.len(), 1);
