@@ -2233,10 +2233,17 @@ pub(crate) async fn run_llm_turn(
                 }
                 let msg = ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
                 history.push(msg.clone());
-                // Tool_use messages are intentionally not persisted: they
-                // can be arbitrarily large and we never reload raw tool
-                // history across restarts anyway (compaction summaries cover
-                // the semantic context).
+                // ACP sessions persist tool traffic; the other stores do
+                // not (see #194). Their line format has no reference
+                // form for a result, so writing one raw would put the
+                // content into the workspace and the retrieve index —
+                // which is exactly what the ACP store's external cache
+                // exists to avoid.
+                if is_acp
+                    && let Err(e) = state.acp_session_store.append_message(&session_id, &msg)
+                {
+                    warn!("Failed to persist a tool_use message: {e}");
+                }
 
                 // Notify client of each tool starting
                 for call in &tool_calls {
@@ -2339,8 +2346,17 @@ pub(crate) async fn run_llm_turn(
                 }
                 let result_msg = ChatMessage::tool_results_with_images(text_results, images);
                 history.push(result_msg.clone());
-                // Tool_result payloads are not persisted — see the matching
-                // tool_use branch above for rationale.
+                // Must follow the `tool_use` append above and must not
+                // be skipped independently of it: a `tool_use` with no
+                // matching `tool_result` is rejected by the API, so a
+                // half-persisted pair is worse than neither.
+                if is_acp
+                    && let Err(e) = state
+                        .acp_session_store
+                        .append_message(&session_id, &result_msg)
+                {
+                    warn!("Failed to persist a tool_result message: {e}");
+                }
             }
         }
     };
@@ -3521,5 +3537,124 @@ mod tests {
         progress.tool_start("recall", "call-1").await;
         progress.tool_end("recall", "call-1").await;
         progress.turn_error("ignored").await;
+    }
+
+    /// The point of the task: after a turn that called a tool, reopening
+    /// the session shows what the agent did, not just what was said.
+    #[tokio::test]
+    async fn an_acp_turn_persists_its_tool_calls() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "risky".to_string(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        state.tools.register_tool(Box::new(RiskyTool::new())).await;
+
+        let sid = "acp-tools".to_string();
+        state.acp_sessions.lock().await.insert(sid.clone());
+        state
+            .acp_session_store
+            .create(&sid, "default", "/work")
+            .unwrap();
+
+        run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("run it"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        let history = state.acp_session_store.history(&sid).expect("the session");
+        let uses: Vec<&str> = history
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                ContentPart::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let results: Vec<&str> = history
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                ContentPart::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(uses, vec!["call-1"], "the tool_use was persisted");
+        assert_eq!(
+            uses, results,
+            "every tool_use has its matching tool_result, in order — an \
+             unpaired one is rejected by the API on reload"
+        );
+    }
+
+    /// `/rpc` and the other transports keep today's behaviour: their
+    /// stores have no reference form for a tool result, so writing one
+    /// raw would put the content in the workspace and the retrieve
+    /// index. Tracked as #194.
+    #[tokio::test]
+    async fn an_rpc_turn_still_does_not_persist_tool_calls() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "risky".to_string(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        state.tools.register_tool(Box::new(RiskyTool::new())).await;
+
+        // Not registered in `acp_sessions`, so this is an /rpc session.
+        let sid = "rpc-tools".to_string();
+
+        run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("run it"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        let stored = state
+            .cross_device_session_store
+            .load_session(&sid)
+            .unwrap_or_default();
+        assert!(
+            !stored.iter().flat_map(|m| m.parts.iter()).any(|p| matches!(
+                p,
+                ContentPart::ToolUse { .. } | ContentPart::ToolResult { .. }
+            )),
+            "the /rpc store must still hold no tool traffic"
+        );
     }
 }
