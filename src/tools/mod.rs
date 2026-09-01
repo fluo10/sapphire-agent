@@ -3,6 +3,7 @@ pub mod ambient_tools;
 pub mod builtin_tools;
 pub mod client_tools;
 pub mod policy;
+pub mod subagent;
 pub mod timer_tools;
 pub mod workspace_tools;
 
@@ -89,13 +90,18 @@ pub struct ToolSet {
 }
 
 struct ToolSetInner {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
     specs: Vec<ToolSpec>,
 }
 
 impl ToolSet {
     pub fn new(tools: Vec<Box<dyn Tool>>, mcp_clients: Vec<Arc<McpClient>>) -> Self {
         let specs = tools.iter().map(|t| t.spec().clone()).collect();
+        // `Box` at the public API (every call site already builds one),
+        // `Arc` in storage — see `execute` below for why: a tool's
+        // execution must be clonable out from under the read guard
+        // rather than run while the guard is held.
+        let tools: Vec<Arc<dyn Tool>> = tools.into_iter().map(Arc::from).collect();
         Self {
             inner: RwLock::new(ToolSetInner { tools, specs }),
             mcp_clients,
@@ -144,19 +150,43 @@ impl ToolSet {
     /// (`src/serve/mod.rs`, `src/agent.rs`). Those strings come from
     /// `policy::refusal_message` and are short by construction, but
     /// anything added on that path is NOT capped by this.
+    ///
+    /// The read guard is held only long enough to find and clone the
+    /// matching `Arc<dyn Tool>` — never across `execute_full` itself.
+    /// That matters beyond ordinary lock hygiene: `subagent`
+    /// (`crate::tools::subagent::SubagentTool`) runs *inside* this
+    /// function and drives a whole nested `TurnLoop`, whose own tool
+    /// calls come back through this very function on the same task.
+    /// `tokio::sync::RwLock` is task-fair — a reader blocks as soon as a
+    /// writer is queued — so holding the guard here across execution
+    /// would let a concurrent writer (an MCP `tools/list_changed`
+    /// refresh via `refresh_if_needed`, or `mcp_reconnect`) queue behind
+    /// this call and then block the nested re-entrant read behind
+    /// *that* writer, with nothing left to release either side: the
+    /// whole `ToolSet`, on every transport, stops answering until
+    /// restart. Cloning the `Arc` and dropping the guard before
+    /// `execute_full` removes the possibility outright, for `subagent`
+    /// and for every other tool alike — including `mcp_reconnect`
+    /// itself, which no longer deadlocks on its own write lock while
+    /// its own call's read guard is still held (#201).
     pub async fn execute(&self, call: &ToolCall) -> ToolOutput {
-        let inner = self.inner.read().await;
-        for tool in &inner.tools {
-            if tool.spec().name == call.name {
-                let mut output = match tool.execute_full(&call.input).await {
-                    Ok(output) => output,
-                    Err(e) => ToolOutput::from(format!("Error: {e:#}")),
-                };
-                output.text = truncate_output(&output.text);
-                return output;
-            }
-        }
-        ToolOutput::from(format!("Unknown tool: {}", call.name))
+        let tool = {
+            let inner = self.inner.read().await;
+            inner
+                .tools
+                .iter()
+                .find(|t| t.spec().name == call.name)
+                .cloned()
+        };
+        let Some(tool) = tool else {
+            return ToolOutput::from(format!("Unknown tool: {}", call.name));
+        };
+        let mut output = match tool.execute_full(&call.input).await {
+            Ok(output) => output,
+            Err(e) => ToolOutput::from(format!("Error: {e:#}")),
+        };
+        output.text = truncate_output(&output.text);
+        output
     }
 
     /// Check all MCP clients for `tools_changed` flags and refresh their
@@ -184,7 +214,7 @@ impl ToolSet {
         inner.specs.retain(|s| !s.name.starts_with(&prefix));
         for tool in new_tools {
             inner.specs.push(tool.spec().clone());
-            inner.tools.push(tool);
+            inner.tools.push(Arc::from(tool));
         }
         info!(
             "MCP '{}': tool list refreshed ({} total tools)",
@@ -222,7 +252,7 @@ impl ToolSet {
     pub async fn register_tool(&self, tool: Box<dyn Tool>) {
         let mut inner = self.inner.write().await;
         inner.specs.push(tool.spec().clone());
-        inner.tools.push(tool);
+        inner.tools.push(Arc::from(tool));
     }
 }
 
@@ -524,6 +554,87 @@ mod tests {
             .map(|s| s.name.to_string())
             .collect();
         assert_eq!(names, vec!["keep_me".to_string()]);
+    }
+
+    /// Regression test for the Critical deadlock fixed in `execute`'s doc
+    /// above: a queued writer must never be blocked behind a tool that is
+    /// still executing. Uses a tool that blocks inside `execute` until
+    /// released, signalling once it has actually entered so the test
+    /// never races the spawn against the tool starting to run — by the
+    /// time that signal fires, the read guard that located the tool is
+    /// guaranteed to have already been dropped.
+    ///
+    /// Sanity-checked by temporarily re-widening `execute`'s read guard to
+    /// span `execute_full` again: with that regression reintroduced, this
+    /// test times out and fails, as expected of a test with teeth.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_writer_is_not_blocked_by_an_executing_tool() {
+        use std::time::Duration;
+        use tokio::sync::Notify;
+
+        /// A tool whose `execute` blocks until `release` is notified.
+        struct BlockingTool {
+            spec: ToolSpec,
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl Tool for BlockingTool {
+            fn spec(&self) -> &ToolSpec {
+                &self.spec
+            }
+            async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok("blocking tool result".to_string())
+            }
+        }
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        let tools = Arc::new(ToolSet::new_empty_for_test());
+        tools
+            .register_tool(Box::new(BlockingTool {
+                spec: ToolSpec {
+                    name: "blocking".to_string().into(),
+                    description: String::new().into(),
+                    input_schema: serde_json::json!({}),
+                },
+                entered: entered.clone(),
+                release: release.clone(),
+            }))
+            .await;
+
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "blocking".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let exec_tools = tools.clone();
+        let handle = tokio::spawn(async move { exec_tools.execute(&call).await });
+
+        // Wait until the tool is actually inside `execute_full`, so the
+        // read guard that located it is guaranteed to have been dropped.
+        entered.notified().await;
+
+        // A writer queued behind that dropped guard must not be blocked
+        // by the tool's still-running execution.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tools.register_tool(Box::new(NamedStub::new("late"))),
+        )
+        .await
+        .expect(
+            "a queued writer must not block behind an executing tool — ToolSet::execute is holding its read guard across execution again",
+        );
+
+        release.notify_one();
+
+        let output = handle.await.expect("execute task panicked");
+        assert_eq!(output.text, "blocking tool result");
     }
 }
 

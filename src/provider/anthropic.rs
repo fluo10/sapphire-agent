@@ -124,6 +124,32 @@ struct ApiToolSpec<'a> {
     input_schema: &'a Value,
 }
 
+/// Map a turn's tool specs to the wire format, treating `Some(&[])` the
+/// same as `None`.
+///
+/// `Some(&[])` is a legitimate *definition* — `tools: []` in an agent's
+/// frontmatter means "answer from the prompt alone", the summarise/judge
+/// case (see `crate::agents::AgentDef::tools`) — but
+/// `#[serde(skip_serializing_if = "Option::is_none")]` on `Request::tools`
+/// only skips `None`, not an empty `Vec` wrapped in `Some`, so that
+/// legitimate definition used to serialize as `"tools": []`. Anthropic's
+/// API tolerates that shape, but OpenAI-compatible backends reject it
+/// outright — folding the two here keeps this provider's wire format
+/// consistent with `openai_compatible`'s rather than relying on one
+/// backend's leniency.
+fn api_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ApiToolSpec<'_>>> {
+    tools.filter(|specs| !specs.is_empty()).map(|specs| {
+        specs
+            .iter()
+            .map(|s| ApiToolSpec {
+                name: &s.name,
+                description: &s.description,
+                input_schema: &s.input_schema,
+            })
+            .collect()
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct ApiMessage {
     role: String,
@@ -322,16 +348,7 @@ impl Provider for AnthropicProvider {
     ) -> Result<ChatResponse> {
         let api_messages: Vec<ApiMessage> = messages.iter().map(chat_message_to_api).collect();
 
-        let api_tools: Option<Vec<ApiToolSpec<'_>>> = tools.map(|specs| {
-            specs
-                .iter()
-                .map(|s| ApiToolSpec {
-                    name: &s.name,
-                    description: &s.description,
-                    input_schema: &s.input_schema,
-                })
-                .collect()
-        });
+        let api_tools = api_tools(tools);
 
         let model = self.select_model(messages);
 
@@ -476,5 +493,54 @@ impl Provider for AnthropicProvider {
             tool_calls,
             stop_reason,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `tools: []` is a legitimate agent definition (an agent that
+    /// answers from its prompt alone), and `Some(&[])` must serialize
+    /// exactly like `None`: no `tools` key in the request body at all —
+    /// see `api_tools`'s doc for why, even though Anthropic's own API
+    /// happens to tolerate `"tools": []`.
+    #[test]
+    fn an_empty_tool_list_is_not_sent_as_an_empty_tools_array() {
+        let empty: &[ToolSpec] = &[];
+
+        assert!(
+            api_tools(Some(empty)).is_none(),
+            "Some(&[]) must map to None, not Some(vec![])"
+        );
+        assert!(api_tools(None).is_none());
+
+        let body = Request {
+            model: "m",
+            max_tokens: 1,
+            system: None,
+            messages: Vec::new(),
+            stream: true,
+            tools: api_tools(Some(empty)),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(
+            json.get("tools").is_none(),
+            "the wire body must omit `tools` entirely, not send `[]`: {json}"
+        );
+    }
+
+    /// A non-empty spec list still reaches the wire, so the fix above
+    /// isn't accidentally swallowing real tool lists too.
+    #[test]
+    fn a_non_empty_tool_list_still_serializes() {
+        let specs = [ToolSpec {
+            name: "get_weather".into(),
+            description: "…".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let mapped = api_tools(Some(&specs)).expect("a non-empty list must stay Some");
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].name, "get_weather");
     }
 }

@@ -20,7 +20,7 @@ use crate::config::Config;
 use crate::context_compression::{generate_summary, maybe_compress};
 use crate::digest_cache::DigestCache;
 use crate::provider::registry::ProviderRegistry;
-use crate::provider::{ChatMessage, ContentPart, Provider, UserInputKind};
+use crate::provider::{ChatMessage, ContentPart, Provider, ToolSpec, UserInputKind};
 use crate::session::{ConversationKey, SessionStore};
 use crate::tools::ToolSet;
 use crate::voice::VoiceProviders;
@@ -2125,9 +2125,14 @@ impl TurnHost for NullProgress {
 pub(crate) enum TurnStop {
     /// The model produced its final message; `text` is `Some`.
     Replied,
-    /// A `Provider::chat` call failed. `TurnHost::turn_error` has
-    /// already been handed the message, so the cause is available to
-    /// whoever is reporting; `text` is `None`.
+    /// A `Provider::chat` call failed; `text` is `None`. `TurnHost::turn_error`
+    /// has already been handed the message, so the cause is available to
+    /// whoever is reporting — on every path except a subagent's nested
+    /// turn, where `SubagentTool::execute` runs it under
+    /// `ParentHostSansTurnError`, which deliberately swallows
+    /// `turn_error` (see that type's doc, `src/tools/subagent.rs`). On
+    /// that path the cause reaches only the log line right before this
+    /// is returned, not any `TurnHost`.
     ProviderError,
     /// [`MAX_TOOL_ROUNDS`] was reached with the model still calling tools.
     /// `text` is `None` — deliberately, because every caller that predates
@@ -2185,6 +2190,490 @@ pub(crate) fn visible_tool_predicate(
             }
             _ => true,
         }
+    }
+}
+
+/// Where a turn's messages go — or that they go nowhere.
+///
+/// `Option<TurnPersistence>` rather than a `bool` on the loop: a
+/// subagent has no session, so there is no id to write to and no
+/// half-persisted state to reason about. Making the absence a shape
+/// rather than a flag means the loop cannot accidentally write to a
+/// session that does not exist.
+pub(crate) struct TurnPersistence {
+    store: Arc<SessionStore>,
+    acp_store: Arc<AcpSessionStore>,
+    session_id: String,
+    is_acp: bool,
+}
+
+impl TurnPersistence {
+    /// Append one message. There is nothing here for a caller to gate a
+    /// paired append on — that bookkeeping belongs to
+    /// `append_acp_only`, whose doc explains it; this method's own
+    /// caller (the final assistant message, which pairs with nothing)
+    /// discards any return value, so there is none.
+    fn append_message(&self, msg: &ChatMessage) {
+        if self.is_acp {
+            if let Err(e) = self.acp_store.append_message(&self.session_id, msg) {
+                warn!("Failed to persist a message: {e}");
+            }
+        } else if let Err(e) = self.store.append(&self.session_id, msg) {
+            warn!("Failed to persist a message: {e}");
+        }
+    }
+
+    /// Append a `tool_use` or `tool_result` message. Returns whether the
+    /// caller may go on to persist a message that must be paired with
+    /// this one.
+    ///
+    /// ACP sessions persist tool traffic; the other stores do not (see
+    /// #194). Their line format has no reference form for a result, so
+    /// writing one raw would put the content into the workspace and the
+    /// retrieve index — which is exactly what the ACP store's external
+    /// cache exists to avoid. Unlike [`Self::append_message`], the
+    /// non-ACP branch writes nothing at all rather than falling back to
+    /// `store.append` — hence the separate method.
+    ///
+    /// `true` when nothing was written at all: there is no pairing to
+    /// break, so a `tool_result` must not be skipped just because its
+    /// `tool_use` was never a candidate for the store.
+    fn append_acp_only(&self, msg: &ChatMessage) -> bool {
+        if !self.is_acp {
+            return true;
+        }
+        match self.acp_store.append_message(&self.session_id, msg) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to persist a message: {e}");
+                false
+            }
+        }
+    }
+
+    /// Append a compaction summary. ACP sessions keep none — their
+    /// history is rebuilt from events on reload, so a stored summary
+    /// would be a second, staler answer to a question the events
+    /// already answer.
+    fn append_summary(&self, summary: &str) {
+        if !self.is_acp
+            && let Err(e) = self.store.append_summary(&self.session_id, summary)
+        {
+            warn!("Failed to persist compaction summary: {e}");
+        }
+    }
+}
+
+/// What a delegating tool needs to run a nested conversation.
+///
+/// Carried the same way the ACP client handle is (`tools::acp_client`),
+/// and for the same reason: `Tool::execute` receives only its JSON
+/// input, and threading a turn through the `Tool` trait would touch
+/// every tool for the benefit of one.
+pub(crate) struct TurnContext {
+    pub state: Arc<ServeState>,
+    pub provider: Arc<dyn Provider>,
+    pub progress: Arc<dyn TurnHost>,
+    /// `Arc<[ToolSpec]>` rather than `Vec<ToolSpec>`: this round's own
+    /// `tool_specs` doesn't change between rounds of the same turn, so
+    /// `TurnLoop::run` builds this once per turn and `Arc::clone`s it
+    /// per round rather than deep-cloning every `ToolSpec` — schemas
+    /// included — on every round of every turn, whether or not any
+    /// subagent is even defined.
+    pub visible_specs: Arc<[ToolSpec]>,
+    pub timer_origin: Option<crate::timer::TimerOrigin>,
+}
+
+tokio::task_local! {
+    static TURN_CONTEXT_TL: Arc<TurnContext>;
+}
+
+/// Run `fut` with a [`TurnContext`] reachable from `current_turn_context`.
+pub(crate) fn scope_turn_context<F: std::future::Future>(
+    ctx: Arc<TurnContext>,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    TURN_CONTEXT_TL.scope(ctx, fut)
+}
+
+/// The context for the turn currently executing a tool call, if there is
+/// one.
+///
+/// `None` outside `scope_turn_context` — which is what makes
+/// `tools::subagent::SubagentTool` refuse on any path that is not a live
+/// turn, rather than reaching for a model and a host that do not exist.
+pub(crate) fn current_turn_context() -> Option<Arc<TurnContext>> {
+    TURN_CONTEXT_TL.try_with(Arc::clone).ok()
+}
+
+/// One model conversation run to completion: call the model, run the
+/// tools it asks for, repeat until it stops asking.
+///
+/// Extracted from `run_llm_turn` so a subagent can run the same loop
+/// without a session behind it. Everything session-shaped lives in
+/// `persistence`, which is `None` for a subagent — see
+/// `TurnPersistence`.
+///
+/// `namespace` is not session state either, but the loop needs it to
+/// scope the memory tool (`scope_memory_namespace`) for every tool call
+/// it executes, so it travels alongside the other per-turn inputs
+/// rather than through `persistence`.
+pub(crate) struct TurnLoop<'a> {
+    pub state: &'a Arc<ServeState>,
+    pub provider: &'a Arc<dyn Provider>,
+    pub system: Option<&'a str>,
+    pub tool_specs: &'a [ToolSpec],
+    pub progress: &'a Arc<dyn TurnHost>,
+    pub timer_origin: Option<crate::timer::TimerOrigin>,
+    pub namespace: String,
+    pub persistence: Option<&'a TurnPersistence>,
+}
+
+impl TurnLoop<'_> {
+    /// Run until the model stops calling tools, the round budget runs
+    /// out, or the provider fails. `history` is both the input and
+    /// where the conversation accumulates.
+    pub(crate) async fn run(self, history: &mut Vec<ChatMessage>) -> (Option<String>, TurnStop) {
+        let state = self.state;
+        let provider: &dyn Provider = &**self.provider;
+        let system = self.system;
+        let tool_specs = self.tool_specs;
+        let progress = self.progress;
+        let namespace = self.namespace;
+        // Read once per turn: `None` on every non-ACP transport, which
+        // is what keeps the client-side tools refusing there rather
+        // than reaching for a connection that does not exist.
+        let host_access_enabled = state.config.tools.host_access.enabled;
+        let compression_config = &state.config.compression;
+        let mut accumulated_text: Vec<String> = Vec::new();
+        // Built once per turn, not once per round: `tool_specs` is fixed
+        // for the whole call to `run`, so cloning it into an
+        // `Arc<[ToolSpec]>` here and `Arc::clone`-ing it into each
+        // round's `TurnContext` below is a pointer copy instead of a
+        // deep clone of every `ToolSpec` — schemas included — on every
+        // round of every turn.
+        let visible_specs: Arc<[ToolSpec]> = Arc::from(tool_specs);
+        let (final_text, stop) = loop {
+            let round = history
+                .iter()
+                .filter(|m| {
+                    m.parts
+                        .iter()
+                        .any(|p| matches!(p, ContentPart::ToolUse { .. }))
+                })
+                .count();
+
+            if round >= MAX_TOOL_ROUNDS {
+                warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS})");
+                // `None` for the text, as before — callers that predate ACP
+                // report this as a failed turn and must keep doing so — but the
+                // prose accumulated so far rides along on the stop reason for
+                // transports that can show partial work.
+                break (
+                    None,
+                    TurnStop::BudgetExhausted {
+                        partial_text: accumulated_text.join("\n\n"),
+                    },
+                );
+            }
+
+            // Check if context compression is needed
+            match maybe_compress(provider, system, history, compression_config).await {
+                Ok(Some(result)) => {
+                    *history = result.compressed;
+                    // ACP sessions do not persist a compaction summary: the
+                    // full event history is re-read from the store on
+                    // reload, so a stored summary would only be a second,
+                    // staler answer to a question the events already
+                    // answer. Compression stays an in-memory optimisation.
+                    if let Some(p) = self.persistence {
+                        p.append_summary(&result.summary);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Context compression failed, continuing with full history: {e}");
+                }
+            }
+
+            // Hydrate `ImageRef` parts from the image cache into full
+            // `Image` parts for the provider call. `Image` parts (just
+            // arrived this turn) and Text/Tool parts pass through;
+            // `ImageRef` parts are intentionally degraded to text markers
+            // so historical images aren't re-billed every turn (the cache
+            // still retains the bytes for an on-demand recall tool).
+            // After hydration, fold each user message's input modality
+            // into a textual prefix so the model knows when a body is a
+            // voice transcript (likely to contain STT errors).
+            let history_for_provider: Vec<ChatMessage> =
+                crate::image_cache::hydrate_history(history)
+                    .into_iter()
+                    .map(apply_input_kind_label)
+                    .collect();
+            let response = provider
+                .chat(system, &history_for_provider, Some(tool_specs))
+                .await;
+
+            match response {
+                Err(e) => {
+                    error!("Provider error: {e:#}");
+                    progress.turn_error(&e.to_string()).await;
+                    break (None, TurnStop::ProviderError);
+                }
+                Ok(resp) if !resp.has_tool_calls() => {
+                    let text = resp.text.unwrap_or_default();
+                    let msg = ChatMessage::assistant(&text);
+                    history.push(msg.clone());
+                    if let Some(p) = self.persistence {
+                        p.append_message(&msg);
+                    }
+                    if !text.is_empty() {
+                        accumulated_text.push(text);
+                    }
+                    break (Some(accumulated_text.join("\n\n")), TurnStop::Replied);
+                }
+                Ok(resp) => {
+                    let tool_calls = resp.tool_calls.clone();
+                    if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
+                        accumulated_text.push(t.clone());
+                    }
+                    let msg =
+                        ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
+                    history.push(msg.clone());
+                    // ACP sessions persist tool traffic; the other stores do
+                    // not (see #194). Their line format has no reference
+                    // form for a result, so writing one raw would put the
+                    // content into the workspace and the retrieve index —
+                    // which is exactly what the ACP store's external cache
+                    // exists to avoid.
+                    //
+                    // Whether this append actually landed is captured and
+                    // carried down to the `tool_result` append below: the
+                    // two must not be skipped independently of each other
+                    // (see the comment there for why).
+                    let tool_use_persisted =
+                        self.persistence.is_none_or(|p| p.append_acp_only(&msg));
+
+                    // Notify client of each tool starting
+                    for call in &tool_calls {
+                        progress.tool_start(&call.id, &call.name).await;
+                    }
+
+                    // Permission gate.
+                    //
+                    // Serial on purpose. `decide` is a cheap pure call, but
+                    // `approve` puts a dialog in front of a human, and
+                    // firing several at once would stack them on the poor
+                    // soul in the editor. Execution below stays concurrent.
+                    //
+                    // `offered` is this round's own advertised list —
+                    // `tool_specs`, by name. `ToolSet::execute` dispatches
+                    // on name across *every* tool registered on the shared
+                    // `ToolSet`, not just the ones this round offered, so
+                    // without checking membership here first, a call
+                    // naming a tool this round never advertised would
+                    // still run. That is what would let a subagent recurse
+                    // by calling `subagent` itself — removed from its own
+                    // `tool_specs` by `subagent_tool_specs`, but not from
+                    // the underlying `ToolSet` — and what would let a
+                    // definition's `tools:` restriction be bypassed by
+                    // simply naming a tool outside it. One check here
+                    // closes both, and the same hallucinated-name gap on
+                    // the ordinary (non-subagent) path.
+                    let offered: std::collections::HashSet<&str> =
+                        tool_specs.iter().map(|s| s.name.as_ref()).collect();
+                    let kinds = self.state.tools.kinds().await;
+                    let origin = progress.origin();
+                    let mut permitted: Vec<crate::provider::ToolCall> = Vec::new();
+                    let mut refused: Vec<(String, String)> = Vec::new();
+                    for call in &tool_calls {
+                        use crate::tools::policy::{
+                            Decision, Refusal, host_tool_denied, kind_of, refusal_message,
+                        };
+
+                        // Three gates, checked in order, only the last of
+                        // which is the origin/kind policy table itself.
+                        //
+                        // `NotOffered` goes first: whether a name is even
+                        // in this round's own `tool_specs` is a fact about
+                        // what *this call* is allowed to see (a subagent's
+                        // `tools:` restriction, `subagent` removed from its
+                        // own nested round, a hallucinated name on an
+                        // ordinary turn) — see `Refusal::NotOffered`'s doc
+                        // — and it has to come before the deployment-wide
+                        // host-machine gate below it, or a name outside
+                        // this round's list but happening to match a host
+                        // tool would be reported as merely unavailable on
+                        // this transport rather than as what it actually
+                        // is: not offered here at all.
+                        //
+                        // The host-machine gate itself sits in front of
+                        // `decide`: it is a fact about the deployment ("may
+                        // this agent touch its own disk at all"), not a
+                        // row in the origin/kind policy table — so it is
+                        // checked, and can refuse, before `decide` is even
+                        // consulted.
+                        let refusal = if !offered.contains(call.name.as_str()) {
+                            Some(refusal_message(&call.name, Refusal::NotOffered))
+                        } else if host_tool_denied(&call.name, host_access_enabled) {
+                            Some(refusal_message(&call.name, Refusal::Unavailable))
+                        } else {
+                            let kind = kind_of(&call.name, &kinds);
+                            let verdict = crate::tools::policy::decide(origin, kind);
+                            match verdict {
+                                Decision::Allow => None,
+                                Decision::Deny => {
+                                    Some(refusal_message(&call.name, Refusal::Unavailable))
+                                }
+                                Decision::Ask => {
+                                    if progress.approve(call, kind).await.allows() {
+                                        None
+                                    } else {
+                                        Some(refusal_message(&call.name, Refusal::UserDeclined))
+                                    }
+                                }
+                            }
+                        };
+
+                        match refusal {
+                            None => {
+                                // Every permitted call, not just an asked
+                                // one: a client that saw `tool_start` needs
+                                // to know this one is running rather than
+                                // still waiting on it.
+                                progress.tool_allowed(&call.id).await;
+                                permitted.push(call.clone());
+                            }
+                            Some(reason) => {
+                                info!("Refused tool {} (id={}): {reason}", call.name, call.id);
+                                refused.push((call.id.clone(), reason));
+                            }
+                        }
+                    }
+
+                    // Execute all tools concurrently — each call wrapped in
+                    // the session's memory namespace (task_local) so the
+                    // memory tool writes under `memory/<namespace>/...`.
+                    let tools = Arc::clone(&self.state.tools);
+                    let ns = namespace.clone();
+                    let timer_origin = self.timer_origin.clone();
+                    // Read once per turn, same as `timer_origin`: `None` on
+                    // every non-ACP transport, which is what keeps the
+                    // client-side tools refusing there rather than reaching
+                    // for a connection that does not exist.
+                    let acp_client = progress.acp_client();
+                    // What `tools::subagent::SubagentTool` needs to run a
+                    // nested conversation, scoped around every call this
+                    // round the same way the timer/ACP task-locals are —
+                    // see `TurnContext`. Built once per round rather than
+                    // per call: it is the same for every permitted call in
+                    // this round. `visible_specs` is an `Arc::clone` of
+                    // the `Arc<[ToolSpec]>` built once above `loop`, not a
+                    // fresh deep clone of `tool_specs` — see that binding's
+                    // comment.
+                    let turn_ctx = Arc::new(TurnContext {
+                        state: Arc::clone(self.state),
+                        provider: Arc::clone(self.provider),
+                        progress: Arc::clone(progress),
+                        visible_specs: Arc::clone(&visible_specs),
+                        timer_origin: timer_origin.clone(),
+                    });
+                    let mut results: Vec<(String, crate::tools::ToolOutput)> =
+                        futures_util::future::join_all(permitted.into_iter().map(|c| {
+                            let tools = Arc::clone(&tools);
+                            let ns = ns.clone();
+                            let origin = timer_origin.clone();
+                            let client = acp_client.clone();
+                            let turn_ctx = Arc::clone(&turn_ctx);
+                            async move {
+                                let fut = crate::tools::workspace_tools::scope_memory_namespace(
+                                    ns,
+                                    async move {
+                                        info!("Executing tool: {} (id={})", c.name, c.id);
+                                        let output = tools.execute(&c).await;
+                                        info!("Tool {} done", c.name);
+                                        (c.id, output)
+                                    },
+                                );
+                                // A subagent's own tool calls need the turn
+                                // context too — nested here rather than
+                                // constructed fresh inside `SubagentTool`,
+                                // so `current_turn_context()` is available
+                                // to any tool this round, not just the one
+                                // named `subagent`.
+                                let fut = scope_turn_context(turn_ctx, fut);
+                                // Both remaining scopes have to wrap
+                                // execution too: the timer tool reads one
+                                // task-local and the client-side tools read
+                                // the other, and either missing breaks that
+                                // set of tools. Each arm awaits in place
+                                // rather than boxing a common future type,
+                                // the same way the single-scope version of
+                                // this match did before the client scope
+                                // was added.
+                                match (origin, client) {
+                                    (Some(o), Some(c)) => {
+                                        crate::timer::scope_timer_origin(
+                                            o,
+                                            crate::tools::acp_client::scope_acp_client(c, fut),
+                                        )
+                                        .await
+                                    }
+                                    (Some(o), None) => {
+                                        crate::timer::scope_timer_origin(o, fut).await
+                                    }
+                                    (None, Some(c)) => {
+                                        crate::tools::acp_client::scope_acp_client(c, fut).await
+                                    }
+                                    (None, None) => fut.await,
+                                }
+                            }
+                        }))
+                        .await;
+
+                    // A refused call still owes the model a tool_result:
+                    // every tool_use in the assistant message must be
+                    // answered, and the reason is more useful to the model
+                    // than silence. The turn is NOT ended — the model may
+                    // have another route, and ACP's `Refusal` stop reason
+                    // means "the agent declined", which is a different
+                    // thing from "the user declined".
+                    for (id, reason) in refused {
+                        results.push((id, crate::tools::ToolOutput::from(reason)));
+                    }
+
+                    // Notify client of each tool completing
+                    for call in &tool_calls {
+                        progress.tool_end(&call.id, &call.name).await;
+                    }
+
+                    let mut text_results = Vec::with_capacity(results.len());
+                    let mut images = Vec::new();
+                    for (id, output) in results {
+                        text_results.push((id, output.text));
+                        images.extend(output.images);
+                    }
+                    let result_msg = ChatMessage::tool_results_with_images(text_results, images);
+                    history.push(result_msg.clone());
+                    // Gated on `tool_use_persisted`: this append must not run
+                    // independently of the `tool_use` append above. If that
+                    // one failed, the tip on disk is still the user message,
+                    // so appending the result here would chain it directly
+                    // onto that user message — a `tool_result` with no
+                    // `tool_use` anywhere before it, which is just as
+                    // rejected by the API as the reverse gap, and unlike the
+                    // in-memory `history` (which is correct either way and
+                    // gets scrubbed/reloaded next turn) would brick the
+                    // on-disk session forever. A half-persisted pair is worse
+                    // than neither, so skip this append too rather than
+                    // leaving only the result on disk.
+                    if tool_use_persisted && let Some(p) = self.persistence {
+                        p.append_acp_only(&result_msg);
+                    }
+                }
+            }
+        };
+        (final_text, stop)
     }
 }
 
@@ -2360,278 +2849,24 @@ pub(crate) async fn run_llm_turn(
             client_terminal,
         ))
         .await;
-    let compression_config = &state.config.compression;
-    let mut accumulated_text: Vec<String> = Vec::new();
-    let (final_text, stop) = loop {
-        let round = history
-            .iter()
-            .filter(|m| {
-                m.parts
-                    .iter()
-                    .any(|p| matches!(p, ContentPart::ToolUse { .. }))
-            })
-            .count();
-
-        if round >= MAX_TOOL_ROUNDS {
-            warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS})");
-            // `None` for the text, as before — callers that predate ACP
-            // report this as a failed turn and must keep doing so — but the
-            // prose accumulated so far rides along on the stop reason for
-            // transports that can show partial work.
-            break (
-                None,
-                TurnStop::BudgetExhausted {
-                    partial_text: accumulated_text.join("\n\n"),
-                },
-            );
-        }
-
-        // Check if context compression is needed
-        match maybe_compress(&*provider, system.as_deref(), &history, compression_config).await {
-            Ok(Some(result)) => {
-                history = result.compressed;
-                // ACP sessions do not persist a compaction summary: the
-                // full event history is re-read from the store on
-                // reload, so a stored summary would only be a second,
-                // staler answer to a question the events already
-                // answer. Compression stays an in-memory optimisation.
-                if !is_acp && let Err(e) = store.append_summary(&session_id, &result.summary) {
-                    warn!("Failed to persist compaction summary: {e}");
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!("Context compression failed, continuing with full history: {e}");
-            }
-        }
-
-        // Hydrate `ImageRef` parts from the image cache into full
-        // `Image` parts for the provider call. `Image` parts (just
-        // arrived this turn) and Text/Tool parts pass through;
-        // `ImageRef` parts are intentionally degraded to text markers
-        // so historical images aren't re-billed every turn (the cache
-        // still retains the bytes for an on-demand recall tool).
-        // After hydration, fold each user message's input modality
-        // into a textual prefix so the model knows when a body is a
-        // voice transcript (likely to contain STT errors).
-        let history_for_provider: Vec<ChatMessage> = crate::image_cache::hydrate_history(&history)
-            .into_iter()
-            .map(apply_input_kind_label)
-            .collect();
-        let response = provider
-            .chat(system.as_deref(), &history_for_provider, Some(&tool_specs))
-            .await;
-
-        match response {
-            Err(e) => {
-                error!("Provider error: {e:#}");
-                progress.turn_error(&e.to_string()).await;
-                break (None, TurnStop::ProviderError);
-            }
-            Ok(resp) if !resp.has_tool_calls() => {
-                let text = resp.text.unwrap_or_default();
-                let msg = ChatMessage::assistant(&text);
-                history.push(msg.clone());
-                if is_acp {
-                    if let Err(e) = state.acp_session_store.append_message(&session_id, &msg) {
-                        warn!("Failed to persist assistant message: {e}");
-                    }
-                } else if let Err(e) = store.append(&session_id, &msg) {
-                    warn!("Failed to persist assistant message: {e}");
-                }
-                if !text.is_empty() {
-                    accumulated_text.push(text);
-                }
-                break (Some(accumulated_text.join("\n\n")), TurnStop::Replied);
-            }
-            Ok(resp) => {
-                let tool_calls = resp.tool_calls.clone();
-                if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
-                    accumulated_text.push(t.clone());
-                }
-                let msg = ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
-                history.push(msg.clone());
-                // ACP sessions persist tool traffic; the other stores do
-                // not (see #194). Their line format has no reference
-                // form for a result, so writing one raw would put the
-                // content into the workspace and the retrieve index —
-                // which is exactly what the ACP store's external cache
-                // exists to avoid.
-                //
-                // Whether this append actually landed is captured and
-                // carried down to the `tool_result` append below: the
-                // two must not be skipped independently of each other
-                // (see the comment there for why).
-                let tool_use_persisted = !is_acp
-                    || match state.acp_session_store.append_message(&session_id, &msg) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            warn!("Failed to persist a tool_use message: {e}");
-                            false
-                        }
-                    };
-
-                // Notify client of each tool starting
-                for call in &tool_calls {
-                    progress.tool_start(&call.id, &call.name).await;
-                }
-
-                // Permission gate.
-                //
-                // Serial on purpose. `decide` is a cheap pure call, but
-                // `approve` puts a dialog in front of a human, and
-                // firing several at once would stack them on the poor
-                // soul in the editor. Execution below stays concurrent.
-                let kinds = state.tools.kinds().await;
-                let origin = progress.origin();
-                let mut permitted: Vec<crate::provider::ToolCall> = Vec::new();
-                let mut refused: Vec<(String, String)> = Vec::new();
-                for call in &tool_calls {
-                    use crate::tools::policy::{
-                        Decision, Refusal, host_tool_denied, kind_of, refusal_message,
-                    };
-
-                    // The host-machine gate sits in front of `decide`:
-                    // it is a fact about the deployment ("may this agent
-                    // touch its own disk at all"), not a row in the
-                    // origin/kind policy table — so it is checked, and
-                    // can refuse, before `decide` is even consulted.
-                    let refusal = if host_tool_denied(&call.name, host_access_enabled) {
-                        Some(refusal_message(&call.name, Refusal::Unavailable))
-                    } else {
-                        let kind = kind_of(&call.name, &kinds);
-                        let verdict = crate::tools::policy::decide(origin, kind);
-                        match verdict {
-                            Decision::Allow => None,
-                            Decision::Deny => {
-                                Some(refusal_message(&call.name, Refusal::Unavailable))
-                            }
-                            Decision::Ask => {
-                                if progress.approve(call, kind).await.allows() {
-                                    None
-                                } else {
-                                    Some(refusal_message(&call.name, Refusal::UserDeclined))
-                                }
-                            }
-                        }
-                    };
-
-                    match refusal {
-                        None => {
-                            // Every permitted call, not just an asked
-                            // one: a client that saw `tool_start` needs
-                            // to know this one is running rather than
-                            // still waiting on it.
-                            progress.tool_allowed(&call.id).await;
-                            permitted.push(call.clone());
-                        }
-                        Some(reason) => {
-                            info!("Refused tool {} (id={}): {reason}", call.name, call.id);
-                            refused.push((call.id.clone(), reason));
-                        }
-                    }
-                }
-
-                // Execute all tools concurrently — each call wrapped in
-                // the session's memory namespace (task_local) so the
-                // memory tool writes under `memory/<namespace>/...`.
-                let tools = Arc::clone(&state.tools);
-                let ns = namespace.clone();
-                let timer_origin = timer_origin.clone();
-                // Read once per turn, same as `timer_origin`: `None` on
-                // every non-ACP transport, which is what keeps the
-                // client-side tools refusing there rather than reaching
-                // for a connection that does not exist.
-                let acp_client = progress.acp_client();
-                let mut results: Vec<(String, crate::tools::ToolOutput)> =
-                    futures_util::future::join_all(permitted.into_iter().map(|c| {
-                        let tools = Arc::clone(&tools);
-                        let ns = ns.clone();
-                        let origin = timer_origin.clone();
-                        let client = acp_client.clone();
-                        async move {
-                            let fut = crate::tools::workspace_tools::scope_memory_namespace(
-                                ns,
-                                async move {
-                                    info!("Executing tool: {} (id={})", c.name, c.id);
-                                    let output = tools.execute(&c).await;
-                                    info!("Tool {} done", c.name);
-                                    (c.id, output)
-                                },
-                            );
-                            // Both scopes have to wrap execution: the
-                            // timer tool reads one task-local and the
-                            // client-side tools read the other, and
-                            // either missing breaks that set of tools.
-                            // Each arm awaits in place rather than
-                            // boxing a common future type, the same way
-                            // the single-scope version of this match did
-                            // before the client scope was added.
-                            match (origin, client) {
-                                (Some(o), Some(c)) => {
-                                    crate::timer::scope_timer_origin(
-                                        o,
-                                        crate::tools::acp_client::scope_acp_client(c, fut),
-                                    )
-                                    .await
-                                }
-                                (Some(o), None) => crate::timer::scope_timer_origin(o, fut).await,
-                                (None, Some(c)) => {
-                                    crate::tools::acp_client::scope_acp_client(c, fut).await
-                                }
-                                (None, None) => fut.await,
-                            }
-                        }
-                    }))
-                    .await;
-
-                // A refused call still owes the model a tool_result:
-                // every tool_use in the assistant message must be
-                // answered, and the reason is more useful to the model
-                // than silence. The turn is NOT ended — the model may
-                // have another route, and ACP's `Refusal` stop reason
-                // means "the agent declined", which is a different
-                // thing from "the user declined".
-                for (id, reason) in refused {
-                    results.push((id, crate::tools::ToolOutput::from(reason)));
-                }
-
-                // Notify client of each tool completing
-                for call in &tool_calls {
-                    progress.tool_end(&call.id, &call.name).await;
-                }
-
-                let mut text_results = Vec::with_capacity(results.len());
-                let mut images = Vec::new();
-                for (id, output) in results {
-                    text_results.push((id, output.text));
-                    images.extend(output.images);
-                }
-                let result_msg = ChatMessage::tool_results_with_images(text_results, images);
-                history.push(result_msg.clone());
-                // Gated on `tool_use_persisted`: this append must not run
-                // independently of the `tool_use` append above. If that
-                // one failed, the tip on disk is still the user message,
-                // so appending the result here would chain it directly
-                // onto that user message — a `tool_result` with no
-                // `tool_use` anywhere before it, which is just as
-                // rejected by the API as the reverse gap, and unlike the
-                // in-memory `history` (which is correct either way and
-                // gets scrubbed/reloaded next turn) would brick the
-                // on-disk session forever. A half-persisted pair is worse
-                // than neither, so skip this append too rather than
-                // leaving only the result on disk.
-                if is_acp
-                    && tool_use_persisted
-                    && let Err(e) = state
-                        .acp_session_store
-                        .append_message(&session_id, &result_msg)
-                {
-                    warn!("Failed to persist a tool_result message: {e}");
-                }
-            }
-        }
+    let persistence = TurnPersistence {
+        store: Arc::clone(&store),
+        acp_store: Arc::clone(&state.acp_session_store),
+        session_id: session_id.clone(),
+        is_acp,
     };
+    let (final_text, stop) = TurnLoop {
+        state: &state,
+        provider: &provider,
+        system: system.as_deref(),
+        tool_specs: &tool_specs,
+        progress: &progress,
+        timer_origin,
+        namespace: namespace.clone(),
+        persistence: Some(&persistence),
+    }
+    .run(&mut history)
+    .await;
 
     // Scrub `Image` parts in the just-completed history into compact
     // `ImageRef` references backed by the workspace-external image
@@ -3001,13 +3236,45 @@ impl crate::tools::Tool for NamedStubTool {
     }
 }
 
+/// Every `chat()` call a [`StubProvider`] has seen, in call order:
+/// `(system, tool names offered)`. `system` is owned (not the borrowed
+/// `Option<&str>` `chat()` receives) so the log outlives the call.
+///
+/// Exists because the scripted responses alone only prove a turn's
+/// *outcome* was right — they say nothing about what the provider was
+/// actually called *with*. Both of `subagent`'s headline properties
+/// (its own system prompt, its own restricted tool list) are otherwise
+/// asserted only where they are computed (`subagent_system_prompt`,
+/// `subagent_tool_specs`), not where they are wired into the call
+/// `TurnLoop::run` makes — this closes that gap. `Clone`, so the handle
+/// obtained from [`StubProvider::call_log`] before the provider is
+/// moved into a `ProviderRegistry` can still be read afterwards.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct ChatLog(Arc<std::sync::Mutex<Vec<(Option<String>, Vec<String>)>>>);
+
+#[cfg(test)]
+impl ChatLog {
+    /// A snapshot of every call recorded so far, in order.
+    pub(crate) fn calls(&self) -> Vec<(Option<String>, Vec<String>)> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 /// Provider double for tests. In "scripted" mode it pops one
 /// [`crate::provider::ChatResponse`] off a queue per `chat()` call. In
 /// "hanging" mode `chat()` never resolves — used to keep a turn in
 /// flight while a cancellation test races it.
 #[cfg(test)]
 pub(crate) struct StubProvider {
-    script: Option<std::sync::Mutex<std::collections::VecDeque<crate::provider::ChatResponse>>>,
+    /// `Err` entries let a test force one specific `chat()` call —
+    /// identified by its position in the sequence, not by which
+    /// conversation made it — to fail while the calls around it
+    /// succeed (see `new_scripted`), the same way an exhausted script
+    /// fails every call after it.
+    script: Option<
+        std::sync::Mutex<std::collections::VecDeque<Result<crate::provider::ChatResponse, String>>>,
+    >,
     /// Only set in hanging mode. Counts entries into the parked `chat()` —
     /// see [`HangingChat::entered`].
     hang_entered: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -3016,6 +3283,8 @@ pub(crate) struct StubProvider {
     /// assert the turn was actually torn down rather than merely observing
     /// that it never completed on its own.
     hang_dropped: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// See [`ChatLog`].
+    calls: ChatLog,
 }
 
 /// The two observations a test can make about a hanging provider's
@@ -3067,10 +3336,19 @@ impl HangingChat {
 #[cfg(test)]
 impl StubProvider {
     pub(crate) fn new(responses: Vec<crate::provider::ChatResponse>) -> Self {
+        Self::new_scripted(responses.into_iter().map(Ok).collect())
+    }
+
+    /// Like `new`, but a script entry can be `Err` instead of a
+    /// response, for a test that needs one particular `chat()` call to
+    /// fail (e.g. a subagent's own provider call) while the calls
+    /// before and after it succeed.
+    pub(crate) fn new_scripted(items: Vec<Result<crate::provider::ChatResponse, String>>) -> Self {
         Self {
-            script: Some(std::sync::Mutex::new(responses.into())),
+            script: Some(std::sync::Mutex::new(items.into())),
             hang_entered: None,
             hang_dropped: None,
+            calls: ChatLog::default(),
         }
     }
 
@@ -3084,9 +3362,16 @@ impl StubProvider {
                 script: None,
                 hang_entered: Some(Arc::clone(&entered)),
                 hang_dropped: Some(Arc::clone(&dropped)),
+                calls: ChatLog::default(),
             },
             HangingChat { entered, dropped },
         )
+    }
+
+    /// A handle onto this provider's [`ChatLog`], to keep after the
+    /// provider is moved into a `ProviderRegistry`.
+    pub(crate) fn call_log(&self) -> ChatLog {
+        self.calls.clone()
     }
 }
 
@@ -3099,10 +3384,16 @@ impl Provider for StubProvider {
 
     async fn chat(
         &self,
-        _system: Option<&str>,
+        system: Option<&str>,
         _messages: &[ChatMessage],
-        _tools: Option<&[crate::provider::ToolSpec]>,
+        tools: Option<&[crate::provider::ToolSpec]>,
     ) -> anyhow::Result<crate::provider::ChatResponse> {
+        self.calls.0.lock().unwrap().push((
+            system.map(|s| s.to_string()),
+            tools
+                .map(|specs| specs.iter().map(|s| s.name.to_string()).collect())
+                .unwrap_or_default(),
+        ));
         let Some(script) = &self.script else {
             // Hold a guard whose Drop flips `hang_dropped` before awaiting
             // forever, so a caller that aborts this future (rather than
@@ -3128,8 +3419,11 @@ impl Provider for StubProvider {
             std::future::pending::<()>().await;
             unreachable!()
         };
-        let next = script.lock().unwrap().pop_front();
-        next.ok_or_else(|| anyhow::anyhow!("StubProvider script exhausted"))
+        match script.lock().unwrap().pop_front() {
+            Some(Ok(resp)) => Ok(resp),
+            Some(Err(msg)) => Err(anyhow::anyhow!(msg)),
+            None => Err(anyhow::anyhow!("StubProvider script exhausted")),
+        }
     }
 }
 
@@ -3152,6 +3446,20 @@ impl ServeState {
         responses: Vec<crate::provider::ChatResponse>,
     ) -> Arc<Self> {
         Self::build_for_test(acp_enabled, StubProvider::new(responses))
+    }
+
+    /// Same as [`Self::for_test_scripted`], plus a [`ChatLog`] handle so
+    /// a test can assert on what each `chat()` call actually received —
+    /// not just the scripted outcome, but the `system`/`tools` a
+    /// property (e.g. a subagent's own prompt and tool list) claims
+    /// were wired through.
+    pub(crate) fn for_test_scripted_with_log(
+        acp_enabled: bool,
+        responses: Vec<crate::provider::ChatResponse>,
+    ) -> (Arc<Self>, ChatLog) {
+        let provider = StubProvider::new(responses);
+        let log = provider.call_log();
+        (Self::build_for_test(acp_enabled, provider), log)
     }
 
     /// State whose provider never returns, so a turn stays in flight.
@@ -3416,6 +3724,578 @@ mod tests {
         assert!(
             ran.load(std::sync::atomic::Ordering::SeqCst),
             "a trusted origin must have executed it"
+        );
+    }
+
+    /// A subagent runs under the parent's `Origin`, so it cannot do
+    /// what the parent was refused. Anything else would make "ask a
+    /// subagent" a way around the permission gate.
+    ///
+    /// `subagent` itself is `ToolKind::Other`, which the policy table
+    /// groups with `Execute` in the same "risky" bucket in every origin
+    /// (see `crate::tools::policy::decide`) — so an origin that
+    /// auto-denies `Execute` (`Origin::Channel`) would auto-deny the
+    /// top-level `subagent` call too, before delegation ever ran, which
+    /// would make the test pass without exercising `SubagentTool` at
+    /// all. `Origin::Acp(SessionMode::Default)` sends every risky call
+    /// through `approve` instead of denying it outright, so this test
+    /// can let the top-level `subagent` call through while having the
+    /// very same `approve` reject the nested `risky` call — proving the
+    /// nested call is judged by the *parent's* host, not a laxer one
+    /// standing in for it.
+    #[tokio::test]
+    async fn a_subagent_is_judged_by_the_parents_origin() {
+        use crate::tools::policy::{Approval, Origin, SessionMode};
+
+        /// Approves everything except a tool named `risky` — modeling a
+        /// human who would say yes to delegating but no to the risky
+        /// command itself, however it is asked. The subagent's nested
+        /// call reaches this exact same `approve`, so if the risky call
+        /// were judged by anything other than the parent's own host it
+        /// would not be rejected here.
+        struct AskExceptRiskyHost;
+        #[async_trait::async_trait]
+        impl TurnHost for AskExceptRiskyHost {
+            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_end(&self, _id: &str, _name: &str) {}
+            async fn turn_error(&self, _message: &str) {}
+            fn origin(&self) -> Origin {
+                Origin::Acp(SessionMode::Default)
+            }
+            async fn approve(
+                &self,
+                call: &crate::provider::ToolCall,
+                _kind: crate::tools::ToolKind,
+            ) -> Approval {
+                if call.name == "risky" {
+                    Approval::RejectOnce
+                } else {
+                    Approval::AllowOnce
+                }
+            }
+        }
+
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                // Parent round 1: delegate to the subagent.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "delegator", "prompt": "run it"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 1: try the Execute-kind tool the
+                // parent itself could not run under this host.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "sub-call-1".to_string(),
+                        name: "risky".to_string(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 2: give up after the refusal.
+                crate::provider::ChatResponse {
+                    text: Some("could not run it".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+                // Parent round 2.
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        let risky = RiskyTool::new();
+        let ran = risky.ran_flag();
+        state.tools.register_tool(Box::new(risky)).await;
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
+                crate::agents::AgentDef {
+                    name: "delegator".to_string(),
+                    description: "Delegates a risky call.".to_string(),
+                    tools: Some(vec!["risky".to_string()]),
+                    prompt: "You are a delegator.".to_string(),
+                },
+            ])))
+            .await;
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-subagent-origin".to_string(),
+            ChatMessage::user("delegate it"),
+            Arc::new(AskExceptRiskyHost) as Arc<dyn TurnHost>,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the subagent must be judged by the parent's own host — the \
+             same `approve` that let delegation through must also be the \
+             one the nested 'risky' call is judged by, and it rejects \
+             that call by name"
+        );
+    }
+
+    /// The depth cap `subagent_tool_specs` gives by removing `subagent`
+    /// from a nested turn's own list is a promise about what is
+    /// *offered* — `ToolSet::execute` dispatches on name across every
+    /// tool the shared `ToolSet` has registered, `subagent` included, so
+    /// without a gate that actually checks the round's own `tool_specs`,
+    /// a subagent could still call `subagent` by name and recurse
+    /// without bound. This asserts the gate, not just the list.
+    #[tokio::test]
+    async fn a_subagent_cannot_invoke_subagent_by_name() {
+        let (state, chat_log) = ServeState::for_test_scripted_with_log(
+            true,
+            vec![
+                // Parent round 1: delegate.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "delegator", "prompt": "go"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 1: try to recurse by naming `subagent`
+                // itself — never in this round's own `tool_specs`, but
+                // still a name the shared `ToolSet` has registered.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "sub-call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "delegator", "prompt": "recurse"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 2: give up after the refusal.
+                crate::provider::ChatResponse {
+                    text: Some("gave up".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+                // Parent round 2.
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
+                crate::agents::AgentDef {
+                    name: "delegator".to_string(),
+                    description: "Delegates.".to_string(),
+                    tools: None,
+                    prompt: "You are a delegator.".to_string(),
+                },
+            ])))
+            .await;
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-subagent-no-recursion".to_string(),
+            ChatMessage::user("delegate it"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        // If the self-call had actually recursed, satisfying it would
+        // need a 5th `chat()` call (a nested-nested turn), leaving the
+        // 4-entry script exhausted and the turn ending in a provider
+        // error rather than "done" — so this one assertion catches
+        // unbounded recursion by construction, without needing to
+        // instrument `SubagentTool` itself.
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert_eq!(
+            chat_log.calls().len(),
+            4,
+            "exactly parent-round-1, subagent-round-1, subagent-round-2, \
+             parent-round-2 — a 5th call would mean the self-recursion \
+             attempt actually ran"
+        );
+    }
+
+    /// A definition's `tools:` restriction is also a promise about what
+    /// is *offered*, and needs the same gate: without it, a subagent
+    /// could call any tool registered on the shared `ToolSet`, whether
+    /// or not its own definition named it. `Origin::Trusted` is used
+    /// here specifically because it allows every kind unconditionally —
+    /// isolating this from `a_subagent_is_judged_by_the_parents_origin`,
+    /// which is about the origin/host gate, not this one.
+    #[tokio::test]
+    async fn a_subagent_restricted_to_one_tool_is_refused_another_that_is_registered() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                // Parent round 1: delegate.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "delegator", "prompt": "go"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 1: try a tool outside its own `tools:`
+                // list — registered on the `ToolSet`, and `Origin::Trusted`
+                // would allow it unconditionally, but the definition
+                // never named it.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "sub-call-1".to_string(),
+                        name: "risky".to_string(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 2: give up after the refusal.
+                crate::provider::ChatResponse {
+                    text: Some("could not run it".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+                // Parent round 2.
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        let risky = RiskyTool::new();
+        let ran = risky.ran_flag();
+        state.tools.register_tool(Box::new(risky)).await;
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
+                crate::agents::AgentDef {
+                    name: "delegator".to_string(),
+                    description: "Delegates, but only echoes.".to_string(),
+                    tools: Some(vec!["echo".to_string()]),
+                    prompt: "You are a delegator.".to_string(),
+                },
+            ])))
+            .await;
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-subagent-restricted-tools".to_string(),
+            ChatMessage::user("delegate it"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "`risky` was registered and `Origin::Trusted` allows every \
+             kind, so only the `tools:` restriction itself explains a \
+             refusal here"
+        );
+    }
+
+    /// `Refusal::NotOffered` closes the same hole on the *ordinary*
+    /// (non-subagent) path — every test above exercises it only through
+    /// `subagent`. A name the model invents (or gets right, but this
+    /// round happens not to offer) that still matches something
+    /// registered on the shared `ToolSet` must be refused before
+    /// `ToolSet::execute` ever dispatches on it — see `TurnLoop::run`'s
+    /// permission gate, which checks `offered` first, ahead of the
+    /// host-machine gate and `decide` both.
+    ///
+    /// `client_shell` is the tool named: it isn't in `HOST_TOOLS`, so
+    /// `host_tool_denied` — the *other* thing that could explain a
+    /// refusal here — never fires for it, and `NullProgress`'s default
+    /// `origin()` is `Origin::Trusted`, which `decide` allows
+    /// unconditionally for every kind. The only thing left standing
+    /// between the call and `ran` flipping `true` is the offered check
+    /// itself: `visible_tool_predicate` excludes `client_shell` from
+    /// this round's own `tool_specs` because `NullProgress` reports no
+    /// ACP client (`has_client` is `false`), even though the tool stays
+    /// registered and visible to `state.tools.kinds()`.
+    #[tokio::test]
+    async fn a_registered_but_unoffered_tool_is_refused_on_an_ordinary_turn() {
+        struct FakeClientShell {
+            spec: crate::provider::ToolSpec,
+            ran: Arc<std::sync::atomic::AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for FakeClientShell {
+            fn spec(&self) -> &crate::provider::ToolSpec {
+                &self.spec
+            }
+            fn kind(&self) -> crate::tools::ToolKind {
+                crate::tools::ToolKind::Execute
+            }
+            async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
+                self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok("ran".to_string())
+            }
+        }
+
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                // Round 1: the model names a tool that is registered on
+                // the shared `ToolSet` but excluded from this round's
+                // own advertised list.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "client_shell".to_string(),
+                        input: json!({"command": "echo hi"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Round 2: give up after the refusal.
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state
+            .tools
+            .register_tool(Box::new(FakeClientShell {
+                spec: crate::provider::ToolSpec {
+                    name: "client_shell".into(),
+                    description: "Pretend to run a command on the client.".into(),
+                    input_schema: json!({ "type": "object", "properties": {} }),
+                },
+                ran: Arc::clone(&ran),
+            }))
+            .await;
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-notoffered-parent-path".to_string(),
+            ChatMessage::user("run something"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "`client_shell` is registered, isn't a `HOST_TOOLS` name (so \
+             `host_tool_denied` never fires), and `Origin::Trusted` \
+             allows every kind unconditionally — only the offered check \
+             itself explains a refusal here"
+        );
+    }
+
+    /// The isolation, asserted rather than assumed: what the subagent
+    /// said to itself must not reach the parent's history or its store.
+    /// Only the final answer comes back, as the tool's result.
+    ///
+    /// Also asserts the two headline properties where they are actually
+    /// *wired* (the `system`/`tools` a `chat()` call was made with), not
+    /// just where they are computed: `subagent_system_prompt` and
+    /// `subagent_tool_specs` are pure functions with their own unit
+    /// tests, but nothing short of inspecting `StubProvider`'s call log
+    /// would catch `TurnLoop { system: Some(&system), ... }` being wired
+    /// to the wrong string, or `tool_specs: &specs` to the parent's
+    /// unfiltered list — every other test here would stay green.
+    #[tokio::test]
+    async fn a_subagents_conversation_does_not_reach_the_parent() {
+        let (state, chat_log) = ServeState::for_test_scripted_with_log(
+            true,
+            vec![
+                // Parent round 1: delegate.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "investigator", "prompt": "go investigate"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 1: an intermediate tool call whose
+                // result carries a string unique to this test. Deliberately
+                // no accompanying text — `TurnLoop::run` folds a round's
+                // narration text into the final answer it returns
+                // (`accumulated_text`), so any text here would legitimately
+                // reach the parent as part of "the final answer" and would
+                // not test isolation at all. A tool call's own result,
+                // by contrast, lives only in the subagent's local,
+                // never-persisted `history`.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "sub-call-1".to_string(),
+                        name: "echo".to_string(),
+                        input: json!({"text": "SUBAGENT_SECRET_MUSING"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 2: its final answer.
+                crate::provider::ChatResponse {
+                    text: Some("FINAL ANSWER: 42".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+                // Parent round 2.
+                crate::provider::ChatResponse {
+                    text: Some("relayed".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
+                crate::agents::AgentDef {
+                    name: "investigator".to_string(),
+                    description: "Investigates something.".to_string(),
+                    tools: Some(vec!["echo".to_string()]),
+                    prompt: "You are an investigator.".to_string(),
+                },
+            ])))
+            .await;
+
+        // A workspace file the *parent's* system prompt is built from
+        // (`Workspace::build_system_prompt`, `# Soul`) but the subagent's
+        // must not be — its whole system prompt is the definition's
+        // `prompt` plus the date, nothing read from the workspace.
+        std::fs::write(
+            state.workspace.dir().join("SOUL.md"),
+            "PARENTS_SOUL_MARKER: I am the parent's own soul file.",
+        )
+        .unwrap();
+
+        let sid = "acp-subagent-isolation".to_string();
+        state.acp_sessions.lock().await.insert(sid.clone());
+        state
+            .acp_session_store
+            .create(&sid, "default", "/work")
+            .unwrap();
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("delegate it"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("relayed"));
+
+        // Whether any message in `history` mentions `needle` anywhere in
+        // its parts — text, a tool call's input, or a tool result.
+        fn history_mentions(history: &[ChatMessage], needle: &str) -> bool {
+            history.iter().any(|m| {
+                m.parts.iter().any(|p| match p {
+                    ContentPart::Text(t) => t.contains(needle),
+                    ContentPart::ToolUse { input, .. } => input.to_string().contains(needle),
+                    ContentPart::ToolResult { content, .. } => content.contains(needle),
+                    _ => false,
+                })
+            })
+        }
+
+        let mem_guard = state.sessions.lock().await;
+        let mem_history = mem_guard.get(&sid).expect("the parent session exists");
+        assert!(
+            !history_mentions(mem_history, "SUBAGENT_SECRET_MUSING"),
+            "the subagent's own intermediate tool traffic must not reach \
+             the parent's in-memory history"
+        );
+
+        let acp_history = state
+            .acp_session_store
+            .history(&sid)
+            .expect("the ACP store has the session");
+        assert!(
+            !history_mentions(&acp_history, "SUBAGENT_SECRET_MUSING"),
+            "the subagent's own intermediate tool traffic must not reach \
+             the parent's ACP store"
+        );
+        assert!(
+            history_mentions(&acp_history, "FINAL ANSWER: 42"),
+            "only the subagent's final answer should reach the parent, as \
+             the tool's own result"
+        );
+
+        // Now the two headline properties, asserted at the actual wire:
+        // what each `chat()` call was made with. Call order matches the
+        // script order above, since the parent and the subagent share
+        // one provider and one script queue: [0] parent round 1
+        // (delegates), [1]/[2] the subagent's own two rounds, [3] parent
+        // round 2.
+        let calls = chat_log.calls();
+        assert_eq!(calls.len(), 4, "unexpected call count: {calls:?}");
+
+        let parent_system = calls[0].0.as_deref().unwrap_or_default();
+        assert!(
+            parent_system.contains("PARENTS_SOUL_MARKER"),
+            "sanity: the parent's own turn must see its workspace's \
+             SOUL.md, or this test cannot tell a wired-through workspace \
+             prompt apart from one that was never read: {parent_system}"
+        );
+        assert!(
+            calls[0].1.iter().any(|n| n == "subagent"),
+            "sanity: the parent must be offered `subagent` itself: {:?}",
+            calls[0].1
+        );
+
+        for (i, (system, tools)) in [&calls[1], &calls[2]].into_iter().enumerate() {
+            let system = system.as_deref().unwrap_or_default();
+            assert!(
+                system.contains("You are an investigator."),
+                "the subagent's round {i} must see its own definition's \
+                 prompt: {system}"
+            );
+            assert!(
+                !system.contains("PARENTS_SOUL_MARKER"),
+                "the subagent's round {i} must not see the parent \
+                 workspace's SOUL.md — its system prompt is the \
+                 definition and nothing else: {system}"
+            );
+            assert_eq!(
+                tools,
+                &vec!["echo".to_string()],
+                "the subagent's round {i} must see exactly its \
+                 definition's own tool list, `subagent` included nowhere \
+                 in it"
+            );
+        }
+
+        let parent_system_2 = calls[3].0.as_deref().unwrap_or_default();
+        assert!(
+            parent_system_2.contains("PARENTS_SOUL_MARKER"),
+            "the parent's second round is still the parent's own turn: {parent_system_2}"
         );
     }
 
@@ -3832,6 +4712,92 @@ mod tests {
         }
         assert_eq!(seen.len(), 1, "one event for the error");
         assert!(seen[0].is_ok());
+    }
+
+    /// The bug Fix 2 closes: a subagent's own provider failure must not
+    /// report itself as *this request's* terminal outcome. `progress`
+    /// for a subagent's nested `TurnLoop` is the parent's own host by
+    /// design — here, `SseProgress` — and unwrapped, `turn_error` sends
+    /// a terminal JSON-RPC error carrying the *parent* request's id the
+    /// instant it is called. If `SubagentTool::execute` did not wrap
+    /// `ctx.progress`, the subagent's own `chat()` failure below would
+    /// fire that mid-turn, and the parent would still go on to finish
+    /// normally afterwards — two terminal responses for one request.
+    ///
+    /// A successful delegation emits exactly two events on this
+    /// `SseProgress` (`tool_start`/`tool_end` for the `subagent` call
+    /// itself); a spurious `turn_error` from the subagent's own failure
+    /// would add a third. Counting is enough — no need to decode
+    /// `Event`'s payload — because nothing else on this path emits.
+    #[tokio::test]
+    async fn a_subagents_provider_failure_does_not_leak_a_stale_terminal_error() {
+        let state = ServeState::build_for_test(
+            true,
+            StubProvider::new_scripted(vec![
+                // Parent round 1: delegate.
+                Ok(crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "delegator", "prompt": "go"}),
+                    }],
+                    stop_reason: None,
+                }),
+                // Subagent round 1: the provider call itself fails.
+                Err("simulated subagent provider failure".to_string()),
+                // Parent round 2, after the subagent's tool result
+                // reports its own failure back as ordinary tool output.
+                Ok(crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                }),
+            ]),
+        );
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
+                crate::agents::AgentDef {
+                    name: "delegator".to_string(),
+                    description: "Delegates.".to_string(),
+                    tools: None,
+                    prompt: "You are a delegator.".to_string(),
+                },
+            ])))
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let progress = Arc::new(SseProgress::new(tx, json!(42)));
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-subagent-sse-provider-failure".to_string(),
+            ChatMessage::user("delegate it"),
+            progress,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.text.as_deref(),
+            Some("done"),
+            "the parent's own turn must complete normally even though \
+             the subagent's own provider call failed"
+        );
+
+        rx.close();
+        let mut seen = Vec::new();
+        while let Some(item) = rx.recv().await {
+            seen.push(item);
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "expected exactly tool_start + tool_end for the `subagent` \
+             call; a 3rd event would be the subagent's own failure \
+             leaking out as this request's terminal error"
+        );
     }
 
     #[tokio::test]

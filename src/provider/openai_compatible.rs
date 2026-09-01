@@ -101,6 +101,36 @@ struct ApiToolFunction<'a> {
     parameters: &'a Value,
 }
 
+/// Map a turn's tool specs to the wire format, treating `Some(&[])` the
+/// same as `None`.
+///
+/// `Some(&[])` is a legitimate *definition* — `tools: []` in an agent's
+/// frontmatter means "answer from the prompt alone", the summarise/judge
+/// case (see `crate::agents::AgentDef::tools`) — but `#[serde(skip_serializing_if
+/// = "Option::is_none")]` on `Request::tools` only skips `None`, not an
+/// empty `Vec` wrapped in `Some`, so that legitimate definition used to
+/// serialize as `"tools": []`. The OpenAI Chat Completions API (and every
+/// backend that speaks its dialect — llama.cpp, Ollama, vLLM) rejects an
+/// empty `tools` array outright, so the one shape the docs describe most
+/// carefully 400'd on every OpenAI-compatible backend. There is no
+/// difference in meaning between "no tools" and "an empty tools array"
+/// on the wire, so folding the two here is correct, not a workaround.
+fn api_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ApiToolSpec<'_>>> {
+    tools.filter(|specs| !specs.is_empty()).map(|specs| {
+        specs
+            .iter()
+            .map(|s| ApiToolSpec {
+                kind: "function",
+                function: ApiToolFunction {
+                    name: &s.name,
+                    description: &s.description,
+                    parameters: &s.input_schema,
+                },
+            })
+            .collect()
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct ApiMessage {
     role: &'static str,
@@ -354,19 +384,7 @@ impl Provider for OpenAICompatibleProvider {
             api_messages.extend(chat_message_to_api(m));
         }
 
-        let api_tools: Option<Vec<ApiToolSpec<'_>>> = tools.map(|specs| {
-            specs
-                .iter()
-                .map(|s| ApiToolSpec {
-                    kind: "function",
-                    function: ApiToolFunction {
-                        name: &s.name,
-                        description: &s.description,
-                        parameters: &s.input_schema,
-                    },
-                })
-                .collect()
-        });
+        let api_tools = api_tools(tools);
 
         let body = Request {
             model: &self.model,
@@ -617,5 +635,48 @@ mod tests {
         assert_eq!(json["role"], "assistant");
         assert!(json.get("content").is_none() || json["content"].is_null());
         assert!(json["tool_calls"].is_array());
+    }
+
+    /// `tools: []` is a legitimate agent definition (an agent that
+    /// answers from its prompt alone), but this is the OpenAI Chat
+    /// Completions wire format, and that API rejects `"tools": []`
+    /// outright. `Some(&[])` must serialize exactly like `None`: no
+    /// `tools` key in the request body at all.
+    #[test]
+    fn an_empty_tool_list_is_not_sent_as_an_empty_tools_array() {
+        let empty: &[ToolSpec] = &[];
+
+        assert!(
+            api_tools(Some(empty)).is_none(),
+            "Some(&[]) must map to None, not Some(vec![])"
+        );
+        assert!(api_tools(None).is_none());
+
+        let body = Request {
+            model: "m",
+            messages: Vec::new(),
+            max_tokens: 1,
+            stream: true,
+            tools: api_tools(Some(empty)),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(
+            json.get("tools").is_none(),
+            "the wire body must omit `tools` entirely, not send `[]`: {json}"
+        );
+    }
+
+    /// A non-empty spec list still reaches the wire, so the fix above
+    /// isn't accidentally swallowing real tool lists too.
+    #[test]
+    fn a_non_empty_tool_list_still_serializes() {
+        let specs = [ToolSpec {
+            name: "get_weather".into(),
+            description: "…".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let mapped = api_tools(Some(&specs)).expect("a non-empty list must stay Some");
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].function.name, "get_weather");
     }
 }

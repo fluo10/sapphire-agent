@@ -19,6 +19,7 @@ A personal AI assistant agent that lives in a [`sapphire-framework`](https://git
 - **Ambient audio ingest**: optional always-on capture from a wearable/pendant device — `POST /audio/ingest` takes raw audio (metadata in query params, no JSON/base64 framing) from a bearer-authenticated device, re-gates it, transcribes it, attributes it to a speaker against reference audio curated in the workspace, and stores the transcript outside the workspace. Records without answering: nothing in this path starts an LLM turn. `transcript_read`, `speaker_candidates` and `speaker_promote` expose the result as agent tools. Disabled by default — enable via `[ambient].enabled = true`; see `config.example.toml`.
 - **Agent-to-agent**: `/a2a` endpoint speaks the v1 A2A protocol (JSON-RPC `SendMessage`, AgentCard) with per-device bearer-token auth — enable via `[a2a].enabled = true`.
 - **External AI integration**: `/mcp` endpoint publishes `write_report` and `recall_memory` tools so Claude Code (and other MCP clients) can share project context with the agent — see [docs/mcp-integration.md](docs/mcp-integration.md).
+- **Subagents**: `<workspace>/agents/<name>.md` definitions the main agent can delegate a task to via the `subagent` tool — its own system prompt, its own tool loop, only the final answer comes back. See [Subagents](#subagents) below.
 - **Editor integration**: `/acp` endpoint speaks the Agent Client Protocol over WebSocket, so Zed can drive the running agent — enable via `[acp].enabled = true`; see [Zed / ACP](#zed--acp) below.
 - **Commands**:
   - `sapphire-agent` — start the channel listeners + JSON-RPC HTTP control API (`/rpc`, `/mcp`, `/a2a`, `/acp`)
@@ -52,6 +53,122 @@ sapphire-agent verify   # sanity-check config and workspace
 sapphire-agent          # start the channel listeners + HTTP control API
 sapphire-call           # one-off interactive session (separate crate)
 ```
+
+## Subagents
+
+The main agent can delegate a task to a specialised subagent via the
+`subagent` tool: a nested conversation with its own system prompt and its
+own tool-calling loop, which hands back only its final answer. Use it to
+keep a large investigation (read 30 files, conclude in 3 lines) out of the
+conversation that would otherwise carry all 30 files forward on every later
+turn.
+
+**Defining one.** Drop a Markdown file under `<workspace>/agents/<name>.md`
+— the same shape as `<workspace>/heartbeat/*.md`, reusing that convention
+rather than inventing a second one. YAML frontmatter for the metadata, the
+body for the prompt:
+
+```markdown
+---
+description: Reviews a diff. Reads and reports; does not edit.
+tools: [client_file_read, workspace_search, memory_read]
+---
+You are a reviewer. Read the diff, report problems, and stop there.
+```
+
+- **`description`** is the *only* thing the parent model sees before
+  deciding whether to delegate — a weak one means the agent never gets
+  called.
+- **`tools`** is optional. Omit it and the subagent inherits the parent's
+  whole visible tool set (see "What a subagent does not inherit" below for
+  the one exception); give it a list — including `[]` — and the subagent is
+  restricted to exactly that. Both are legitimate: an empty list is a valid
+  definition, for an agent that only needs the prompt to summarise or judge.
+- **The body** is the subagent's entire system prompt. That is genuinely
+  all of it — see below.
+
+Definitions are read once at process startup, the same as heartbeat tasks;
+adding or editing one needs a restart. A file with no or invalid
+frontmatter, or no `description`, is skipped with a warning at load time —
+one broken definition does not take the others down.
+
+**`tools:` is enforced, not a hint.** `TurnLoop::run` refuses, before any
+other check, any tool call whose name was not in the round's own advertised
+list — this is what makes a reviewer definition that says "reviews, does
+not edit" actually unable to edit, rather than merely undocumented for
+editing. The same check is what caps delegation depth (see below) and
+applies identically on the parent's own turn, closing a hallucinated- or
+out-of-list tool name there too.
+
+**What a subagent does not inherit.** Its system prompt is the
+definition's body plus the current date and time — and nothing else. In
+particular, none of the following reach it: `SOUL.md`, `IDENTITY.md`,
+`USER.md`, `AGENTS.md`, `TOOLS.md` or any other workspace file the main
+agent's prompt is built from, the memory digest, today's cross-session
+digest, room metadata, or the configured `anthropic.system_prompt`. **This
+is the point of the feature, not an oversight.** The main agent carries all
+of that deliberately — it is meant to be someone to work *with* — but a
+code review does not need yesterday's conversation, and dropping the parts
+a task doesn't need is what a subagent is *for*. The date is the one
+exception: an agent that doesn't know today's date can't correctly use a
+tool that writes one, and that's a fact rather than a personality trait.
+
+That statement is about the *prompt text*, though, not about *tool reach*:
+a definition with no `tools:` key still inherits whichever `memory_*` tools
+the parent can see, and a subagent's memory calls land in the same
+namespace the delegating conversation is already in. So "a subagent has no
+memory" is true of what it's told up front, not of what it's able to go
+look up — that distinction is entirely in the definition's own `tools:`
+list.
+
+**Isolation is about history and the store, not about visibility.** A
+subagent's tool calls still fire the same `tool_start`/`tool_end`
+notifications on the parent's host that the parent's own calls do, so they
+show up live in an ACP session's stream — that's necessary for a
+permission prompt triggered by a subagent's call to make sense as coming
+from *this* conversation. What doesn't happen is persistence: nothing from
+a subagent's internal turns reaches the parent's stored history or the ACP
+session store. Only the returned final answer does, as the `subagent`
+tool's own result — reload the session later and you see "delegated to
+reviewer, got back Y", not the 30 files it read to get there.
+
+That "only the returned final answer" is text-only, too: `SubagentTool::execute`
+returns a plain `String`, so a nested tool's image output has nowhere to
+go. If a subagent's own tool list includes `recall_image`, calling it
+produces nothing the parent (or the model) can see — the image bytes are
+simply dropped rather than attached to anything.
+
+**Delegation is depth 1.** A subagent's own tool list never contains
+`subagent`, regardless of what its definition's `tools:` says — and, per
+the enforcement above, this isn't just an omission from the list a
+subagent is offered: a call literally naming `subagent` is refused the
+same way any other out-of-list name is, so a subagent cannot recurse by
+guessing.
+
+**Permission requests work normally.** A subagent's tool calls are judged
+by the parent's own `Origin`, through the parent's own `TurnHost` — the
+same gate, the same person asked, the same standing allow/deny answers.
+Delegating is not a way to get done by proxy what the model would be
+refused directly.
+
+**`subagent` runs unconditionally on every trusted transport, and is
+excluded only on Matrix and Discord.** Its `ToolKind` is `Other` — what a
+subagent actually does depends entirely on which agent it delegates to, so
+it can't honestly be classified as `Read`, `Edit`, `Execute`, etc., and
+`Other` is the policy table's most conservative bucket. `Origin::Trusted`
+(`/rpc`, `/a2a`, voice) allows every kind unconditionally, so those three
+run `subagent` the same as any other tool; on ACP it is asked for in
+`default` mode and allowed once edits are accepted or bypassed, same as
+any other `Other` call. `Origin::Channel` is the one origin that denies
+every `Other` call unconditionally, so Matrix and Discord — and only
+Matrix and Discord — cannot call `subagent` at all. See the
+[permission table](#permission-and-modes) below.
+
+**Project conventions are not shared yet.** A client-side project's
+`CLAUDE.md` isn't threaded into a subagent's prompt — but the main agent
+doesn't read it either, currently. Both are tracked together in
+[#199](https://github.com/fluo10/sapphire-agent/issues/199); when that
+lands, subagents get it too.
 
 ## Zed / ACP
 

@@ -5,6 +5,7 @@
 
 mod acp_session;
 mod agent;
+mod agents;
 mod ambient;
 mod channel;
 mod cli_device;
@@ -427,6 +428,21 @@ async fn main() -> Result<()> {
                 config.timer.presets.clone(),
             )
             .await;
+
+            // ── Subagents ─────────────────────────────────────────────────
+            // Loaded from `<workspace>/agents/*.md` — same shape as
+            // `<workspace>/heartbeat/*.md`. Registered outside
+            // `default_tool_set` (rather than inside it) so that
+            // function's existing call sites, including the test in
+            // `src/agent.rs`, stay untouched by this feature. Only
+            // registered when at least one definition loaded: a tool
+            // with nobody to delegate to has no reason to be offered.
+            let agent_defs = agents::load_agents_dir(&workspace_dir.join("agents"));
+            if !agent_defs.is_empty() {
+                tool_set
+                    .register_tool(Box::new(tools::subagent::SubagentTool::new(agent_defs)))
+                    .await;
+            }
 
             // ── Session store base directory ────────────────────────────────
             let sessions_base = config.resolved_sessions_dir(&workspace_dir);
