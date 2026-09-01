@@ -213,9 +213,17 @@ pub async fn generate_summary(
                     transcript.push_str(&format!("{role_label}: [Called tool: {name}]\n\n"));
                 }
                 ContentPart::ToolResult { content, .. } => {
-                    // Truncate long tool results to keep the summary prompt manageable
+                    // Truncate long tool results to keep the summary prompt
+                    // manageable. `floor_char_boundary` is required: byte
+                    // 500 can land inside a multi-byte character (a CJK
+                    // tool result routed through here by an ACP session's
+                    // `history()` makes this a routine occurrence, not an
+                    // edge case), and a raw slice there panics.
                     let truncated = if content.len() > 500 {
-                        format!("{}... (truncated)", &content[..500])
+                        format!(
+                            "{}... (truncated)",
+                            &content[..content.floor_char_boundary(500)]
+                        )
                     } else {
                         content.clone()
                     };
@@ -259,6 +267,28 @@ pub async fn generate_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal `Provider` double for `generate_summary`: always returns
+    /// the same short text, regardless of what transcript it was handed.
+    struct StubProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for StubProvider {
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        async fn chat(
+            &self,
+            _system: Option<&str>,
+            _messages: &[ChatMessage],
+            _tools: Option<&[crate::provider::ToolSpec]>,
+        ) -> anyhow::Result<crate::provider::ChatResponse> {
+            Ok(crate::provider::ChatResponse::text_only(
+                "a summary".to_string(),
+            ))
+        }
+    }
 
     #[test]
     fn test_estimate_tokens_ascii() {
@@ -329,5 +359,33 @@ mod tests {
             split <= 3,
             "split should be at or before the tool-use message"
         );
+    }
+
+    /// `generate_summary`'s tool-result truncation slices at a raw byte
+    /// index. A CJK tool result long enough to cross the 500-byte cutoff
+    /// must not land byte 500 inside a multi-byte character — this is
+    /// the exact panic that `spawn_acp_digest_sweep` started hitting
+    /// twice an hour once ACP sessions began persisting tool results.
+    #[tokio::test]
+    async fn a_long_cjk_tool_result_does_not_panic_on_the_byte_cutoff() {
+        // 3 bytes per character; 200 characters is 600 bytes, comfortably
+        // past the 500-byte cutoff and guaranteed to straddle it given the
+        // fixed 3-byte width.
+        let long_cjk = "日".repeat(200);
+        let messages = vec![ChatMessage {
+            role: Role::User,
+            parts: vec![ContentPart::ToolResult {
+                tool_use_id: "c1".to_string(),
+                content: long_cjk,
+            }],
+            input_kind: None,
+            user_id: None,
+        }];
+
+        // Must not panic, and must produce a summary (the stub's fixed
+        // text — what matters here is that generate_summary returned at
+        // all rather than unwinding inside the tokio task).
+        let summary = generate_summary(&StubProvider, &messages).await.unwrap();
+        assert_eq!(summary, "a summary");
     }
 }

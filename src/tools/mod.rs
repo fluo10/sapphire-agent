@@ -122,14 +122,24 @@ impl ToolSet {
     /// text result plus any image attachments the tool produced; the
     /// caller is responsible for assembling them into a tool_result
     /// user message.
+    ///
+    /// The text is capped here — see `truncate_output`. Note this is
+    /// not *quite* every tool_result the model sees: a call refused by
+    /// the permission gate never reaches this function, and its
+    /// `ToolOutput` is built directly by the caller
+    /// (`src/serve/mod.rs`, `src/agent.rs`). Those strings come from
+    /// `policy::refusal_message` and are short by construction, but
+    /// anything added on that path is NOT capped by this.
     pub async fn execute(&self, call: &ToolCall) -> ToolOutput {
         let inner = self.inner.read().await;
         for tool in &inner.tools {
             if tool.spec().name == call.name {
-                return match tool.execute_full(&call.input).await {
+                let mut output = match tool.execute_full(&call.input).await {
                     Ok(output) => output,
                     Err(e) => ToolOutput::from(format!("Error: {e:#}")),
                 };
+                output.text = truncate_output(&output.text);
+                return output;
             }
         }
         ToolOutput::from(format!("Unknown tool: {}", call.name))
@@ -280,6 +290,59 @@ pub async fn default_tool_set(
     tool_set
 }
 
+/// The cap shared by `truncate_output` (tool *results*) and
+/// `AcpSessionStore::store_part` (tool *inputs* — see Fix 4/#194): both
+/// bound what a single tool call can put into memory, the model's
+/// input, and an indexed on-disk file. Kept as one constant so the two
+/// call sites cannot drift apart.
+pub(crate) const OUTPUT_CAP_BYTES: usize = 50_000;
+
+/// Cap a tool result at 50 000 bytes, keeping head + tail.
+///
+/// Applied at `ToolSet::execute` rather than inside each tool, because
+/// that is the one place every builtin and every MCP tool's output
+/// passes through — per-tool truncation would be forgotten by the next
+/// tool someone adds.
+///
+/// The cap is what bounds a tool result's cost in all three places it
+/// lands: the in-memory history, the model's input, and (for ACP
+/// sessions) the tool-result cache on disk.
+///
+/// Head and tail both survive because they carry different things: a
+/// file's shape is at the top, and a failing command's error is at the
+/// bottom.
+///
+/// The head, tail and marker budgets add up to `MAX` rather than
+/// overshooting it, so truncating an already-truncated result is a
+/// no-op. The previous constants (20 000 + 30 000, plus the marker on
+/// top) exceeded the cap, which meant a second pass cut again and
+/// nested the markers — harmless only for as long as truncation
+/// happened in exactly one place, which is what this change ends.
+///
+/// The cap and the marker are both byte counts, not character counts —
+/// the mechanism has to be byte-based to actually bound memory and disk
+/// usage. For CJK text, where a character is 3 bytes, the effective
+/// cap is roughly a third of the number that appears here.
+pub(crate) fn truncate_output(s: &str) -> String {
+    const MAX: usize = OUTPUT_CAP_BYTES;
+    // Room for `\n\n[... 1234567 bytes truncated ...]\n\n`, generously.
+    const MARKER_BUDGET: usize = 200;
+    const HEAD: usize = 19_920;
+    const TAIL: usize = MAX - MARKER_BUDGET - HEAD;
+
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    let head_end = s.floor_char_boundary(HEAD);
+    let tail_start = s.floor_char_boundary(s.len() - TAIL);
+    format!(
+        "{}\n\n[... {} bytes truncated ...]\n\n{}",
+        &s[..head_end],
+        tail_start - head_end,
+        &s[tail_start..]
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,5 +443,145 @@ mod tests {
             input_schema: serde_json::json!({}),
         });
         assert_eq!(bare.kind(), ToolKind::Other);
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    #[test]
+    fn short_output_is_returned_unchanged() {
+        let s = "a short result";
+        assert_eq!(truncate_output(s), s);
+    }
+
+    /// The cap exists so one `file_read` of a large file cannot put the
+    /// whole file into the in-memory history, the model's input, and the
+    /// cache all at once.
+    #[test]
+    fn long_output_is_cut_to_the_cap_with_a_marker() {
+        let s = "x".repeat(120_000);
+        let out = truncate_output(&s);
+        assert!(
+            out.len() < s.len(),
+            "a 120k result must not come back whole"
+        );
+        assert!(out.contains("bytes truncated"), "got {}", &out[..80]);
+    }
+
+    /// Head and tail are both kept: the head is where a file's shape is,
+    /// the tail is where a failing command's error is.
+    #[test]
+    fn both_ends_survive_truncation() {
+        let s = format!(
+            "{}{}{}",
+            "H".repeat(30_000),
+            "M".repeat(60_000),
+            "T".repeat(30_000)
+        );
+        let out = truncate_output(&s);
+        assert!(out.starts_with('H'), "the head is kept");
+        assert!(out.ends_with('T'), "the tail is kept");
+        assert!(
+            !out.contains(&"M".repeat(1000)),
+            "the middle is what gets dropped"
+        );
+    }
+
+    /// Cutting at a byte index inside a multi-byte character would
+    /// panic. `floor_char_boundary` is what prevents it, so a result
+    /// that is entirely multi-byte is the case worth pinning.
+    ///
+    /// A leading ASCII byte is prepended so the fixed-width 3-byte `日`
+    /// characters no longer line up with HEAD (19 920) and the tail
+    /// start — both multiples of 3 for a bare repeated character, so
+    /// naive byte indexing would land on a boundary anyway and the test
+    /// would pass for the wrong reason.
+    #[test]
+    fn a_multibyte_result_is_cut_on_a_character_boundary() {
+        let s = format!("x{}", "日".repeat(60_000)); // well past the cap
+        let out = truncate_output(&s);
+        assert!(out.contains("bytes truncated"));
+        assert!(out.starts_with('x') && out.ends_with('日'));
+    }
+
+    /// The cap has to be a cap: a result that has already been cut must
+    /// come back unchanged rather than picking up a second marker.
+    ///
+    /// The old constants did not satisfy this — head 20 000 + tail
+    /// 30 000 + the marker itself exceeds 50 000, so a second pass cut
+    /// again and nested the markers. That only stayed invisible because
+    /// truncation happened in exactly one place.
+    #[test]
+    fn truncating_an_already_truncated_result_changes_nothing() {
+        let once = truncate_output(&"x".repeat(200_000));
+        assert!(
+            once.len() <= 50_000,
+            "the cap is a cap: {} bytes",
+            once.len()
+        );
+        assert_eq!(truncate_output(&once), once);
+        assert_eq!(once.matches("bytes truncated").count(), 1);
+    }
+
+    /// A stub tool that always returns a huge result, standing in for
+    /// e.g. `file_read` on a large file. Modeled on `RiskyTool` in
+    /// `src/serve/mod.rs`.
+    struct HugeOutputTool {
+        spec: ToolSpec,
+    }
+
+    impl HugeOutputTool {
+        fn new() -> Self {
+            Self {
+                spec: ToolSpec {
+                    name: "huge_output".into(),
+                    description: "Always returns a huge result.".into(),
+                    input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                },
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for HugeOutputTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
+            Ok("y".repeat(120_000))
+        }
+    }
+
+    /// The regression this suite exists to catch: every test above calls
+    /// `truncate_output` directly, so deleting the call site at
+    /// `ToolSet::execute` (this function, not the helper) would leave
+    /// the whole module green while silently reverting the cap on the
+    /// one path every tool result actually travels through.
+    #[tokio::test]
+    async fn tool_set_execute_applies_the_cap() {
+        let tool_set = ToolSet::new(vec![Box::new(HugeOutputTool::new())], Vec::new());
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "huge_output".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let output = tool_set.execute(&call).await;
+
+        assert!(
+            output.text.len() <= 50_000,
+            "ToolSet::execute must cap the output itself, not rely on the \
+             tool to do it: got {} bytes",
+            output.text.len()
+        );
+        assert_eq!(
+            output.text.matches("bytes truncated").count(),
+            1,
+            "exactly one truncation marker: {}",
+            &output.text[..200.min(output.text.len())]
+        );
     }
 }

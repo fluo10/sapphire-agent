@@ -91,7 +91,17 @@ pub enum StoredPart {
     },
     ToolResultRef {
         tool_use_id: String,
-        sha256: String,
+        /// `None` means the result had nowhere to be stored — the cache
+        /// was unavailable when this line was written. Distinct from a
+        /// hash whose entry has since been evicted, but only in how it
+        /// arose: a reader treats both as "the pairing is here, the
+        /// content is not", and `load_part` produces the same
+        /// `MISSING_RESULT` for each.
+        ///
+        /// `Option<String>` also reads a bare string as `Some`, so a
+        /// line written before this field became optional still loads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
     },
     /// Anything the storage layer does not model — images, for now.
     /// Kept as a marker so the message is not silently emptied.
@@ -290,33 +300,69 @@ impl AcpSessionStore {
             ContentPart::ToolUse { id, name, input } => StoredPart::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
-                input: input.clone(),
+                // Unlike a result, an input has nowhere to go but the
+                // JSONL itself — there is no cache/hash indirection for
+                // it. That file lives under `workspace_dir/sessions`,
+                // which the retrieve indexer walks, so an unbounded
+                // input (e.g. a multi-megabyte `file_write`) would put
+                // its whole content into the index — exactly what the
+                // ACP store's external cache exists to keep out for
+                // results (see the `ToolResult` arm below), and what an
+                // uncapped `input` would silently reintroduce. Elide
+                // rather than truncate: truncated JSON does not parse,
+                // and a reload needs `input` to still be valid JSON of
+                // the same shape.
+                input: self.elide_oversized_input(input),
             },
             ContentPart::ToolResult {
                 tool_use_id,
                 content,
-            } => match &self.cache {
-                Some(cache) => StoredPart::ToolResultRef {
+            } => {
+                // A cache miss on read degrades gracefully; a missing
+                // cache on write must not be allowed to degrade any
+                // further. Writing `Other` here would drop the
+                // `tool_use_id`, leaving a `tool_use` with no matching
+                // `tool_result` — which the API rejects outright, so the
+                // session would fail to load rather than load thinner.
+                let sha256 = match &self.cache {
+                    Some(cache) => Some(cache.put(content)?),
+                    None => {
+                        warn!(
+                            "Tool-result cache unavailable; recording '{tool_use_id}' \
+                             with no content"
+                        );
+                        None
+                    }
+                };
+                StoredPart::ToolResultRef {
                     tool_use_id: tool_use_id.clone(),
-                    sha256: cache.put(content)?,
-                },
-                // No cache to put the content in — record the same
-                // "vanished" marker a cache-hit miss would produce on
-                // reload, rather than failing the whole append. The
-                // `tool_use`/`tool_result` pairing the API validates
-                // still stays intact.
-                None => {
-                    warn!(
-                        "Tool-result cache unavailable; storing '{tool_use_id}' as an \
-                         unrecoverable marker"
-                    );
-                    StoredPart::Other
+                    sha256,
                 }
-            },
+            }
             // Images are not carried by this version. Recorded as a
             // marker rather than dropped, so a message that was only an
             // image does not read back as an empty one.
             _ => StoredPart::Other,
+        })
+    }
+
+    /// Storage-path-only transformation: never touches the in-memory
+    /// value, only what gets written to the JSONL — the same shape as
+    /// the result hashing right above it. An oversized input becomes a
+    /// small marker object instead of being written verbatim, so a
+    /// single large tool call cannot dump its whole payload into the
+    /// (indexed) session file. Still valid JSON, so the `input` field's
+    /// type is unchanged and a reload still produces a well-formed
+    /// `ToolUse`.
+    fn elide_oversized_input(&self, input: &serde_json::Value) -> serde_json::Value {
+        let size = serde_json::to_string(input).map(|s| s.len()).unwrap_or(0);
+        if size <= crate::tools::OUTPUT_CAP_BYTES {
+            return input.clone();
+        }
+        serde_json::json!({
+            "_elided": format!(
+                "{size} bytes of tool input, too large to store"
+            )
         })
     }
 }
@@ -483,7 +529,131 @@ impl AcpSessionStore {
                 break;
             }
         }
-        Some(out)
+
+        // A `tool_use` can end up on disk without its `tool_result` —
+        // the second `append_message` failed (the cache write erred),
+        // the process died between the two appends, a sync landed only
+        // half the pair. The write side already warns and moves on
+        // rather than losing the turn; left uncorrected here, the gap
+        // it leaves is worse than a lost message, because the API
+        // requires a `tool_result` to sit in the message *immediately
+        // following* its `tool_use` — not merely present somewhere
+        // later in the transcript. That is why the repair is spliced in
+        // right after the message that carries the orphan, rather than
+        // gathered into one message at the end: a trailing message is
+        // only correct while the orphan happens to be the last thing on
+        // record. Once a fresh turn chains a real message onto a
+        // not-yet-repaired orphan (the in-memory repair from a prior
+        // read is never written back), a later read would otherwise
+        // place the trailing repair after that unrelated message
+        // instead of between the two, and the session goes right back
+        // to unloadable. Synthesise rather than drop the `tool_use`:
+        // dropping would erase the fact that the agent attempted the
+        // call, and `MISSING_RESULT` is exactly the shape a cache miss
+        // already produces, so the model sees nothing it doesn't
+        // already know how to handle.
+        //
+        // The check below is positional — "does the immediately
+        // adjacent message carry the matching part" — rather than "does
+        // a matching part exist anywhere in the transcript". A set-based
+        // check silently accepts pairings the API rejects: two messages
+        // that both carry `tool_use` id `c1` where only one is actually
+        // answered (the set contains `c1` either way, so neither gets
+        // repaired); an id answered many messages earlier than the
+        // `tool_use` that (re)issued it, reachable through a fork the
+        // walk resolves differently or a partial sync; and a
+        // `tool_result` that answers nothing adjacent at all. The
+        // positional check is symmetric — a `tool_use` needs its
+        // `tool_result` in the very next message, and a `tool_result`
+        // needs its `tool_use` in the very previous one — so both
+        // directions are handled by looking at the same two neighbours.
+        let mut repaired = Vec::with_capacity(out.len());
+        for (idx, message) in out.iter().enumerate() {
+            // A `tool_result` whose id has no matching `tool_use` in the
+            // immediately preceding message is not a valid pairing,
+            // wherever else in the transcript its id might appear —
+            // drop it. If that empties the message, drop the message
+            // too: an empty message is its own API error.
+            let prev_tool_use_ids: std::collections::HashSet<&str> = idx
+                .checked_sub(1)
+                .and_then(|p| out.get(p))
+                .map(|prev| {
+                    prev.parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            ContentPart::ToolUse { id, .. } => Some(id.as_str()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let kept_parts: Vec<ContentPart> = message
+                .parts
+                .iter()
+                .filter(|p| match p {
+                    ContentPart::ToolResult { tool_use_id, .. } => {
+                        prev_tool_use_ids.contains(tool_use_id.as_str())
+                    }
+                    _ => true,
+                })
+                .cloned()
+                .collect();
+            if kept_parts.is_empty() && !message.parts.is_empty() {
+                continue;
+            }
+
+            // A `tool_use` in this message is answered only if the
+            // immediately following message carries a `tool_result` for
+            // its id. Ids are deduplicated so two `tool_use` parts that
+            // (wrongly) share one id do not produce two `tool_result`s
+            // for it in the repair.
+            let next_tool_result_ids: std::collections::HashSet<&str> = out
+                .get(idx + 1)
+                .map(|next| {
+                    next.parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            ContentPart::ToolResult { tool_use_id, .. } => {
+                                Some(tool_use_id.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut repaired_ids = std::collections::HashSet::new();
+            let orphan_results: Vec<ContentPart> = message
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::ToolUse { id, .. }
+                        if !next_tool_result_ids.contains(id.as_str())
+                            && repaired_ids.insert(id.clone()) =>
+                    {
+                        Some(ContentPart::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: MISSING_RESULT.to_string(),
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            repaired.push(ChatMessage {
+                parts: kept_parts,
+                ..message.clone()
+            });
+            if !orphan_results.is_empty() {
+                repaired.push(ChatMessage {
+                    role: Role::User,
+                    parts: orphan_results,
+                    input_kind: None,
+                    user_id: None,
+                });
+            }
+        }
+
+        Some(repaired)
     }
 
     fn load_part(&self, part: &StoredPart) -> ContentPart {
@@ -499,14 +669,13 @@ impl AcpSessionStore {
                 sha256,
             } => ContentPart::ToolResult {
                 tool_use_id: tool_use_id.clone(),
-                // A miss is expected, not exceptional: the cache lives
-                // outside the workspace and is not synced. No cache at
-                // all (failed to open at startup) is just a permanent
-                // miss for every hash.
-                content: self
-                    .cache
+                // Absent either way — no hash was ever written, or the
+                // hash's entry is gone. The model can call the tool
+                // again if it needs to; what it cannot recover from is
+                // an unpaired `tool_use`.
+                content: sha256
                     .as_ref()
-                    .and_then(|cache| cache.get(sha256))
+                    .and_then(|sha| self.cache.as_ref()?.get(sha))
                     .unwrap_or_else(|| MISSING_RESULT.to_string()),
             },
             StoredPart::Other => {
@@ -889,8 +1058,9 @@ mod tests {
 
     /// A cache that failed to open at startup must degrade the store,
     /// not break it: a session must still be creatable and a tool
-    /// result still appendable (as an unrecoverable marker) rather than
-    /// erroring the whole turn.
+    /// result still appendable — as a `ToolResultRef` with `sha256: None`,
+    /// keeping the `tool_use_id` pairing intact — rather than erroring
+    /// the whole turn.
     #[test]
     fn a_tool_result_appends_cleanly_when_the_cache_is_unavailable() {
         let (dir, store) = store_without_cache();
@@ -912,6 +1082,174 @@ mod tests {
             "appending must not fail just because the cache is unavailable: {result:?}"
         );
         drop(dir);
+    }
+
+    /// The regression this task exists for. A tool result stored with no
+    /// cache must still read back as a `ToolResult` carrying its
+    /// `tool_use_id` — an unpaired `tool_use` is rejected by the API,
+    /// which is a broken session rather than a degraded one.
+    ///
+    /// A preceding `tool_use` message is required for the `tool_result`
+    /// to survive `history()`'s positional repair (Fix 2) at all — a
+    /// `tool_result` with no `tool_use` anywhere before it is exactly
+    /// the invalid pairing that repair now drops, so this fixture must
+    /// be a valid pair to exercise what the test is actually about: the
+    /// hash-cache round trip.
+    #[test]
+    fn a_result_stored_without_a_cache_keeps_its_pairing() {
+        let (_d, store) = store_without_cache();
+        store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &tool_use_message("c1")).unwrap();
+        store
+            .append_message(
+                "s1",
+                &tool_result_message("c1", "content that cannot be cached"),
+            )
+            .unwrap();
+
+        let history = store.history("s1").expect("the session loads");
+        assert_eq!(
+            history[1].parts[0],
+            ContentPart::ToolResult {
+                tool_use_id: "c1".to_string(),
+                content: MISSING_RESULT.to_string(),
+            },
+            "the id survives even though the content never had anywhere to go"
+        );
+    }
+
+    /// The two ways a result can be absent — never cached, or cached and
+    /// later evicted — must read back identically. A reader has no
+    /// reason to tell them apart: both mean "the pairing is here, the
+    /// content is not".
+    #[test]
+    fn never_cached_and_evicted_read_back_the_same() {
+        let (dir_a, cached) = store();
+        cached.create("s1", "default", "/p").unwrap();
+        cached
+            .append_message("s1", &tool_use_message("c1"))
+            .unwrap();
+        cached
+            .append_message("s1", &tool_result_message("c1", "gone later"))
+            .unwrap();
+        std::fs::remove_dir_all(dir_a.path().join("cache")).unwrap();
+        let evicted = cached.history("s1").unwrap();
+
+        let (_dir_b, uncached) = store_without_cache();
+        uncached.create("s1", "default", "/p").unwrap();
+        uncached
+            .append_message("s1", &tool_use_message("c1"))
+            .unwrap();
+        uncached
+            .append_message("s1", &tool_result_message("c1", "never stored"))
+            .unwrap();
+        let never = uncached.history("s1").unwrap();
+
+        assert_eq!(evicted[1].parts, never[1].parts);
+    }
+
+    /// Fix 4/#194: a tool *input* has no cache/hash indirection the way a
+    /// result does, so an unbounded input (e.g. a multi-megabyte
+    /// `file_write`) would otherwise go straight into the JSONL — which
+    /// lives under `workspace_dir/sessions` and is walked by the
+    /// retrieve indexer. It must be elided on the way to disk, and the
+    /// elided form must still be valid, well-shaped JSON so a reload
+    /// still produces a `ToolUse`.
+    #[test]
+    fn an_oversized_tool_input_is_elided_on_the_way_to_disk() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+
+        let huge = "x".repeat(60_000);
+        store
+            .append_message(
+                "s1",
+                &ChatMessage {
+                    role: Role::Assistant,
+                    parts: vec![ContentPart::ToolUse {
+                        id: "c1".to_string(),
+                        name: "file_write".to_string(),
+                        input: serde_json::json!({ "content": huge }),
+                    }],
+                    input_kind: None,
+                    user_id: None,
+                },
+            )
+            .unwrap();
+
+        let raw = std::fs::read_to_string(store.path_for_test("s1")).unwrap();
+        assert!(
+            !raw.contains(&"x".repeat(60_000)),
+            "the oversized input must not reach the (indexed) JSONL verbatim"
+        );
+
+        let history = store.history("s1").expect("the session loads");
+        match &history[0].parts[0] {
+            ContentPart::ToolUse { id, name, input } => {
+                assert_eq!(id, "c1");
+                assert_eq!(name, "file_write");
+                assert!(
+                    input.get("_elided").is_some(),
+                    "the reloaded input must carry the elision marker: {input:?}"
+                );
+            }
+            other => panic!("expected a ToolUse, got {other:?}"),
+        }
+    }
+
+    /// The elision in the test above must not fire on an ordinary,
+    /// well-under-the-cap input — the common case is untouched.
+    #[test]
+    fn an_ordinary_tool_input_is_stored_unchanged() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+
+        let input = serde_json::json!({ "path": "notes.md", "content": "hello" });
+        store
+            .append_message(
+                "s1",
+                &ChatMessage {
+                    role: Role::Assistant,
+                    parts: vec![ContentPart::ToolUse {
+                        id: "c1".to_string(),
+                        name: "file_write".to_string(),
+                        input: input.clone(),
+                    }],
+                    input_kind: None,
+                    user_id: None,
+                },
+            )
+            .unwrap();
+
+        let history = store.history("s1").expect("the session loads");
+        match &history[0].parts[0] {
+            ContentPart::ToolUse { input: got, .. } => {
+                assert_eq!(got, &input, "an ordinary input must round-trip unchanged");
+            }
+            other => panic!("expected a ToolUse, got {other:?}"),
+        }
+    }
+
+    /// A cache that is present still stores the hash, not the content.
+    #[test]
+    fn a_cached_result_still_records_its_hash() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &tool_use_message("c1")).unwrap();
+        store
+            .append_message("s1", &tool_result_message("c1", "the real output"))
+            .unwrap();
+
+        let raw = std::fs::read_to_string(store.path_for_test("s1")).unwrap();
+        assert!(!raw.contains("the real output"), "got {raw}");
+        assert!(raw.contains("tool_result_ref"), "got {raw}");
+        assert_eq!(
+            store.history("s1").unwrap()[1].parts[0],
+            ContentPart::ToolResult {
+                tool_use_id: "c1".to_string(),
+                content: "the real output".to_string(),
+            }
+        );
     }
 
     /// The listing is per namespace. Another namespace's sessions are
@@ -1043,13 +1381,14 @@ mod tests {
     fn a_cached_tool_result_is_restored_whole() {
         let (_d, store) = store();
         store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &tool_use_message("c1")).unwrap();
         store
             .append_message("s1", &tool_result_message("c1", "the original output"))
             .unwrap();
 
         let history = store.history("s1").unwrap();
         assert_eq!(
-            history[0].parts[0],
+            history[1].parts[0],
             ContentPart::ToolResult {
                 tool_use_id: "c1".to_string(),
                 content: "the original output".to_string(),
@@ -1065,6 +1404,7 @@ mod tests {
     fn a_lost_tool_result_becomes_a_placeholder_rather_than_an_error() {
         let (dir, store) = store();
         store.create("s1", "default", "/p").unwrap();
+        store.append_message("s1", &tool_use_message("c1")).unwrap();
         store
             .append_message("s1", &tool_result_message("c1", "gone tomorrow"))
             .unwrap();
@@ -1074,7 +1414,7 @@ mod tests {
 
         let history = store.history("s1").expect("the session still loads");
         assert_eq!(
-            history[0].parts[0],
+            history[1].parts[0],
             ContentPart::ToolResult {
                 tool_use_id: "c1".to_string(),
                 content: MISSING_RESULT.to_string(),
@@ -1171,6 +1511,450 @@ mod tests {
         );
     }
 
+    /// The read-side fix for the write side's warn-and-continue: an
+    /// `append_message` for a `tool_result` can fail after its
+    /// `tool_use` sibling already landed, or the process can die between
+    /// the two. Either way, a `tool_use` with nothing answering it must
+    /// not brick the session — `history()` closes the gap itself rather
+    /// than handing the API an unpaired call on reload.
+    #[test]
+    fn an_unanswered_tool_use_gets_a_synthesised_result() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("run it"))
+            .unwrap();
+
+        // Hand-write a `tool_use` with no matching `tool_result` after
+        // it — standing in for a crash or a failed cache write between
+        // the two appends `run_llm_turn` makes.
+        let parent = store.events("s1").unwrap()[0].id;
+        let path = store.path_for_test("s1");
+        let orphan_use = serde_json::json!({
+            "kind": "message",
+            "id": Uuid::now_v7(),
+            "parent": parent,
+            "at": Utc::now(),
+            "role": "assistant",
+            "parts": [{"tool_use": {"id": "call-1", "name": "risky", "input": {}}}],
+        });
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{orphan_use}").unwrap();
+        drop(f);
+
+        let history = store.history("s1").expect("the session still loads");
+        let last = history.last().expect("a synthesised message was appended");
+        assert_eq!(
+            last.parts,
+            vec![ContentPart::ToolResult {
+                tool_use_id: "call-1".to_string(),
+                content: MISSING_RESULT.to_string(),
+            }],
+            "the unanswered tool_use gets a placeholder result so the \
+             pairing holds on reload"
+        );
+    }
+
+    /// The case that exposed the trailing-message version as wrong: the
+    /// API requires a `tool_result` to sit in the message *immediately
+    /// following* its `tool_use`, not merely somewhere later in the
+    /// transcript. If a real message chains onto a not-yet-repaired
+    /// orphan — a later turn continues the conversation without ever
+    /// writing the read-side repair back to disk — a trailing repair
+    /// would land after that unrelated message instead of between the
+    /// two, leaving the session unloadable all over again on the next
+    /// fresh read.
+    #[test]
+    fn a_repair_lands_right_after_its_orphan_even_when_later_messages_follow() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+
+        // Hand-write the `tool_use` as the session's very first event.
+        // No `append_message` call has happened yet, so the store's
+        // `tips` cache holds nothing for this session — the next append
+        // falls back to reading the file for the tip, exactly as a
+        // real writer resuming after a crash would, and correctly
+        // chains onto this hand-written event.
+        let path = store.path_for_test("s1");
+        let orphan_id = Uuid::now_v7();
+        let orphan_use = serde_json::json!({
+            "kind": "message",
+            "id": orphan_id,
+            "parent": null,
+            "at": Utc::now(),
+            "role": "assistant",
+            "parts": [{"tool_use": {"id": "call-1", "name": "risky", "input": {}}}],
+        });
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{orphan_use}").unwrap();
+        drop(f);
+
+        // A later turn carries the conversation on, on disk, without
+        // the orphan ever having been repaired in place.
+        store
+            .append_message("s1", &ChatMessage::user("continue"))
+            .unwrap();
+        store
+            .append_message("s1", &ChatMessage::assistant("ok"))
+            .unwrap();
+
+        let history = store.history("s1").expect("the session still loads");
+        assert_eq!(
+            history.len(),
+            4,
+            "orphan, repair, then the two later messages: {history:?}"
+        );
+        assert!(
+            matches!(&history[0].parts[..], [ContentPart::ToolUse { id, .. }] if id == "call-1"),
+            "message 0 is the orphaned tool_use: {history:?}"
+        );
+        assert_eq!(
+            history[1].parts,
+            vec![ContentPart::ToolResult {
+                tool_use_id: "call-1".to_string(),
+                content: MISSING_RESULT.to_string(),
+            }],
+            "the repair must be message 1, immediately after the orphan \
+             and before the later real messages: {history:?}"
+        );
+        assert!(
+            matches!(&history[2].parts[..], [ContentPart::Text(t)] if t == "continue"),
+            "the later real message must follow the repair, not precede it: {history:?}"
+        );
+        assert!(
+            matches!(&history[3].parts[..], [ContentPart::Text(t)] if t == "ok"),
+            "got {history:?}"
+        );
+    }
+
+    /// Two separate orphaned `tool_use`s, far apart in the conversation,
+    /// each get their own repair spliced in right after themselves —
+    /// not merged into one message anywhere.
+    #[test]
+    fn two_far_apart_orphans_each_get_their_own_repair_in_position() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        let path = store.path_for_test("s1");
+
+        let write_line = |parent: Option<Uuid>, id: Uuid, role: &str, parts: serde_json::Value| {
+            let line = serde_json::json!({
+                "kind": "message",
+                "id": id,
+                "parent": parent,
+                "at": Utc::now(),
+                "role": role,
+                "parts": parts,
+            });
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            use std::io::Write as _;
+            writeln!(f, "{line}").unwrap();
+        };
+
+        let e1 = Uuid::now_v7();
+        write_line(None, e1, "user", serde_json::json!([{"text": "start"}]));
+        let e2 = Uuid::now_v7();
+        write_line(
+            Some(e1),
+            e2,
+            "assistant",
+            serde_json::json!([{"tool_use": {"id": "call-a", "name": "risky", "input": {}}}]),
+        );
+        let e3 = Uuid::now_v7();
+        write_line(
+            Some(e2),
+            e3,
+            "user",
+            serde_json::json!([{"text": "middle"}]),
+        );
+        let e4 = Uuid::now_v7();
+        write_line(
+            Some(e3),
+            e4,
+            "assistant",
+            serde_json::json!([{"tool_use": {"id": "call-b", "name": "risky", "input": {}}}]),
+        );
+        write_line(
+            Some(e4),
+            Uuid::now_v7(),
+            "user",
+            serde_json::json!([{"text": "end"}]),
+        );
+
+        let history = store.history("s1").expect("the session still loads");
+        let shapes: Vec<String> = history
+            .iter()
+            .map(|m| match &m.parts[..] {
+                [ContentPart::Text(t)] => format!("text:{t}"),
+                [ContentPart::ToolUse { id, .. }] => format!("tool_use:{id}"),
+                [
+                    ContentPart::ToolResult {
+                        tool_use_id,
+                        content,
+                    },
+                ] => format!(
+                    "tool_result:{tool_use_id}:{}",
+                    if content == MISSING_RESULT {
+                        "missing"
+                    } else {
+                        "other"
+                    }
+                ),
+                other => format!("unexpected:{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                "text:start".to_string(),
+                "tool_use:call-a".to_string(),
+                "tool_result:call-a:missing".to_string(),
+                "text:middle".to_string(),
+                "tool_use:call-b".to_string(),
+                "tool_result:call-b:missing".to_string(),
+                "text:end".to_string(),
+            ],
+            "each orphan's repair must sit right after its own tool_use, \
+             not gathered together or moved to the end: {shapes:?}"
+        );
+    }
+
+    /// The fix above must only fire on a genuine gap — a session whose
+    /// `tool_use`/`tool_result` pair is already complete gains nothing.
+    #[test]
+    fn a_complete_pair_gains_no_synthesised_result() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store
+            .append_message(
+                "s1",
+                &ChatMessage::assistant_with_tools(
+                    None,
+                    vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "risky".to_string(),
+                        input: serde_json::json!({}),
+                    }],
+                ),
+            )
+            .unwrap();
+        store
+            .append_message("s1", &tool_result_message("call-1", "the real output"))
+            .unwrap();
+
+        let history = store.history("s1").expect("the session loads");
+        let result_count = history
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter(|p| matches!(p, ContentPart::ToolResult { .. }))
+            .count();
+        assert_eq!(
+            result_count, 1,
+            "no extra result should be synthesised when the pairing is already complete"
+        );
+    }
+
+    /// Fix 2, failure shape 1: two separate `tool_use`s reuse the same
+    /// id "c1" — the first is genuinely answered by the message right
+    /// after it, the second is not. A set-based "has `c1` been answered
+    /// anywhere" check would see the first answer and wrongly suppress
+    /// the second `tool_use`'s repair. The positional check must not
+    /// make that mistake: each `tool_use` is judged only by its own
+    /// immediate neighbour.
+    #[test]
+    fn two_tool_uses_sharing_an_id_are_checked_independently_by_position() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("start"))
+            .unwrap();
+        store.append_message("s1", &tool_use_message("c1")).unwrap();
+        store
+            .append_message("s1", &tool_result_message("c1", "first answer"))
+            .unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("middle"))
+            .unwrap();
+        // A second, unrelated tool_use that happens to reuse id "c1" —
+        // and this one is never answered.
+        store.append_message("s1", &tool_use_message("c1")).unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("end"))
+            .unwrap();
+
+        let history = store.history("s1").expect("the session loads");
+        let results: Vec<&ContentPart> = history
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter(|p| matches!(p, ContentPart::ToolResult { .. }))
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                &ContentPart::ToolResult {
+                    tool_use_id: "c1".to_string(),
+                    content: "first answer".to_string(),
+                },
+                &ContentPart::ToolResult {
+                    tool_use_id: "c1".to_string(),
+                    content: MISSING_RESULT.to_string(),
+                },
+            ],
+            "the first call-1 stays answered by its real result; the second \
+             must still get its own repair even though the id was already \
+             seen: {results:?}"
+        );
+    }
+
+    /// Fix 2, failure shape 2: a `tool_result` sits many messages before
+    /// the `tool_use` it claims to answer — reachable through a fork the
+    /// walk resolves differently, or a partial sync that landed events
+    /// out of their real order. The pairing is positionally invalid
+    /// (nothing in the immediately preceding message has that id), so
+    /// the stray result must be dropped, and the real, unanswered
+    /// `tool_use` still gets its own repair.
+    #[test]
+    fn a_result_answering_a_non_adjacent_tool_use_is_dropped() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        let path = store.path_for_test("s1");
+
+        let write_line = |parent: Option<Uuid>, id: Uuid, role: &str, parts: serde_json::Value| {
+            let line = serde_json::json!({
+                "kind": "message",
+                "id": id,
+                "parent": parent,
+                "at": Utc::now(),
+                "role": role,
+                "parts": parts,
+            });
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            use std::io::Write as _;
+            writeln!(f, "{line}").unwrap();
+        };
+
+        // e1: an ordinary root message with no tool_use at all.
+        let e1 = Uuid::now_v7();
+        write_line(None, e1, "user", serde_json::json!([{"text": "root"}]));
+        // e2: a tool_result for "orphan" — positionally invalid, since
+        // e1 carries no matching tool_use.
+        let e2 = Uuid::now_v7();
+        write_line(
+            Some(e1),
+            e2,
+            "user",
+            serde_json::json!([{"tool_result_ref": {"tool_use_id": "orphan", "sha256": null}}]),
+        );
+        // e3: unrelated text.
+        let e3 = Uuid::now_v7();
+        write_line(Some(e2), e3, "user", serde_json::json!([{"text": "later"}]));
+        // e4: the real tool_use, never answered.
+        let e4 = Uuid::now_v7();
+        write_line(
+            Some(e3),
+            e4,
+            "assistant",
+            serde_json::json!([{"tool_use": {"id": "orphan", "name": "risky", "input": {}}}]),
+        );
+
+        let history = store.history("s1").expect("the session still loads");
+        let shapes: Vec<String> = history
+            .iter()
+            .map(|m| match &m.parts[..] {
+                [ContentPart::Text(t)] => format!("text:{t}"),
+                [ContentPart::ToolUse { id, .. }] => format!("tool_use:{id}"),
+                [
+                    ContentPart::ToolResult {
+                        tool_use_id,
+                        content,
+                    },
+                ] => format!(
+                    "tool_result:{tool_use_id}:{}",
+                    if content == MISSING_RESULT {
+                        "missing"
+                    } else {
+                        "other"
+                    }
+                ),
+                other => format!("unexpected:{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                "text:root".to_string(),
+                // e2's tool_result_ref is gone entirely: it was the only
+                // part on that message, so the whole message is dropped.
+                "text:later".to_string(),
+                "tool_use:orphan".to_string(),
+                "tool_result:orphan:missing".to_string(),
+            ],
+            "the non-adjacent result must be dropped, and the real \
+             orphan must still get its own repair: {shapes:?}"
+        );
+    }
+
+    /// Fix 2, failure shape 3: two `ToolUse` parts in the same message
+    /// share an id. If neither is answered, the repair must carry that
+    /// id exactly once — not two `ToolResult`s with the same
+    /// `tool_use_id`, which would itself be a malformed message.
+    #[test]
+    fn duplicate_tool_use_ids_in_one_message_get_one_repair_each() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store
+            .append_message(
+                "s1",
+                &ChatMessage::assistant_with_tools(
+                    None,
+                    vec![
+                        crate::provider::ToolCall {
+                            id: "dup".to_string(),
+                            name: "risky".to_string(),
+                            input: serde_json::json!({}),
+                        },
+                        crate::provider::ToolCall {
+                            id: "dup".to_string(),
+                            name: "risky".to_string(),
+                            input: serde_json::json!({}),
+                        },
+                    ],
+                ),
+            )
+            .unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("no answer follows"))
+            .unwrap();
+
+        let history = store.history("s1").expect("the session loads");
+        // [tool_use(dup, dup), repair(dup), "no answer follows"] — the
+        // repair is spliced immediately after the tool_use message, not
+        // gathered at the end.
+        let repair = &history[1];
+        assert_eq!(
+            repair.parts,
+            vec![ContentPart::ToolResult {
+                tool_use_id: "dup".to_string(),
+                content: MISSING_RESULT.to_string(),
+            }],
+            "one tool_use id must produce exactly one repaired result, even \
+             though it appeared twice: {repair:?}"
+        );
+    }
+
     fn tool_result_message(tool_use_id: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: Role::User,
@@ -1181,6 +1965,20 @@ mod tests {
             input_kind: None,
             user_id: None,
         }
+    }
+
+    /// A minimal assistant message carrying one `tool_use`, for tests
+    /// that need `history()`'s positional repair (Fix 2) to see a valid
+    /// pair rather than dropping a `tool_result` with nothing before it.
+    fn tool_use_message(id: &str) -> ChatMessage {
+        ChatMessage::assistant_with_tools(
+            None,
+            vec![crate::provider::ToolCall {
+                id: id.to_string(),
+                name: "risky".to_string(),
+                input: serde_json::json!({}),
+            }],
+        )
     }
 
     fn digest_cache(dir: &tempfile::TempDir) -> Arc<crate::digest_cache::DigestCache> {
