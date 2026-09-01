@@ -4176,7 +4176,9 @@ mod tests {
         tools.push(Box::new(crate::tools::client_tools::ClientFileWrite::new()));
         tools.push(Box::new(crate::tools::client_tools::ClientShell::new()));
         tools.push(Box::new(crate::tools::client_tools::ClientShellStart::new()));
-        tools.push(Box::new(crate::tools::client_tools::ClientShellOutput::new()));
+        tools.push(Box::new(
+            crate::tools::client_tools::ClientShellOutput::new(),
+        ));
         tools.push(Box::new(crate::tools::client_tools::ClientShellKill::new()));
         ToolSet::new(tools, Vec::new())
     }
@@ -4255,7 +4257,10 @@ mod tests {
         })
         .await;
         for tool in terminal_tools {
-            assert!(names.contains(&tool.to_string()), "missing {tool}: {names:?}");
+            assert!(
+                names.contains(&tool.to_string()),
+                "missing {tool}: {names:?}"
+            );
         }
 
         let names = tool_names_for_turn(TestCaps {
@@ -4265,7 +4270,10 @@ mod tests {
         })
         .await;
         for tool in terminal_tools {
-            assert!(!names.contains(&tool.to_string()), "unexpected {tool}: {names:?}");
+            assert!(
+                !names.contains(&tool.to_string()),
+                "unexpected {tool}: {names:?}"
+            );
         }
     }
 

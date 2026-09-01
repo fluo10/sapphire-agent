@@ -936,8 +936,16 @@ mod tests {
         })
         .await;
 
-        assert_eq!(fake.killed.lock().unwrap().len(), 1, "the command is stopped");
-        assert_eq!(fake.released.lock().unwrap().len(), 1, "and the handle freed");
+        assert_eq!(
+            fake.killed.lock().unwrap().len(),
+            1,
+            "the command is stopped"
+        );
+        assert_eq!(
+            fake.released.lock().unwrap().len(),
+            1,
+            "and the handle freed"
+        );
         assert!(
             state
                 .acp_terminals
@@ -1043,7 +1051,12 @@ mod tests {
         );
         assert!(fake.killed.lock().unwrap().is_empty());
         assert_eq!(
-            state.acp_terminals.lock().await.get(TEST_SESSION_ID).map(Vec::len),
+            state
+                .acp_terminals
+                .lock()
+                .await
+                .get(TEST_SESSION_ID)
+                .map(Vec::len),
             Some(1),
             "and the handle stays addressable for a client that reconnects"
         );
@@ -1070,7 +1083,12 @@ mod tests {
         .await;
 
         assert_eq!(
-            state.acp_terminals.lock().await.get(TEST_SESSION_ID).map(Vec::len),
+            state
+                .acp_terminals
+                .lock()
+                .await
+                .get(TEST_SESSION_ID)
+                .map(Vec::len),
             Some(1),
             "a timed-out one-shot's handle must be tracked, or it escapes the cap and \
              the model can never see it to clean it up"
