@@ -59,7 +59,17 @@ pub struct TerminalOutput {
 /// behind by a connection other than the one asking, without this
 /// module depending on `ServeState` itself — hence the type living
 /// here rather than in `serve`.
-pub(crate) type TerminalRegistry = Arc<tokio::sync::Mutex<HashMap<String, Vec<TerminalHandle>>>>;
+///
+/// `std::sync::Mutex`, not `tokio::sync::Mutex`, and deliberately so:
+/// [`TerminalReservation`]'s `Drop` frees a leaked reservation
+/// synchronously, and `Drop` cannot `.await` a `tokio::sync::Mutex`.
+/// The trade a sync mutex usually asks for — never held across an
+/// `.await` — holds here: every critical section on this registry
+/// (`try_reserve_terminal_slot`, `track_terminal`, `untrack_terminal`,
+/// and `TerminalReservation`'s own `resolve`/`Drop`) is a short,
+/// synchronous `HashMap`/`Vec` operation with no `.await` inside the
+/// lock span.
+pub(crate) type TerminalRegistry = Arc<std::sync::Mutex<HashMap<String, Vec<TerminalHandle>>>>;
 
 /// What the editor can be asked to do on its own machine.
 ///
@@ -117,27 +127,33 @@ pub trait AcpClient: Send + Sync {
     /// — the cap was bypassable within a single turn. Reserving
     /// atomically here closes that gap.
     ///
-    /// On success the slot is held until [`track_terminal`] resolves it
-    /// into a real handle. If the subsequent `create_terminal` call
-    /// fails, the caller must free the reservation by calling
-    /// [`untrack_terminal`](AcpClient::untrack_terminal) with
-    /// [`reserved_terminal_placeholder`] — otherwise the slot leaks.
+    /// On success, returns a [`TerminalReservation`] that holds the
+    /// slot until [`track_terminal`] consumes it, resolving it into a
+    /// real handle. If the caller instead drops the reservation without
+    /// ever calling `track_terminal` — `create_terminal` fails, an
+    /// early return, or the whole call is cancelled (the turn's future
+    /// dropped mid-RPC, which ACP treats as routine: Escape in an
+    /// editor, a dropped socket) — the reservation's own `Drop` frees
+    /// the slot. Nothing else can leak it, which is the point: a
+    /// cancelled `create_terminal` used to leave an un-freeable
+    /// placeholder in the registry forever.
     ///
-    /// On refusal, returns the handles currently held (never including
-    /// another in-flight reservation, which is not a real handle the
-    /// model could act on) so the caller can still name what is held in
-    /// its refusal message.
-    async fn try_reserve_terminal_slot(&self) -> Result<(), Vec<TerminalHandle>>;
+    /// On refusal, returns a [`CapHeld`] naming the handles currently
+    /// held and counting any reservations still in flight (neither of
+    /// which the caller can just drop into a `Vec<TerminalHandle>` —
+    /// an in-flight reservation has no handle a model could act on)
+    /// so the refusal message can still account for the full cap
+    /// rather than silently omitting what it can't name.
+    async fn try_reserve_terminal_slot(&self) -> Result<TerminalReservation, CapHeld>;
 
-    /// Record that `handle` now belongs to this client's session, so
-    /// it counts against the cap until
+    /// Consume `reservation`, resolving it into `handle` so it counts
+    /// against the cap as a real, trackable terminal until
     /// [`untrack_terminal`](AcpClient::untrack_terminal) drops it.
     ///
-    /// If a reservation from [`try_reserve_terminal_slot`] is still
-    /// outstanding for this session, this resolves (consumes) one of
-    /// them atomically in the same lock span, rather than adding a
-    /// second slot's worth of count for what was already reserved.
-    async fn track_terminal(&self, handle: TerminalHandle);
+    /// Takes the reservation by value specifically so a resolved
+    /// reservation cannot also be freed by its own `Drop` — see
+    /// [`TerminalReservation::resolve`].
+    async fn track_terminal(&self, reservation: TerminalReservation, handle: TerminalHandle);
 
     /// Drop `handle` from this client's session tracking.
     ///
@@ -147,15 +163,101 @@ pub trait AcpClient: Send + Sync {
     /// is nothing left to release, only bookkeeping to correct so a
     /// handle the client has already forgotten stops counting against
     /// the cap.
-    ///
-    /// Also used to release a reservation that never turned into a real
-    /// terminal — pass [`reserved_terminal_placeholder`] when
-    /// `create_terminal` fails after a successful
-    /// `try_reserve_terminal_slot`. Removes at most one matching entry
-    /// (never every entry with that value), so releasing one
-    /// placeholder reservation cannot also free a sibling reservation
-    /// still in flight.
     async fn untrack_terminal(&self, handle: &TerminalHandle);
+}
+
+/// What [`AcpClient::try_reserve_terminal_slot`] returns on refusal.
+///
+/// Split into named handles and a bare reservation count because an
+/// in-flight reservation has no id yet for the model to act on (it
+/// hasn't been handed a handle by `create_terminal`) — so it cannot
+/// simply be added to `handles`. Dropping it from the refusal
+/// silently instead would tell a model holding 8 terminals that it
+/// holds only, say, 3: a shorter list than the cap it's told it's
+/// hit, with no way to reconcile the two. [`cap_error`](
+/// crate::tools::client_tools::cap_error) reports both.
+pub(crate) struct CapHeld {
+    pub(crate) handles: Vec<TerminalHandle>,
+    pub(crate) reservations: usize,
+}
+
+/// Holds one session's terminal-cap slot from a successful
+/// [`AcpClient::try_reserve_terminal_slot`] until
+/// [`AcpClient::track_terminal`] resolves it into a real handle.
+///
+/// The fix this type exists for: the placeholder
+/// `try_reserve_terminal_slot` used to push into the registry was
+/// freed only by `track_terminal` or an explicit `untrack_terminal`
+/// call on `create_terminal` failure — so if the call was cancelled
+/// in between (the turn's future dropped mid-RPC, which is exactly
+/// what a dropped socket or an Escape-to-cancel produces), neither
+/// ever ran and the placeholder stayed in the registry forever,
+/// permanently costing the session one of its 8 terminal slots.
+///
+/// Making the reservation a guard closes that: `Drop` frees the slot
+/// unless [`resolve`](Self::resolve) has already consumed it, so
+/// *however* the reservation stops being held — resolved, explicitly
+/// dropped, or the enclosing future simply going away — the slot is
+/// accounted for exactly once.
+pub(crate) struct TerminalReservation {
+    registry: TerminalRegistry,
+    session_key: String,
+    /// Set by [`resolve`](Self::resolve) so `Drop` can tell "already
+    /// turned into a real handle" apart from "still just a
+    /// placeholder, free it." Without this, `Drop` would run *after*
+    /// `resolve` too (dropping `self` is unconditional, not something
+    /// `resolve` moving fields out of `self` skips) and remove the
+    /// real handle `resolve` just installed.
+    resolved: bool,
+}
+
+impl TerminalReservation {
+    pub(crate) fn new(registry: TerminalRegistry, session_key: String) -> Self {
+        Self {
+            registry,
+            session_key,
+            resolved: false,
+        }
+    }
+
+    /// Swap this reservation's placeholder for `handle` in one lock
+    /// span, and mark it resolved so `Drop` leaves the result alone.
+    ///
+    /// Consumes `self` (rather than taking `&mut self`) so a caller
+    /// cannot accidentally resolve the same reservation twice or use
+    /// it again after resolving — the type system, not just the
+    /// `resolved` flag, rules that out.
+    pub(crate) fn resolve(mut self, handle: TerminalHandle) {
+        let mut held = self.registry.lock().unwrap();
+        let entry = held.entry(self.session_key.clone()).or_default();
+        if let Some(pos) = entry.iter().position(|h| h.0 == RESERVED_TERMINAL_MARKER) {
+            entry.remove(pos);
+        }
+        entry.push(handle);
+        self.resolved = true;
+    }
+}
+
+impl Drop for TerminalReservation {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        // Not `self.registry.lock().await` — see `TerminalRegistry`'s
+        // doc for why this registry is a `std::sync::Mutex`: `Drop`
+        // cannot `.await`, and this is the whole reason the reservation
+        // can free itself from here regardless of *how* it stopped
+        // being held.
+        let mut held = self.registry.lock().unwrap();
+        if let Some(entry) = held.get_mut(&self.session_key) {
+            if let Some(pos) = entry.iter().position(|h| h.0 == RESERVED_TERMINAL_MARKER) {
+                entry.remove(pos);
+            }
+            if entry.is_empty() {
+                held.remove(&self.session_key);
+            }
+        }
+    }
 }
 
 /// The value [`AcpClient::try_reserve_terminal_slot`] pushes in place of
@@ -219,6 +321,15 @@ pub(crate) mod tests {
         /// `tokio::time::timeout` race actually win on the timeout arm
         /// without a test sleeping out a real wall-clock timeout.
         exit_never_returns: Mutex<bool>,
+        /// Set by [`FakeClient::make_create_terminal_hang`] /
+        /// [`FakeClient::let_create_terminal_finish`]. When true,
+        /// `create_terminal` records the call and then blocks forever
+        /// (after its usual `yield_now`) instead of returning a handle
+        /// — used to park a caller between `try_reserve_terminal_slot`
+        /// and `track_terminal`, so a test can drop or abort it there
+        /// the same way a cancelled turn would, and check that the
+        /// reservation frees itself rather than leaking.
+        create_never_returns: Mutex<bool>,
         /// Set by [`FakeClient::hand_out_distinct_handles`]. When true,
         /// `create_terminal` hands back `t1`, `t2`, … in order instead
         /// of always `t1` — needed by the cap test, which has to tell
@@ -268,6 +379,22 @@ pub(crate) mod tests {
         /// timeout branch.
         pub(crate) fn make_exit_never_return(&self) {
             *self.exit_never_returns.lock().unwrap() = true;
+        }
+
+        /// Make every future `create_terminal` call record itself (so
+        /// tests can still see the reservation land) and then hang
+        /// forever instead of returning — parking the caller between
+        /// `try_reserve_terminal_slot` and `track_terminal`, exactly
+        /// where a cancelled `create_terminal` RPC leaves a real turn.
+        pub(crate) fn make_create_terminal_hang(&self) {
+            *self.create_never_returns.lock().unwrap() = true;
+        }
+
+        /// Undo [`make_create_terminal_hang`](Self::make_create_terminal_hang),
+        /// so a subsequent `create_terminal` call resolves normally
+        /// again.
+        pub(crate) fn let_create_terminal_finish(&self) {
+            *self.create_never_returns.lock().unwrap() = false;
         }
 
         /// Make `create_terminal` hand back sequential ids (`t1`, `t2`,
@@ -345,6 +472,13 @@ pub(crate) mod tests {
             // test built on it would pass even against the old, buggy
             // read-then-write code.
             tokio::task::yield_now().await;
+            if *self.create_never_returns.lock().unwrap() {
+                // Never resolves — see `make_create_terminal_hang`. The
+                // call is recorded and the reservation above is already
+                // in the registry; only the RPC round trip itself hangs,
+                // matching a real cancelled `create_terminal`.
+                std::future::pending::<()>().await;
+            }
             let id = if *self.distinct_handles.lock().unwrap() {
                 let mut next = self.next_handle.lock().unwrap();
                 *next += 1;
@@ -384,29 +518,32 @@ pub(crate) mod tests {
             }
             Ok(())
         }
-        async fn try_reserve_terminal_slot(&self) -> Result<(), Vec<TerminalHandle>> {
-            let mut registry = self.terminals.lock().await;
+        async fn try_reserve_terminal_slot(&self) -> Result<TerminalReservation, CapHeld> {
+            let mut registry = self.terminals.lock().unwrap();
             let held = registry.entry(self.terminal_session.clone()).or_default();
             if held.len() >= crate::tools::client_tools::MAX_TERMINALS_PER_SESSION {
-                return Err(held
+                let handles: Vec<TerminalHandle> = held
                     .iter()
                     .filter(|h| h.0 != RESERVED_TERMINAL_MARKER)
                     .cloned()
-                    .collect());
+                    .collect();
+                let reservations = held.len() - handles.len();
+                return Err(CapHeld {
+                    handles,
+                    reservations,
+                });
             }
             held.push(reserved_terminal_placeholder());
-            Ok(())
+            Ok(TerminalReservation::new(
+                Arc::clone(&self.terminals),
+                self.terminal_session.clone(),
+            ))
         }
-        async fn track_terminal(&self, handle: TerminalHandle) {
-            let mut registry = self.terminals.lock().await;
-            let held = registry.entry(self.terminal_session.clone()).or_default();
-            if let Some(pos) = held.iter().position(|h| h.0 == RESERVED_TERMINAL_MARKER) {
-                held.remove(pos);
-            }
-            held.push(handle);
+        async fn track_terminal(&self, reservation: TerminalReservation, handle: TerminalHandle) {
+            reservation.resolve(handle);
         }
         async fn untrack_terminal(&self, handle: &TerminalHandle) {
-            let mut registry = self.terminals.lock().await;
+            let mut registry = self.terminals.lock().unwrap();
             if let Some(held) = registry.get_mut(&self.terminal_session) {
                 if let Some(pos) = held.iter().position(|h| h == handle) {
                     held.remove(pos);

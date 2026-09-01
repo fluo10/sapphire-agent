@@ -624,34 +624,39 @@ impl crate::tools::acp_client::AcpClient for AcpClientHandle {
 
     async fn try_reserve_terminal_slot(
         &self,
-    ) -> Result<(), Vec<crate::tools::acp_client::TerminalHandle>> {
-        let mut registry = self.terminals.lock().await;
+    ) -> Result<crate::tools::acp_client::TerminalReservation, crate::tools::acp_client::CapHeld>
+    {
+        let mut registry = self.terminals.lock().unwrap();
         let held = registry.entry(self.session_id.to_string()).or_default();
         if held.len() >= crate::tools::client_tools::MAX_TERMINALS_PER_SESSION {
-            return Err(held
+            let handles: Vec<crate::tools::acp_client::TerminalHandle> = held
                 .iter()
                 .filter(|h| h.0 != crate::tools::acp_client::RESERVED_TERMINAL_MARKER)
                 .cloned()
-                .collect());
+                .collect();
+            let reservations = held.len() - handles.len();
+            return Err(crate::tools::acp_client::CapHeld {
+                handles,
+                reservations,
+            });
         }
         held.push(crate::tools::acp_client::reserved_terminal_placeholder());
-        Ok(())
+        Ok(crate::tools::acp_client::TerminalReservation::new(
+            Arc::clone(&self.terminals),
+            self.session_id.to_string(),
+        ))
     }
 
-    async fn track_terminal(&self, handle: crate::tools::acp_client::TerminalHandle) {
-        let mut registry = self.terminals.lock().await;
-        let held = registry.entry(self.session_id.to_string()).or_default();
-        if let Some(pos) = held
-            .iter()
-            .position(|h| h.0 == crate::tools::acp_client::RESERVED_TERMINAL_MARKER)
-        {
-            held.remove(pos);
-        }
-        held.push(handle);
+    async fn track_terminal(
+        &self,
+        reservation: crate::tools::acp_client::TerminalReservation,
+        handle: crate::tools::acp_client::TerminalHandle,
+    ) {
+        reservation.resolve(handle);
     }
 
     async fn untrack_terminal(&self, handle: &crate::tools::acp_client::TerminalHandle) {
-        let mut registry = self.terminals.lock().await;
+        let mut registry = self.terminals.lock().unwrap();
         if let Some(held) = registry.get_mut(&self.session_id.to_string()) {
             if let Some(pos) = held.iter().position(|h| h == handle) {
                 held.remove(pos);

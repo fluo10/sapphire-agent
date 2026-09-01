@@ -243,7 +243,7 @@ impl ServeState {
             acp_session_store,
             acp_sessions: tokio::sync::Mutex::new(HashSet::new()),
             digest_cache,
-            acp_terminals: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            acp_terminals: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 

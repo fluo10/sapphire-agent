@@ -361,33 +361,29 @@ impl Tool for ClientShell {
         // them wrote it back. `try_reserve_terminal_slot` does the
         // check and the reservation in one lock span so that cannot
         // happen. See its doc.
-        client
+        let reservation = client
             .try_reserve_terminal_slot()
             .await
             .map_err(|held| cap_error(&held))?;
 
-        let handle = match client
+        // If `create_terminal` errors, or this whole call is cancelled
+        // before it returns — the turn's future dropped mid-RPC, which
+        // is exactly the cancellation ACP treats as routine (Escape in
+        // an editor, a dropped socket) — `reservation` is dropped here
+        // without ever reaching `track_terminal` below. Its `Drop`
+        // frees the slot itself; nothing further to do on this path.
+        // See `TerminalReservation`'s doc.
+        let handle = client
             .create_terminal(command, &args, cwd, Some(OUTPUT_CAP_BYTES as u64))
-            .await
-        {
-            Ok(h) => h,
-            Err(e) => {
-                // Nothing was created, so there is no handle to track —
-                // but the reservation above claimed a slot that must be
-                // freed, or the cap would permanently lose one seat.
-                client
-                    .untrack_terminal(&crate::tools::acp_client::reserved_terminal_placeholder())
-                    .await;
-                return Err(e);
-            }
-        };
+            .await?;
         // Tracked immediately, before anything that can fail or be
         // dropped: a `wait_for_terminal_exit` error below, or this
         // whole future being dropped mid-wait (turn cancellation), must
         // not lose a command that is genuinely still running on the
-        // user's machine. This also resolves the reservation above into
-        // the real handle.
-        client.track_terminal(handle.clone()).await;
+        // user's machine. This also consumes `reservation`, resolving
+        // it into the real handle so its `Drop` won't also try to free
+        // the slot out from under the now-tracked handle.
+        client.track_terminal(reservation, handle.clone()).await;
 
         match tokio::time::timeout(timeout, client.wait_for_terminal_exit(&handle)).await {
             Ok(status) => {
@@ -457,12 +453,27 @@ pub(crate) const MAX_TERMINALS_PER_SESSION: usize = 8;
 /// at the cap. Pulled out so the wording — and the handle substrings
 /// (`t1`, `t{MAX_TERMINALS_PER_SESSION}`) the cap test keys on — lives
 /// in one place.
-fn cap_error(held: &[TerminalHandle]) -> anyhow::Error {
-    let ids: Vec<String> = held.iter().map(TerminalHandle::to_string).collect();
+///
+/// `held.handles` alone can be shorter than `MAX_TERMINALS_PER_SESSION`
+/// even though the session really is at the cap: a concurrent call
+/// elsewhere in this same turn may be mid-`create_terminal`, holding a
+/// reservation with no handle yet. Naming only `held.handles` in that
+/// case would tell the model it holds fewer terminals than the cap it
+/// is being refused against, with no way to reconcile the two — so any
+/// in-flight reservations are appended as a count instead of being
+/// silently dropped from the listing.
+pub(crate) fn cap_error(held: &crate::tools::acp_client::CapHeld) -> anyhow::Error {
+    let mut parts: Vec<String> = held.handles.iter().map(TerminalHandle::to_string).collect();
+    if held.reservations > 0 {
+        parts.push(format!(
+            "{} more still starting (no handle yet)",
+            held.reservations
+        ));
+    }
     anyhow::anyhow!(
         "already holding the maximum of {MAX_TERMINALS_PER_SESSION} terminals for this \
          session: {}. Use client_shell_kill to free one before starting another.",
-        ids.join(", ")
+        parts.join(", ")
     )
 }
 
@@ -564,27 +575,19 @@ impl Tool for ClientShellStart {
         // not let them all read the count before any of them wrote it
         // back — a real, reachable way to bypass the cap within one
         // turn, not just across concurrent prompts.
-        client
+        let reservation = client
             .try_reserve_terminal_slot()
             .await
             .map_err(|held| cap_error(&held))?;
 
-        let handle = match client
+        // As in `ClientShell`: if `create_terminal` errors or this call
+        // is cancelled before it returns, `reservation` is dropped
+        // without reaching `track_terminal`, and its `Drop` frees the
+        // slot on its own.
+        let handle = client
             .create_terminal(command, &args, cwd, Some(OUTPUT_CAP_BYTES as u64))
-            .await
-        {
-            Ok(h) => h,
-            Err(e) => {
-                // Free the reservation — nothing was created, so there
-                // is no handle to track, but the claimed slot must not
-                // leak.
-                client
-                    .untrack_terminal(&crate::tools::acp_client::reserved_terminal_placeholder())
-                    .await;
-                return Err(e);
-            }
-        };
-        client.track_terminal(handle.clone()).await;
+            .await?;
+        client.track_terminal(reservation, handle.clone()).await;
         Ok(format!(
             "Started terminal {handle}. Use client_shell_output to check on it, or \
              client_shell_kill to stop it."
@@ -1043,7 +1046,7 @@ mod tests {
         })
         .await;
 
-        let held = state.acp_terminals.lock().await;
+        let held = state.acp_terminals.lock().unwrap();
         assert_eq!(held.get(TEST_SESSION_ID).map(Vec::len), Some(1));
     }
 
@@ -1080,7 +1083,7 @@ mod tests {
             state
                 .acp_terminals
                 .lock()
-                .await
+                .unwrap()
                 .get(TEST_SESSION_ID)
                 .is_none_or(Vec::is_empty),
             "and it is no longer tracked"
@@ -1159,7 +1162,7 @@ mod tests {
             state
                 .acp_terminals
                 .lock()
-                .await
+                .unwrap()
                 .get(TEST_SESSION_ID)
                 .map(Vec::len),
             Some(1),
@@ -1191,7 +1194,7 @@ mod tests {
             state
                 .acp_terminals
                 .lock()
-                .await
+                .unwrap()
                 .get(TEST_SESSION_ID)
                 .is_none_or(Vec::is_empty),
             "but a kill frees the handle from tracking regardless of whether the client \
@@ -1237,7 +1240,7 @@ mod tests {
             state
                 .acp_terminals
                 .lock()
-                .await
+                .unwrap()
                 .get(TEST_SESSION_ID)
                 .map(Vec::len),
             Some(1),
@@ -1269,7 +1272,7 @@ mod tests {
             state
                 .acp_terminals
                 .lock()
-                .await
+                .unwrap()
                 .get(TEST_SESSION_ID)
                 .map(Vec::len),
             Some(1),
@@ -1344,7 +1347,7 @@ mod tests {
             state
                 .acp_terminals
                 .lock()
-                .await
+                .unwrap()
                 .get(TEST_SESSION_ID)
                 .map(Vec::len),
             Some(1),
@@ -1384,7 +1387,7 @@ mod tests {
             state
                 .acp_terminals
                 .lock()
-                .await
+                .unwrap()
                 .get(TEST_SESSION_ID)
                 .map(Vec::len),
             Some(1),
@@ -1434,11 +1437,230 @@ mod tests {
             state
                 .acp_terminals
                 .lock()
-                .await
+                .unwrap()
                 .get(TEST_SESSION_ID)
                 .map(Vec::len),
             Some(MAX_TERMINALS_PER_SESSION),
             "the registry itself must never hold more than the cap, even transiently"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Reservation-leak fix: cancellation between reserve and track
+    // -----------------------------------------------------------------
+
+    /// The regression this whole task exists to close, reproduced and
+    /// then disproved.
+    ///
+    /// Before `TerminalReservation` existed, the placeholder
+    /// `try_reserve_terminal_slot` pushed was freed only by
+    /// `track_terminal` or an explicit `untrack_terminal` on
+    /// `create_terminal` failure — neither of which runs when the
+    /// call's future is dropped in between (a cancelled turn: Escape in
+    /// an editor, a dropped socket firing `connection_cancel`, exactly
+    /// what `create_terminal`'s RPC being in flight is the routine case
+    /// for). The placeholder stayed in the registry forever, and after
+    /// `MAX_TERMINALS_PER_SESSION` such cancellations the session could
+    /// never start another terminal again, on this connection or any
+    /// reconnect.
+    ///
+    /// Cancelling `MAX_TERMINALS_PER_SESSION + 1` times — one more than
+    /// the cap — and then still succeeding is the sharpest version of
+    /// this: if even a single cancellation leaked its slot, the cap
+    /// would already be hit and the final start below would be refused
+    /// instead of succeeding.
+    #[tokio::test]
+    async fn a_dropped_reservation_does_not_leak_the_slot() {
+        let (state, fake) = shell_test_state().await;
+        // Parks every `create_terminal` call after it records itself
+        // and after the reservation above it has already landed in the
+        // registry — the same window a real cancellation drops the
+        // turn's future in.
+        fake.make_create_terminal_hang();
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+
+        for _ in 0..(MAX_TERMINALS_PER_SESSION + 1) {
+            let task_client = Arc::clone(&client);
+            let join = tokio::spawn(scope_acp_client(task_client, async move {
+                ClientShellStart::new()
+                    .execute(&json!({"command": "sleep", "args": ["999"]}))
+                    .await
+            }));
+
+            // Let the spawned task actually reserve its slot and reach
+            // the hang inside `create_terminal` before cancelling it —
+            // otherwise this loop would abort a task that never got far
+            // enough to exercise the drop path at all.
+            for _ in 0..200 {
+                if state
+                    .acp_terminals
+                    .lock()
+                    .unwrap()
+                    .get(TEST_SESSION_ID)
+                    .map(Vec::len)
+                    == Some(1)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                state
+                    .acp_terminals
+                    .lock()
+                    .unwrap()
+                    .get(TEST_SESSION_ID)
+                    .map(Vec::len),
+                Some(1),
+                "the reservation must be visible before it is cancelled, or this test does \
+                 not exercise the drop path this fix is about"
+            );
+
+            // The cancellation this fix is about: the turn's future is
+            // dropped mid-RPC. `abort` reproduces exactly that for a
+            // spawned task.
+            join.abort();
+            let _ = join.await;
+
+            assert!(
+                state
+                    .acp_terminals
+                    .lock()
+                    .unwrap()
+                    .get(TEST_SESSION_ID)
+                    .is_none_or(Vec::is_empty),
+                "a reservation whose future is dropped before track_terminal must free its \
+                 slot immediately, not leak it"
+            );
+        }
+
+        // The proof that matters: after MAX_TERMINALS_PER_SESSION + 1
+        // cancellations, a fresh start still succeeds. Before this fix,
+        // each cancellation above would have permanently cost the
+        // session a slot, and it would already be stuck at the cap.
+        fake.let_create_terminal_finish();
+        scope_acp_client(client, async {
+            ClientShellStart::new()
+                .execute(&json!({"command": "sleep", "args": ["999"]}))
+                .await
+                .expect(
+                    "the session must still be able to start a terminal after repeated \
+                     cancellations",
+                )
+        })
+        .await;
+    }
+
+    // -----------------------------------------------------------------
+    // Reservation-leak fix: cap_error accounts for in-flight reservations
+    // -----------------------------------------------------------------
+
+    /// The second half of the trap this task closes: a model refused at
+    /// the cap while some of what it holds is still an in-flight
+    /// reservation (no handle yet, because `create_terminal` hasn't
+    /// returned) must not be shown a listing shorter than the maximum
+    /// it is told it hit. `try_reserve_terminal_slot` cannot name a
+    /// reservation as a handle — there isn't one yet — so `cap_error`
+    /// has to account for it some other way instead of just omitting
+    /// it.
+    #[test]
+    fn cap_error_accounts_for_in_flight_reservations() {
+        let held = crate::tools::acp_client::CapHeld {
+            handles: vec![
+                TerminalHandle("t1".to_string()),
+                TerminalHandle("t2".to_string()),
+                TerminalHandle("t3".to_string()),
+            ],
+            reservations: 5,
+        };
+        let message = cap_error(&held).to_string();
+
+        assert!(
+            message.contains(&MAX_TERMINALS_PER_SESSION.to_string()),
+            "still names the cap itself: {message}"
+        );
+        for id in ["t1", "t2", "t3"] {
+            assert!(
+                message.contains(id),
+                "still names every real handle held: {message}"
+            );
+        }
+        // The bug this guards against: a refusal that claims "the
+        // maximum of 8" while naming only 3 handles and saying nothing
+        // about the other 5 gives the model nothing to reconcile the
+        // two numbers with.
+        assert!(
+            message.contains('5'),
+            "the 5 in-flight reservations must be accounted for, not silently dropped from \
+             a listing shorter than the 8 the message claims: {message}"
+        );
+    }
+
+    /// End-to-end version of the same fix: eight concurrent
+    /// `client_shell_start` calls that are all still mid-`create_terminal`
+    /// (parked, so none of them has resolved into a real handle yet)
+    /// must still be reflected in the refusal a ninth concurrent call
+    /// gets — as a count, since none of the eight has a handle for the
+    /// message to name.
+    #[tokio::test]
+    async fn the_cap_refusal_accounts_for_reservations_still_in_flight() {
+        let (state, fake) = shell_test_state().await;
+        fake.make_create_terminal_hang();
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+
+        let mut holders = Vec::new();
+        for _ in 0..MAX_TERMINALS_PER_SESSION {
+            let task_client = Arc::clone(&client);
+            holders.push(tokio::spawn(scope_acp_client(task_client, async move {
+                ClientShellStart::new()
+                    .execute(&json!({"command": "sleep", "args": ["999"]}))
+                    .await
+            })));
+        }
+
+        for _ in 0..2000 {
+            if state
+                .acp_terminals
+                .lock()
+                .unwrap()
+                .get(TEST_SESSION_ID)
+                .map(Vec::len)
+                == Some(MAX_TERMINALS_PER_SESSION)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            state
+                .acp_terminals
+                .lock()
+                .unwrap()
+                .get(TEST_SESSION_ID)
+                .map(Vec::len),
+            Some(MAX_TERMINALS_PER_SESSION),
+            "all eight must be reserved (none resolved — create_terminal is parked) before \
+             the refusal below is meaningful"
+        );
+
+        let refusal = scope_acp_client(Arc::clone(&client), async {
+            ClientShellStart::new()
+                .execute(&json!({"command": "one", "args": ["too", "many"]}))
+                .await
+                .unwrap_err()
+                .to_string()
+        })
+        .await;
+
+        assert!(
+            refusal.contains(&MAX_TERMINALS_PER_SESSION.to_string()),
+            "the refusal must account for every in-flight reservation, not present a \
+             listing shorter than the {MAX_TERMINALS_PER_SESSION} it claims: {refusal}"
+        );
+
+        for h in holders {
+            h.abort();
+            let _ = h.await;
+        }
     }
 }
