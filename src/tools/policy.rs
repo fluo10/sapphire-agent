@@ -79,9 +79,14 @@ pub enum Origin {
     /// The heartbeat's chat leg arrives here too, because it shares
     /// `Agent::handle_message`. That is the right answer rather than an
     /// accident: heartbeat tasks are workspace files, and `file_write`
-    /// is an `Edit`, which this origin allows unasked — so a trusted
-    /// heartbeat would let a chat message write itself a task that runs
-    /// a command on the next tick.
+    /// is an `Edit`, which this origin allows unasked *when host access
+    /// is on* — so a trusted heartbeat would let a chat message write
+    /// itself a task that runs a command on the next tick. With host
+    /// access off (the default this crate ships), `host_tool_denied`
+    /// refuses `file_write` before `decide` is even consulted, so this
+    /// origin cannot reach it regardless of what `decide` says below —
+    /// but the conclusion (`Channel` must not be trusted with `Edit`)
+    /// still holds for anyone who turns host access on.
     Channel,
     /// `/rpc`, voice and `/a2a`: authenticated before the turn began,
     /// with no UI to ask through. Behaviour must not change for these.
@@ -161,6 +166,31 @@ pub fn refusal_message(tool: &str, why: Refusal) -> String {
     }
 }
 
+/// The tools that operate on the agent's own filesystem and shell.
+///
+/// Listed by name rather than derived from `ToolKind`, because the
+/// distinction is *which machine*, not how dangerous the operation is:
+/// `memory_add` is also an `Edit`, and it is never in question.
+pub const HOST_TOOLS: &[&str] = &[
+    "file_read",
+    "file_write",
+    "file_append",
+    "file_delete",
+    "dir_list",
+    "dir_walk",
+    "shell",
+];
+
+/// Whether this call is refused before the policy table is consulted.
+///
+/// A gate in front of `decide` rather than a row inside it: `decide` is
+/// a pure function of origin and kind, and this is a fact about the
+/// deployment. Keeping them apart means the permission table still
+/// reads as one thing.
+pub fn host_tool_denied(name: &str, host_access_enabled: bool) -> bool {
+    !host_access_enabled && HOST_TOOLS.contains(&name)
+}
+
 /// The whole policy. The table in the design spec is this function.
 pub fn decide(origin: Origin, kind: ToolKind) -> Decision {
     // Group first, so that a `ToolKind` variant added upstream lands in
@@ -208,15 +238,30 @@ pub fn decide(origin: Origin, kind: ToolKind) -> Decision {
 /// `Origin::Channel` reaches this, and `decide` never returns `Ask` for
 /// it — but a later policy change that did must not silently open the
 /// channel path, so the unreachable case fails closed.
+///
+/// `host_access_enabled` is checked before `decide` for the same reason
+/// it is in `run_llm_turn`'s permission loop: it is a fact about the
+/// deployment, not a row in the origin/kind table, so a host tool never
+/// even reaches `decide` while it is off — including for a channel
+/// message, which has nobody to ask and would otherwise reach `Edit`/
+/// `Delete` tools like `file_write`/`file_delete` unasked.
 pub fn partition_without_asking(
     origin: Origin,
     calls: &[crate::provider::ToolCall],
     kinds: &[(String, ToolKind)],
+    host_access_enabled: bool,
 ) -> (Vec<crate::provider::ToolCall>, Vec<(String, String)>) {
     let mut permitted = Vec::with_capacity(calls.len());
     let mut refused = Vec::new();
 
     for call in calls {
+        if host_tool_denied(&call.name, host_access_enabled) {
+            refused.push((
+                call.id.clone(),
+                refusal_message(&call.name, Refusal::Unavailable),
+            ));
+            continue;
+        }
         match decide(origin, kind_of(&call.name, kinds)) {
             Decision::Allow => permitted.push(call.clone()),
             Decision::Deny | Decision::Ask => refused.push((
@@ -409,7 +454,7 @@ mod tests {
             call("c3", "mcp__x__y"),
         ];
 
-        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds);
+        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds, true);
 
         let kept: Vec<&str> = permitted.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(kept, vec!["c1"]);
@@ -419,13 +464,88 @@ mod tests {
         assert!(refused[0].1.contains("shell"), "got {}", refused[0].1);
     }
 
+    /// The host gate applies inside `partition_without_asking` too, not
+    /// just at `decide`/`host_tool_denied` in isolation — this is what
+    /// actually closes the channel path, since `Origin::Channel` has no
+    /// other gate in front of it.
+    #[test]
+    fn partition_without_asking_refuses_host_tools_when_host_access_is_off() {
+        let kinds = vec![("file_delete".to_string(), ToolKind::Delete)];
+        let calls = vec![call("c1", "file_delete")];
+
+        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds, false);
+
+        assert!(permitted.is_empty(), "host access is off by default");
+        assert_eq!(refused.len(), 1);
+        assert!(refused[0].1.contains("file_delete"), "got {}", refused[0].1);
+    }
+
+    #[test]
+    fn partition_without_asking_allows_host_tools_when_host_access_is_on() {
+        let kinds = vec![("file_delete".to_string(), ToolKind::Delete)];
+        let calls = vec![call("c1", "file_delete")];
+
+        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds, true);
+
+        assert_eq!(permitted.len(), 1);
+        assert!(refused.is_empty());
+    }
+
+    /// The seven tools that touch the agent's own machine. Off unless
+    /// the operator turned them on — including for `Origin::Trusted`,
+    /// which is the voice pipeline and the heartbeat.
+    #[test]
+    fn host_tools_are_denied_when_host_access_is_off() {
+        for name in HOST_TOOLS {
+            assert!(
+                host_tool_denied(name, false),
+                "{name} must be denied with host access off"
+            );
+        }
+    }
+
+    #[test]
+    fn host_tools_are_allowed_through_when_host_access_is_on() {
+        for name in HOST_TOOLS {
+            assert!(
+                !host_tool_denied(name, true),
+                "{name} must fall through to the policy table when enabled"
+            );
+        }
+    }
+
+    /// The gate is about *which machine*, not about the tool's risk, so
+    /// a workspace-scoped tool is never caught by it.
+    #[test]
+    fn workspace_tools_are_not_host_tools() {
+        for name in ["memory_add", "workspace_search", "timer_set", "web_search"] {
+            assert!(!host_tool_denied(name, false), "{name} is not a host tool");
+        }
+    }
+
+    /// The hole this closes: `file_delete` is `Delete`, which
+    /// `Origin::Channel` allows unasked, so a Discord message can
+    /// delete a file on the agent's host today.
+    #[test]
+    fn a_channel_turn_cannot_reach_file_delete_with_host_access_off() {
+        assert_eq!(
+            decide(Origin::Channel, ToolKind::Delete),
+            Decision::Allow,
+            "the policy table alone still allows it — which is the point"
+        );
+        assert!(
+            host_tool_denied("file_delete", false),
+            "the host gate is what stops it"
+        );
+    }
+
     /// A trusted origin refuses nothing, so the helper is a no-op there.
     #[test]
     fn partition_keeps_everything_for_a_trusted_origin() {
         let kinds = vec![("shell".to_string(), ToolKind::Execute)];
         let calls = vec![call("c1", "shell")];
 
-        let (permitted, refused) = partition_without_asking(Origin::Trusted, &calls, &kinds);
+        let (permitted, refused) = partition_without_asking(Origin::Trusted, &calls, &kinds, true);
 
         assert_eq!(permitted.len(), 1);
         assert!(refused.is_empty());
@@ -441,7 +561,7 @@ mod tests {
         let calls = vec![call("c1", "shell")];
 
         let (permitted, refused) =
-            partition_without_asking(Origin::Acp(SessionMode::Default), &calls, &kinds);
+            partition_without_asking(Origin::Acp(SessionMode::Default), &calls, &kinds, true);
 
         assert!(permitted.is_empty(), "an Ask must not be treated as Allow");
         assert_eq!(refused.len(), 1);

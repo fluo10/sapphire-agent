@@ -60,16 +60,18 @@
 use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, CurrentModeUpdate, Error,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
-    ResumeSessionResponse, SessionCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
+    AgentCapabilities, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
+    CreateTerminalRequest, CurrentModeUpdate, Error, InitializeRequest, InitializeResponse,
+    KillTerminalRequest, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, PromptRequest, PromptResponse, ReadTextFileRequest,
+    ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionId, SessionInfo,
+    SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
     SessionResumeCapabilities, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
-    StopReason, TextContent, ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields,
+    StopReason, TerminalId, TerminalOutputRequest, TextContent, ToolCall as AcpToolCall,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, WaitForTerminalExitRequest,
+    WriteTextFileRequest,
 };
 use agent_client_protocol::{
     Agent, Client, ConnectionTo, Lines, on_receive_notification, on_receive_request,
@@ -80,7 +82,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -110,11 +112,24 @@ struct AcpSession {
     /// once, at creation, so a loaded session's recorded cwd here cannot
     /// be used to update the stored one, and no code should try.
     ///
-    /// Still nothing reads this field back out of the struct (a future
-    /// `terminal/create` handler is the intended reader, per the module
-    /// doc), so the attribute stays until that lands.
-    #[allow(dead_code)]
+    /// Read at `session/prompt` time and copied onto the turn's
+    /// [`AcpProgress`] the same way `client_capabilities` is, so
+    /// `ClientShell` (`src/tools/client_tools.rs`) can default a
+    /// `terminal/create` call's working directory to it when the model
+    /// doesn't pass one.
     cwd: PathBuf,
+    /// What the client declared it can do, from `initialize`'s
+    /// `clientCapabilities`. Copied in from the connection-wide
+    /// [`AcpSessions::client_capabilities`] at `session/new` and at
+    /// `adopt_session` time, so a client-side tool can read it straight
+    /// off the session it is running under rather than reaching back
+    /// into connection state.
+    ///
+    /// Read at `session/prompt` time and copied onto the turn's
+    /// [`AcpProgress`], whose `client_fs_caps` is what makes the two
+    /// flags observable in `visible_tool_predicate`
+    /// (`src/serve/mod.rs`).
+    client_capabilities: ClientCapabilities,
     /// Cancellation tokens for the turns *currently in flight* on this
     /// session, keyed by their connection-wide turn number.
     ///
@@ -150,6 +165,14 @@ struct AcpSessions {
     /// can remove exactly its own token — `CancellationToken` has no identity
     /// to match on, and "the newest" is not the answer once turns overlap.
     next_turn: std::sync::atomic::AtomicU64,
+    /// What the client told `initialize` it can do. Set once, by the
+    /// `initialize` handler, and read by `session/new` and
+    /// `adopt_session` to stamp a copy onto each [`AcpSession`] — the
+    /// capability is a property of the client at the other end of this
+    /// connection, not of any one session, so there is exactly one
+    /// connection-wide copy rather than one per session that could
+    /// drift from it.
+    client_capabilities: std::sync::Mutex<ClientCapabilities>,
 }
 
 /// Reports one prompt turn's progress to an ACP client as `session/update`
@@ -177,15 +200,78 @@ struct AcpProgress {
     /// not change the rules under a call already being judged.
     mode: crate::tools::policy::SessionMode,
     permissions: Arc<super::acp_permissions::PermissionStore>,
+    /// This turn's session's recorded `client_capabilities`
+    /// ([`AcpSession::client_capabilities`]), copied in at construction
+    /// time rather than looked up again mid-turn. `client_fs_caps`
+    /// reads `fs.read_text_file`/`fs.write_text_file` off this, and
+    /// `client_terminal_cap` reads `terminal` off it the same way.
+    client_capabilities: ClientCapabilities,
+    /// This turn's session's recorded [`AcpSession::cwd`], copied in at
+    /// construction time the same way `client_capabilities` is. Handed
+    /// to `AcpClientHandle` by `acp_client()` below, which is what lets
+    /// `ClientShell` default a terminal's working directory to the
+    /// session's without this struct exposing a bespoke `TurnHost`
+    /// accessor for it.
+    cwd: PathBuf,
+    /// The whole host's terminal registry (`ServeState.acp_terminals`),
+    /// cloned in at construction time. Handed to `AcpClientHandle` by
+    /// `acp_client()` below, which is what lets the client-shell tools
+    /// (`src/tools/client_tools.rs`) track and cap terminals per
+    /// session without this struct or `AcpClientHandle` holding the
+    /// whole `ServeState`.
+    terminals: crate::tools::acp_client::TerminalRegistry,
+}
+
+/// The `(read, write)` pair `TurnHost::client_fs_caps` reports, pulled
+/// out of `AcpProgress::client_fs_caps` into its own free function so a
+/// test can call it directly against a hand-built `ClientCapabilities`
+/// — the only way to prove these two lines actually read the recorded
+/// value rather than, say, returning a constant or swapping the two
+/// fields. `AcpProgress` itself is built at exactly one call site
+/// (`serve_connection`'s `session/prompt` handler) and never in a test,
+/// so a test that only reached `AcpProgress::client_fs_caps` through
+/// `&self` would need one anyway; this is the smaller thing to build.
+///
+/// The two flags are read independently — never folded into one "fs"
+/// bit — because a client can implement `fs/read_text_file` without
+/// `fs/write_text_file`, or vice versa.
+fn fs_caps_from(caps: &ClientCapabilities) -> (bool, bool) {
+    (caps.fs.read_text_file, caps.fs.write_text_file)
+}
+
+/// The flag `TurnHost::client_terminal_cap` reports, pulled out for the
+/// same reason as `fs_caps_from` above: a test can call it directly
+/// against a hand-built `ClientCapabilities` without constructing an
+/// `AcpProgress`.
+fn terminal_cap_from(caps: &ClientCapabilities) -> bool {
+    caps.terminal
+}
+
+/// The working directory `AcpClientHandle::create_terminal` sends on
+/// the wire: the model's explicit `cwd` when it gave one, else the
+/// turn's session cwd. Pulled out for the same reason as
+/// `fs_caps_from`/`terminal_cap_from` above — this is a two-way branch
+/// picking between two paths, and inlined it is easy to get backwards
+/// (session cwd when the model *did* supply one) without a test able to
+/// tell the difference, since a real session's cwd usually differs from
+/// wherever the model happens to ask for anyway.
+fn effective_cwd(requested: Option<&str>, session_cwd: &Path) -> PathBuf {
+    requested
+        .map(PathBuf::from)
+        .unwrap_or_else(|| session_cwd.to_path_buf())
 }
 
 impl AcpProgress {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         session_id: SessionId,
         connection: ConnectionTo<Client>,
         profile: String,
         mode: crate::tools::policy::SessionMode,
         permissions: Arc<super::acp_permissions::PermissionStore>,
+        client_capabilities: ClientCapabilities,
+        cwd: PathBuf,
+        terminals: crate::tools::acp_client::TerminalRegistry,
     ) -> Self {
         Self {
             session_id,
@@ -194,6 +280,9 @@ impl AcpProgress {
             profile,
             mode,
             permissions,
+            client_capabilities,
+            cwd,
+            terminals,
         }
     }
 
@@ -257,6 +346,37 @@ impl super::TurnHost for AcpProgress {
 
     fn origin(&self) -> crate::tools::policy::Origin {
         crate::tools::policy::Origin::Acp(self.mode)
+    }
+
+    /// The client-side tools reach the editor through this. Built fresh
+    /// from this turn's own `session_id` and `connection` rather than
+    /// wrapping `self`: `AcpProgress` carries turn-scoped state
+    /// (`error`, `permissions`, `mode`) that a client-side tool has no
+    /// business touching, and `Arc<Self>` is not reachable from `&self`
+    /// here anyway — `AcpProgress` is not `Clone` (its `error` mutex
+    /// isn't), so a small handle holding just what `AcpClient` needs is
+    /// both the simplest thing that works and the right boundary.
+    fn acp_client(&self) -> Option<Arc<dyn crate::tools::acp_client::AcpClient>> {
+        Some(Arc::new(AcpClientHandle {
+            session_id: self.session_id.clone(),
+            connection: self.connection.clone(),
+            cwd: self.cwd.clone(),
+            terminals: Arc::clone(&self.terminals),
+        }))
+    }
+
+    /// Read straight off this turn's recorded `client_capabilities`,
+    /// via `fs_caps_from` — see that function's doc for why the read
+    /// is pulled out rather than written here.
+    fn client_fs_caps(&self) -> (bool, bool) {
+        fs_caps_from(&self.client_capabilities)
+    }
+
+    /// Whether this turn's editor declared `terminal/*` support, via
+    /// `terminal_cap_from` — see that function's doc for why the read
+    /// is pulled out rather than written here.
+    fn client_terminal_cap(&self) -> bool {
+        terminal_cap_from(&self.client_capabilities)
     }
 
     /// Move a call from `Pending` to `InProgress`.
@@ -377,6 +497,174 @@ impl super::TurnHost for AcpProgress {
             self.permissions.record(&self.profile, &call.name, approval);
         }
         approval
+    }
+}
+
+/// What `AcpClient`'s methods need to reach the editor: which session
+/// to name on the wire, and the connection to send on. Cheap to clone
+/// (both fields are), so [`AcpProgress::acp_client`] hands out a fresh
+/// one rather than sharing state with the turn it was built from.
+#[derive(Clone)]
+struct AcpClientHandle {
+    session_id: SessionId,
+    connection: ConnectionTo<Client>,
+    /// This turn's session's cwd, copied in from [`AcpProgress::cwd`].
+    /// `create_terminal` falls back to it when called with `cwd: None`.
+    cwd: PathBuf,
+    /// Shared with `ServeState.acp_terminals` via [`AcpProgress::terminals`].
+    /// `try_reserve_terminal_slot`/`track_terminal`/`untrack_terminal`
+    /// below key into it with `session_id.to_string()` — the same string
+    /// `AcpSession::agent_session_id` holds for this session, since a
+    /// `SessionId` is minted from exactly that string.
+    terminals: crate::tools::acp_client::TerminalRegistry,
+}
+
+#[async_trait::async_trait]
+impl crate::tools::acp_client::AcpClient for AcpClientHandle {
+    async fn read_text_file(
+        &self,
+        path: &str,
+        line: Option<u32>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<String> {
+        let request = ReadTextFileRequest::new(self.session_id.clone(), path)
+            .line(line)
+            .limit(limit);
+        // Not awaited inside a request handler: `AcpClientHandle` is
+        // only ever reached through the `current_acp_client` task-local,
+        // which is scoped around tool execution inside `run_llm_turn` —
+        // the same "outside the dispatch loop" position `approve` above
+        // relies on, and for the same reason: awaiting a sent request
+        // inside a handler would stop the dispatch loop from parsing
+        // the client's answer.
+        let response = self.connection.send_request(request).block_task().await?;
+        Ok(response.content)
+    }
+
+    async fn write_text_file(&self, path: &str, content: &str) -> anyhow::Result<()> {
+        let request = WriteTextFileRequest::new(self.session_id.clone(), path, content);
+        self.connection.send_request(request).block_task().await?;
+        Ok(())
+    }
+
+    async fn create_terminal(
+        &self,
+        command: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        output_byte_limit: Option<u64>,
+    ) -> anyhow::Result<crate::tools::acp_client::TerminalHandle> {
+        let request = CreateTerminalRequest::new(self.session_id.clone(), command)
+            .args(args.to_vec())
+            .cwd(Some(effective_cwd(cwd, &self.cwd)))
+            .output_byte_limit(output_byte_limit);
+        let response = self.connection.send_request(request).block_task().await?;
+        Ok(crate::tools::acp_client::TerminalHandle(
+            response.terminal_id.0.to_string(),
+        ))
+    }
+
+    async fn terminal_output(
+        &self,
+        terminal: &crate::tools::acp_client::TerminalHandle,
+    ) -> anyhow::Result<crate::tools::acp_client::TerminalOutput> {
+        let request = TerminalOutputRequest::new(
+            self.session_id.clone(),
+            TerminalId::new(terminal.0.clone()),
+        );
+        let response = self.connection.send_request(request).block_task().await?;
+        Ok(crate::tools::acp_client::TerminalOutput {
+            output: response.output,
+            truncated: response.truncated,
+            exit_status: response
+                .exit_status
+                .map(|s| crate::tools::acp_client::ExitStatus {
+                    exit_code: s.exit_code,
+                    signal: s.signal,
+                }),
+        })
+    }
+
+    async fn wait_for_terminal_exit(
+        &self,
+        terminal: &crate::tools::acp_client::TerminalHandle,
+    ) -> anyhow::Result<crate::tools::acp_client::ExitStatus> {
+        let request = WaitForTerminalExitRequest::new(
+            self.session_id.clone(),
+            TerminalId::new(terminal.0.clone()),
+        );
+        let response = self.connection.send_request(request).block_task().await?;
+        Ok(crate::tools::acp_client::ExitStatus {
+            exit_code: response.exit_status.exit_code,
+            signal: response.exit_status.signal,
+        })
+    }
+
+    async fn kill_terminal(
+        &self,
+        terminal: &crate::tools::acp_client::TerminalHandle,
+    ) -> anyhow::Result<()> {
+        let request =
+            KillTerminalRequest::new(self.session_id.clone(), TerminalId::new(terminal.0.clone()));
+        self.connection.send_request(request).block_task().await?;
+        Ok(())
+    }
+
+    async fn release_terminal(
+        &self,
+        terminal: &crate::tools::acp_client::TerminalHandle,
+    ) -> anyhow::Result<()> {
+        let request = ReleaseTerminalRequest::new(
+            self.session_id.clone(),
+            TerminalId::new(terminal.0.clone()),
+        );
+        self.connection.send_request(request).block_task().await?;
+        Ok(())
+    }
+
+    async fn try_reserve_terminal_slot(
+        &self,
+    ) -> Result<crate::tools::acp_client::TerminalReservation, crate::tools::acp_client::CapHeld>
+    {
+        let mut registry = self.terminals.lock().unwrap();
+        let held = registry.entry(self.session_id.to_string()).or_default();
+        if held.len() >= crate::tools::client_tools::MAX_TERMINALS_PER_SESSION {
+            let handles: Vec<crate::tools::acp_client::TerminalHandle> = held
+                .iter()
+                .filter(|h| h.0 != crate::tools::acp_client::RESERVED_TERMINAL_MARKER)
+                .cloned()
+                .collect();
+            let reservations = held.len() - handles.len();
+            return Err(crate::tools::acp_client::CapHeld {
+                handles,
+                reservations,
+            });
+        }
+        held.push(crate::tools::acp_client::reserved_terminal_placeholder());
+        Ok(crate::tools::acp_client::TerminalReservation::new(
+            Arc::clone(&self.terminals),
+            self.session_id.to_string(),
+        ))
+    }
+
+    async fn track_terminal(
+        &self,
+        reservation: crate::tools::acp_client::TerminalReservation,
+        handle: crate::tools::acp_client::TerminalHandle,
+    ) {
+        reservation.resolve(handle);
+    }
+
+    async fn untrack_terminal(&self, handle: &crate::tools::acp_client::TerminalHandle) {
+        let mut registry = self.terminals.lock().unwrap();
+        if let Some(held) = registry.get_mut(&self.session_id.to_string()) {
+            if let Some(pos) = held.iter().position(|h| h == handle) {
+                held.remove(pos);
+            }
+            if held.is_empty() {
+                registry.remove(&self.session_id.to_string());
+            }
+        }
     }
 }
 
@@ -556,6 +844,33 @@ async fn count_session_open(state: &Arc<ServeState>, id: &str) {
     }
 }
 
+/// Release every session id a closing connection held: decrement
+/// `open_acp_sessions` for each, dropping the entry once its count
+/// reaches zero.
+///
+/// Called from `serve_connection`'s teardown, and from
+/// `client_tools`'s `simulate_connection_teardown` test helper — the
+/// same function both reach lets a test prove "closing a connection
+/// releases nothing in `acp_terminals`" against the real teardown
+/// code, rather than against a test's own idea of what teardown does.
+///
+/// Deliberately does **not** touch `acp_terminals`: `terminal/release`
+/// kills the command it releases, so freeing a terminal here because a
+/// socket dropped would kill a build over a network blip. The handles
+/// stay tracked against the session id, so a client that reconnects
+/// and reloads the session can still reach them.
+pub(crate) async fn release_connection_sessions(state: &Arc<ServeState>, held: Vec<String>) {
+    let mut open = state.open_acp_sessions.lock().await;
+    for id in held {
+        if let Some(count) = open.get_mut(&id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                open.remove(&id);
+            }
+        }
+    }
+}
+
 /// Validate an existing session id and adopt it onto this connection.
 ///
 /// Shared by `session/load` and `session/resume`, which differ only in
@@ -609,6 +924,7 @@ async fn adopt_session(
             AcpSession {
                 agent_session_id: id.clone(),
                 cwd,
+                client_capabilities: sessions.client_capabilities.lock().unwrap().clone(),
                 turns: HashMap::new(),
                 mode: crate::tools::policy::SessionMode::Default,
             },
@@ -639,51 +955,62 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
         .builder()
         .name("sapphire-agent")
         .on_receive_request(
-            async move |req: InitializeRequest, responder, _connection| {
-                // Answer with the version we will actually speak, which the
-                // ACP specification defines as the client's version if we
-                // support it and otherwise the latest version we do support
-                // (the prose spec's Initialization / "Protocol Version
-                // Negotiation" section; the SDK only carries the version
-                // constants themselves, in `schema/src/version.rs`). Handing
-                // the request back unchanged lies in both directions: a v2
-                // client told "2" sends v2-shaped traffic nothing here
-                // understands, and a v0 client told "0" is the same lie at the
-                // other end — v0 being a pre-release the schema documents as
-                // one to treat as unsupported.
-                //
-                // An explicit supported set rather than a clamp: with one
-                // version implemented the correct answer is `V1` for every
-                // input, and this keeps saying what we actually support as
-                // versions accumulate, instead of silently claiming each new
-                // gap in the range.
-                //
-                // `V1`, not `LATEST`: this is a claim about what *this* code
-                // implements. `LATEST` means "newest stable the SDK knows of"
-                // and would resume telling exactly this lie the day the SDK
-                // promotes v2 (it is cfg-gated off when `unstable_protocol_v2`
-                // is enabled, precisely so that choice stays explicit).
-                const SUPPORTED: [ProtocolVersion; 1] = [ProtocolVersion::V1];
-                let version = if SUPPORTED.contains(&req.protocol_version) {
-                    req.protocol_version
-                } else {
-                    ProtocolVersion::V1
-                };
+            {
+                let sessions = Arc::clone(&sessions);
+                async move |req: InitializeRequest, responder, _connection| {
+                    // Which client tools exist is decided per session from
+                    // this, so it has to survive past this handler rather
+                    // than being parsed and dropped. There is no session yet
+                    // to hang it on — `session/new` and `adopt_session` are
+                    // what copy it onto one, from here.
+                    *sessions.client_capabilities.lock().unwrap() =
+                        req.client_capabilities.clone();
 
-                // `authMethods` is empty because the bearer token checked
-                // above already authenticated the peer, so ACP never sees
-                // an unauthenticated client.
-                responder.respond(
-                    InitializeResponse::new(version).agent_capabilities(
-                        AgentCapabilities::new()
-                            .load_session(true)
-                            .session_capabilities(
-                                SessionCapabilities::new()
-                                    .list(SessionListCapabilities::new())
-                                    .resume(SessionResumeCapabilities::new()),
-                            ),
-                    ),
-                )
+                    // Answer with the version we will actually speak, which the
+                    // ACP specification defines as the client's version if we
+                    // support it and otherwise the latest version we do support
+                    // (the prose spec's Initialization / "Protocol Version
+                    // Negotiation" section; the SDK only carries the version
+                    // constants themselves, in `schema/src/version.rs`). Handing
+                    // the request back unchanged lies in both directions: a v2
+                    // client told "2" sends v2-shaped traffic nothing here
+                    // understands, and a v0 client told "0" is the same lie at the
+                    // other end — v0 being a pre-release the schema documents as
+                    // one to treat as unsupported.
+                    //
+                    // An explicit supported set rather than a clamp: with one
+                    // version implemented the correct answer is `V1` for every
+                    // input, and this keeps saying what we actually support as
+                    // versions accumulate, instead of silently claiming each new
+                    // gap in the range.
+                    //
+                    // `V1`, not `LATEST`: this is a claim about what *this* code
+                    // implements. `LATEST` means "newest stable the SDK knows of"
+                    // and would resume telling exactly this lie the day the SDK
+                    // promotes v2 (it is cfg-gated off when `unstable_protocol_v2`
+                    // is enabled, precisely so that choice stays explicit).
+                    const SUPPORTED: [ProtocolVersion; 1] = [ProtocolVersion::V1];
+                    let version = if SUPPORTED.contains(&req.protocol_version) {
+                        req.protocol_version
+                    } else {
+                        ProtocolVersion::V1
+                    };
+
+                    // `authMethods` is empty because the bearer token checked
+                    // above already authenticated the peer, so ACP never sees
+                    // an unauthenticated client.
+                    responder.respond(
+                        InitializeResponse::new(version).agent_capabilities(
+                            AgentCapabilities::new()
+                                .load_session(true)
+                                .session_capabilities(
+                                    SessionCapabilities::new()
+                                        .list(SessionListCapabilities::new())
+                                        .resume(SessionResumeCapabilities::new()),
+                                ),
+                        ),
+                    )
+                }
             },
             on_receive_request!(),
         )
@@ -764,6 +1091,11 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         AcpSession {
                             agent_session_id,
                             cwd: req.cwd.clone(),
+                            client_capabilities: sessions
+                                .client_capabilities
+                                .lock()
+                                .unwrap()
+                                .clone(),
                             // No turn is running yet, so there is nothing for
                             // a `session/cancel` to reach.
                             turns: HashMap::new(),
@@ -1018,10 +1350,18 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         guard.get_mut(&req.session_id).map(|session| {
                             let turn_cancel = connection_cancel.child_token();
                             session.turns.insert(turn, turn_cancel.clone());
-                            (session.agent_session_id.clone(), turn_cancel, session.mode)
+                            (
+                                session.agent_session_id.clone(),
+                                turn_cancel,
+                                session.mode,
+                                session.client_capabilities.clone(),
+                                session.cwd.clone(),
+                            )
                         })
                     };
-                    let Some((agent_session_id, turn_cancel, mode)) = looked_up else {
+                    let Some((agent_session_id, turn_cancel, mode, client_capabilities, cwd)) =
+                        looked_up
+                    else {
                         // Not created on the fly: a prompt naming a session
                         // this connection never minted is a client bug, and
                         // starting one here would quietly open a second
@@ -1087,6 +1427,9 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         profile_name.clone(),
                         mode,
                         Arc::clone(&state.permissions),
+                        client_capabilities,
+                        cwd,
+                        Arc::clone(&state.acp_terminals),
                     ));
 
                     // The turn runs OUTSIDE the dispatch loop, and the
@@ -1247,6 +1590,13 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
     // `open_acp_sessions` into a leak that warns forever: the next
     // connection to load the same session would find a stale count already
     // above one and warn about a collision that no longer exists.
+    //
+    // Terminals are deliberately NOT released here. `terminal/release`
+    // kills the command, and a dropped socket is not a reason to kill a
+    // build running on the user's machine. The handles stay tracked
+    // against the session, so a client that reconnects and loads the
+    // session can still reach them. See `release_connection_sessions`'s
+    // doc for the rest of the reasoning.
     {
         let held: Vec<String> = sessions
             .inner
@@ -1255,15 +1605,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
             .values()
             .map(|s| s.agent_session_id.clone())
             .collect();
-        let mut open = state.open_acp_sessions.lock().await;
-        for id in held {
-            if let Some(count) = open.get_mut(&id) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    open.remove(&id);
-                }
-            }
-        }
+        release_connection_sessions(&state, held).await;
     }
 
     // Belt and braces, and known to be so. By the time this runs the socket
@@ -1287,7 +1629,16 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serve::HangingChat;
+    // `TurnHost` is only needed here, for `.acp_client()` in
+    // `the_default_turn_host_offers_no_client` below — production code
+    // in this file calls it fully qualified as `super::TurnHost`
+    // instead, so importing it at module scope would be unused there.
+    use crate::serve::{HangingChat, NullProgress, TurnHost};
+    // Only `fs_caps_from_reads_the_recorded_flags_independently` below
+    // builds a `FileSystemCapabilities` directly; production code in
+    // this file only ever reads `.fs` off an already-built
+    // `ClientCapabilities`.
+    use agent_client_protocol::schema::v1::FileSystemCapabilities;
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
@@ -3486,4 +3837,82 @@ mod tests {
             "timed out waiting for the closed connection to release its session"
         );
     }
+
+    /// A non-ACP turn must not find a client. `/rpc`, Matrix, Discord
+    /// and voice have no editor on the other end.
+    #[test]
+    fn the_default_turn_host_offers_no_client() {
+        assert!(NullProgress.acp_client().is_none());
+    }
+
+    /// `fs_caps_from` must read the recorded flags — not a constant,
+    /// and not the wrong field. Asymmetric input in both directions is
+    /// the point: identical flags cannot catch a read/write swap, and
+    /// a single direction cannot catch a constant `(true, true)` or
+    /// `(false, false)`.
+    #[test]
+    fn fs_caps_from_reads_the_recorded_flags_independently() {
+        let read_only =
+            ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true));
+        assert_eq!(fs_caps_from(&read_only), (true, false));
+
+        let write_only =
+            ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true));
+        assert_eq!(fs_caps_from(&write_only), (false, true));
+    }
+
+    /// `terminal_cap_from` must read the recorded flag, not return a
+    /// constant.
+    #[test]
+    fn terminal_cap_from_reads_the_recorded_flag() {
+        assert!(terminal_cap_from(&ClientCapabilities::new().terminal(true)));
+        assert!(!terminal_cap_from(
+            &ClientCapabilities::new().terminal(false)
+        ));
+    }
+
+    /// `effective_cwd` picks between two genuinely different paths —
+    /// not two spellings of the same one — so an implementation that
+    /// swapped which side wins would fail loudly instead of passing by
+    /// coincidence.
+    #[test]
+    fn effective_cwd_prefers_the_requested_path_and_falls_back_to_the_session() {
+        let session_cwd = Path::new(if cfg!(windows) {
+            "C:\\session\\root"
+        } else {
+            "/session/root"
+        });
+        let requested = if cfg!(windows) {
+            "C:\\model\\chosen"
+        } else {
+            "/model/chosen"
+        };
+
+        assert_eq!(
+            effective_cwd(Some(requested), session_cwd),
+            PathBuf::from(requested),
+            "an explicit cwd from the model must win"
+        );
+        assert_eq!(
+            effective_cwd(None, session_cwd),
+            session_cwd.to_path_buf(),
+            "absent that, the session's cwd is the fallback"
+        );
+    }
+
+    // `initialize_records_the_clients_capabilities` — deliberately not
+    // written here. The plan anticipated this: `AcpSession` and
+    // `AcpSessions` (where `client_capabilities` lands, see the field
+    // doc on each) live entirely inside `serve_connection`'s spawned
+    // task, with no accessor a test outside that task can reach — the
+    // only view this test module has onto a live connection is the
+    // wire, and nothing on the wire echoes capabilities back. What
+    // Task 4 added instead: `fs_caps_from` (above) proves the two
+    // recorded flags are read out correctly and independently, and
+    // `serve::tests::the_two_fs_tools_follow_their_own_capability_flags`
+    // proves `visible_tool_predicate` turns them into the right tool
+    // list — between the two, a client's declared capability is
+    // observable end to end even though no single test crosses the
+    // wire. See task-3-report.md and task-4-report.md for the record
+    // of this decision.
 }
