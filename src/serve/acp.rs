@@ -206,6 +206,23 @@ struct AcpProgress {
     client_capabilities: ClientCapabilities,
 }
 
+/// The `(read, write)` pair `TurnHost::client_fs_caps` reports, pulled
+/// out of `AcpProgress::client_fs_caps` into its own free function so a
+/// test can call it directly against a hand-built `ClientCapabilities`
+/// — the only way to prove these two lines actually read the recorded
+/// value rather than, say, returning a constant or swapping the two
+/// fields. `AcpProgress` itself is built at exactly one call site
+/// (`serve_connection`'s `session/prompt` handler) and never in a test,
+/// so a test that only reached `AcpProgress::client_fs_caps` through
+/// `&self` would need one anyway; this is the smaller thing to build.
+///
+/// The two flags are read independently — never folded into one "fs"
+/// bit — because a client can implement `fs/read_text_file` without
+/// `fs/write_text_file`, or vice versa.
+fn fs_caps_from(caps: &ClientCapabilities) -> (bool, bool) {
+    (caps.fs.read_text_file, caps.fs.write_text_file)
+}
+
 impl AcpProgress {
     fn new(
         session_id: SessionId,
@@ -303,14 +320,11 @@ impl super::TurnHost for AcpProgress {
         }))
     }
 
-    /// Read straight off this turn's recorded `client_capabilities` —
-    /// the two flags independently, since a client can implement
-    /// `fs/read_text_file` without `fs/write_text_file` or vice versa.
+    /// Read straight off this turn's recorded `client_capabilities`,
+    /// via `fs_caps_from` — see that function's doc for why the read
+    /// is pulled out rather than written here.
     fn client_fs_caps(&self) -> (bool, bool) {
-        (
-            self.client_capabilities.fs.read_text_file,
-            self.client_capabilities.fs.write_text_file,
-        )
+        fs_caps_from(&self.client_capabilities)
     }
 
     /// Move a call from `Pending` to `InProgress`.
@@ -1485,6 +1499,11 @@ mod tests {
     // in this file calls it fully qualified as `super::TurnHost`
     // instead, so importing it at module scope would be unused there.
     use crate::serve::{HangingChat, NullProgress, TurnHost};
+    // Only `fs_caps_from_reads_the_recorded_flags_independently` below
+    // builds a `FileSystemCapabilities` directly; production code in
+    // this file only ever reads `.fs` off an already-built
+    // `ClientCapabilities`.
+    use agent_client_protocol::schema::v1::FileSystemCapabilities;
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
@@ -3691,15 +3710,35 @@ mod tests {
         assert!(NullProgress.acp_client().is_none());
     }
 
+    /// `fs_caps_from` must read the recorded flags — not a constant,
+    /// and not the wrong field. Asymmetric input in both directions is
+    /// the point: identical flags cannot catch a read/write swap, and
+    /// a single direction cannot catch a constant `(true, true)` or
+    /// `(false, false)`.
+    #[test]
+    fn fs_caps_from_reads_the_recorded_flags_independently() {
+        let read_only =
+            ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true));
+        assert_eq!(fs_caps_from(&read_only), (true, false));
+
+        let write_only =
+            ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true));
+        assert_eq!(fs_caps_from(&write_only), (false, true));
+    }
+
     // `initialize_records_the_clients_capabilities` — deliberately not
     // written here. The plan anticipated this: `AcpSession` and
     // `AcpSessions` (where `client_capabilities` lands, see the field
     // doc on each) live entirely inside `serve_connection`'s spawned
     // task, with no accessor a test outside that task can reach — the
     // only view this test module has onto a live connection is the
-    // wire, and nothing on the wire echoes capabilities back. The
-    // assertion belongs in Task 4's tool-list filtering tests instead,
-    // where a client's declared capabilities produce an observable
-    // difference (which client tools are offered). See
-    // task-3-report.md for the record of this decision.
+    // wire, and nothing on the wire echoes capabilities back. What
+    // Task 4 added instead: `fs_caps_from` (above) proves the two
+    // recorded flags are read out correctly and independently, and
+    // `serve::tests::the_two_fs_tools_follow_their_own_capability_flags`
+    // proves `visible_tool_predicate` turns them into the right tool
+    // list — between the two, a client's declared capability is
+    // observable end to end even though no single test crosses the
+    // wire. See task-3-report.md and task-4-report.md for the record
+    // of this decision.
 }
