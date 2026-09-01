@@ -5,6 +5,7 @@
 
 mod acp_session;
 mod agent;
+mod agents;
 mod ambient;
 mod channel;
 mod cli_device;
