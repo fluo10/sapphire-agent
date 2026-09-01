@@ -742,6 +742,42 @@ mod tests {
     use super::*;
     use crate::provider::{ChatMessage, ContentPart, Role};
 
+    /// The local date "now" belongs to under `boundary_hour`.
+    ///
+    /// Deliberately not `Local::now().date_naive()`. A timestamp before
+    /// the boundary hour belongs to the *previous* local day, so the
+    /// naive date and the store's day window disagree for those hours —
+    /// which made these tests pass all day and fail only when CI
+    /// happened to run between midnight and 04:00.
+    fn today(boundary_hour: u8) -> chrono::NaiveDate {
+        crate::session::local_date_for_timestamp(chrono::Local::now(), boundary_hour)
+    }
+
+    /// The rule the helper above encodes, pinned on its own so a future
+    /// reader does not have to infer it from a failing CI run.
+    #[test]
+    fn a_timestamp_before_the_boundary_belongs_to_the_previous_day() {
+        use chrono::TimeZone as _;
+        let at_two_am = chrono::Local
+            .with_ymd_and_hms(2026, 9, 1, 2, 0, 0)
+            .single()
+            .expect("an unambiguous local time");
+        assert_eq!(
+            crate::session::local_date_for_timestamp(at_two_am, 4),
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            "02:00 under a 04:00 boundary is still the previous day"
+        );
+
+        let at_ten_am = chrono::Local
+            .with_ymd_and_hms(2026, 9, 1, 10, 0, 0)
+            .single()
+            .expect("an unambiguous local time");
+        assert_eq!(
+            crate::session::local_date_for_timestamp(at_ten_am, 4),
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+        );
+    }
+
     fn store() -> (tempfile::TempDir, AcpSessionStore) {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
@@ -1166,7 +1202,7 @@ mod tests {
         store.append_title("s1", "parser hunt").unwrap();
         cache.put("s1", "we fixed the parser", None).unwrap();
 
-        let today = chrono::Local::now().date_naive();
+        let today = today(4);
         let found = store.intraday_digests_for_day(today, 4, &cache);
         assert_eq!(found.len(), 1);
         let (meta, digest) = &found[0];
@@ -1189,7 +1225,7 @@ mod tests {
         store.create("s1", "work", "/p").unwrap();
         store.append_message("s1", &ChatMessage::user("x")).unwrap();
 
-        let today = chrono::Local::now().date_naive();
+        let today = today(4);
         assert!(store.intraday_digests_for_day(today, 4, &cache).is_empty());
         assert!(store.history("s1").is_some(), "the session still loads");
     }
@@ -1215,7 +1251,7 @@ mod tests {
             .append_message("s1", &ChatMessage::user("something new"))
             .unwrap();
 
-        let today = chrono::Local::now().date_naive();
+        let today = today(4);
         assert_eq!(
             store.sessions_needing_digest(&cache, today, 4),
             vec!["s1".to_string()]
@@ -1232,7 +1268,7 @@ mod tests {
             .unwrap();
         cache.put("s1", "covered", None).unwrap();
 
-        let today = chrono::Local::now().date_naive();
+        let today = today(4);
         assert!(store.sessions_needing_digest(&cache, today, 4).is_empty());
     }
 
@@ -1245,7 +1281,7 @@ mod tests {
             .append_message("s1", &ChatMessage::user("first words"))
             .unwrap();
 
-        let today = chrono::Local::now().date_naive();
+        let today = today(4);
         assert_eq!(
             store.sessions_needing_digest(&cache, today, 4),
             vec!["s1".to_string()]
@@ -1264,7 +1300,7 @@ mod tests {
             .append_message("s1", &ChatMessage::user("old news"))
             .unwrap();
 
-        let tomorrow = chrono::Local::now().date_naive() + chrono::Duration::days(1);
+        let tomorrow = today(4) + chrono::Duration::days(1);
         assert!(
             store
                 .sessions_needing_digest(&cache, tomorrow, 4)
@@ -1286,7 +1322,7 @@ mod tests {
             .unwrap();
         store.append_title("s1", "parser hunt").unwrap();
 
-        let today = chrono::Local::now().date_naive();
+        let today = today(4);
         let sessions = store.sessions_for_day(today, 4);
         assert_eq!(sessions.len(), 1);
         let (meta, messages) = &sessions[0];
@@ -1316,7 +1352,7 @@ mod tests {
             .append_message("s1", &ChatMessage::user("thanks"))
             .unwrap();
 
-        let today = chrono::Local::now().date_naive();
+        let today = today(4);
         let (_, messages) = store.sessions_for_day(today, 4).remove(0);
         let texts: Vec<&str> = messages
             .iter()
@@ -1335,7 +1371,7 @@ mod tests {
         store.create("s1", "default", "/p").unwrap();
         store.append_message("s1", &ChatMessage::user("x")).unwrap();
 
-        let today = chrono::Local::now().date_naive();
+        let today = today(4);
         assert_eq!(store.session_dates(4, |_meta| true), vec![today]);
     }
 
@@ -1356,7 +1392,7 @@ mod tests {
             .append_message("s-work", &ChatMessage::user("y"))
             .unwrap();
 
-        let today = chrono::Local::now().date_naive();
+        let today = today(4);
         let default_dates =
             store.session_dates(4, |meta| meta.namespace.as_deref() == Some("default"));
         assert_eq!(default_dates, vec![today]);

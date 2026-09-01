@@ -536,8 +536,14 @@ pub(crate) fn spawn_acp_digest_sweep(state: Arc<ServeState>) {
             let Some(cache) = state.digest_cache.as_ref() else {
                 continue;
             };
-            let today = chrono::Local::now().date_naive();
             let boundary = state.config.day_boundary_hour;
+            // NOT `Local::now().date_naive()`. Before the day-boundary
+            // hour a timestamp belongs to the previous local day, so the
+            // naive date and the store's day window disagree — and every
+            // session's newest message would fall outside the window,
+            // making the sweep silently do nothing between midnight and
+            // the boundary. `heartbeat.rs` derives its dates the same way.
+            let today = crate::session::local_date_for_timestamp(chrono::Local::now(), boundary);
             let due = state
                 .acp_session_store
                 .sessions_needing_digest(cache, today, boundary);

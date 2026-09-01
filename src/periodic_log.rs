@@ -1345,6 +1345,17 @@ fn short_id(id: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The local date "now" belongs to under `boundary_hour`.
+    ///
+    /// Deliberately not `Local::now().date_naive()`. A timestamp before
+    /// the boundary hour belongs to the *previous* local day, so the
+    /// naive date and a day window disagree for those hours — which made
+    /// these tests pass all day and fail only when CI happened to run
+    /// between midnight and 04:00.
+    fn today(boundary_hour: u8) -> NaiveDate {
+        crate::session::local_date_for_timestamp(chrono::Local::now(), boundary_hour)
+    }
+
     #[test]
     fn stems_basic() {
         let d = NaiveDate::from_ymd_opt(2026, 4, 15).unwrap();
@@ -1731,7 +1742,7 @@ mod tests {
             .unwrap();
         digest_cache.put("s1", "we fixed the parser", None).unwrap();
 
-        let today = chrono::Local::now().date_naive();
+        let today = today(4);
         let boundary_hour = 4u8;
 
         let in_namespace = build_today_digest_for_namespace(
@@ -1863,7 +1874,7 @@ mod tests {
             .append(&chan_id, &ChatMessage::user("channel said this second"))
             .unwrap();
 
-        let today = chrono::Local::now().date_naive();
+        let today = today(4);
         let predicate = |_: &SessionMeta| true;
         let sessions =
             sessions_for_day_merged(&channel_store, Some(&acp_store), today, 4, &predicate);
@@ -1910,7 +1921,7 @@ mod tests {
             .append_message("default-session", &ChatMessage::user("default stuff"))
             .unwrap();
 
-        let today = chrono::Local::now().date_naive();
+        let today = today(4);
 
         let work_predicate = |meta: &SessionMeta| meta.namespace.as_deref() == Some("work");
         let work_sessions =
