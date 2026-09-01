@@ -2203,26 +2203,18 @@ pub(crate) struct TurnPersistence {
 }
 
 impl TurnPersistence {
-    /// Append one message. Returns whether the caller may go on to
-    /// persist a message that must be paired with this one.
-    ///
-    /// `true` when nothing was written at all: there is no pairing to
-    /// break, so a `tool_result` must not be skipped just because its
-    /// `tool_use` was never a candidate for the store.
-    fn append_message(&self, msg: &ChatMessage) -> bool {
+    /// Append one message. There is nothing here for a caller to gate a
+    /// paired append on — that bookkeeping belongs to
+    /// `append_acp_only`, whose doc explains it; this method's own
+    /// caller (the final assistant message, which pairs with nothing)
+    /// discards any return value, so there is none.
+    fn append_message(&self, msg: &ChatMessage) {
         if self.is_acp {
-            match self.acp_store.append_message(&self.session_id, msg) {
-                Ok(()) => true,
-                Err(e) => {
-                    warn!("Failed to persist a message: {e}");
-                    false
-                }
-            }
-        } else {
-            if let Err(e) = self.store.append(&self.session_id, msg) {
+            if let Err(e) = self.acp_store.append_message(&self.session_id, msg) {
                 warn!("Failed to persist a message: {e}");
             }
-            true
+        } else if let Err(e) = self.store.append(&self.session_id, msg) {
+            warn!("Failed to persist a message: {e}");
         }
     }
 
@@ -2277,7 +2269,13 @@ pub(crate) struct TurnContext {
     pub state: Arc<ServeState>,
     pub provider: Arc<dyn Provider>,
     pub progress: Arc<dyn TurnHost>,
-    pub visible_specs: Vec<ToolSpec>,
+    /// `Arc<[ToolSpec]>` rather than `Vec<ToolSpec>`: this round's own
+    /// `tool_specs` doesn't change between rounds of the same turn, so
+    /// `TurnLoop::run` builds this once per turn and `Arc::clone`s it
+    /// per round rather than deep-cloning every `ToolSpec` — schemas
+    /// included — on every round of every turn, whether or not any
+    /// subagent is even defined.
+    pub visible_specs: Arc<[ToolSpec]>,
     pub timer_origin: Option<crate::timer::TimerOrigin>,
 }
 
@@ -2343,6 +2341,13 @@ impl TurnLoop<'_> {
         let host_access_enabled = state.config.tools.host_access.enabled;
         let compression_config = &state.config.compression;
         let mut accumulated_text: Vec<String> = Vec::new();
+        // Built once per turn, not once per round: `tool_specs` is fixed
+        // for the whole call to `run`, so cloning it into an
+        // `Arc<[ToolSpec]>` here and `Arc::clone`-ing it into each
+        // round's `TurnContext` below is a pointer copy instead of a
+        // deep clone of every `ToolSpec` — schemas included — on every
+        // round of every turn.
+        let visible_specs: Arc<[ToolSpec]> = Arc::from(tool_specs);
         let (final_text, stop) = loop {
             let round = history
                 .iter()
@@ -2481,11 +2486,28 @@ impl TurnLoop<'_> {
                             Decision, Refusal, host_tool_denied, kind_of, refusal_message,
                         };
 
-                        // The host-machine gate sits in front of `decide`:
-                        // it is a fact about the deployment ("may this agent
-                        // touch its own disk at all"), not a row in the
-                        // origin/kind policy table — so it is checked, and
-                        // can refuse, before `decide` is even consulted.
+                        // Three gates, checked in order, only the last of
+                        // which is the origin/kind policy table itself.
+                        //
+                        // `NotOffered` goes first: whether a name is even
+                        // in this round's own `tool_specs` is a fact about
+                        // what *this call* is allowed to see (a subagent's
+                        // `tools:` restriction, `subagent` removed from its
+                        // own nested round, a hallucinated name on an
+                        // ordinary turn) — see `Refusal::NotOffered`'s doc
+                        // — and it has to come before the deployment-wide
+                        // host-machine gate below it, or a name outside
+                        // this round's list but happening to match a host
+                        // tool would be reported as merely unavailable on
+                        // this transport rather than as what it actually
+                        // is: not offered here at all.
+                        //
+                        // The host-machine gate itself sits in front of
+                        // `decide`: it is a fact about the deployment ("may
+                        // this agent touch its own disk at all"), not a
+                        // row in the origin/kind policy table — so it is
+                        // checked, and can refuse, before `decide` is even
+                        // consulted.
                         let refusal = if !offered.contains(call.name.as_str()) {
                             Some(refusal_message(&call.name, Refusal::NotOffered))
                         } else if host_tool_denied(&call.name, host_access_enabled) {
@@ -2540,13 +2562,15 @@ impl TurnLoop<'_> {
                     // round the same way the timer/ACP task-locals are —
                     // see `TurnContext`. Built once per round rather than
                     // per call: it is the same for every permitted call in
-                    // this round, and `visible_specs` cloning `tool_specs`
-                    // once here is cheaper than doing it per call.
+                    // this round. `visible_specs` is an `Arc::clone` of
+                    // the `Arc<[ToolSpec]>` built once above `loop`, not a
+                    // fresh deep clone of `tool_specs` — see that binding's
+                    // comment.
                     let turn_ctx = Arc::new(TurnContext {
                         state: Arc::clone(self.state),
                         provider: Arc::clone(self.provider),
                         progress: Arc::clone(progress),
-                        visible_specs: tool_specs.to_vec(),
+                        visible_specs: Arc::clone(&visible_specs),
                         timer_origin: timer_origin.clone(),
                     });
                     let mut results: Vec<(String, crate::tools::ToolOutput)> =
@@ -3238,7 +3262,14 @@ impl ChatLog {
 /// flight while a cancellation test races it.
 #[cfg(test)]
 pub(crate) struct StubProvider {
-    script: Option<std::sync::Mutex<std::collections::VecDeque<crate::provider::ChatResponse>>>,
+    /// `Err` entries let a test force one specific `chat()` call —
+    /// identified by its position in the sequence, not by which
+    /// conversation made it — to fail while the calls around it
+    /// succeed (see `new_scripted`), the same way an exhausted script
+    /// fails every call after it.
+    script: Option<
+        std::sync::Mutex<std::collections::VecDeque<Result<crate::provider::ChatResponse, String>>>,
+    >,
     /// Only set in hanging mode. Counts entries into the parked `chat()` —
     /// see [`HangingChat::entered`].
     hang_entered: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -3300,8 +3331,16 @@ impl HangingChat {
 #[cfg(test)]
 impl StubProvider {
     pub(crate) fn new(responses: Vec<crate::provider::ChatResponse>) -> Self {
+        Self::new_scripted(responses.into_iter().map(Ok).collect())
+    }
+
+    /// Like `new`, but a script entry can be `Err` instead of a
+    /// response, for a test that needs one particular `chat()` call to
+    /// fail (e.g. a subagent's own provider call) while the calls
+    /// before and after it succeed.
+    pub(crate) fn new_scripted(items: Vec<Result<crate::provider::ChatResponse, String>>) -> Self {
         Self {
-            script: Some(std::sync::Mutex::new(responses.into())),
+            script: Some(std::sync::Mutex::new(items.into())),
             hang_entered: None,
             hang_dropped: None,
             calls: ChatLog::default(),
@@ -3375,8 +3414,11 @@ impl Provider for StubProvider {
             std::future::pending::<()>().await;
             unreachable!()
         };
-        let next = script.lock().unwrap().pop_front();
-        next.ok_or_else(|| anyhow::anyhow!("StubProvider script exhausted"))
+        match script.lock().unwrap().pop_front() {
+            Some(Ok(resp)) => Ok(resp),
+            Some(Err(msg)) => Err(anyhow::anyhow!(msg)),
+            None => Err(anyhow::anyhow!("StubProvider script exhausted")),
+        }
     }
 }
 
@@ -3967,6 +4009,101 @@ mod tests {
             "`risky` was registered and `Origin::Trusted` allows every \
              kind, so only the `tools:` restriction itself explains a \
              refusal here"
+        );
+    }
+
+    /// `Refusal::NotOffered` closes the same hole on the *ordinary*
+    /// (non-subagent) path — every test above exercises it only through
+    /// `subagent`. A name the model invents (or gets right, but this
+    /// round happens not to offer) that still matches something
+    /// registered on the shared `ToolSet` must be refused before
+    /// `ToolSet::execute` ever dispatches on it — see `TurnLoop::run`'s
+    /// permission gate, which checks `offered` first, ahead of the
+    /// host-machine gate and `decide` both.
+    ///
+    /// `client_shell` is the tool named: it isn't in `HOST_TOOLS`, so
+    /// `host_tool_denied` — the *other* thing that could explain a
+    /// refusal here — never fires for it, and `NullProgress`'s default
+    /// `origin()` is `Origin::Trusted`, which `decide` allows
+    /// unconditionally for every kind. The only thing left standing
+    /// between the call and `ran` flipping `true` is the offered check
+    /// itself: `visible_tool_predicate` excludes `client_shell` from
+    /// this round's own `tool_specs` because `NullProgress` reports no
+    /// ACP client (`has_client` is `false`), even though the tool stays
+    /// registered and visible to `state.tools.kinds()`.
+    #[tokio::test]
+    async fn a_registered_but_unoffered_tool_is_refused_on_an_ordinary_turn() {
+        struct FakeClientShell {
+            spec: crate::provider::ToolSpec,
+            ran: Arc<std::sync::atomic::AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for FakeClientShell {
+            fn spec(&self) -> &crate::provider::ToolSpec {
+                &self.spec
+            }
+            fn kind(&self) -> crate::tools::ToolKind {
+                crate::tools::ToolKind::Execute
+            }
+            async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
+                self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok("ran".to_string())
+            }
+        }
+
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                // Round 1: the model names a tool that is registered on
+                // the shared `ToolSet` but excluded from this round's
+                // own advertised list.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "client_shell".to_string(),
+                        input: json!({"command": "echo hi"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Round 2: give up after the refusal.
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state
+            .tools
+            .register_tool(Box::new(FakeClientShell {
+                spec: crate::provider::ToolSpec {
+                    name: "client_shell".into(),
+                    description: "Pretend to run a command on the client.".into(),
+                    input_schema: json!({ "type": "object", "properties": {} }),
+                },
+                ran: Arc::clone(&ran),
+            }))
+            .await;
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-notoffered-parent-path".to_string(),
+            ChatMessage::user("run something"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "`client_shell` is registered, isn't a `HOST_TOOLS` name (so \
+             `host_tool_denied` never fires), and `Origin::Trusted` \
+             allows every kind unconditionally — only the offered check \
+             itself explains a refusal here"
         );
     }
 
@@ -4570,6 +4707,92 @@ mod tests {
         }
         assert_eq!(seen.len(), 1, "one event for the error");
         assert!(seen[0].is_ok());
+    }
+
+    /// The bug Fix 2 closes: a subagent's own provider failure must not
+    /// report itself as *this request's* terminal outcome. `progress`
+    /// for a subagent's nested `TurnLoop` is the parent's own host by
+    /// design — here, `SseProgress` — and unwrapped, `turn_error` sends
+    /// a terminal JSON-RPC error carrying the *parent* request's id the
+    /// instant it is called. If `SubagentTool::execute` did not wrap
+    /// `ctx.progress`, the subagent's own `chat()` failure below would
+    /// fire that mid-turn, and the parent would still go on to finish
+    /// normally afterwards — two terminal responses for one request.
+    ///
+    /// A successful delegation emits exactly two events on this
+    /// `SseProgress` (`tool_start`/`tool_end` for the `subagent` call
+    /// itself); a spurious `turn_error` from the subagent's own failure
+    /// would add a third. Counting is enough — no need to decode
+    /// `Event`'s payload — because nothing else on this path emits.
+    #[tokio::test]
+    async fn a_subagents_provider_failure_does_not_leak_a_stale_terminal_error() {
+        let state = ServeState::build_for_test(
+            true,
+            StubProvider::new_scripted(vec![
+                // Parent round 1: delegate.
+                Ok(crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "delegator", "prompt": "go"}),
+                    }],
+                    stop_reason: None,
+                }),
+                // Subagent round 1: the provider call itself fails.
+                Err("simulated subagent provider failure".to_string()),
+                // Parent round 2, after the subagent's tool result
+                // reports its own failure back as ordinary tool output.
+                Ok(crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                }),
+            ]),
+        );
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
+                crate::agents::AgentDef {
+                    name: "delegator".to_string(),
+                    description: "Delegates.".to_string(),
+                    tools: None,
+                    prompt: "You are a delegator.".to_string(),
+                },
+            ])))
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let progress = Arc::new(SseProgress::new(tx, json!(42)));
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-subagent-sse-provider-failure".to_string(),
+            ChatMessage::user("delegate it"),
+            progress,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.text.as_deref(),
+            Some("done"),
+            "the parent's own turn must complete normally even though \
+             the subagent's own provider call failed"
+        );
+
+        rx.close();
+        let mut seen = Vec::new();
+        while let Some(item) = rx.recv().await {
+            seen.push(item);
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "expected exactly tool_start + tool_end for the `subagent` \
+             call; a 3rd event would be the subagent's own failure \
+             leaking out as this request's terminal error"
+        );
     }
 
     #[tokio::test]

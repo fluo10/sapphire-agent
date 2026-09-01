@@ -90,13 +90,18 @@ pub struct ToolSet {
 }
 
 struct ToolSetInner {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
     specs: Vec<ToolSpec>,
 }
 
 impl ToolSet {
     pub fn new(tools: Vec<Box<dyn Tool>>, mcp_clients: Vec<Arc<McpClient>>) -> Self {
         let specs = tools.iter().map(|t| t.spec().clone()).collect();
+        // `Box` at the public API (every call site already builds one),
+        // `Arc` in storage — see `execute` below for why: a tool's
+        // execution must be clonable out from under the read guard
+        // rather than run while the guard is held.
+        let tools: Vec<Arc<dyn Tool>> = tools.into_iter().map(Arc::from).collect();
         Self {
             inner: RwLock::new(ToolSetInner { tools, specs }),
             mcp_clients,
@@ -145,19 +150,43 @@ impl ToolSet {
     /// (`src/serve/mod.rs`, `src/agent.rs`). Those strings come from
     /// `policy::refusal_message` and are short by construction, but
     /// anything added on that path is NOT capped by this.
+    ///
+    /// The read guard is held only long enough to find and clone the
+    /// matching `Arc<dyn Tool>` — never across `execute_full` itself.
+    /// That matters beyond ordinary lock hygiene: `subagent`
+    /// (`crate::tools::subagent::SubagentTool`) runs *inside* this
+    /// function and drives a whole nested `TurnLoop`, whose own tool
+    /// calls come back through this very function on the same task.
+    /// `tokio::sync::RwLock` is task-fair — a reader blocks as soon as a
+    /// writer is queued — so holding the guard here across execution
+    /// would let a concurrent writer (an MCP `tools/list_changed`
+    /// refresh via `refresh_if_needed`, or `mcp_reconnect`) queue behind
+    /// this call and then block the nested re-entrant read behind
+    /// *that* writer, with nothing left to release either side: the
+    /// whole `ToolSet`, on every transport, stops answering until
+    /// restart. Cloning the `Arc` and dropping the guard before
+    /// `execute_full` removes the possibility outright, for `subagent`
+    /// and for every other tool alike — including `mcp_reconnect`
+    /// itself, which no longer deadlocks on its own write lock while
+    /// its own call's read guard is still held (#201).
     pub async fn execute(&self, call: &ToolCall) -> ToolOutput {
-        let inner = self.inner.read().await;
-        for tool in &inner.tools {
-            if tool.spec().name == call.name {
-                let mut output = match tool.execute_full(&call.input).await {
-                    Ok(output) => output,
-                    Err(e) => ToolOutput::from(format!("Error: {e:#}")),
-                };
-                output.text = truncate_output(&output.text);
-                return output;
-            }
-        }
-        ToolOutput::from(format!("Unknown tool: {}", call.name))
+        let tool = {
+            let inner = self.inner.read().await;
+            inner
+                .tools
+                .iter()
+                .find(|t| t.spec().name == call.name)
+                .cloned()
+        };
+        let Some(tool) = tool else {
+            return ToolOutput::from(format!("Unknown tool: {}", call.name));
+        };
+        let mut output = match tool.execute_full(&call.input).await {
+            Ok(output) => output,
+            Err(e) => ToolOutput::from(format!("Error: {e:#}")),
+        };
+        output.text = truncate_output(&output.text);
+        output
     }
 
     /// Check all MCP clients for `tools_changed` flags and refresh their
@@ -185,7 +214,7 @@ impl ToolSet {
         inner.specs.retain(|s| !s.name.starts_with(&prefix));
         for tool in new_tools {
             inner.specs.push(tool.spec().clone());
-            inner.tools.push(tool);
+            inner.tools.push(Arc::from(tool));
         }
         info!(
             "MCP '{}': tool list refreshed ({} total tools)",
@@ -223,7 +252,7 @@ impl ToolSet {
     pub async fn register_tool(&self, tool: Box<dyn Tool>) {
         let mut inner = self.inner.write().await;
         inner.specs.push(tool.spec().clone());
-        inner.tools.push(tool);
+        inner.tools.push(Arc::from(tool));
     }
 }
 

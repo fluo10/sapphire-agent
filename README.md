@@ -71,7 +71,7 @@ body for the prompt:
 ```markdown
 ---
 description: Reviews a diff. Reads and reports; does not edit.
-tools: [client_file_read, workspace_search, retrieve]
+tools: [client_file_read, workspace_search, memory_read]
 ---
 You are a reviewer. Read the diff, report problems, and stop there.
 ```
@@ -132,6 +132,12 @@ session store. Only the returned final answer does, as the `subagent`
 tool's own result — reload the session later and you see "delegated to
 reviewer, got back Y", not the 30 files it read to get there.
 
+That "only the returned final answer" is text-only, too: `SubagentTool::execute`
+returns a plain `String`, so a nested tool's image output has nowhere to
+go. If a subagent's own tool list includes `recall_image`, calling it
+produces nothing the parent (or the model) can see — the image bytes are
+simply dropped rather than attached to anything.
+
 **Delegation is depth 1.** A subagent's own tool list never contains
 `subagent`, regardless of what its definition's `tools:` says — and, per
 the enforcement above, this isn't just an omission from the list a
@@ -145,13 +151,18 @@ same gate, the same person asked, the same standing allow/deny answers.
 Delegating is not a way to get done by proxy what the model would be
 refused directly.
 
-**`subagent` is effectively ACP-only.** Its `ToolKind` is `Other` — what a
+**`subagent` runs unconditionally on every trusted transport, and is
+excluded only on Matrix and Discord.** Its `ToolKind` is `Other` — what a
 subagent actually does depends entirely on which agent it delegates to, so
 it can't honestly be classified as `Read`, `Edit`, `Execute`, etc., and
-`Other` is the policy table's most conservative bucket. `Origin::Channel`
-denies every `Other` call unconditionally, so Matrix and Discord cannot
-call `subagent` at all — see the [permission table](#permission-and-modes)
-below.
+`Other` is the policy table's most conservative bucket. `Origin::Trusted`
+(`/rpc`, `/a2a`, voice) allows every kind unconditionally, so those three
+run `subagent` the same as any other tool; on ACP it is asked for in
+`default` mode and allowed once edits are accepted or bypassed, same as
+any other `Other` call. `Origin::Channel` is the one origin that denies
+every `Other` call unconditionally, so Matrix and Discord — and only
+Matrix and Discord — cannot call `subagent` at all. See the
+[permission table](#permission-and-modes) below.
 
 **Project conventions are not shared yet.** A client-side project's
 `CLAUDE.md` isn't threaded into a subagent's prompt — but the main agent

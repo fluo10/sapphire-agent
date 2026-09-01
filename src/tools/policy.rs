@@ -171,9 +171,15 @@ pub fn refusal_message(tool: &str, why: Refusal) -> String {
             "Permission denied: the '{tool}' tool is not available on this \
              transport. Try another approach, or ask the user to run it."
         ),
+        // Deliberately not "Permission denied": for a name this round
+        // never offered — a typo, a hallucination, or `subagent`
+        // reaching past its own depth cap — there is no permission to
+        // ask for. Opening with "Permission denied" would invite the
+        // model to ask the user to grant access to something that does
+        // not exist here at all.
         Refusal::NotOffered => format!(
-            "Permission denied: the '{tool}' tool is not available in this \
-             conversation. Try another approach, or ask the user."
+            "The '{tool}' tool is not available in this conversation. \
+             Try another approach, or ask the user."
         ),
     }
 }
@@ -434,8 +440,12 @@ mod tests {
         assert_eq!(kind_of("no_such_tool", &kinds), ToolKind::Other);
     }
 
-    /// Both refusal reasons name the tool, so the model can tell which
-    /// of several calls was refused, and say why.
+    /// All three refusal reasons name the tool, so the model can tell
+    /// which of several calls was refused, and each reads distinctly
+    /// from the other two — a decline, a deployment-wide unavailability,
+    /// and a name this round simply never offered are different things
+    /// to tell the model, and it needs to be able to act on the
+    /// difference (only the first is "you could ask the user again").
     #[test]
     fn refusal_messages_name_the_tool_and_the_reason() {
         let declined = refusal_message("shell", Refusal::UserDeclined);
@@ -444,9 +454,26 @@ mod tests {
 
         let unavailable = refusal_message("shell", Refusal::Unavailable);
         assert!(unavailable.contains("shell"), "got {unavailable}");
+
+        let not_offered = refusal_message("shell", Refusal::NotOffered);
+        assert!(not_offered.contains("shell"), "got {not_offered}");
+        assert!(
+            !not_offered.contains("Permission denied"),
+            "an invented/out-of-round name has no permission to be denied: {not_offered}"
+        );
+
         assert_ne!(
             declined, unavailable,
             "the model should be able to tell a refusal from an unavailability"
+        );
+        assert_ne!(
+            declined, not_offered,
+            "a decline and a name outside this round's own list must read differently"
+        );
+        assert_ne!(
+            unavailable, not_offered,
+            "a deployment-wide unavailability and a name simply not offered \
+             this round must read differently"
         );
     }
 

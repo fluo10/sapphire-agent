@@ -219,4 +219,13 @@ heartbeat タスクと同じで、v1 ではそれでよい。
   本文は前提を明示していなかったが、ツール呼び出しの永続化自体が
   ACP セッションのみ（既存4ストアは #194 待ち）なので、この決定が
   効くのも ACP セッションだけである。README にもその前提を明記した。
+- **「実質 ACP 専用の機能になる」（上の「Matrix と Discord からは
+  サブエージェントを呼べない」の段落）は言い過ぎだった。** `subagent`
+  の `ToolKind` は `Other` だが、`Other` を無条件に拒否するのは
+  `Origin::Channel`（Matrix・Discord）だけで、`Origin::Trusted`
+  （`/rpc`・`/a2a`・voice）は種類を問わず無条件に許可する。ACP でも
+  `default` モードでは確認、`accept_edits`/`bypass` では許可と、他の
+  `Other` 系ツールと同じ扱いに過ぎない。除外されるのは Matrix と
+  Discord のみで、そこは本文の指摘どおり正しかった。README の
+  「effectively ACP-only」という記述も誤りだったので合わせて修正した。
 - 上記以外に、実装が spec の決定事項そのものと食い違った箇所は無い。
