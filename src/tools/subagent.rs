@@ -17,22 +17,39 @@
 //! no model. What a subagent needs to run is threaded through instead
 //! via a `tokio::task_local` (`crate::serve::TurnContext`,
 //! `scope_turn_context`/`current_turn_context`), the same vehicle
-//! `crate::tools::acp_client` uses for the ACP connection. Because
-//! `SubagentTool::execute` runs *inside* `ToolSet::execute` (it is
-//! itself one of the tools that set owns), and the nested loop it drives
-//! calls back into the very same `ToolSet::execute` for its own tool
-//! calls, `ToolSet::execute`'s `self.inner.read().await` is acquired
-//! twice, re-entrantly, on the same task before the outer acquisition
-//! is released. That is safe here specifically because nothing on this
-//! path ever requests the write lock while a turn's tools are running:
-//! `ToolSet::register_tool` only runs at startup, and
-//! `ToolSet::refresh_if_needed` (the other writer) is called once by
-//! `run_llm_turn` *before* `TurnLoop::run` is even constructed, never
-//! from inside the loop or from a subagent's own nested loop. With no
-//! writer ever contending for the lock mid-turn, `tokio::sync::RwLock`
-//! grants any number of concurrent (including re-entrant) readers, so
-//! the nested `.read().await` cannot block behind — and therefore
-//! cannot deadlock with — the read guard the outer call still holds.
+//! `crate::tools::acp_client` uses for the ACP connection.
+//!
+//! **What "isolation" does not cover.** `TurnHost::tool_start`/`tool_end`
+//! fire on the *parent's* host for a subagent's own tool calls too (they
+//! run inside the same `scope_turn_context`/`scope_memory_namespace`
+//! wrapping every call in the parent's round), so a subagent's tool
+//! activity is visible in the parent's ACP session stream as
+//! notifications. That is necessary — it is what makes a permission
+//! prompt for a subagent's call legible as coming from *this*
+//! conversation — but it means the notification channel is not part of
+//! what stays isolated. Nothing from it reaches the parent's stored
+//! history or the ACP session store; only the returned final answer
+//! does, as this tool's own result.
+//!
+//! **Lock re-entrancy.** Because `SubagentTool::execute` runs *inside*
+//! `ToolSet::execute` (it is itself one of the tools that set owns), and
+//! the nested loop it drives calls back into the very same
+//! `ToolSet::execute` for its own tool calls, `ToolSet::execute`'s
+//! `self.inner.read().await` is acquired twice, re-entrantly, on the
+//! same task before the outer acquisition is released.
+//! `tokio::sync::RwLock` only blocks a new reader behind a writer that
+//! is already queued, so this is safe as long as nothing requests the
+//! write lock while a turn's tools are running — which is *not* quite
+//! true: `mcp_reconnect` (`crate::tools::builtin_tools::McpReconnectTool`
+//! → `ToolSet::reconnect_mcp_server` → `inner.write().await`) is
+//! model-callable from inside `ToolSet::execute`, exactly like this
+//! tool. It already deadlocks on its own today, though — it asks for
+//! the write lock while `ToolSet::execute`'s own read guard for *that
+//! very call* is still held, with nothing nested involved — so every
+//! new hang scenario a subagent's re-entrant read could reach already
+//! contains that existing one, and this feature introduces no new
+//! deadlock. See the `mcp_reconnect` self-deadlock issue for that bug
+//! itself; it is not fixed here.
 
 use crate::agents::AgentDef;
 use crate::provider::{ChatMessage, ToolSpec};
@@ -45,10 +62,11 @@ pub(crate) const SUBAGENT_TOOL_NAME: &str = "subagent";
 
 /// A subagent's whole system prompt.
 ///
-/// The definition's body, plus the date — and nothing else. Not the
-/// workspace files (`SOUL.md`, `IDENTITY.md`, `USER.md`, `AGENTS.md`,
-/// `TOOLS.md`), not memory, not the day's cross-session digest, not the
-/// room metadata, not the configured base prompt.
+/// The definition's body, plus the date — and nothing else is baked
+/// into the *prompt text*: not the workspace files (`SOUL.md`,
+/// `IDENTITY.md`, `USER.md`, `AGENTS.md`, `TOOLS.md`), not a MEMORY.md
+/// digest, not the day's cross-session digest, not the room metadata,
+/// not the configured base prompt.
 ///
 /// Dropping those is not an oversight, it is the feature: the main
 /// agent carries them deliberately — it is someone to work *with* — and
@@ -58,6 +76,15 @@ pub(crate) const SUBAGENT_TOOL_NAME: &str = "subagent";
 /// The date is the one exception, because an agent that does not know
 /// today's date cannot use a tool that writes one, and that is a fact
 /// rather than a personality.
+///
+/// This is a statement about the prompt, not about reach: an
+/// unrestricted definition (`tools: None`) still inherits whichever
+/// `memory_*` tools the parent can see, and — because
+/// `SubagentTool::execute` reads `current_memory_namespace()` at call
+/// time — those calls land in the same namespace the delegating
+/// conversation is already in. A subagent is not told what is in
+/// memory; it is not prevented from asking, unless its own `tools:`
+/// list says so.
 pub(crate) fn subagent_system_prompt(def: &AgentDef) -> String {
     let now = chrono::Local::now();
     format!(

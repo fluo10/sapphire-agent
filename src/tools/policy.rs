@@ -134,6 +134,14 @@ pub enum Refusal {
     UserDeclined,
     /// The policy refuses it outright on this transport; nobody was asked.
     Unavailable,
+    /// The name does not appear in this round's own `tool_specs` — it
+    /// was never offered to this conversation, whether or not it is
+    /// registered on the shared `ToolSet`. Distinct from `Unavailable`:
+    /// that reason is about the deployment (host access, a missing
+    /// editor); this one is about what *this* call is allowed to see —
+    /// a subagent's `tools:` restriction, or `subagent` itself once
+    /// removed from a nested turn's own list.
+    NotOffered,
 }
 
 /// Look a tool's kind up by name.
@@ -162,6 +170,10 @@ pub fn refusal_message(tool: &str, why: Refusal) -> String {
         Refusal::Unavailable => format!(
             "Permission denied: the '{tool}' tool is not available on this \
              transport. Try another approach, or ask the user to run it."
+        ),
+        Refusal::NotOffered => format!(
+            "Permission denied: the '{tool}' tool is not available in this \
+             conversation. Try another approach, or ask the user."
         ),
     }
 }

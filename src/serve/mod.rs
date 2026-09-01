@@ -2455,6 +2455,23 @@ impl TurnLoop<'_> {
                     // `approve` puts a dialog in front of a human, and
                     // firing several at once would stack them on the poor
                     // soul in the editor. Execution below stays concurrent.
+                    //
+                    // `offered` is this round's own advertised list —
+                    // `tool_specs`, by name. `ToolSet::execute` dispatches
+                    // on name across *every* tool registered on the shared
+                    // `ToolSet`, not just the ones this round offered, so
+                    // without checking membership here first, a call
+                    // naming a tool this round never advertised would
+                    // still run. That is what would let a subagent recurse
+                    // by calling `subagent` itself — removed from its own
+                    // `tool_specs` by `subagent_tool_specs`, but not from
+                    // the underlying `ToolSet` — and what would let a
+                    // definition's `tools:` restriction be bypassed by
+                    // simply naming a tool outside it. One check here
+                    // closes both, and the same hallucinated-name gap on
+                    // the ordinary (non-subagent) path.
+                    let offered: std::collections::HashSet<&str> =
+                        tool_specs.iter().map(|s| s.name.as_ref()).collect();
                     let kinds = self.state.tools.kinds().await;
                     let origin = progress.origin();
                     let mut permitted: Vec<crate::provider::ToolCall> = Vec::new();
@@ -2469,7 +2486,9 @@ impl TurnLoop<'_> {
                         // touch its own disk at all"), not a row in the
                         // origin/kind policy table — so it is checked, and
                         // can refuse, before `decide` is even consulted.
-                        let refusal = if host_tool_denied(&call.name, host_access_enabled) {
+                        let refusal = if !offered.contains(call.name.as_str()) {
+                            Some(refusal_message(&call.name, Refusal::NotOffered))
+                        } else if host_tool_denied(&call.name, host_access_enabled) {
                             Some(refusal_message(&call.name, Refusal::Unavailable))
                         } else {
                             let kind = kind_of(&call.name, &kinds);
@@ -3188,6 +3207,31 @@ impl crate::tools::Tool for NamedStubTool {
     }
 }
 
+/// Every `chat()` call a [`StubProvider`] has seen, in call order:
+/// `(system, tool names offered)`. `system` is owned (not the borrowed
+/// `Option<&str>` `chat()` receives) so the log outlives the call.
+///
+/// Exists because the scripted responses alone only prove a turn's
+/// *outcome* was right — they say nothing about what the provider was
+/// actually called *with*. Both of `subagent`'s headline properties
+/// (its own system prompt, its own restricted tool list) are otherwise
+/// asserted only where they are computed (`subagent_system_prompt`,
+/// `subagent_tool_specs`), not where they are wired into the call
+/// `TurnLoop::run` makes — this closes that gap. `Clone`, so the handle
+/// obtained from [`StubProvider::call_log`] before the provider is
+/// moved into a `ProviderRegistry` can still be read afterwards.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct ChatLog(Arc<std::sync::Mutex<Vec<(Option<String>, Vec<String>)>>>);
+
+#[cfg(test)]
+impl ChatLog {
+    /// A snapshot of every call recorded so far, in order.
+    pub(crate) fn calls(&self) -> Vec<(Option<String>, Vec<String>)> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 /// Provider double for tests. In "scripted" mode it pops one
 /// [`crate::provider::ChatResponse`] off a queue per `chat()` call. In
 /// "hanging" mode `chat()` never resolves — used to keep a turn in
@@ -3203,6 +3247,8 @@ pub(crate) struct StubProvider {
     /// assert the turn was actually torn down rather than merely observing
     /// that it never completed on its own.
     hang_dropped: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// See [`ChatLog`].
+    calls: ChatLog,
 }
 
 /// The two observations a test can make about a hanging provider's
@@ -3258,6 +3304,7 @@ impl StubProvider {
             script: Some(std::sync::Mutex::new(responses.into())),
             hang_entered: None,
             hang_dropped: None,
+            calls: ChatLog::default(),
         }
     }
 
@@ -3271,9 +3318,16 @@ impl StubProvider {
                 script: None,
                 hang_entered: Some(Arc::clone(&entered)),
                 hang_dropped: Some(Arc::clone(&dropped)),
+                calls: ChatLog::default(),
             },
             HangingChat { entered, dropped },
         )
+    }
+
+    /// A handle onto this provider's [`ChatLog`], to keep after the
+    /// provider is moved into a `ProviderRegistry`.
+    pub(crate) fn call_log(&self) -> ChatLog {
+        self.calls.clone()
     }
 }
 
@@ -3286,10 +3340,16 @@ impl Provider for StubProvider {
 
     async fn chat(
         &self,
-        _system: Option<&str>,
+        system: Option<&str>,
         _messages: &[ChatMessage],
-        _tools: Option<&[crate::provider::ToolSpec]>,
+        tools: Option<&[crate::provider::ToolSpec]>,
     ) -> anyhow::Result<crate::provider::ChatResponse> {
+        self.calls.0.lock().unwrap().push((
+            system.map(|s| s.to_string()),
+            tools
+                .map(|specs| specs.iter().map(|s| s.name.to_string()).collect())
+                .unwrap_or_default(),
+        ));
         let Some(script) = &self.script else {
             // Hold a guard whose Drop flips `hang_dropped` before awaiting
             // forever, so a caller that aborts this future (rather than
@@ -3339,6 +3399,20 @@ impl ServeState {
         responses: Vec<crate::provider::ChatResponse>,
     ) -> Arc<Self> {
         Self::build_for_test(acp_enabled, StubProvider::new(responses))
+    }
+
+    /// Same as [`Self::for_test_scripted`], plus a [`ChatLog`] handle so
+    /// a test can assert on what each `chat()` call actually received —
+    /// not just the scripted outcome, but the `system`/`tools` a
+    /// property (e.g. a subagent's own prompt and tool list) claims
+    /// were wired through.
+    pub(crate) fn for_test_scripted_with_log(
+        acp_enabled: bool,
+        responses: Vec<crate::provider::ChatResponse>,
+    ) -> (Arc<Self>, ChatLog) {
+        let provider = StubProvider::new(responses);
+        let log = provider.call_log();
+        (Self::build_for_test(acp_enabled, provider), log)
     }
 
     /// State whose provider never returns, so a turn stays in flight.
@@ -3727,12 +3801,190 @@ mod tests {
         );
     }
 
+    /// The depth cap `subagent_tool_specs` gives by removing `subagent`
+    /// from a nested turn's own list is a promise about what is
+    /// *offered* — `ToolSet::execute` dispatches on name across every
+    /// tool the shared `ToolSet` has registered, `subagent` included, so
+    /// without a gate that actually checks the round's own `tool_specs`,
+    /// a subagent could still call `subagent` by name and recurse
+    /// without bound. This asserts the gate, not just the list.
+    #[tokio::test]
+    async fn a_subagent_cannot_invoke_subagent_by_name() {
+        let (state, chat_log) = ServeState::for_test_scripted_with_log(
+            true,
+            vec![
+                // Parent round 1: delegate.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "delegator", "prompt": "go"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 1: try to recurse by naming `subagent`
+                // itself — never in this round's own `tool_specs`, but
+                // still a name the shared `ToolSet` has registered.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "sub-call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "delegator", "prompt": "recurse"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 2: give up after the refusal.
+                crate::provider::ChatResponse {
+                    text: Some("gave up".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+                // Parent round 2.
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
+                crate::agents::AgentDef {
+                    name: "delegator".to_string(),
+                    description: "Delegates.".to_string(),
+                    tools: None,
+                    prompt: "You are a delegator.".to_string(),
+                },
+            ])))
+            .await;
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-subagent-no-recursion".to_string(),
+            ChatMessage::user("delegate it"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        // If the self-call had actually recursed, satisfying it would
+        // need a 5th `chat()` call (a nested-nested turn), leaving the
+        // 4-entry script exhausted and the turn ending in a provider
+        // error rather than "done" — so this one assertion catches
+        // unbounded recursion by construction, without needing to
+        // instrument `SubagentTool` itself.
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert_eq!(
+            chat_log.calls().len(),
+            4,
+            "exactly parent-round-1, subagent-round-1, subagent-round-2, \
+             parent-round-2 — a 5th call would mean the self-recursion \
+             attempt actually ran"
+        );
+    }
+
+    /// A definition's `tools:` restriction is also a promise about what
+    /// is *offered*, and needs the same gate: without it, a subagent
+    /// could call any tool registered on the shared `ToolSet`, whether
+    /// or not its own definition named it. `Origin::Trusted` is used
+    /// here specifically because it allows every kind unconditionally —
+    /// isolating this from `a_subagent_is_judged_by_the_parents_origin`,
+    /// which is about the origin/host gate, not this one.
+    #[tokio::test]
+    async fn a_subagent_restricted_to_one_tool_is_refused_another_that_is_registered() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                // Parent round 1: delegate.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "delegator", "prompt": "go"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 1: try a tool outside its own `tools:`
+                // list — registered on the `ToolSet`, and `Origin::Trusted`
+                // would allow it unconditionally, but the definition
+                // never named it.
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "sub-call-1".to_string(),
+                        name: "risky".to_string(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                // Subagent round 2: give up after the refusal.
+                crate::provider::ChatResponse {
+                    text: Some("could not run it".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+                // Parent round 2.
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        let risky = RiskyTool::new();
+        let ran = risky.ran_flag();
+        state.tools.register_tool(Box::new(risky)).await;
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
+                crate::agents::AgentDef {
+                    name: "delegator".to_string(),
+                    description: "Delegates, but only echoes.".to_string(),
+                    tools: Some(vec!["echo".to_string()]),
+                    prompt: "You are a delegator.".to_string(),
+                },
+            ])))
+            .await;
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-subagent-restricted-tools".to_string(),
+            ChatMessage::user("delegate it"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "`risky` was registered and `Origin::Trusted` allows every \
+             kind, so only the `tools:` restriction itself explains a \
+             refusal here"
+        );
+    }
+
     /// The isolation, asserted rather than assumed: what the subagent
     /// said to itself must not reach the parent's history or its store.
     /// Only the final answer comes back, as the tool's result.
+    ///
+    /// Also asserts the two headline properties where they are actually
+    /// *wired* (the `system`/`tools` a `chat()` call was made with), not
+    /// just where they are computed: `subagent_system_prompt` and
+    /// `subagent_tool_specs` are pure functions with their own unit
+    /// tests, but nothing short of inspecting `StubProvider`'s call log
+    /// would catch `TurnLoop { system: Some(&system), ... }` being wired
+    /// to the wrong string, or `tool_specs: &specs` to the parent's
+    /// unfiltered list — every other test here would stay green.
     #[tokio::test]
     async fn a_subagents_conversation_does_not_reach_the_parent() {
-        let state = ServeState::for_test_scripted(
+        let (state, chat_log) = ServeState::for_test_scripted_with_log(
             true,
             vec![
                 // Parent round 1: delegate.
@@ -3790,6 +4042,16 @@ mod tests {
             ])))
             .await;
 
+        // A workspace file the *parent's* system prompt is built from
+        // (`Workspace::build_system_prompt`, `# Soul`) but the subagent's
+        // must not be — its whole system prompt is the definition's
+        // `prompt` plus the date, nothing read from the workspace.
+        std::fs::write(
+            state.workspace.dir().join("SOUL.md"),
+            "PARENTS_SOUL_MARKER: I am the parent's own soul file.",
+        )
+        .unwrap();
+
         let sid = "acp-subagent-isolation".to_string();
         state.acp_sessions.lock().await.insert(sid.clone());
         state
@@ -3842,6 +4104,56 @@ mod tests {
             history_mentions(&acp_history, "FINAL ANSWER: 42"),
             "only the subagent's final answer should reach the parent, as \
              the tool's own result"
+        );
+
+        // Now the two headline properties, asserted at the actual wire:
+        // what each `chat()` call was made with. Call order matches the
+        // script order above, since the parent and the subagent share
+        // one provider and one script queue: [0] parent round 1
+        // (delegates), [1]/[2] the subagent's own two rounds, [3] parent
+        // round 2.
+        let calls = chat_log.calls();
+        assert_eq!(calls.len(), 4, "unexpected call count: {calls:?}");
+
+        let parent_system = calls[0].0.as_deref().unwrap_or_default();
+        assert!(
+            parent_system.contains("PARENTS_SOUL_MARKER"),
+            "sanity: the parent's own turn must see its workspace's \
+             SOUL.md, or this test cannot tell a wired-through workspace \
+             prompt apart from one that was never read: {parent_system}"
+        );
+        assert!(
+            calls[0].1.iter().any(|n| n == "subagent"),
+            "sanity: the parent must be offered `subagent` itself: {:?}",
+            calls[0].1
+        );
+
+        for (i, (system, tools)) in [&calls[1], &calls[2]].into_iter().enumerate() {
+            let system = system.as_deref().unwrap_or_default();
+            assert!(
+                system.contains("You are an investigator."),
+                "the subagent's round {i} must see its own definition's \
+                 prompt: {system}"
+            );
+            assert!(
+                !system.contains("PARENTS_SOUL_MARKER"),
+                "the subagent's round {i} must not see the parent \
+                 workspace's SOUL.md — its system prompt is the \
+                 definition and nothing else: {system}"
+            );
+            assert_eq!(
+                tools,
+                &vec!["echo".to_string()],
+                "the subagent's round {i} must see exactly its \
+                 definition's own tool list, `subagent` included nowhere \
+                 in it"
+            );
+        }
+
+        let parent_system_2 = calls[3].0.as_deref().unwrap_or_default();
+        assert!(
+            parent_system_2.contains("PARENTS_SOUL_MARKER"),
+            "the parent's second round is still the parent's own turn: {parent_system_2}"
         );
     }
 

@@ -382,6 +382,18 @@ impl Workspace {
     }
 }
 
+#[cfg(test)]
+impl Workspace {
+    /// The workspace root `build_system_prompt` reads `AGENTS.md`,
+    /// `SOUL.md`, etc. from. Test-only: production code has no reason to
+    /// reach behind `build_system_prompt`'s own file reads, but a test
+    /// that wants to assert a workspace file's content is (or is not)
+    /// reflected in the prompt needs somewhere to write that file first.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
