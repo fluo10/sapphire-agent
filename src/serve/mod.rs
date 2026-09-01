@@ -529,6 +529,24 @@ pub(crate) struct SessionResidency {
 }
 
 impl ServeState {
+    /// Holds `state.sessions` locked for the entire walk below, rather
+    /// than cloning the map and computing off the clone. Cloning would
+    /// allocate a second full copy of every session's history — exactly
+    /// the thing this measurement exists to find out is too big, so a
+    /// diagnostic must not be able to double the peak it is diagnosing.
+    ///
+    /// That is affordable because the walk does no I/O and no `.await`,
+    /// and its per-element work is `String::len()`, which is O(1)
+    /// (`String` stores its length rather than scanning bytes) — so the
+    /// whole pass is linear over memory already resident, run once per
+    /// 30-minute sweep. Even a million messages costs a few
+    /// milliseconds of contention, twice an hour.
+    ///
+    /// This reasoning holds only while every per-element step here stays
+    /// O(1). If a future field needs to walk bytes or hash content, that
+    /// cost is no longer free under the lock and this needs a different
+    /// shape (e.g. compute off a clone, or sample instead of scanning
+    /// everything).
     pub(crate) async fn session_residency(&self) -> SessionResidency {
         let sessions = self.sessions.lock().await;
         let mut out = SessionResidency {
@@ -3747,10 +3765,7 @@ mod tests {
         let state = ServeState::for_test(true);
         {
             let mut sessions = state.sessions.lock().await;
-            sessions.insert(
-                "small".to_string(),
-                vec![ChatMessage::user("hi")],
-            );
+            sessions.insert("small".to_string(), vec![ChatMessage::user("hi")]);
             sessions.insert(
                 "big".to_string(),
                 vec![ChatMessage {
