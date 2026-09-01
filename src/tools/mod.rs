@@ -555,6 +555,87 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["keep_me".to_string()]);
     }
+
+    /// Regression test for the Critical deadlock fixed in `execute`'s doc
+    /// above: a queued writer must never be blocked behind a tool that is
+    /// still executing. Uses a tool that blocks inside `execute` until
+    /// released, signalling once it has actually entered so the test
+    /// never races the spawn against the tool starting to run — by the
+    /// time that signal fires, the read guard that located the tool is
+    /// guaranteed to have already been dropped.
+    ///
+    /// Sanity-checked by temporarily re-widening `execute`'s read guard to
+    /// span `execute_full` again: with that regression reintroduced, this
+    /// test times out and fails, as expected of a test with teeth.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_writer_is_not_blocked_by_an_executing_tool() {
+        use std::time::Duration;
+        use tokio::sync::Notify;
+
+        /// A tool whose `execute` blocks until `release` is notified.
+        struct BlockingTool {
+            spec: ToolSpec,
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl Tool for BlockingTool {
+            fn spec(&self) -> &ToolSpec {
+                &self.spec
+            }
+            async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok("blocking tool result".to_string())
+            }
+        }
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        let tools = Arc::new(ToolSet::new_empty_for_test());
+        tools
+            .register_tool(Box::new(BlockingTool {
+                spec: ToolSpec {
+                    name: "blocking".to_string().into(),
+                    description: String::new().into(),
+                    input_schema: serde_json::json!({}),
+                },
+                entered: entered.clone(),
+                release: release.clone(),
+            }))
+            .await;
+
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "blocking".to_string(),
+            input: serde_json::json!({}),
+        };
+
+        let exec_tools = tools.clone();
+        let handle = tokio::spawn(async move { exec_tools.execute(&call).await });
+
+        // Wait until the tool is actually inside `execute_full`, so the
+        // read guard that located it is guaranteed to have been dropped.
+        entered.notified().await;
+
+        // A writer queued behind that dropped guard must not be blocked
+        // by the tool's still-running execution.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tools.register_tool(Box::new(NamedStub::new("late"))),
+        )
+        .await
+        .expect(
+            "a queued writer must not block behind an executing tool — ToolSet::execute is holding its read guard across execution again",
+        );
+
+        release.notify_one();
+
+        let output = handle.await.expect("execute task panicked");
+        assert_eq!(output.text, "blocking tool result");
+    }
 }
 
 #[cfg(test)]

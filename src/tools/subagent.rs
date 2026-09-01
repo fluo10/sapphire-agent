@@ -202,10 +202,17 @@ fn build_spec(agents: &[AgentDef]) -> ToolSpec {
 /// records a message, read back solely when the *parent's* own turn
 /// ends with no reply) but still wrong: a subagent's failure has no
 /// business overwriting what the parent's own failure, if any, would
-/// have said. Swallowing it here keeps a subagent's provider failure on
-/// the one channel that is actually correct for it — surfacing as this
-/// tool's own result, which the parent model reads like any other tool
-/// output and can act on.
+/// have said. Swallowing it here keeps a subagent's provider failure off
+/// that channel — but it does not surface the cause anywhere the model
+/// can read. `TurnStop::ProviderError` yields `text: None`, so
+/// `SubagentTool::execute`'s match on `stop` falls through to a generic
+/// `"[the subagent produced no answer]"` result (`src/tools/subagent.rs`,
+/// below) — the parent model sees only that, never the specific error.
+/// The cause is not lost operationally: `run_llm_turn`
+/// (`src/serve/mod.rs`) logs it (`error!("Provider error: {e:#}")`)
+/// before calling `turn_error`, so it is visible there. Whether it
+/// should also reach the parent model is a separate design question,
+/// not settled by this wrapper.
 ///
 /// Every other method is forwarded completely unchanged: `origin()`,
 /// `approve()`, `acp_client()`, `client_fs_caps()`,
@@ -225,9 +232,10 @@ impl crate::serve::TurnHost for ParentHostSansTurnError {
         self.0.tool_end(id, name).await;
     }
 
-    /// Swallowed — see the type doc. The subagent's own tool result
-    /// still carries the failure to the model; nothing is lost, it just
-    /// does not also masquerade as *this* turn's terminal outcome.
+    /// Swallowed — see the type doc. Nothing is lost operationally (the
+    /// cause is logged before this would have fired); it just does not
+    /// also masquerade as *this* turn's terminal outcome, and — per the
+    /// type doc — it does not reach the parent model either.
     async fn turn_error(&self, _message: &str) {}
 
     fn origin(&self) -> crate::tools::policy::Origin {

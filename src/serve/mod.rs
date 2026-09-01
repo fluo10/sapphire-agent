@@ -2125,9 +2125,14 @@ impl TurnHost for NullProgress {
 pub(crate) enum TurnStop {
     /// The model produced its final message; `text` is `Some`.
     Replied,
-    /// A `Provider::chat` call failed. `TurnHost::turn_error` has
-    /// already been handed the message, so the cause is available to
-    /// whoever is reporting; `text` is `None`.
+    /// A `Provider::chat` call failed; `text` is `None`. `TurnHost::turn_error`
+    /// has already been handed the message, so the cause is available to
+    /// whoever is reporting — on every path except a subagent's nested
+    /// turn, where `SubagentTool::execute` runs it under
+    /// `ParentHostSansTurnError`, which deliberately swallows
+    /// `turn_error` (see that type's doc, `src/tools/subagent.rs`). On
+    /// that path the cause reaches only the log line right before this
+    /// is returned, not any `TurnHost`.
     ProviderError,
     /// [`MAX_TOOL_ROUNDS`] was reached with the model still calling tools.
     /// `text` is `None` — deliberately, because every caller that predates
