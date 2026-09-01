@@ -38,7 +38,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const MAX_TOOL_ROUNDS: usize = 10;
 
@@ -512,6 +512,61 @@ async fn digest_all_sessions(state: &Arc<ServeState>) {
     }
 }
 
+/// What `state.sessions` is holding, for the idle-eviction decision that
+/// has not been made yet.
+///
+/// `largest` is the point: a total cannot distinguish many accumulated
+/// sessions from one very long one, and only the first of those is fixed
+/// by dropping idle sessions.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SessionResidency {
+    pub sessions: usize,
+    pub messages: usize,
+    pub text_bytes: usize,
+    pub tool_result_bytes: usize,
+    /// `(session_id, bytes)` for the heaviest single session.
+    pub largest: Option<(String, usize)>,
+}
+
+impl ServeState {
+    pub(crate) async fn session_residency(&self) -> SessionResidency {
+        let sessions = self.sessions.lock().await;
+        let mut out = SessionResidency {
+            sessions: sessions.len(),
+            messages: 0,
+            text_bytes: 0,
+            tool_result_bytes: 0,
+            largest: None,
+        };
+        for (id, history) in sessions.iter() {
+            out.messages += history.len();
+            let mut this_session = 0usize;
+            for msg in history {
+                for part in &msg.parts {
+                    match part {
+                        ContentPart::Text(t) => {
+                            out.text_bytes += t.len();
+                            this_session += t.len();
+                        }
+                        ContentPart::ToolResult { content, .. } => {
+                            out.tool_result_bytes += content.len();
+                            this_session += content.len();
+                        }
+                        // Tool inputs and images are not what this
+                        // measurement is deciding about, and counting
+                        // them would blur the two numbers that matter.
+                        _ => {}
+                    }
+                }
+            }
+            if out.largest.as_ref().is_none_or(|(_, b)| this_session > *b) {
+                out.largest = Some((id.clone(), this_session));
+            }
+        }
+        out
+    }
+}
+
 /// Refresh the digest of every ACP session that has grown since it was
 /// last digested.
 ///
@@ -528,6 +583,24 @@ pub(crate) fn spawn_acp_digest_sweep(state: Arc<ServeState>) {
         let period = std::time::Duration::from_secs(1800);
         loop {
             tokio::time::sleep(period).await;
+
+            // Rides on this timer rather than adding one. Debug level:
+            // it is input for a design decision, not an operational
+            // signal anyone needs at info.
+            let r = state.session_residency().await;
+            debug!(
+                "session residency: {} session(s), {} message(s), {} B text, \
+                 {} B tool results; largest {}",
+                r.sessions,
+                r.messages,
+                r.text_bytes,
+                r.tool_result_bytes,
+                match &r.largest {
+                    Some((id, bytes)) => format!("{id} at {bytes} B"),
+                    None => "none".to_string(),
+                }
+            );
+
             // No cache to check freshness against and nowhere to write
             // a refreshed digest — skip this tick entirely rather than
             // failing. The unavailable cache was already logged once
@@ -3663,5 +3736,55 @@ mod tests {
             )),
             "the /rpc store must still hold no tool traffic"
         );
+    }
+
+    /// The measurement exists to distinguish "many sessions accumulate"
+    /// from "one session grows", because only the first is fixed by
+    /// dropping idle sessions. A total alone cannot tell them apart, so
+    /// the largest single session is reported too.
+    #[tokio::test]
+    async fn residency_separates_the_total_from_the_largest_session() {
+        let state = ServeState::for_test(true);
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.insert(
+                "small".to_string(),
+                vec![ChatMessage::user("hi")],
+            );
+            sessions.insert(
+                "big".to_string(),
+                vec![ChatMessage {
+                    role: Role::User,
+                    parts: vec![ContentPart::ToolResult {
+                        tool_use_id: "c1".to_string(),
+                        content: "x".repeat(5_000),
+                    }],
+                    input_kind: None,
+                    user_id: None,
+                }],
+            );
+        }
+
+        let r = state.session_residency().await;
+        assert_eq!(r.sessions, 2);
+        assert_eq!(r.messages, 2);
+        assert_eq!(r.text_bytes, 2, "only the 'hi'");
+        assert_eq!(r.tool_result_bytes, 5_000);
+        assert_eq!(
+            r.largest.as_ref().map(|(id, _)| id.as_str()),
+            Some("big"),
+            "the largest session is named so one long thread is \
+             distinguishable from many short ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn residency_of_an_empty_map_is_all_zero() {
+        let state = ServeState::for_test(true);
+        state.sessions.lock().await.clear();
+        let r = state.session_residency().await;
+        assert_eq!(r.sessions, 0);
+        assert_eq!(r.messages, 0);
+        assert_eq!(r.largest, None);
     }
 }
