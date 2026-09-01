@@ -82,7 +82,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -238,6 +238,20 @@ fn fs_caps_from(caps: &ClientCapabilities) -> (bool, bool) {
 /// `AcpProgress`.
 fn terminal_cap_from(caps: &ClientCapabilities) -> bool {
     caps.terminal
+}
+
+/// The working directory `AcpClientHandle::create_terminal` sends on
+/// the wire: the model's explicit `cwd` when it gave one, else the
+/// turn's session cwd. Pulled out for the same reason as
+/// `fs_caps_from`/`terminal_cap_from` above — this is a two-way branch
+/// picking between two paths, and inlined it is easy to get backwards
+/// (session cwd when the model *did* supply one) without a test able to
+/// tell the difference, since a real session's cwd usually differs from
+/// wherever the model happens to ask for anyway.
+fn effective_cwd(requested: Option<&str>, session_cwd: &Path) -> PathBuf {
+    requested
+        .map(PathBuf::from)
+        .unwrap_or_else(|| session_cwd.to_path_buf())
 }
 
 impl AcpProgress {
@@ -523,13 +537,9 @@ impl crate::tools::acp_client::AcpClient for AcpClientHandle {
         cwd: Option<&str>,
         output_byte_limit: Option<u64>,
     ) -> anyhow::Result<crate::tools::acp_client::TerminalHandle> {
-        // `cwd` is the model's explicit choice when given; absent that,
-        // the session's own cwd — never no cwd at all, since the
-        // session always has one.
-        let effective_cwd = cwd.map(PathBuf::from).unwrap_or_else(|| self.cwd.clone());
         let request = CreateTerminalRequest::new(self.session_id.clone(), command)
             .args(args.to_vec())
-            .cwd(Some(effective_cwd))
+            .cwd(Some(effective_cwd(cwd, &self.cwd)))
             .output_byte_limit(output_byte_limit);
         let response = self.connection.send_request(request).block_task().await?;
         Ok(crate::tools::acp_client::TerminalHandle(
@@ -3770,6 +3780,35 @@ mod tests {
         assert!(!terminal_cap_from(
             &ClientCapabilities::new().terminal(false)
         ));
+    }
+
+    /// `effective_cwd` picks between two genuinely different paths —
+    /// not two spellings of the same one — so an implementation that
+    /// swapped which side wins would fail loudly instead of passing by
+    /// coincidence.
+    #[test]
+    fn effective_cwd_prefers_the_requested_path_and_falls_back_to_the_session() {
+        let session_cwd = Path::new(if cfg!(windows) {
+            "C:\\session\\root"
+        } else {
+            "/session/root"
+        });
+        let requested = if cfg!(windows) {
+            "C:\\model\\chosen"
+        } else {
+            "/model/chosen"
+        };
+
+        assert_eq!(
+            effective_cwd(Some(requested), session_cwd),
+            PathBuf::from(requested),
+            "an explicit cwd from the model must win"
+        );
+        assert_eq!(
+            effective_cwd(None, session_cwd),
+            session_cwd.to_path_buf(),
+            "absent that, the session's cwd is the fallback"
+        );
     }
 
     // `initialize_records_the_clients_capabilities` — deliberately not
