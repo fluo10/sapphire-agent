@@ -17,25 +17,6 @@ fn expand_path(path_str: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path_str).as_ref())
 }
 
-/// Truncate output to at most 50 000 chars, keeping head + tail.
-fn truncate_output(s: &str) -> String {
-    const MAX: usize = 50_000;
-    const HEAD: usize = 20_000;
-    const TAIL: usize = 30_000;
-
-    if s.len() <= MAX {
-        return s.to_string();
-    }
-    let head_end = s.floor_char_boundary(HEAD);
-    let tail_start = s.floor_char_boundary(s.len() - TAIL);
-    format!(
-        "{}\n\n[... {} chars truncated ...]\n\n{}",
-        &s[..head_end],
-        s.len() - HEAD - TAIL,
-        &s[tail_start..]
-    )
-}
-
 // ---------------------------------------------------------------------------
 // file_read
 // ---------------------------------------------------------------------------
@@ -1044,8 +1025,8 @@ impl Tool for ShellTool {
 
         match result {
             Ok(Ok(output)) => {
-                let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
-                let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                 let exit_code = output.status.code().unwrap_or(-1);
 
                 if stderr.is_empty() {
