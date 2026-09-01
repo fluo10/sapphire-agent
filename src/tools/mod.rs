@@ -1,3 +1,4 @@
+pub mod acp_client;
 pub mod ambient_tools;
 pub mod builtin_tools;
 pub mod policy;
