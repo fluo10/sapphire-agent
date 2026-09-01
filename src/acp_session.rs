@@ -91,7 +91,17 @@ pub enum StoredPart {
     },
     ToolResultRef {
         tool_use_id: String,
-        sha256: String,
+        /// `None` means the result had nowhere to be stored — the cache
+        /// was unavailable when this line was written. Distinct from a
+        /// hash whose entry has since been evicted, but only in how it
+        /// arose: a reader treats both as "the pairing is here, the
+        /// content is not", and `load_part` produces the same
+        /// `MISSING_RESULT` for each.
+        ///
+        /// `Option<String>` also reads a bare string as `Some`, so a
+        /// line written before this field became optional still loads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
     },
     /// Anything the storage layer does not model — images, for now.
     /// Kept as a marker so the message is not silently emptied.
@@ -295,24 +305,28 @@ impl AcpSessionStore {
             ContentPart::ToolResult {
                 tool_use_id,
                 content,
-            } => match &self.cache {
-                Some(cache) => StoredPart::ToolResultRef {
+            } => {
+                // A cache miss on read degrades gracefully; a missing
+                // cache on write must not be allowed to degrade any
+                // further. Writing `Other` here would drop the
+                // `tool_use_id`, leaving a `tool_use` with no matching
+                // `tool_result` — which the API rejects outright, so the
+                // session would fail to load rather than load thinner.
+                let sha256 = match &self.cache {
+                    Some(cache) => Some(cache.put(content)?),
+                    None => {
+                        warn!(
+                            "Tool-result cache unavailable; recording '{tool_use_id}' \
+                             with no content"
+                        );
+                        None
+                    }
+                };
+                StoredPart::ToolResultRef {
                     tool_use_id: tool_use_id.clone(),
-                    sha256: cache.put(content)?,
-                },
-                // No cache to put the content in — record the same
-                // "vanished" marker a cache-hit miss would produce on
-                // reload, rather than failing the whole append. The
-                // `tool_use`/`tool_result` pairing the API validates
-                // still stays intact.
-                None => {
-                    warn!(
-                        "Tool-result cache unavailable; storing '{tool_use_id}' as an \
-                         unrecoverable marker"
-                    );
-                    StoredPart::Other
+                    sha256,
                 }
-            },
+            }
             // Images are not carried by this version. Recorded as a
             // marker rather than dropped, so a message that was only an
             // image does not read back as an empty one.
@@ -499,14 +513,13 @@ impl AcpSessionStore {
                 sha256,
             } => ContentPart::ToolResult {
                 tool_use_id: tool_use_id.clone(),
-                // A miss is expected, not exceptional: the cache lives
-                // outside the workspace and is not synced. No cache at
-                // all (failed to open at startup) is just a permanent
-                // miss for every hash.
-                content: self
-                    .cache
+                // Absent either way — no hash was ever written, or the
+                // hash's entry is gone. The model can call the tool
+                // again if it needs to; what it cannot recover from is
+                // an unpaired `tool_use`.
+                content: sha256
                     .as_ref()
-                    .and_then(|cache| cache.get(sha256))
+                    .and_then(|sha| self.cache.as_ref()?.get(sha))
                     .unwrap_or_else(|| MISSING_RESULT.to_string()),
             },
             StoredPart::Other => {
@@ -912,6 +925,74 @@ mod tests {
             "appending must not fail just because the cache is unavailable: {result:?}"
         );
         drop(dir);
+    }
+
+    /// The regression this task exists for. A tool result stored with no
+    /// cache must still read back as a `ToolResult` carrying its
+    /// `tool_use_id` — an unpaired `tool_use` is rejected by the API,
+    /// which is a broken session rather than a degraded one.
+    #[test]
+    fn a_result_stored_without_a_cache_keeps_its_pairing() {
+        let (_d, store) = store_without_cache();
+        store.create("s1", "default", "/p").unwrap();
+        store
+            .append_message("s1", &tool_result_message("c1", "content that cannot be cached"))
+            .unwrap();
+
+        let history = store.history("s1").expect("the session loads");
+        assert_eq!(
+            history[0].parts[0],
+            ContentPart::ToolResult {
+                tool_use_id: "c1".to_string(),
+                content: MISSING_RESULT.to_string(),
+            },
+            "the id survives even though the content never had anywhere to go"
+        );
+    }
+
+    /// The two ways a result can be absent — never cached, or cached and
+    /// later evicted — must read back identically. A reader has no
+    /// reason to tell them apart: both mean "the pairing is here, the
+    /// content is not".
+    #[test]
+    fn never_cached_and_evicted_read_back_the_same() {
+        let (dir_a, cached) = store();
+        cached.create("s1", "default", "/p").unwrap();
+        cached
+            .append_message("s1", &tool_result_message("c1", "gone later"))
+            .unwrap();
+        std::fs::remove_dir_all(dir_a.path().join("cache")).unwrap();
+        let evicted = cached.history("s1").unwrap();
+
+        let (_dir_b, uncached) = store_without_cache();
+        uncached.create("s1", "default", "/p").unwrap();
+        uncached
+            .append_message("s1", &tool_result_message("c1", "never stored"))
+            .unwrap();
+        let never = uncached.history("s1").unwrap();
+
+        assert_eq!(evicted[0].parts, never[0].parts);
+    }
+
+    /// A cache that is present still stores the hash, not the content.
+    #[test]
+    fn a_cached_result_still_records_its_hash() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store
+            .append_message("s1", &tool_result_message("c1", "the real output"))
+            .unwrap();
+
+        let raw = std::fs::read_to_string(store.path_for_test("s1")).unwrap();
+        assert!(!raw.contains("the real output"), "got {raw}");
+        assert!(raw.contains("tool_result_ref"), "got {raw}");
+        assert_eq!(
+            store.history("s1").unwrap()[0].parts[0],
+            ContentPart::ToolResult {
+                tool_use_id: "c1".to_string(),
+                content: "the real output".to_string(),
+            }
+        );
     }
 
     /// The listing is per namespace. Another namespace's sessions are
