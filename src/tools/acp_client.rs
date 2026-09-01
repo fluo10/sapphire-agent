@@ -22,6 +22,11 @@ use std::sync::Arc;
 /// parse or construct one except from what the client returned. The
 /// inner `String` is public only so tests (the fake client) can build
 /// one directly — a real handle is only ever the client's own value.
+// Nothing constructs one from live code yet — `FakeClient::create_terminal`
+// is the only constructor today, and it is itself unreachable until
+// Task 5's `ClientShell` calls `AcpClient::create_terminal`. Remove this
+// allow there.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalHandle(pub String);
 
@@ -31,12 +36,18 @@ impl std::fmt::Display for TerminalHandle {
     }
 }
 
+// Not constructed by any live call site until Task 5's `ClientShell` calls
+// `AcpClient::wait_for_terminal_exit`. Remove this allow there.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExitStatus {
     pub exit_code: Option<u32>,
     pub signal: Option<String>,
 }
 
+// Not constructed by any live call site until Task 5's `ClientShell` calls
+// `AcpClient::terminal_output`. Remove this allow there.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TerminalOutput {
     pub output: String,
@@ -54,6 +65,9 @@ pub struct TerminalOutput {
 /// those.
 #[async_trait::async_trait]
 pub trait AcpClient: Send + Sync {
+    // No call site until Task 4's `ClientFileRead` calls this. Remove this
+    // allow there.
+    #[allow(dead_code)]
     async fn read_text_file(
         &self,
         path: &str,
@@ -63,6 +77,9 @@ pub trait AcpClient: Send + Sync {
 
     async fn write_text_file(&self, path: &str, content: &str) -> anyhow::Result<()>;
 
+    // No call site until Task 5's `ClientShell` calls this. Remove this
+    // allow there.
+    #[allow(dead_code)]
     async fn create_terminal(
         &self,
         command: &str,
@@ -71,16 +88,22 @@ pub trait AcpClient: Send + Sync {
         output_byte_limit: Option<u64>,
     ) -> anyhow::Result<TerminalHandle>;
 
-    async fn terminal_output(&self, terminal: &TerminalHandle)
-    -> anyhow::Result<TerminalOutput>;
+    // No call site until Task 5's `ClientShell` calls this. Remove this
+    // allow there.
+    #[allow(dead_code)]
+    async fn terminal_output(&self, terminal: &TerminalHandle) -> anyhow::Result<TerminalOutput>;
 
-    async fn wait_for_terminal_exit(
-        &self,
-        terminal: &TerminalHandle,
-    ) -> anyhow::Result<ExitStatus>;
+    // No call site until Task 5's `ClientShell` calls this. Remove this
+    // allow there.
+    #[allow(dead_code)]
+    async fn wait_for_terminal_exit(&self, terminal: &TerminalHandle)
+    -> anyhow::Result<ExitStatus>;
 
     /// Ends the command but keeps the handle usable, so the output can
     /// still be collected afterwards.
+    // No call site until Task 6's `ClientShellKill` calls this. Remove
+    // this allow there.
+    #[allow(dead_code)]
     async fn kill_terminal(&self, terminal: &TerminalHandle) -> anyhow::Result<()>;
 
     /// Frees the handle — **and kills the command if it is still
@@ -89,6 +112,9 @@ pub trait AcpClient: Send + Sync {
     /// invalidates the `TerminalId` afterwards. Nothing may call this
     /// just because a connection went away — releasing on a dropped
     /// socket would kill a user's build over a network blip.
+    // No call site until Task 5's `ClientShell` releases on the happy
+    // path. Remove this allow there.
+    #[allow(dead_code)]
     async fn release_terminal(&self, terminal: &TerminalHandle) -> anyhow::Result<()>;
 }
 
@@ -114,7 +140,7 @@ pub fn current_acp_client() -> Option<Arc<dyn AcpClient>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
@@ -122,8 +148,16 @@ mod tests {
     /// from a script, so the tools can be driven without a socket.
     #[derive(Default)]
     pub(crate) struct FakeClient {
+        // Written by `read_text_file` but nothing reads it back until
+        // Task 4's tests assert on `fake.reads`. Remove this allow there.
+        #[allow(dead_code)]
         pub reads: Mutex<Vec<(String, Option<u32>, Option<u32>)>>,
         pub writes: Mutex<Vec<(String, String)>>,
+        // Set by Task 4's tests to script an error/answer from
+        // `read_text_file`; nothing reads it back today because nothing
+        // calls `read_text_file` yet. Remove this allow once Task 4
+        // lands.
+        #[allow(dead_code)]
         pub read_answer: Mutex<Option<Result<String, String>>>,
     }
 
@@ -164,10 +198,7 @@ mod tests {
         async fn terminal_output(&self, _t: &TerminalHandle) -> anyhow::Result<TerminalOutput> {
             Ok(TerminalOutput::default())
         }
-        async fn wait_for_terminal_exit(
-            &self,
-            _t: &TerminalHandle,
-        ) -> anyhow::Result<ExitStatus> {
+        async fn wait_for_terminal_exit(&self, _t: &TerminalHandle) -> anyhow::Result<ExitStatus> {
             Ok(ExitStatus::default())
         }
         async fn kill_terminal(&self, _t: &TerminalHandle) -> anyhow::Result<()> {
