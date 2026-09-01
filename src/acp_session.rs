@@ -503,22 +503,23 @@ impl AcpSessionStore {
         // the process died between the two appends, a sync landed only
         // half the pair. The write side already warns and moves on
         // rather than losing the turn; left uncorrected here, the gap
-        // it leaves is worse than a lost message, because the Anthropic
-        // API rejects the *whole* conversation on reload, not just the
-        // orphaned call — the session becomes permanently unloadable.
-        // Synthesise the missing half instead of dropping the `tool_use`:
+        // it leaves is worse than a lost message, because the API
+        // requires a `tool_result` to sit in the message *immediately
+        // following* its `tool_use` — not merely present somewhere
+        // later in the transcript. That is why the repair is spliced in
+        // right after the message that carries the orphan, rather than
+        // gathered into one message at the end: a trailing message is
+        // only correct while the orphan happens to be the last thing on
+        // record. Once a fresh turn chains a real message onto a
+        // not-yet-repaired orphan (the in-memory repair from a prior
+        // read is never written back), a later read would otherwise
+        // place the trailing repair after that unrelated message
+        // instead of between the two, and the session goes right back
+        // to unloadable. Synthesise rather than drop the `tool_use`:
         // dropping would erase the fact that the agent attempted the
         // call, and `MISSING_RESULT` is exactly the shape a cache miss
-        // already produces, so the model sees nothing it doesn't already
-        // know how to handle.
-        let tool_use_ids: Vec<String> = out
-            .iter()
-            .flat_map(|m| &m.parts)
-            .filter_map(|p| match p {
-                ContentPart::ToolUse { id, .. } => Some(id.clone()),
-                _ => None,
-            })
-            .collect();
+        // already produces, so the model sees nothing it doesn't
+        // already know how to handle.
         let answered: std::collections::HashSet<String> = out
             .iter()
             .flat_map(|m| &m.parts)
@@ -527,24 +528,33 @@ impl AcpSessionStore {
                 _ => None,
             })
             .collect();
-        let orphan_results: Vec<ContentPart> = tool_use_ids
-            .into_iter()
-            .filter(|id| !answered.contains(id))
-            .map(|tool_use_id| ContentPart::ToolResult {
-                tool_use_id,
-                content: MISSING_RESULT.to_string(),
-            })
-            .collect();
-        if !orphan_results.is_empty() {
-            out.push(ChatMessage {
-                role: Role::User,
-                parts: orphan_results,
-                input_kind: None,
-                user_id: None,
-            });
+        let mut repaired = Vec::with_capacity(out.len());
+        for message in out {
+            let orphan_results: Vec<ContentPart> = message
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::ToolUse { id, .. } if !answered.contains(id) => {
+                        Some(ContentPart::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: MISSING_RESULT.to_string(),
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            repaired.push(message);
+            if !orphan_results.is_empty() {
+                repaired.push(ChatMessage {
+                    role: Role::User,
+                    parts: orphan_results,
+                    input_kind: None,
+                    user_id: None,
+                });
+            }
         }
 
-        Some(out)
+        Some(repaired)
     }
 
     fn load_part(&self, part: &StoredPart) -> ContentPart {
@@ -1347,6 +1357,176 @@ mod tests {
             }],
             "the unanswered tool_use gets a placeholder result so the \
              pairing holds on reload"
+        );
+    }
+
+    /// The case that exposed the trailing-message version as wrong: the
+    /// API requires a `tool_result` to sit in the message *immediately
+    /// following* its `tool_use`, not merely somewhere later in the
+    /// transcript. If a real message chains onto a not-yet-repaired
+    /// orphan — a later turn continues the conversation without ever
+    /// writing the read-side repair back to disk — a trailing repair
+    /// would land after that unrelated message instead of between the
+    /// two, leaving the session unloadable all over again on the next
+    /// fresh read.
+    #[test]
+    fn a_repair_lands_right_after_its_orphan_even_when_later_messages_follow() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+
+        // Hand-write the `tool_use` as the session's very first event.
+        // No `append_message` call has happened yet, so the store's
+        // `tips` cache holds nothing for this session — the next append
+        // falls back to reading the file for the tip, exactly as a
+        // real writer resuming after a crash would, and correctly
+        // chains onto this hand-written event.
+        let path = store.path_for_test("s1");
+        let orphan_id = Uuid::now_v7();
+        let orphan_use = serde_json::json!({
+            "kind": "message",
+            "id": orphan_id,
+            "parent": null,
+            "at": Utc::now(),
+            "role": "assistant",
+            "parts": [{"tool_use": {"id": "call-1", "name": "risky", "input": {}}}],
+        });
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{orphan_use}").unwrap();
+        drop(f);
+
+        // A later turn carries the conversation on, on disk, without
+        // the orphan ever having been repaired in place.
+        store
+            .append_message("s1", &ChatMessage::user("continue"))
+            .unwrap();
+        store
+            .append_message("s1", &ChatMessage::assistant("ok"))
+            .unwrap();
+
+        let history = store.history("s1").expect("the session still loads");
+        assert_eq!(
+            history.len(),
+            4,
+            "orphan, repair, then the two later messages: {history:?}"
+        );
+        assert!(
+            matches!(&history[0].parts[..], [ContentPart::ToolUse { id, .. }] if id == "call-1"),
+            "message 0 is the orphaned tool_use: {history:?}"
+        );
+        assert_eq!(
+            history[1].parts,
+            vec![ContentPart::ToolResult {
+                tool_use_id: "call-1".to_string(),
+                content: MISSING_RESULT.to_string(),
+            }],
+            "the repair must be message 1, immediately after the orphan \
+             and before the later real messages: {history:?}"
+        );
+        assert!(
+            matches!(&history[2].parts[..], [ContentPart::Text(t)] if t == "continue"),
+            "the later real message must follow the repair, not precede it: {history:?}"
+        );
+        assert!(
+            matches!(&history[3].parts[..], [ContentPart::Text(t)] if t == "ok"),
+            "got {history:?}"
+        );
+    }
+
+    /// Two separate orphaned `tool_use`s, far apart in the conversation,
+    /// each get their own repair spliced in right after themselves —
+    /// not merged into one message anywhere.
+    #[test]
+    fn two_far_apart_orphans_each_get_their_own_repair_in_position() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        let path = store.path_for_test("s1");
+
+        let write_line = |parent: Option<Uuid>, id: Uuid, role: &str, parts: serde_json::Value| {
+            let line = serde_json::json!({
+                "kind": "message",
+                "id": id,
+                "parent": parent,
+                "at": Utc::now(),
+                "role": role,
+                "parts": parts,
+            });
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            use std::io::Write as _;
+            writeln!(f, "{line}").unwrap();
+        };
+
+        let e1 = Uuid::now_v7();
+        write_line(None, e1, "user", serde_json::json!([{"text": "start"}]));
+        let e2 = Uuid::now_v7();
+        write_line(
+            Some(e1),
+            e2,
+            "assistant",
+            serde_json::json!([{"tool_use": {"id": "call-a", "name": "risky", "input": {}}}]),
+        );
+        let e3 = Uuid::now_v7();
+        write_line(
+            Some(e2),
+            e3,
+            "user",
+            serde_json::json!([{"text": "middle"}]),
+        );
+        let e4 = Uuid::now_v7();
+        write_line(
+            Some(e3),
+            e4,
+            "assistant",
+            serde_json::json!([{"tool_use": {"id": "call-b", "name": "risky", "input": {}}}]),
+        );
+        write_line(
+            Some(e4),
+            Uuid::now_v7(),
+            "user",
+            serde_json::json!([{"text": "end"}]),
+        );
+
+        let history = store.history("s1").expect("the session still loads");
+        let shapes: Vec<String> = history
+            .iter()
+            .map(|m| match &m.parts[..] {
+                [ContentPart::Text(t)] => format!("text:{t}"),
+                [ContentPart::ToolUse { id, .. }] => format!("tool_use:{id}"),
+                [
+                    ContentPart::ToolResult {
+                        tool_use_id,
+                        content,
+                    },
+                ] => format!(
+                    "tool_result:{tool_use_id}:{}",
+                    if content == MISSING_RESULT {
+                        "missing"
+                    } else {
+                        "other"
+                    }
+                ),
+                other => format!("unexpected:{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                "text:start".to_string(),
+                "tool_use:call-a".to_string(),
+                "tool_result:call-a:missing".to_string(),
+                "text:middle".to_string(),
+                "tool_use:call-b".to_string(),
+                "tool_result:call-b:missing".to_string(),
+                "text:end".to_string(),
+            ],
+            "each orphan's repair must sit right after its own tool_use, \
+             not gathered together or moved to the end: {shapes:?}"
         );
     }
 
