@@ -1007,7 +1007,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Enumerate `<base_dir>/<namespace>/<kind>/*.jsonl` across every namespace
 /// directory. Returns an empty Vec when `base_dir` doesn't exist yet (fresh
 /// install) or has no namespace subdirs. Each returned path is absolute.
-fn collect_session_files(base_dir: &Path, kind: &str) -> Vec<PathBuf> {
+pub(crate) fn collect_session_files(base_dir: &Path, kind: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(base_dir) else {
         return out;
@@ -1039,7 +1039,7 @@ fn collect_session_files(base_dir: &Path, kind: &str) -> Vec<PathBuf> {
 /// with a given `boundary_hour`.
 ///
 /// Window: `[date @ boundary_hour:00:00 local, (date+1day) @ boundary_hour:00:00 local)`
-fn day_window(date: NaiveDate, boundary_hour: u8) -> (DateTime<Utc>, DateTime<Utc>) {
+pub(crate) fn day_window(date: NaiveDate, boundary_hour: u8) -> (DateTime<Utc>, DateTime<Utc>) {
     let start_local = date
         .and_hms_opt(boundary_hour as u32, 0, 0)
         .expect("valid time");

@@ -15,16 +15,19 @@
 //! transport expects, so [`lines_transport`] adapts the socket without
 //! reframing anything.
 //!
-//! `initialize`, `session/new`, `session/prompt` and `session/cancel` are
-//! answered here.
+//! `initialize`, `session/new`, `session/prompt`, `session/cancel`,
+//! `session/list`, `session/load`, `session/resume` and `session/set_mode`
+//! are answered here.
 //!
 //! A prompt is not implemented here beyond its ACP shape: it extracts the
 //! text, hands the turn to [`super::run_llm_turn`] — the same executor
 //! behind `/rpc`, voice and A2A — and translates that turn's progress back
 //! into `session/update` notifications. There is deliberately no second
-//! tool loop, history handling or persistence on this path, so an editor's
-//! conversation lands in the same session store, under the same memory
-//! namespace and system prompt, as every other transport's.
+//! tool loop or history handling on this path. Persistence, though,
+//! lands in `acp_session_store`, ACP's own store — separate from every
+//! other transport's `SessionStore` (see `acp_session.rs`'s module doc
+//! for why) — while still writing under the same memory namespace and
+//! system prompt as every other transport's.
 //!
 //! A turn does *not* run in the handler that received it. The SDK's request
 //! callbacks hold its dispatch loop, which parses no further frame on the
@@ -58,11 +61,14 @@ use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, CurrentModeUpdate, Error,
-    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionId, SessionMode as AcpSessionMode, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
+    ResumeSessionResponse, SessionCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
+    SessionResumeCapabilities, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
+    StopReason, TextContent, ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields,
 };
 use agent_client_protocol::{
@@ -97,6 +103,16 @@ struct AcpSession {
     /// exists, or otherwise treat it as a local path. It is recorded now
     /// because a later phase needs it as the default working directory for
     /// client-side terminals (`terminal/create`); until then it is inert.
+    ///
+    /// Recorded straight from `req.cwd` on both `session/new` and
+    /// `session/load`/`session/resume` — which does NOT feed it back into
+    /// the store: `AcpSessionStore::create` only writes a session's cwd
+    /// once, at creation, so a loaded session's recorded cwd here cannot
+    /// be used to update the stored one, and no code should try.
+    ///
+    /// Still nothing reads this field back out of the struct (a future
+    /// `terminal/create` handler is the intended reader, per the module
+    /// doc), so the attribute stays until that lands.
     #[allow(dead_code)]
     cwd: PathBuf,
     /// Cancellation tokens for the turns *currently in flight* on this
@@ -503,6 +519,114 @@ where
     )
 }
 
+/// The mode list every session starts with.
+///
+/// A loaded session starts in `default` like a new one: the mode is a
+/// statement about how the editor wants the agent to behave right now,
+/// not a property of the conversation, so it is not persisted.
+fn mode_state() -> SessionModeState {
+    SessionModeState::new(
+        crate::tools::policy::SessionMode::Default.id(),
+        crate::tools::policy::SessionMode::ALL
+            .into_iter()
+            .map(|m| AcpSessionMode::new(m.id(), m.name()).description(m.description()))
+            .collect(),
+    )
+}
+
+/// Count this connection as holding `id`, warning when another
+/// connection already does.
+///
+/// Shared by `adopt_session` (`session/load`, `session/resume`) and
+/// `session/new` — every path that hands a connection a session must
+/// count it, since the decrement in `serve_connection` walks every
+/// session a connection's map holds and expects each to have been
+/// counted on the way in.
+async fn count_session_open(state: &Arc<ServeState>, id: &str) {
+    let mut open = state.open_acp_sessions.lock().await;
+    let count = open.entry(id.to_string()).or_insert(0);
+    *count += 1;
+    if *count > 1 {
+        warn!(
+            "ACP: session {id} is now open on {count} connections. Concurrent prompts on \
+             one session are not history-safe: run_llm_turn clones the history at the top \
+             and writes it back whole, so the last turn to finish wins in memory while both \
+             have already appended to the transcript."
+        );
+    }
+}
+
+/// Validate an existing session id and adopt it onto this connection.
+///
+/// Shared by `session/load` and `session/resume`, which differ only in
+/// whether they replay afterwards. `Err` carries the refusal to answer
+/// with — one wording for both "no such session" and "not yours", so
+/// the pair cannot be used to enumerate ids.
+async fn adopt_session(
+    state: &Arc<ServeState>,
+    sessions: &Arc<AcpSessions>,
+    profile_name: &str,
+    session_id: &SessionId,
+    cwd: PathBuf,
+) -> Result<String, Error> {
+    let id = session_id.to_string();
+    let namespace = state
+        .config
+        .namespace_for_room_profile(profile_name)
+        .to_string();
+    let refuse = || Error::invalid_params().data("no such session is available on this connection");
+
+    let Some(summary) = state.acp_session_store.summary(&id) else {
+        return Err(refuse());
+    };
+    if summary.header.namespace != namespace {
+        warn!(
+            "ACP: refused adopting {id}: it belongs to namespace {}, not {namespace}",
+            summary.header.namespace
+        );
+        return Err(refuse());
+    }
+    if summary.is_closed {
+        // Symmetric with `session/list`, which excludes closed sessions:
+        // an archived conversation must be unreachable by id the same way
+        // it is unlisted, not just invisible in the picker. Same refusal
+        // as the other two cases, so the trio stays indistinguishable.
+        return Err(refuse());
+    }
+
+    state
+        .session_room_profiles
+        .lock()
+        .await
+        .insert(id.clone(), profile_name.to_string());
+    state.acp_sessions.lock().await.insert(id.clone());
+    let already_held = sessions
+        .inner
+        .lock()
+        .await
+        .insert(
+            session_id.clone(),
+            AcpSession {
+                agent_session_id: id.clone(),
+                cwd,
+                turns: HashMap::new(),
+                mode: crate::tools::policy::SessionMode::Default,
+            },
+        )
+        .is_some();
+    if !already_held {
+        // Count holders, not adoptions. Re-adopting a session this
+        // connection already has — a `load` then a `resume`, or a
+        // client retry over the same socket — replaces the map entry
+        // rather than adding one, and teardown subtracts one per entry.
+        // Incrementing anyway would leave a phantom holder behind after
+        // every real one had gone, and the next connection to open the
+        // session would be warned about a peer that no longer exists.
+        count_session_open(state, &id).await;
+    }
+    Ok(id)
+}
+
 /// Drive one ACP connection until the peer goes away.
 async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_name: String) {
     let sessions = Arc::new(AcpSessions::default());
@@ -546,13 +670,19 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     ProtocolVersion::V1
                 };
 
-                // `loadSession` is false because `session/load` is not
-                // implemented. `authMethods` is empty because the bearer token
-                // checked above already authenticated the peer, so ACP never
-                // sees an unauthenticated client.
+                // `authMethods` is empty because the bearer token checked
+                // above already authenticated the peer, so ACP never sees
+                // an unauthenticated client.
                 responder.respond(
-                    InitializeResponse::new(version)
-                        .agent_capabilities(AgentCapabilities::new().load_session(false)),
+                    InitializeResponse::new(version).agent_capabilities(
+                        AgentCapabilities::new()
+                            .load_session(true)
+                            .session_capabilities(
+                                SessionCapabilities::new()
+                                    .list(SessionListCapabilities::new())
+                                    .resume(SessionResumeCapabilities::new()),
+                            ),
+                    ),
                 )
             },
             on_receive_request!(),
@@ -598,7 +728,37 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         .await
                         .insert(agent_session_id.clone(), profile_name.clone());
 
+                    // Write the session's header now, rather than leaving
+                    // the cwd to wait for a first turn: `AcpSessionStore`
+                    // has no lazy-create path the way the old `/rpc` store
+                    // did (`append_*` requires the file to already exist),
+                    // so this is what makes the session appendable at all.
+                    // Registering it in `acp_sessions` is what makes
+                    // `run_llm_turn` route this session's history and
+                    // messages through that store instead of `/rpc`'s.
+                    let namespace = state
+                        .config
+                        .namespace_for_room_profile(&profile_name)
+                        .to_string();
+                    let cwd_string = req.cwd.to_string_lossy().to_string();
+                    if let Err(e) =
+                        state
+                            .acp_session_store
+                            .create(&agent_session_id, &namespace, &cwd_string)
+                    {
+                        warn!(
+                            "ACP: failed to create the session store entry for {agent_session_id}: {e}"
+                        );
+                        return responder.respond_with_internal_error(e.to_string());
+                    }
+                    state
+                        .acp_sessions
+                        .lock()
+                        .await
+                        .insert(agent_session_id.clone());
+
                     let session_id = SessionId::new(agent_session_id.clone());
+                    count_session_open(&state, &agent_session_id).await;
                     sessions.inner.lock().await.insert(
                         session_id.clone(),
                         AcpSession {
@@ -615,17 +775,153 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     // the one that asks. `NewSessionResponse.modes` is a
                     // plain `Option` in the schema, with no capability
                     // gating it, so `initialize` needs no change.
-                    let modes = SessionModeState::new(
-                        crate::tools::policy::SessionMode::Default.id(),
-                        crate::tools::policy::SessionMode::ALL
-                            .into_iter()
-                            .map(|m| {
-                                AcpSessionMode::new(m.id(), m.name()).description(m.description())
-                            })
-                            .collect(),
-                    );
+                    responder.respond(NewSessionResponse::new(session_id).modes(mode_state()))
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                let profile_name = profile_name.clone();
+                async move |req: ListSessionsRequest, responder, _connection| {
+                    let namespace = state
+                        .config
+                        .namespace_for_room_profile(&profile_name)
+                        .to_string();
+                    let store = Arc::clone(&state.acp_session_store);
+                    let wanted_cwd = req.cwd.as_ref().map(|c| c.to_string_lossy().to_string());
 
-                    responder.respond(NewSessionResponse::new(session_id).modes(modes))
+                    let sessions: Vec<SessionInfo> = store
+                        .list_summaries(&namespace)
+                        .into_iter()
+                        // An editor opens a thread on every panel open, so
+                        // most sessions are created and never typed into —
+                        // those are not conversations to show.
+                        .filter(|summary| summary.has_messages)
+                        // A closed session is archived, not current.
+                        .filter(|summary| !summary.is_closed)
+                        .filter(|summary| {
+                            // `list_summaries` already scopes by namespace
+                            // directory, but the boundary is checked here
+                            // too on purpose: it is what `session/load`
+                            // also enforces, and the redundancy is
+                            // deliberate defense in depth rather than an
+                            // oversight.
+                            summary.header.namespace == namespace
+                        })
+                        .filter(|summary| match &wanted_cwd {
+                            Some(wanted) => &summary.header.cwd == wanted,
+                            None => true,
+                        })
+                        .map(|summary| {
+                            let updated_at = store
+                                .absolute_path_for(&summary.header.session_id)
+                                .and_then(|path| std::fs::metadata(&path).and_then(|m| m.modified()).ok())
+                                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+                            let mut info = SessionInfo::new(
+                                SessionId::new(summary.header.session_id.clone()),
+                                PathBuf::from(&summary.header.cwd),
+                            );
+                            info = info.title(summary.title.clone());
+                            info = info.updated_at(updated_at);
+                            info
+                        })
+                        .collect();
+
+                    // No pagination: the whole list, every time. A
+                    // cursor earns its keep when a namespace holds
+                    // thousands of sessions, and none does yet.
+                    responder.respond(ListSessionsResponse::new(sessions))
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let sessions = Arc::clone(&sessions);
+                let state = Arc::clone(&state);
+                let profile_name = profile_name.clone();
+                async move |req: LoadSessionRequest, responder, connection: ConnectionTo<Client>| {
+                    // Validation and adoption are shared with
+                    // `session/resume` — see `adopt_session`. `load`'s
+                    // own job starts after that: replaying the history
+                    // the resumed session already has.
+                    let id = match adopt_session(
+                        &state,
+                        &sessions,
+                        &profile_name,
+                        &req.session_id,
+                        req.cwd.clone(),
+                    )
+                    .await
+                    {
+                        Ok(id) => id,
+                        Err(e) => return responder.respond_with_error(e),
+                    };
+                    let store = Arc::clone(&state.acp_session_store);
+
+                    // Replay BEFORE answering: the ACP specification
+                    // orders it that way, and a client that got the
+                    // reply first would render an empty thread and then
+                    // watch messages appear underneath it.
+                    for message in store.history(&id).unwrap_or_default() {
+                        let text: String = message
+                            .parts
+                            .iter()
+                            .filter_map(|part| match part {
+                                crate::provider::ContentPart::Text(t) => Some(t.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+                        let update = match message.role {
+                            crate::provider::Role::User => SessionUpdate::UserMessageChunk(chunk),
+                            crate::provider::Role::Assistant => {
+                                SessionUpdate::AgentMessageChunk(chunk)
+                            }
+                        };
+                        if let Err(e) = connection.send_notification(SessionNotification::new(
+                            req.session_id.clone(),
+                            update,
+                        )) {
+                            warn!("ACP: dropped a replay update for {id}: {e}");
+                        }
+                    }
+
+                    responder.respond(LoadSessionResponse::new().modes(mode_state()))
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let sessions = Arc::clone(&sessions);
+                let state = Arc::clone(&state);
+                let profile_name = profile_name.clone();
+                async move |req: ResumeSessionRequest, responder, _connection| {
+                    // Same adoption as `load`, no replay. The ACP
+                    // specification frames `resume` as the fallback for
+                    // agents that cannot load at all; offered here so a
+                    // client can skip redrawing a long conversation.
+                    match adopt_session(
+                        &state,
+                        &sessions,
+                        &profile_name,
+                        &req.session_id,
+                        req.cwd.clone(),
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            responder.respond(ResumeSessionResponse::new().modes(mode_state()))
+                        }
+                        Err(e) => responder.respond_with_error(e),
+                    }
                 }
             },
             on_receive_request!(),
@@ -779,10 +1075,11 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                         .join("\n");
 
                     // Everything past this point belongs to `run_llm_turn`:
-                    // history, the tool loop, persistence and the memory
-                    // namespace all come from the shared executor, so an
-                    // editor's conversation lands in the same session store,
-                    // with the same system prompt, as `/rpc` and A2A.
+                    // history, the tool loop and the memory namespace all
+                    // come from the shared executor. Persistence still
+                    // routes to ACP's own `acp_session_store`, separate
+                    // from `/rpc` and A2A's `SessionStore` — but under the
+                    // same memory namespace and system prompt as either.
                     let session_id = req.session_id.clone();
                     let progress = Arc::new(AcpProgress::new(
                         session_id.clone(),
@@ -945,6 +1242,29 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
         )
         .connect_to(lines_transport(socket, connection_cancel.clone()))
         .await;
+
+    // Release every session this connection held. Missing this would turn
+    // `open_acp_sessions` into a leak that warns forever: the next
+    // connection to load the same session would find a stale count already
+    // above one and warn about a collision that no longer exists.
+    {
+        let held: Vec<String> = sessions
+            .inner
+            .lock()
+            .await
+            .values()
+            .map(|s| s.agent_session_id.clone())
+            .collect();
+        let mut open = state.open_acp_sessions.lock().await;
+        for id in held {
+            if let Some(count) = open.get_mut(&id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    open.remove(&id);
+                }
+            }
+        }
+    }
 
     // Belt and braces, and known to be so. By the time this runs the socket
     // has gone, so `cancel_when_exhausted` has already fired the token, and
@@ -1123,7 +1443,7 @@ mod tests {
         assert_eq!(resp["id"], 0);
         let result = &resp["result"];
         assert_eq!(result["protocolVersion"], 1);
-        assert_eq!(result["agentCapabilities"]["loadSession"], false);
+        assert_eq!(result["agentCapabilities"]["loadSession"], true);
         assert_eq!(
             result["authMethods"],
             serde_json::json!([]),
@@ -1350,8 +1670,9 @@ mod tests {
     /// `result.stopReason` or `error`).
     ///
     /// The session id is returned rather than discarded so callers can
-    /// assert against *that* session in the shared store, instead of
-    /// against whatever session happens to be the only one there.
+    /// assert against *that* session — most now in `acp_session_store`,
+    /// ACP's own store — instead of against whatever session happens to
+    /// be the only one there.
     ///
     /// `conversation` cannot be used here: it filters frames down to one
     /// request id and would drop exactly the notifications under test,
@@ -1483,11 +1804,14 @@ mod tests {
         assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
     }
 
-    /// A prompt turn must land in the same session store as every other
-    /// transport: `session/prompt` delegates to `run_llm_turn`, so the
-    /// user message and the reply are in the session's history afterwards.
+    /// A prompt turn's history reaches `run_llm_turn`'s in-memory
+    /// `state.sessions` map, keyed by the exact session id the agent
+    /// handed back in `session/new`'s reply: `session/prompt` delegates
+    /// to `run_llm_turn`, so the user message and the reply are in
+    /// `state.sessions` afterwards, not lost or filed under a different
+    /// id.
     #[tokio::test]
-    async fn prompt_history_lands_in_the_shared_session_store() {
+    async fn a_prompt_turns_history_lands_under_its_own_session_id() {
         let state = ServeState::for_test_scripted(
             true,
             vec![crate::provider::ChatResponse {
@@ -1515,6 +1839,32 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["hi", "hello from the agent"], "got {texts:?}");
+    }
+
+    /// `session/new` writes the session's header — `cwd` included —
+    /// eagerly, before any turn runs: `AcpSessionStore` has no
+    /// lazy-create path, so this is what makes the session appendable
+    /// at all. `session/list` will have nothing else to filter a
+    /// project by, so if this regresses the listing is always empty.
+    #[tokio::test]
+    async fn a_new_sessions_cwd_reaches_the_store() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![crate::provider::ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let store = Arc::clone(&state.acp_session_store);
+        let addr = spawn(state).await;
+
+        let (session_id, _updates, _reply) = drive(&addr, text_prompt("hi")).await;
+
+        let summary = store
+            .summary(&session_id)
+            .expect("session/new persisted the session's header");
+        assert_eq!(summary.header.cwd, test_cwd());
     }
 
     /// Zed sends every `@file` mention as a `resource_link` block, which
@@ -2342,6 +2692,798 @@ mod tests {
         assert_eq!(
             asked, 1,
             "accept_edits must still ask about an Execute tool"
+        );
+    }
+
+    fn list_request(id: i64, cwd: Option<&str>) -> serde_json::Value {
+        let params = match cwd {
+            Some(cwd) => serde_json::json!({ "cwd": cwd }),
+            None => serde_json::json!({}),
+        };
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "session/list", "params": params
+        })
+    }
+
+    /// `initialize` then an unfiltered `session/list` on a fresh
+    /// connection, returning just the session ids in the reply's order.
+    async fn list_session_ids(addr: &str) -> Vec<String> {
+        let replies = conversation(addr, vec![initialize_request(0), list_request(1, None)]).await;
+        replies[1]["result"]["sessions"]
+            .as_array()
+            .expect("sessions is an array")
+            .iter()
+            .map(|s| s["sessionId"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The listing shows ACP sessions and nothing else. An editor's
+    /// thread list must not contain the user's Matrix/`/rpc` conversations
+    /// — that mixing is what this whole branch exists to undo. Unlike the
+    /// other `list_*` tests below, this one puts a real entry in
+    /// `cross_device_session_store` and asserts it does NOT leak through,
+    /// so an edit that made `session/list` read the shared store again
+    /// (instead of `acp_session_store`) would fail it even though every
+    /// other list test only ever populates the ACP store.
+    #[tokio::test]
+    async fn the_listing_shows_only_acp_sessions() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+
+        state
+            .acp_session_store
+            .create("acp-1", &ours, "/work")
+            .unwrap();
+        state
+            .acp_session_store
+            .append_message("acp-1", &crate::provider::ChatMessage::user("hi"))
+            .unwrap();
+
+        // A conversation from the shared store, which must not appear.
+        state
+            .cross_device_session_store
+            .ensure_session("rpc-1", &("rpc-1".to_string(), None), "rpc", None, &ours)
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let ids = list_session_ids(&addr).await;
+        assert_eq!(ids, vec!["acp-1".to_string()], "got {ids:?}");
+    }
+
+    /// A thread the editor opened and never typed into is not a
+    /// conversation. Zed calls `session/new` on every panel open, so
+    /// listing those would bury the real ones.
+    #[tokio::test]
+    async fn an_empty_session_is_not_listed() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        state
+            .acp_session_store
+            .create("never-used", &ours, "/work")
+            .unwrap();
+
+        let addr = spawn(state).await;
+        assert!(
+            list_session_ids(&addr).await.is_empty(),
+            "an unprompted session must not be listed"
+        );
+    }
+
+    /// The boundary. A token pinned to one room profile must not see
+    /// another profile's conversations.
+    #[tokio::test]
+    async fn list_only_returns_this_namespaces_sessions() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.acp_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+
+        store.create("mine", &ours, "/p").unwrap();
+        store
+            .append_message("mine", &crate::provider::ChatMessage::user("hi"))
+            .unwrap();
+        store.create("theirs", "someone-else", "/p").unwrap();
+        store
+            .append_message("theirs", &crate::provider::ChatMessage::user("hi"))
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(&addr, vec![initialize_request(0), list_request(1, None)]).await;
+
+        let ids: Vec<&str> = replies[1]["result"]["sessions"]
+            .as_array()
+            .expect("sessions is an array")
+            .iter()
+            .map(|s| s["sessionId"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"mine"), "got {ids:?}");
+        assert!(
+            !ids.contains(&"theirs"),
+            "another namespace leaked into the list: {ids:?}"
+        );
+        assert_eq!(replies[1]["result"]["nextCursor"], serde_json::Value::Null);
+    }
+
+    /// A header line that fails to parse cannot say whose it is — the same
+    /// property `main`'s `SessionStore` protects with an optional
+    /// `namespace`, but `AcpSessionStore`'s `SessionHeader.namespace` is a
+    /// required field, so the equivalent of "written before namespace
+    /// existed" is a header the type cannot even deserialize. An unknown
+    /// owner is not the same as "mine", so it is not listed either way.
+    #[tokio::test]
+    async fn list_omits_sessions_with_an_unparseable_header() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.acp_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        store.create("mine", &ours, "/p").unwrap();
+        store
+            .append_message("mine", &crate::provider::ChatMessage::user("hi"))
+            .unwrap();
+
+        // Hand-written: a "header" line missing the `namespace` field
+        // `SessionHeader` requires, so it fails to deserialize.
+        let dir = store
+            .absolute_path_for("mine")
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::write(
+            dir.join("broken.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "kind": "header",
+                    "session_id": "broken",
+                    "cwd": "/p",
+                    "created_at": "2020-01-01T00:00:00Z"
+                })
+            ),
+        )
+        .unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(&addr, vec![initialize_request(0), list_request(1, None)]).await;
+
+        let ids: Vec<&str> = replies[1]["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["sessionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["mine"],
+            "an unparseable header must not leak into the list: {ids:?}"
+        );
+    }
+
+    /// A closed session is archived, not current. Listing it would offer
+    /// the user a thread the agent has already summarised and moved on
+    /// from.
+    #[tokio::test]
+    async fn list_omits_closed_sessions() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.acp_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+
+        store.create("open", &ours, "/p").unwrap();
+        store
+            .append_message("open", &crate::provider::ChatMessage::user("hi"))
+            .unwrap();
+        store.create("closed", &ours, "/p").unwrap();
+        store
+            .append_message("closed", &crate::provider::ChatMessage::user("hi"))
+            .unwrap();
+        store.close("closed").unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(&addr, vec![initialize_request(0), list_request(1, None)]).await;
+
+        let ids: Vec<&str> = replies[1]["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["sessionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["open"], "got {ids:?}");
+    }
+
+    /// The editor filters by project: an exact match against the recorded
+    /// `cwd`. `AcpSessionStore`'s `cwd` is a required field — every ACP
+    /// session reports one at `session/new` — so unlike the old shared
+    /// store there is no "no cwd" case left to test here.
+    #[tokio::test]
+    async fn list_honours_the_cwd_filter() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.acp_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+
+        store.create("here", &ours, "/projects/here").unwrap();
+        store
+            .append_message("here", &crate::provider::ChatMessage::user("hi"))
+            .unwrap();
+        store
+            .create("elsewhere", &ours, "/projects/elsewhere")
+            .unwrap();
+        store
+            .append_message("elsewhere", &crate::provider::ChatMessage::user("hi"))
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(
+            &addr,
+            vec![
+                initialize_request(0),
+                list_request(1, Some("/projects/here")),
+                list_request(2, None),
+            ],
+        )
+        .await;
+
+        let ids = |r: &serde_json::Value| -> Vec<String> {
+            r["result"]["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["sessionId"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        assert_eq!(
+            ids(&replies[1]),
+            vec!["here".to_string()],
+            "filtered by cwd"
+        );
+        let all = ids(&replies[2]);
+        assert!(all.contains(&"here".to_string()), "got {all:?}");
+        assert!(all.contains(&"elsewhere".to_string()), "got {all:?}");
+        assert_eq!(all.len(), 2, "unfiltered must include both, got {all:?}");
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_listing() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let addr = spawn(state).await;
+        let reply = roundtrip(&addr, initialize_request(0)).await;
+        assert!(
+            !reply["result"]["agentCapabilities"]["sessionCapabilities"]["list"].is_null(),
+            "got {reply}"
+        );
+    }
+
+    fn load_request(id: i64, session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "session/load",
+            "params": { "sessionId": session_id, "cwd": test_cwd(), "mcpServers": [] }
+        })
+    }
+
+    /// Loading replays the conversation as session/update notifications,
+    /// and does so BEFORE answering — a client that got the reply first
+    /// would render an empty thread and then have messages appear under
+    /// it.
+    #[tokio::test]
+    async fn load_replays_the_conversation_before_replying() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.acp_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = "sess-replay".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
+        store
+            .append_message(&sid, &crate::provider::ChatMessage::user("first"))
+            .unwrap();
+        store
+            .append_message(&sid, &crate::provider::ChatMessage::assistant("second"))
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), load_request(1, &sid)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        let mut replayed: Vec<(String, String)> = Vec::new();
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["method"] == "session/update" {
+                let u = &v["params"]["update"];
+                replayed.push((
+                    u["sessionUpdate"].as_str().unwrap().to_string(),
+                    u["content"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                ));
+            } else if v["id"] == 1 {
+                assert!(v["error"].is_null(), "load failed: {v}");
+                break;
+            }
+        }
+
+        assert_eq!(
+            replayed,
+            vec![
+                ("user_message_chunk".to_string(), "first".to_string()),
+                ("agent_message_chunk".to_string(), "second".to_string()),
+            ],
+            "the replay must arrive in order, before the reply"
+        );
+    }
+
+    /// The boundary that filtering the list cannot provide: `load` takes
+    /// an id directly, so a session that never appears in any list is
+    /// still reachable by anyone who learns its id.
+    #[tokio::test]
+    async fn load_refuses_another_namespaces_session() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.acp_session_store);
+        let theirs = "theirs".to_string();
+        store.create(&theirs, "someone-else", "/p").unwrap();
+
+        let addr = spawn(state).await;
+        let replies =
+            conversation(&addr, vec![initialize_request(0), load_request(1, &theirs)]).await;
+        assert_eq!(replies[1]["error"]["code"], -32602, "got {}", replies[1]);
+    }
+
+    /// The two refusals must be indistinguishable. If "not yours" reads
+    /// differently from "no such session", the pair enumerates ids.
+    #[tokio::test]
+    async fn an_unknown_and_a_forbidden_session_look_the_same() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.acp_session_store);
+        let theirs = "theirs".to_string();
+        store.create(&theirs, "someone-else", "/p").unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(
+            &addr,
+            vec![
+                initialize_request(0),
+                load_request(1, &theirs),
+                load_request(2, "01900000-0000-7000-8000-000000000000"),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            replies[1]["error"], replies[2]["error"],
+            "the two refusals differ"
+        );
+    }
+
+    /// `session/list` excludes a closed session so it drops out of the
+    /// picker, but `session/load` took an id directly. If load still
+    /// honoured it, an archived conversation would be gone from the list
+    /// yet reachable and appendable by anyone who kept its id — and the
+    /// two refusal paths would no longer be the only way in, breaking the
+    /// "cannot enumerate ids" property the identical wording exists for.
+    #[tokio::test]
+    async fn load_refuses_a_closed_session() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.acp_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = "sess-closed".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
+        store.close(&sid).unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(
+            &addr,
+            vec![
+                initialize_request(0),
+                load_request(1, &sid),
+                load_request(2, "01900000-0000-7000-8000-000000000000"),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            replies[1]["error"], replies[2]["error"],
+            "a closed session must refuse the same way an unknown one does, got {}",
+            replies[1]
+        );
+    }
+
+    /// A loaded session is a real session: prompting it continues the
+    /// conversation rather than starting a new one. This is what proves
+    /// the adapter registered the *existing* id, not a fresh one.
+    #[tokio::test]
+    async fn a_loaded_session_continues_its_history() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![crate::provider::ChatResponse {
+                text: Some("third".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let store = Arc::clone(&state.acp_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = "sess-continues".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
+        store
+            .append_message(&sid, &crate::provider::ChatMessage::user("first"))
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let mut ws = connect(&addr).await;
+        for request in [
+            initialize_request(0),
+            load_request(1, &sid),
+            prompt_request(2, &sid, text_prompt("second")),
+        ] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 2 {
+                assert_eq!(v["result"]["stopReason"], "end_turn", "got {v}");
+                break;
+            }
+        }
+
+        let history = store.history(&sid).expect("the session still exists");
+        let texts: Vec<String> = history
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                crate::provider::ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["first", "second", "third"], "got {texts:?}");
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_loading() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let addr = spawn(state).await;
+        let reply = roundtrip(&addr, initialize_request(0)).await;
+        assert_eq!(reply["result"]["agentCapabilities"]["loadSession"], true);
+    }
+
+    fn resume_request(id: i64, session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "session/resume",
+            "params": { "sessionId": session_id, "cwd": test_cwd(), "mcpServers": [] }
+        })
+    }
+
+    /// `resume` is `load` without the replay — for a client that wants
+    /// the session back without paying to redraw a long conversation.
+    /// It must still continue the history.
+    #[tokio::test]
+    async fn resume_continues_without_replaying() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![crate::provider::ChatResponse {
+                text: Some("second".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let store = Arc::clone(&state.acp_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = "sess-resume".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
+        store
+            .append_message(&sid, &crate::provider::ChatMessage::user("first"))
+            .unwrap();
+
+        let addr = spawn(state).await;
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), resume_request(1, &sid)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        let mut updates_before_reply = 0usize;
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["method"] == "session/update" {
+                updates_before_reply += 1;
+            } else if v["id"] == 1 {
+                assert!(v["error"].is_null(), "resume failed: {v}");
+                break;
+            }
+        }
+        assert_eq!(updates_before_reply, 0, "resume must not replay");
+
+        // ...and the history is still there for the next turn.
+        ws.send(Message::Text(
+            prompt_request(2, &sid, text_prompt("x")).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 2 {
+                assert_eq!(v["result"]["stopReason"], "end_turn", "got {v}");
+                break;
+            }
+        }
+        let history = store.history(&sid).unwrap();
+        assert!(history.len() >= 3, "the resumed session kept its history");
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_resume() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let addr = spawn(state).await;
+        let reply = roundtrip(&addr, initialize_request(0)).await;
+        assert!(
+            !reply["result"]["agentCapabilities"]["sessionCapabilities"]["resume"].is_null(),
+            "got {reply}"
+        );
+    }
+
+    /// A header line too broken to say whose it is refuses the same way an
+    /// unknown or another namespace's session does. `session/list` already
+    /// omits these (`list_omits_sessions_with_an_unparseable_header`);
+    /// `load` must not let a client reach one directly by id either — an
+    /// unknown owner is not the same as "mine".
+    #[tokio::test]
+    async fn load_refuses_a_session_with_an_unparseable_header() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.acp_session_store);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let mine = "mine".to_string();
+        store.create(&mine, &ours, "/p").unwrap();
+
+        // Same technique as `list_omits_sessions_with_an_unparseable_header`:
+        // a "header" line missing the `namespace` field `SessionHeader`
+        // requires, so `summary()` cannot see it at all.
+        let dir = store
+            .absolute_path_for(&mine)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let broken_id = "broken";
+        std::fs::write(
+            dir.join(format!("{broken_id}.jsonl")),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "kind": "header",
+                    "session_id": broken_id,
+                    "cwd": "/p",
+                    "created_at": "2020-01-01T00:00:00Z"
+                })
+            ),
+        )
+        .unwrap();
+
+        let addr = spawn(state).await;
+        let replies = conversation(
+            &addr,
+            vec![initialize_request(0), load_request(1, broken_id)],
+        )
+        .await;
+        assert_eq!(replies[1]["error"]["code"], -32602, "got {}", replies[1]);
+    }
+
+    /// Two connections can now hold the same session, which makes the
+    /// history race in `run_llm_turn` reachable across connections
+    /// rather than only within one. The race is not fixed here — this
+    /// only makes hitting it observable, because a corrupted transcript
+    /// with no log line is undebuggable.
+    #[tokio::test]
+    async fn opening_a_session_twice_is_counted() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.acp_session_store);
+        let counts = Arc::clone(&state.open_acp_sessions);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = "sess-twice".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
+
+        let addr = spawn(state).await;
+        let mut a = connect(&addr).await;
+        let mut b = connect(&addr).await;
+        for ws in [&mut a, &mut b] {
+            for request in [initialize_request(0), load_request(1, &sid)] {
+                ws.send(Message::Text(request.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            loop {
+                let Message::Text(t) = next_frame(ws).await else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["id"] == 1 {
+                    assert!(v["error"].is_null(), "load failed: {v}");
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            counts.lock().await.get(&sid).copied(),
+            Some(2),
+            "both connections should be counted as holding the session"
+        );
+    }
+
+    /// The bug the review caught: re-adopting a session this connection
+    /// already holds — `session/load` then `session/resume` on the same
+    /// socket, the realistic shape of a client retry — must not count as
+    /// a second holder. `sessions.inner.insert` overwrites the existing
+    /// entry rather than adding one, so if the increment ran
+    /// unconditionally the count would drift to 2 while only one
+    /// connection actually holds it, and that phantom entry would
+    /// outlive the connection: teardown only removes one holder per
+    /// entry still in the map, leaving 1 forever.
+    #[tokio::test]
+    async fn readopting_a_session_on_the_same_connection_is_not_double_counted() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.acp_session_store);
+        let counts = Arc::clone(&state.open_acp_sessions);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = "sess-readopt".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
+
+        let addr = spawn(state).await;
+        let mut ws = connect(&addr).await;
+        for request in [
+            initialize_request(0),
+            load_request(1, &sid),
+            resume_request(2, &sid),
+        ] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+            loop {
+                let Message::Text(t) = next_frame(&mut ws).await else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["id"] == request["id"] {
+                    assert!(v["error"].is_null(), "adopting failed: {v}");
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            counts.lock().await.get(&sid).copied(),
+            Some(1),
+            "the same connection re-adopting its own session must not be \
+             counted as a second holder"
+        );
+
+        ws.send(Message::Close(None)).await.unwrap();
+        drop(ws);
+
+        let released = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if counts.lock().await.get(&sid).is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "timed out waiting for the closed connection to release its session — a \
+             phantom holder left the entry stuck above 0"
+        );
+    }
+
+    /// The other half of the counter: a connection that goes away must
+    /// release every session it held. Skipping this would turn
+    /// `open_acp_sessions` into a leak — the next `session/load` for a
+    /// session whose real owner disconnected long ago would find a
+    /// stale count still above one and warn about a collision that no
+    /// longer exists.
+    #[tokio::test]
+    async fn closing_a_connection_releases_its_sessions() {
+        let state = ServeState::for_test_scripted(true, Vec::new());
+        let store = Arc::clone(&state.acp_session_store);
+        let counts = Arc::clone(&state.open_acp_sessions);
+        let ours = state
+            .config
+            .namespace_for_room_profile("developer")
+            .to_string();
+        let sid = "sess-close-conn".to_string();
+        store.create(&sid, &ours, "/p").unwrap();
+
+        let addr = spawn(state).await;
+        let mut ws = connect(&addr).await;
+        for request in [initialize_request(0), load_request(1, &sid)] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+        loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == 1 {
+                assert!(v["error"].is_null(), "load failed: {v}");
+                break;
+            }
+        }
+        assert_eq!(
+            counts.lock().await.get(&sid).copied(),
+            Some(1),
+            "load should have registered the session as open"
+        );
+
+        ws.send(Message::Close(None)).await.unwrap();
+        drop(ws);
+
+        let released = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if counts.lock().await.get(&sid).is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "timed out waiting for the closed connection to release its session"
         );
     }
 }

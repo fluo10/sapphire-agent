@@ -40,7 +40,7 @@ pub enum Role {
 }
 
 /// A single part of a message's content.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ContentPart {
     Text(String),
     /// Inline image, base64-encoded. `media_type` is the MIME type (e.g. `image/png`).

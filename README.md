@@ -55,10 +55,12 @@ sapphire-call           # one-off interactive session (separate crate)
 ## Zed / ACP
 
 `sapphire-agent` can be driven directly from [Zed](https://zed.dev) as an ACP
-(Agent Client Protocol) agent, running against the same production workspace,
-memory and sessions as every other transport — a Zed conversation is not a
-separate agent, it lands in the same session store as `/rpc`, Matrix and
-Discord.
+(Agent Client Protocol) agent, running against the same production workspace
+and memory as every other transport — a Zed conversation is not a separate
+agent. Its sessions do get their own store, though: a separate directory
+tree and line format from `/rpc`, Matrix and Discord, not a `cwd`-tagged row
+folded into one of theirs. See
+[Loading past sessions](#loading-past-sessions) below for the layout.
 
 **1. Enable the endpoint** in your config (host-local; the workspace config
 layer cannot turn this on):
@@ -165,14 +167,97 @@ and `file_write` is an edit, which a channel may perform without being asked —
 so trusting that path would let a chat message write itself a task that runs a
 command on the next tick.
 
+### Loading past sessions
+
+An ACP session lives at `<sessions_dir>/<namespace>/acp/<id>.jsonl`, its own
+tree with its own line format — separate from `/rpc`'s. It is routed by the
+`namespace` recorded in the session's own header, not by a room id (an ACP
+session has none), and it is recorded with `channel: "acp"`. Every line is
+`kind`-tagged; the first is the header (`session_id`, `namespace`, `cwd`,
+`created_at`), and every event after it carries a UUIDv7 `id` and the
+`parent` it was appended after. **The `parent` chain is the authority on
+order, not the `id`'s embedded clock** — two writers with skewed clocks
+would otherwise sort against each other wrongly.
+
+Zed's session picker lists this token's own conversations: `session/list`
+returns every open session under the connecting device's room profile's
+memory namespace — that is the isolation boundary, not the room profile
+itself, so two profiles that leave `memory_namespace` unset both land on
+`default` and see each other's sessions. Zed can further narrow the list to
+the project directory it has open (`cwd`), which every ACP session records
+(the header field is required, not optional, since `session/new` always
+reports one).
+Picking one hands it to `session/load`, which replays the stored
+conversation into the editor before answering the request, or to
+`session/resume`, which does the same without the replay. Either way the
+session is a real one afterwards — prompting it continues the existing
+history rather than starting a fresh conversation.
+
+**A per-session digest is cached outside the workspace, addressed by
+session id.** `<cache_dir>/sapphire-agent/digests/<session_id>.json`
+holds one intra-day digest per session — "what this session has covered
+today" — overwritten in place rather than appended to. Losing it costs
+only today's cross-session block — the block other rooms' system prompts
+use to see what this session has been doing today. It is not the durable
+record: the daily log is, built from the session's own events rather than
+from the digest.
+
+A second, similarly workspace-external location,
+`<cache_dir>/sapphire-agent/tool-results/<sha256>`, is a content-addressed
+cache meant to hold a tool call's result by hash — but **nothing writes to
+it today.** Tool calls are not persisted at all (see "A loaded session's
+tool calls are not replayed" below), so `run_llm_turn` never reaches the
+code that would populate or read this cache. `ToolResultCache`,
+`StoredPart::ToolUse` and `StoredPart::ToolResultRef` are real types that
+exist for the replay design tracked as
+[#191](https://github.com/fluo10/sapphire-agent/issues/191), not for
+anything currently in the request path.
+
+Both caches sit outside the workspace for the same reason: `<workspace>/sessions`
+is in the retrieve search index, and a digest that is rewritten as the
+conversation grows would otherwise pile up near-duplicate summaries inside
+an indexed file and skew search — sync cost is secondary. A digest also
+cannot be pruned out of the session log itself: events are chained by
+`parent`, and removing one orphans its children.
+
+**ACP sessions appear in both the cross-session "today" digest and the
+daily log.** The digest is kept current by a sweep on a rolling 30-minute
+cadence from process start, which regenerates only the sessions whose
+newest message postdates their cached digest. `/rpc`, device-default and
+MCP sessions still do not reach the daily log —
+[#189](https://github.com/fluo10/sapphire-agent/issues/189).
+
+**Tool calls are not restored on replay.** See "A loaded session's tool
+calls are not replayed" below — `tool_use` and `tool_result` messages are
+not persisted to the JSONL at all (not merely skipped on replay), so
+reloading a session restores what was said but not what was done.
+
+**Opening the same session on two connections at once is not safe to
+prompt from both.** Nothing stops a second Zed window — or any other ACP
+client — from loading a session that is already open elsewhere, but
+`run_llm_turn` clones a session's history at the start of a turn and
+writes the whole vector back at the end. Two turns racing on one session
+are last-writer-wins in memory, while both have already appended their own
+messages to the on-disk transcript, so the two views diverge. Loading does
+not create this race — `/rpc` and the voice heartbeat could already reach
+it with two prompts on one connection — it makes it reachable *across*
+connections too. It is not fixed here: a `session/load` or
+`session/resume` that lands on an already-open session logs a `session
+{id} is now open on N connections` warning, so a divergence at least
+leaves a trace, but the fix itself needs a per-session lock held across a
+whole turn.
+
 ### Known limitations
 
 - **Replies are not streamed token by token.** `Provider::chat` returns a
   complete response, not a stream, so the whole reply arrives as a single
   chunk at the end of the turn. Tool calls *do* still appear progressively as
   they run.
-- **No session resumption.** A dropped connection ends the session. ACP v1
-  has no resumption mechanism, and `session/load` is not implemented.
+- **No automatic reconnection.** A dropped connection does not resume on
+  its own — ACP v1 has no mechanism for the editor to reconnect
+  transparently. The conversation is not lost, though: reopen it through
+  `session/load` or `session/resume` from Zed's session picker, see
+  "Loading past sessions" above.
 - **Tool calls reach the editor as a bare name.** No arguments and no results
   are sent — the shared turn executor reports only a tool's id and name — so
   Zed shows "shell" rather than the command it ran or what came back. The one
@@ -193,6 +278,16 @@ command on the next tick.
   the API returns, so neither `session/update: usage_update` nor
   `PromptResponse.usage` is sent, and the editor cannot show what a turn
   cost or how full the context is.
+- **Tool calls are not persisted, so a loaded session's tool calls are not
+  replayed.** `run_llm_turn` does not write `tool_use` or `tool_result`
+  messages to the JSONL at all — only text messages are. `session/load`'s
+  replay is a direct consequence: there is nothing beyond text parts in the
+  stored history to project to the editor. A restored conversation shows
+  what was said, not what the agent did. Wiring this up needs a replay
+  design (what a stale tool result even means to resend to the model) and
+  is tracked as [#191](https://github.com/fluo10/sapphire-agent/issues/191);
+  `ToolResultCache`, `StoredPart::ToolUse` and `StoredPart::ToolResultRef`
+  already exist for it but have no production caller yet.
 
 ### Configuring `websocat` in Zed
 

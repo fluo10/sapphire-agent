@@ -16,6 +16,8 @@
 //!   across the boundary.
 //! - Yearly ← the 12 monthly bodies of that calendar year.
 
+use crate::acp_session::AcpSessionStore;
+use crate::digest_cache::DigestCache;
 use crate::provider::{ChatMessage, ContentPart, Provider, Role};
 use crate::session::{SessionMeta, SessionStore, StoredMessage};
 use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
@@ -221,6 +223,7 @@ pub fn daily_stems_in_current_iso_week_before(today: NaiveDate) -> Vec<String> {
 /// Callers compute it from `Config::namespace_for_room`.
 pub fn pending_daily_dates<F>(
     session_store: &SessionStore,
+    acp_store: Option<&AcpSessionStore>,
     workspace_dir: &Path,
     namespace: &str,
     boundary_hour: u8,
@@ -230,12 +233,52 @@ where
     F: Fn(&crate::session::SessionMeta) -> bool,
 {
     let today = crate::session::local_date_for_timestamp(Local::now(), boundary_hour);
-    let mut dates = session_store.all_session_dates_filtered(boundary_hour, room_predicate);
+    let mut dates = Vec::new();
+    // Borrow `room_predicate` for the ACP side first — `&F` also
+    // satisfies `Fn(&SessionMeta) -> bool` — then move it into the
+    // channel-store call below. Without this filter, every namespace's
+    // catch-up would see every other namespace's ACP dates as pending
+    // (see `AcpSessionStore::session_dates`'s doc).
+    if let Some(acp) = acp_store {
+        dates.extend(acp.session_dates(boundary_hour, &room_predicate));
+    }
+    dates.extend(session_store.all_session_dates_filtered(boundary_hour, room_predicate));
+    dates.sort();
+    dates.dedup();
     dates.retain(|&date| {
         date < today
             && !log_abs_path(workspace_dir, namespace, LogKind::Daily, &daily_stem(date)).exists()
     });
     dates
+}
+
+/// Merge `session_store`'s sessions for `date` with `acp_store`'s (when
+/// present), filtered by `room_predicate` on both sides and ordered by
+/// `created_at` — the exact input `format_sessions` reads.
+///
+/// Pure and read-only (no LLM call), so this is the seam the two-source
+/// merge itself is tested through: `generate_daily_log` cannot be driven
+/// from a test without a real provider, but this can.
+fn sessions_for_day_merged<F>(
+    session_store: &SessionStore,
+    acp_store: Option<&AcpSessionStore>,
+    date: NaiveDate,
+    boundary_hour: u8,
+    room_predicate: &F,
+) -> Vec<(SessionMeta, Vec<StoredMessage>)>
+where
+    F: Fn(&crate::session::SessionMeta) -> bool,
+{
+    let mut sessions = session_store.sessions_for_day_filtered(date, boundary_hour, room_predicate);
+    if let Some(acp) = acp_store {
+        sessions.extend(
+            acp.sessions_for_day(date, boundary_hour)
+                .into_iter()
+                .filter(|(meta, _)| room_predicate(meta)),
+        );
+    }
+    sessions.sort_by_key(|(meta, _)| meta.created_at);
+    sessions
 }
 
 /// Generate a daily log for `date` and write it to `memory/daily/YYYY-MM-DD.md`.
@@ -247,6 +290,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub async fn generate_daily_log<F>(
     session_store: &SessionStore,
+    acp_store: Option<&AcpSessionStore>,
     provider: &dyn Provider,
     ws_state: &Arc<Mutex<WorkspaceState>>,
     workspace_dir: &Path,
@@ -258,7 +302,13 @@ pub async fn generate_daily_log<F>(
 where
     F: Fn(&crate::session::SessionMeta) -> bool,
 {
-    let sessions = session_store.sessions_for_day_filtered(date, boundary_hour, room_predicate);
+    let sessions = sessions_for_day_merged(
+        session_store,
+        acp_store,
+        date,
+        boundary_hour,
+        &room_predicate,
+    );
     let stem = daily_stem(date);
     let has_existing = read_body(workspace_dir, namespace, LogKind::Daily, &stem)
         .is_some_and(|b| !b.trim().is_empty());
@@ -855,8 +905,10 @@ pub async fn catchup_missing_daily_digests(
 /// Errors are logged but not propagated so startup is not blocked.
 /// Returns the number of logs successfully generated, so callers can decide
 /// whether to invalidate downstream caches.
+#[allow(clippy::too_many_arguments)]
 pub async fn catchup_pending_daily_logs<F>(
     session_store: &SessionStore,
+    acp_store: Option<&AcpSessionStore>,
     provider: &dyn Provider,
     ws_state: &Arc<Mutex<WorkspaceState>>,
     workspace_dir: &Path,
@@ -869,6 +921,7 @@ where
 {
     let pending = pending_daily_dates(
         session_store,
+        acp_store,
         workspace_dir,
         namespace,
         boundary_hour,
@@ -886,6 +939,7 @@ where
     for date in pending {
         match generate_daily_log(
             session_store,
+            acp_store,
             provider,
             ws_state,
             workspace_dir,
@@ -1163,6 +1217,7 @@ pub async fn catchup_pending_yearly_logs(
 ///
 /// Returns `None` when no qualifying digest exists, so the caller can
 /// omit the namespace from the cache map and the system prompt block.
+#[allow(clippy::too_many_arguments)]
 pub fn build_today_digest_for_namespace<F>(
     namespace: &str,
     today: NaiveDate,
@@ -1170,6 +1225,8 @@ pub fn build_today_digest_for_namespace<F>(
     channel_store: &SessionStore,
     cross_device_store: Option<&SessionStore>,
     device_default_store: Option<&SessionStore>,
+    acp_store: Option<&AcpSessionStore>,
+    digest_cache: Option<&DigestCache>,
     room_to_namespace: F,
 ) -> Option<String>
 where
@@ -1183,6 +1240,9 @@ where
     if let Some(s) = device_default_store {
         entries.extend(s.intraday_digests_for_day(today, boundary_hour));
     }
+    if let (Some(s), Some(c)) = (acp_store, digest_cache) {
+        entries.extend(s.intraday_digests_for_day(today, boundary_hour, c));
+    }
     if entries.is_empty() {
         return None;
     }
@@ -1191,12 +1251,13 @@ where
     for (meta, digest) in entries {
         let is_rpc = meta.channel == "rpc";
         let is_device_default = meta.channel == "device-default";
+        let is_acp = meta.channel == "acp";
         let ns = if is_rpc {
             crate::config::DEFAULT_NAMESPACE_NAME.to_string()
-        } else if is_device_default {
-            // Device-default sessions pin their namespace at create time —
-            // honour it directly so an NSFW-profile satellite's digests
-            // don't leak into the default namespace.
+        } else if is_device_default || is_acp {
+            // These pin their namespace at creation time — honour it
+            // directly rather than deriving one from a room id they do
+            // not have.
             meta.namespace
                 .clone()
                 .unwrap_or_else(|| crate::config::DEFAULT_NAMESPACE_NAME.to_string())
@@ -1206,7 +1267,7 @@ where
         if ns != namespace {
             continue;
         }
-        let room_label = if is_rpc || is_device_default {
+        let room_label = if is_rpc || is_device_default || is_acp {
             meta.title
                 .clone()
                 .unwrap_or_else(|| format!("{}/{}", meta.channel, short_id(&meta.session_id)))
@@ -1232,6 +1293,7 @@ where
 /// suitable for `Workspace::replace_today_digests`. Each namespace is
 /// rendered independently so a multi-namespace deployment doesn't leak
 /// rooms across the chain.
+#[allow(clippy::too_many_arguments)]
 pub fn build_all_today_digests<F>(
     namespaces: &[String],
     today: NaiveDate,
@@ -1239,6 +1301,8 @@ pub fn build_all_today_digests<F>(
     channel_store: &SessionStore,
     cross_device_store: Option<&SessionStore>,
     device_default_store: Option<&SessionStore>,
+    acp_store: Option<&AcpSessionStore>,
+    digest_cache: Option<&DigestCache>,
     room_to_namespace: F,
 ) -> HashMap<String, String>
 where
@@ -1253,6 +1317,8 @@ where
             channel_store,
             cross_device_store,
             device_default_store,
+            acp_store,
+            digest_cache,
             room_to_namespace,
         ) {
             out.insert(ns.clone(), text);
@@ -1278,6 +1344,17 @@ fn short_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The local date "now" belongs to under `boundary_hour`.
+    ///
+    /// Deliberately not `Local::now().date_naive()`. A timestamp before
+    /// the boundary hour belongs to the *previous* local day, so the
+    /// naive date and a day window disagree for those hours — which made
+    /// these tests pass all day and fail only when CI happened to run
+    /// between midnight and 04:00.
+    fn today(boundary_hour: u8) -> NaiveDate {
+        crate::session::local_date_for_timestamp(chrono::Local::now(), boundary_hour)
+    }
 
     #[test]
     fn stems_basic() {
@@ -1642,5 +1719,377 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(digest, vec!["fresh"]);
+    }
+
+    /// An ACP session's digest reaches the room's system prompt, and it
+    /// is routed by the namespace in its header rather than by a room id
+    /// it does not have.
+    #[test]
+    fn an_acp_digest_lands_in_its_own_namespace() {
+        let td = make_tempdir();
+        let sessions_base = td.path().join("sessions");
+        let channel_store = SessionStore::new(sessions_base.join("channel"), "channel");
+
+        let tool_result_cache =
+            crate::tool_result_cache::ToolResultCache::open(td.path().join("tool-results"))
+                .unwrap();
+        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), Some(tool_result_cache));
+        let digest_cache = DigestCache::open(td.path().join("digests")).unwrap();
+
+        acp_store.create("s1", "work", "/p").unwrap();
+        acp_store
+            .append_message("s1", &ChatMessage::user("did a thing"))
+            .unwrap();
+        digest_cache.put("s1", "we fixed the parser", None).unwrap();
+
+        let today = today(4);
+        let boundary_hour = 4u8;
+
+        let in_namespace = build_today_digest_for_namespace(
+            "work",
+            today,
+            boundary_hour,
+            &channel_store,
+            None,
+            None,
+            Some(&acp_store),
+            Some(&digest_cache),
+            |room_id: &str| room_id.to_string(),
+        );
+        assert!(
+            in_namespace
+                .as_deref()
+                .is_some_and(|body| body.contains("we fixed the parser")),
+            "expected the ACP digest in its own namespace's block: {in_namespace:?}"
+        );
+
+        let other_namespace = build_today_digest_for_namespace(
+            "default",
+            today,
+            boundary_hour,
+            &channel_store,
+            None,
+            None,
+            Some(&acp_store),
+            Some(&digest_cache),
+            |room_id: &str| room_id.to_string(),
+        );
+        assert!(
+            other_namespace.is_none(),
+            "the ACP digest must not leak into a different namespace: {other_namespace:?}"
+        );
+    }
+
+    // ── the two-source merge (`sessions_for_day_merged` / `pending_daily_dates`) ──
+    //
+    // `generate_daily_log` can't be driven from a test without a real LLM
+    // provider (`write_log_with_digest` calls one), so the merge it relies
+    // on is exercised directly through the pure helper instead.
+
+    /// Build a fresh channel-store + ACP-store pair under one temp dir,
+    /// namespaced under `sessions/{channel,acp}` the way `main.rs` lays
+    /// them out.
+    fn merge_test_stores(td: &tempfile::TempDir) -> (SessionStore, AcpSessionStore) {
+        let sessions_base = td.path().join("sessions");
+        let channel_store = SessionStore::new(sessions_base.join("channel"), "channel");
+        let tool_result_cache =
+            crate::tool_result_cache::ToolResultCache::open(td.path().join("tool-results"))
+                .unwrap();
+        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), Some(tool_result_cache));
+        (channel_store, acp_store)
+    }
+
+    /// Append a message to an existing channel-store session with an
+    /// explicit (possibly backdated) timestamp, bypassing `append()`
+    /// (which always stamps `Utc::now()`). Mirrors the file format
+    /// documented at the top of `session.rs` and the hand-crafted-line
+    /// pattern `session.rs`'s own tests already use for backdating.
+    fn backdate_channel_message(
+        store: &SessionStore,
+        session_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        text: &str,
+    ) {
+        let path = store.absolute_path_for(session_id).expect("session exists");
+        let line = serde_json::json!({
+            "timestamp": at,
+            "role": "user",
+            "parts": [{"Text": text}],
+        });
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    /// Same idea for the ACP store: a raw `Line::Message` written
+    /// directly to the file so `at` can be backdated. Mirrors the
+    /// forged-event pattern `acp_session.rs`'s own tests use.
+    fn backdate_acp_message(
+        store: &AcpSessionStore,
+        session_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        text: &str,
+    ) {
+        let path = store.path_for_test(session_id);
+        let line = serde_json::json!({
+            "kind": "message",
+            "id": uuid::Uuid::now_v7(),
+            "parent": serde_json::Value::Null,
+            "at": at,
+            "role": "user",
+            "parts": [{"text": text}],
+        });
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    /// Both sources reach the transcript input, interleaved by
+    /// `created_at` rather than one block after the other. The ACP
+    /// session is created *first* (so it must sort first); the merge
+    /// pushes channel-store results first and extends with the ACP
+    /// results after, so this only passes if the trailing
+    /// `sort_by_key(created_at)` actually re-orders rather than leaving
+    /// push order intact.
+    #[test]
+    fn merged_sessions_for_day_interleaves_both_stores_by_created_at() {
+        let td = make_tempdir();
+        let (channel_store, acp_store) = merge_test_stores(&td);
+
+        acp_store.create("acp1", "default", "/p").unwrap();
+        acp_store
+            .append_message("acp1", &ChatMessage::user("acp said this first"))
+            .unwrap();
+
+        let chan_id = channel_store
+            .create_session(&("room1".to_string(), None), "matrix", "default")
+            .unwrap();
+        channel_store
+            .append(&chan_id, &ChatMessage::user("channel said this second"))
+            .unwrap();
+
+        let today = today(4);
+        let predicate = |_: &SessionMeta| true;
+        let sessions =
+            sessions_for_day_merged(&channel_store, Some(&acp_store), today, 4, &predicate);
+
+        assert_eq!(
+            sessions.len(),
+            2,
+            "both sources must contribute: {sessions:?}"
+        );
+        assert!(
+            sessions[0].0.created_at <= sessions[1].0.created_at,
+            "result must be ordered by created_at: {:?}",
+            sessions
+                .iter()
+                .map(|(m, _)| (&m.session_id, m.created_at))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            sessions[0].0.session_id, "acp1",
+            "the ACP session was created first and must sort first — proves the merge \
+             re-sorts by created_at instead of leaving the channel-store half \
+             (pushed first) ahead of the ACP half (extended in after) regardless of \
+             actual timing"
+        );
+    }
+
+    /// The room predicate is applied to the ACP side too, not just the
+    /// channel-store side — the property `Heartbeat::namespace_for_session`'s
+    /// `"acp"` arm exists to make true. An ACP session's own header
+    /// namespace decides which namespace's log it belongs to.
+    #[test]
+    fn merged_sessions_for_day_applies_the_room_predicate_to_acp_too() {
+        let td = make_tempdir();
+        let (channel_store, acp_store) = merge_test_stores(&td);
+
+        acp_store.create("work-session", "work", "/p").unwrap();
+        acp_store
+            .append_message("work-session", &ChatMessage::user("work stuff"))
+            .unwrap();
+        acp_store
+            .create("default-session", "default", "/p")
+            .unwrap();
+        acp_store
+            .append_message("default-session", &ChatMessage::user("default stuff"))
+            .unwrap();
+
+        let today = today(4);
+
+        let work_predicate = |meta: &SessionMeta| meta.namespace.as_deref() == Some("work");
+        let work_sessions =
+            sessions_for_day_merged(&channel_store, Some(&acp_store), today, 4, &work_predicate);
+        assert_eq!(
+            work_sessions
+                .iter()
+                .map(|(m, _)| m.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["work-session"],
+            "only the 'work'-namespace ACP session should pass a 'work' predicate: \
+             {work_sessions:?}"
+        );
+
+        let default_predicate = |meta: &SessionMeta| meta.namespace.as_deref() == Some("default");
+        let default_sessions = sessions_for_day_merged(
+            &channel_store,
+            Some(&acp_store),
+            today,
+            4,
+            &default_predicate,
+        );
+        assert_eq!(
+            default_sessions
+                .iter()
+                .map(|(m, _)| m.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["default-session"],
+            "only the 'default'-namespace ACP session should pass a 'default' \
+             predicate: {default_sessions:?}"
+        );
+    }
+
+    /// `pending_daily_dates` merges the two stores' date sets and dedups
+    /// them: a date only the ACP store knows about must still surface as
+    /// pending, and a date both stores know about must appear exactly
+    /// once, not twice.
+    #[test]
+    fn pending_daily_dates_merges_and_dedups_across_stores() {
+        let td = make_tempdir();
+        let (channel_store, acp_store) = merge_test_stores(&td);
+        let boundary_hour = 4u8;
+
+        let today = crate::session::local_date_for_timestamp(Local::now(), boundary_hour);
+        let channel_only_day = today - Duration::days(4);
+        let acp_only_day = today - Duration::days(3);
+        let shared_day = today - Duration::days(2);
+
+        let (channel_only_start, _) = crate::session::day_window(channel_only_day, boundary_hour);
+        let (acp_only_start, _) = crate::session::day_window(acp_only_day, boundary_hour);
+        let (shared_start, _) = crate::session::day_window(shared_day, boundary_hour);
+
+        // Channel store knows channel_only_day and shared_day.
+        let chan1 = channel_store
+            .create_session(&("room1".to_string(), None), "matrix", "default")
+            .unwrap();
+        backdate_channel_message(
+            &channel_store,
+            &chan1,
+            channel_only_start + Duration::hours(1),
+            "channel only",
+        );
+        let chan2 = channel_store
+            .create_session(&("room1".to_string(), None), "matrix", "default")
+            .unwrap();
+        backdate_channel_message(
+            &channel_store,
+            &chan2,
+            shared_start + Duration::hours(1),
+            "channel side of the shared day",
+        );
+
+        // ACP store knows acp_only_day and shared_day.
+        acp_store.create("acp-only", "default", "/p").unwrap();
+        backdate_acp_message(
+            &acp_store,
+            "acp-only",
+            acp_only_start + Duration::hours(1),
+            "acp only",
+        );
+        acp_store.create("acp-shared", "default", "/p").unwrap();
+        backdate_acp_message(
+            &acp_store,
+            "acp-shared",
+            shared_start + Duration::hours(2),
+            "acp side of the shared day",
+        );
+
+        let predicate = |_: &SessionMeta| true;
+        let pending = pending_daily_dates(
+            &channel_store,
+            Some(&acp_store),
+            td.path(),
+            "default",
+            boundary_hour,
+            predicate,
+        );
+
+        assert!(
+            pending.contains(&channel_only_day),
+            "a channel-only date must still be pending: {pending:?}"
+        );
+        assert!(
+            pending.contains(&acp_only_day),
+            "a date only the ACP store knows about must be reported as pending: {pending:?}"
+        );
+        assert_eq!(
+            pending.iter().filter(|&&d| d == shared_day).count(),
+            1,
+            "a date both stores know about must appear exactly once, not twice: {pending:?}"
+        );
+    }
+
+    /// A date that only has messages in another namespace's ACP session
+    /// must not be reported pending for this namespace. Before this was
+    /// fixed, `pending_daily_dates` pulled every ACP date unfiltered, so
+    /// `generate_daily_log` would find no in-namespace sessions for that
+    /// date, write nothing, and the phantom date would stay pending
+    /// forever — re-walked on every startup and catch-up tick.
+    #[test]
+    fn pending_daily_dates_does_not_leak_another_namespaces_acp_date() {
+        let td = make_tempdir();
+        let (channel_store, acp_store) = merge_test_stores(&td);
+        let boundary_hour = 4u8;
+
+        // `pending_daily_dates` only reports dates strictly before
+        // today (today's own log isn't due yet), so the message must
+        // be backdated for this to exercise the "pending" path at all.
+        let today = crate::session::local_date_for_timestamp(Local::now(), boundary_hour);
+        let (yesterday_start, _) =
+            crate::session::day_window(today - Duration::days(1), boundary_hour);
+        acp_store.create("work-only", "work", "/p").unwrap();
+        backdate_acp_message(
+            &acp_store,
+            "work-only",
+            yesterday_start + Duration::hours(1),
+            "work stuff",
+        );
+
+        let default_predicate = |meta: &SessionMeta| meta.namespace.as_deref() == Some("default");
+        let pending = pending_daily_dates(
+            &channel_store,
+            Some(&acp_store),
+            td.path(),
+            "default",
+            boundary_hour,
+            default_predicate,
+        );
+
+        assert!(
+            pending.is_empty(),
+            "a date belonging only to the 'work' namespace's ACP session must not be \
+             pending for 'default': {pending:?}"
+        );
+
+        let work_predicate = |meta: &SessionMeta| meta.namespace.as_deref() == Some("work");
+        let work_pending = pending_daily_dates(
+            &channel_store,
+            Some(&acp_store),
+            td.path(),
+            "work",
+            boundary_hour,
+            work_predicate,
+        );
+        assert_eq!(
+            work_pending.len(),
+            1,
+            "the 'work' namespace's own predicate must still see its date: {work_pending:?}"
+        );
     }
 }
