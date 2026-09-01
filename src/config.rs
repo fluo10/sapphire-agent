@@ -747,6 +747,21 @@ pub struct ToolsConfig {
     /// with the naming convention `mcp__<name>__<tool_name>`.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Whether the agent may touch its own filesystem and shell.
+    #[serde(default)]
+    pub host_access: HostAccess,
+}
+
+/// Whether the agent may touch the machine it runs on.
+///
+/// Off by default. On a self-hosted deployment this is the server, and
+/// "read any file, run any command" is not something a Discord message
+/// should reach by default. Turning it on is a deliberate act; running
+/// the agent in a container is the recommended way to do it.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct HostAccess {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Configuration for a single external MCP server.

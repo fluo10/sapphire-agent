@@ -161,6 +161,31 @@ pub fn refusal_message(tool: &str, why: Refusal) -> String {
     }
 }
 
+/// The tools that operate on the agent's own filesystem and shell.
+///
+/// Listed by name rather than derived from `ToolKind`, because the
+/// distinction is *which machine*, not how dangerous the operation is:
+/// `memory_add` is also an `Edit`, and it is never in question.
+pub const HOST_TOOLS: &[&str] = &[
+    "file_read",
+    "file_write",
+    "file_append",
+    "file_delete",
+    "dir_list",
+    "dir_walk",
+    "shell",
+];
+
+/// Whether this call is refused before the policy table is consulted.
+///
+/// A gate in front of `decide` rather than a row inside it: `decide` is
+/// a pure function of origin and kind, and this is a fact about the
+/// deployment. Keeping them apart means the permission table still
+/// reads as one thing.
+pub fn host_tool_denied(name: &str, host_access_enabled: bool) -> bool {
+    !host_access_enabled && HOST_TOOLS.contains(&name)
+}
+
 /// The whole policy. The table in the design spec is this function.
 pub fn decide(origin: Origin, kind: ToolKind) -> Decision {
     // Group first, so that a `ToolKind` variant added upstream lands in
@@ -417,6 +442,54 @@ mod tests {
         let refused_ids: Vec<&str> = refused.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(refused_ids, vec!["c2", "c3"]);
         assert!(refused[0].1.contains("shell"), "got {}", refused[0].1);
+    }
+
+    /// The seven tools that touch the agent's own machine. Off unless
+    /// the operator turned them on — including for `Origin::Trusted`,
+    /// which is the voice pipeline and the heartbeat.
+    #[test]
+    fn host_tools_are_denied_when_host_access_is_off() {
+        for name in HOST_TOOLS {
+            assert!(
+                host_tool_denied(name, false),
+                "{name} must be denied with host access off"
+            );
+        }
+    }
+
+    #[test]
+    fn host_tools_are_allowed_through_when_host_access_is_on() {
+        for name in HOST_TOOLS {
+            assert!(
+                !host_tool_denied(name, true),
+                "{name} must fall through to the policy table when enabled"
+            );
+        }
+    }
+
+    /// The gate is about *which machine*, not about the tool's risk, so
+    /// a workspace-scoped tool is never caught by it.
+    #[test]
+    fn workspace_tools_are_not_host_tools() {
+        for name in ["memory_add", "workspace_search", "timer_set", "web_search"] {
+            assert!(!host_tool_denied(name, false), "{name} is not a host tool");
+        }
+    }
+
+    /// The hole this closes: `file_delete` is `Delete`, which
+    /// `Origin::Channel` allows unasked, so a Discord message can
+    /// delete a file on the agent's host today.
+    #[test]
+    fn a_channel_turn_cannot_reach_file_delete_with_host_access_off() {
+        assert_eq!(
+            decide(Origin::Channel, ToolKind::Delete),
+            Decision::Allow,
+            "the policy table alone still allows it — which is the point"
+        );
+        assert!(
+            host_tool_denied("file_delete", false),
+            "the host gate is what stops it"
+        );
     }
 
     /// A trusted origin refuses nothing, so the helper is a no-op there.

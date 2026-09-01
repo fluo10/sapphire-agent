@@ -2237,7 +2237,16 @@ pub(crate) async fn run_llm_turn(
 
     // 5. Tool-calling loop — refresh MCP tools if any server signalled a change.
     state.tools.refresh_if_needed().await;
-    let tool_specs = state.tools.specs().await;
+    // A tool the caller cannot use is worse than absent — see
+    // `ToolSet::specs_filtered`. Host tools (the agent's own filesystem
+    // and shell) are hidden from the list whenever the operator has not
+    // opted this deployment into host access; client-side tools add
+    // their own condition to this predicate in a later task.
+    let host_access_enabled = state.config.tools.host_access.enabled;
+    let tool_specs = state
+        .tools
+        .specs_filtered(|name| !crate::tools::policy::host_tool_denied(name, host_access_enabled))
+        .await;
     let compression_config = &state.config.compression;
     let mut accumulated_text: Vec<String> = Vec::new();
     let (final_text, stop) = loop {
@@ -2365,18 +2374,31 @@ pub(crate) async fn run_llm_turn(
                 let mut permitted: Vec<crate::provider::ToolCall> = Vec::new();
                 let mut refused: Vec<(String, String)> = Vec::new();
                 for call in &tool_calls {
-                    use crate::tools::policy::{Decision, Refusal, kind_of, refusal_message};
+                    use crate::tools::policy::{
+                        Decision, Refusal, host_tool_denied, kind_of, refusal_message,
+                    };
 
-                    let kind = kind_of(&call.name, &kinds);
-                    let verdict = crate::tools::policy::decide(origin, kind);
-                    let refusal = match verdict {
-                        Decision::Allow => None,
-                        Decision::Deny => Some(refusal_message(&call.name, Refusal::Unavailable)),
-                        Decision::Ask => {
-                            if progress.approve(call, kind).await.allows() {
-                                None
-                            } else {
-                                Some(refusal_message(&call.name, Refusal::UserDeclined))
+                    // The host-machine gate sits in front of `decide`:
+                    // it is a fact about the deployment ("may this agent
+                    // touch its own disk at all"), not a row in the
+                    // origin/kind policy table — so it is checked, and
+                    // can refuse, before `decide` is even consulted.
+                    let refusal = if host_tool_denied(&call.name, host_access_enabled) {
+                        Some(refusal_message(&call.name, Refusal::Unavailable))
+                    } else {
+                        let kind = kind_of(&call.name, &kinds);
+                        let verdict = crate::tools::policy::decide(origin, kind);
+                        match verdict {
+                            Decision::Allow => None,
+                            Decision::Deny => {
+                                Some(refusal_message(&call.name, Refusal::Unavailable))
+                            }
+                            Decision::Ask => {
+                                if progress.approve(call, kind).await.allows() {
+                                    None
+                                } else {
+                                    Some(refusal_message(&call.name, Refusal::UserDeclined))
+                                }
                             }
                         }
                     };
@@ -2391,7 +2413,7 @@ pub(crate) async fn run_llm_turn(
                             permitted.push(call.clone());
                         }
                         Some(reason) => {
-                            info!("Refused tool {} (id={}): {verdict:?}", call.name, call.id);
+                            info!("Refused tool {} (id={}): {reason}", call.name, call.id);
                             refused.push((call.id.clone(), reason));
                         }
                     }

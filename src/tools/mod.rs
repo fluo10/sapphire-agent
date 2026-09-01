@@ -106,6 +106,23 @@ impl ToolSet {
         self.inner.read().await.specs.clone()
     }
 
+    /// The specs a particular turn should see.
+    ///
+    /// A tool the caller cannot use is worse than absent: the model
+    /// spends a round trip discovering the refusal, and on an ACP
+    /// session it may pick the host's `file_read` when it meant the
+    /// editor's.
+    pub async fn specs_filtered(&self, keep: impl Fn(&str) -> bool) -> Vec<ToolSpec> {
+        self.inner
+            .read()
+            .await
+            .specs
+            .iter()
+            .filter(|s| keep(&s.name))
+            .cloned()
+            .collect()
+    }
+
     /// Every registered tool's name and kind. Exists so the policy test
     /// can pin the whole classification table in one assertion rather
     /// than constructing each tool by hand.
@@ -444,6 +461,60 @@ mod tests {
             input_schema: serde_json::json!({}),
         });
         assert_eq!(bare.kind(), ToolKind::Other);
+    }
+
+    /// A minimal named stub for tests that only care about a tool's
+    /// name being present in a spec list — modeled on `Bare` above, but
+    /// keeping the name so `specs_filtered`'s predicate has something
+    /// to match against.
+    struct NamedStub(ToolSpec);
+
+    impl NamedStub {
+        fn new(name: &str) -> Self {
+            Self(ToolSpec {
+                name: name.to_string().into(),
+                description: String::new().into(),
+                input_schema: serde_json::json!({}),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Tool for NamedStub {
+        fn spec(&self) -> &ToolSpec {
+            &self.0
+        }
+        async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    impl ToolSet {
+        /// A `ToolSet` with nothing registered, for tests that only
+        /// want to exercise `register_tool` / `specs_filtered` without
+        /// building a real workspace.
+        fn new_empty_for_test() -> Self {
+            ToolSet::new(Vec::new(), Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn specs_filtered_keeps_only_what_the_predicate_allows() {
+        let tools = ToolSet::new_empty_for_test();
+        tools
+            .register_tool(Box::new(NamedStub::new("keep_me")))
+            .await;
+        tools
+            .register_tool(Box::new(NamedStub::new("drop_me")))
+            .await;
+
+        let names: Vec<String> = tools
+            .specs_filtered(|n| n == "keep_me")
+            .await
+            .into_iter()
+            .map(|s| s.name.to_string())
+            .collect();
+        assert_eq!(names, vec!["keep_me".to_string()]);
     }
 }
 
