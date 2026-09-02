@@ -203,7 +203,8 @@ anything that is not a direct child of the skills directory.
 
 **A checkout with uncommitted changes is not removed.** If `git status
 --porcelain` is non-empty, uninstall refuses and says so; the person may have
-edited a skill in place. An explicit `force` overrides.
+edited a skill in place. There is no override — see `## 実装時の訂正` below
+for why `force` was removed after it shipped.
 
 #### The two layouts the index accepts
 
@@ -295,7 +296,7 @@ required for it.
 | `skill_update` on a diverged or locally-edited checkout | The fast-forward fails; reported per entry, and with no name given the other entries still update. |
 | `skill_update` where the stored remote is not `https` | Refused for that entry, naming the remote. |
 | `skill_update` with no name and nothing installed | Recoverable error pointing at `skill_install`. |
-| `skill_uninstall` on a checkout with local modifications | Refused, naming the modified files. `force` overrides. |
+| `skill_uninstall` on a checkout with local modifications | Refused, naming the modified files. No override — see `## 実装時の訂正`. |
 | `skill_uninstall` on an unknown name | Recoverable error listing what is installed. |
 | `fs/read_text_file` refuses the path | Retry through the terminal; only then report. |
 | Unknown skill name | Recoverable error listing the known names — the convention `subagent` already follows. |
@@ -474,3 +475,109 @@ not written.
   superpowers' own non-Claude manifests declare, which makes it the most stable
   part of the layout, but it is still someone else's repository moving twice a
   month.
+
+## 実装時の訂正
+
+Four places where implementation proved this spec wrong, or changed a
+decision it recorded. Left here rather than silently edited into the
+sections above, because a spec that still asserts something the branch
+disproved is worse than no spec.
+
+**`force` never shipped as a `skill_uninstall` parameter — it was removed
+before merge.** This spec's "A checkout with uncommitted changes is not
+removed" prose and its failure-mode table both originally said a dirty
+checkout is refused "unless `force` overrides" (both corrected in place
+above, pointing back here). That was implemented and then taken back out,
+because
+`policy::decide` returns `Allow` for `ToolKind::Delete` under
+`Origin::Acp(AcceptEdits)`, while `ToolKind::Execute` returns `Ask` there —
+so an uninstall does not prompt in `accept_edits` mode the way an install or
+update does. A model-settable `force` boolean would therefore have let the
+model discard a person's uncommitted edits to a skill with nobody asked,
+which is exactly the case this refusal exists to catch. The fix was to
+delete the parameter rather than gate it further: a dirty checkout is now
+refused outright, full stop, and the person resolves it themselves — commit,
+stash, or `rm -rf` — on their own machine, where their uncommitted work
+actually is. `skill_uninstall`'s tool description and its failure-mode row
+above have been corrected to match; nothing in the shipped code accepts
+`force`.
+
+**Re-validating the stored remote does not close the doctored-`.git/config`
+case the way "The stored remote is re-validated before the pull" claims.**
+That section reasoned that checking `git remote get-url origin` against the
+same `https://`-only rule the install applies "removes the asymmetry" with
+`skill_install`. It does not, on its own: `git pull` with no repository
+argument does not necessarily consult `remote.origin.url` at all — it
+resolves the remote to use from `branch.<current>.remote`, falling back to
+`origin` only when that is unset. A `.git/config` doctored with
+`[branch "main"] remote = evil` and an `ext::` URL on a remote named `evil`,
+leaving `remote.origin.url` itself honest, would pass the re-validation
+check described here and still reach `git pull` against the bad remote.
+`url.<base>.insteadOf` is a second such gap: `git remote get-url` reports
+the URL as stored, unrewritten, while the rewrite happens later, at
+transport time — so a rewritten-to-`ext::` remote would also read as clean.
+What actually closes both is `GIT_ALLOW_PROTOCOL=https`, set on every `git`
+invocation `skill_install`/`skill_update`/`skill_uninstall` make (by running
+`git` through `env GIT_TERMINAL_PROMPT=0 GIT_ALLOW_PROTOCOL=https git …`
+rather than invoking it directly) — it is enforced by git itself at the
+point it actually opens a transport, regardless of which config field
+carried the bad URL. The pre-pull remote check described in this section
+still runs, and is still worth having: it is a cheap, specific check that
+names the bad remote directly for the common case (`origin` itself doctored)
+rather than leaving that case to surface however `GIT_ALLOW_PROTOCOL`
+happens to fail the subsequent `git pull`. It is a sanity check layered on
+top of the real protection, not the thing that provides it.
+
+One more thing this section should have said and didn't: **`git pull` runs
+the checkout's own `.git/hooks/post-merge` if the pull changed anything, and
+no URL or protocol guard — `GIT_ALLOW_PROTOCOL` included — prevents that.**
+This is not a hole `skill_update` opens: it is the person's own machine and
+their own checkout, and a hook already sitting in a `.git/hooks/` directory
+they control is no more reachable through this tool than through running
+`git pull` there by hand. But it is a fact about what this design does and
+does not close, and it belongs on the record rather than left for the next
+reader to rediscover by reasoning about `post-merge` from scratch.
+
+**"The resolved directory is cached for the session" undersold what the
+session boundary actually had to be.** The first implementation cached the
+resolved index as a single slot on `SkillTool` itself. That was wrong:
+`SkillTool` is registered once into the `ToolSet` shared by every `/acp`
+connection through `ServeState`, and `/acp` accepts many concurrent editor
+connections against that one state — so "a session belongs to exactly one
+connection" (true) says nothing about whether *the tool* is scoped per
+session (it was not). A second editor, on a second machine, calling
+`skill()` after a first editor already had, would have been served the
+first editor's directory and absolute paths — including the first editor's
+home directory name — without the resolver ever running on the second
+machine at all. The fix: `TurnContext` (`src/serve/mod.rs`) gained a
+`session_id: Option<String>` field, and `SkillTool`'s cache became a
+`HashMap<String, Arc<SkillIndex>>` keyed by it, capped at 128 entries (past
+the cap the whole map is cleared rather than evicting precisely — losing a
+cached entry only costs the next `skill()` call in that session one extra
+resolver round trip, so LRU precision buys nothing here). A turn with no
+session id to key on — reached today only by a subagent's nested tool call,
+where `TurnContext::session_id` is `None` because that turn has no
+`TurnPersistence` — always re-resolves and is never written to the map: an
+absent key means "never cache this," not "cache it under some shared
+placeholder."
+
+**Resume does not delete a stored child when its agent definition fails to
+resolve — an early implementation of "The definition is re-read on resume"
+did, and that was a real bug, not a hypothetical one.** That section's own
+text — "If the definition has since been deleted or renamed, resume fails
+with a recoverable error" — was always the intended behaviour, but a version
+of `SubagentTool::resume` briefly called `SubagentCache::remove` on exactly
+this path, reasoning that a handle whose definition doesn't resolve can
+never resume again anyway. That reasoning missed a real case:
+`agents::load_agents_dir` *skips* a single `.md` it cannot read or parse,
+logging a warning, rather than failing the whole load — so a definition can
+be absent on one load (a mid-save write, a YAML typo since fixed) and
+present again on the next. Deleting the cached child on that first miss
+turned a transient, recoverable absence into a permanently destroyed
+conversation. The fix: `resume` only bails on an unresolved definition now;
+the entry is left in place for `prune_before`/`retain_days` to retire on its
+own schedule if the definition truly never comes back.
+`SubagentCache::remove` itself is kept — the round-trip test still exercises
+it, and a real caller (an explicit "forget this conversation" operator
+action, say) may yet want it — but nothing in this branch calls it in
+production any more.
