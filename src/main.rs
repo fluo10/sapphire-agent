@@ -24,6 +24,7 @@ mod periodic_log;
 mod provider;
 mod serve;
 mod session;
+mod skills;
 mod timer;
 mod tool_result_cache;
 mod tools;

