@@ -525,8 +525,9 @@ impl Agent {
     ///
     /// Tool parts used to be stripped here — raw history was never
     /// reloaded, so persisting them would only have bloated the JSONL.
-    /// It is reloaded now (#194), and a history that remembers what was
-    /// said but not what was done is the gap this exists to close.
+    /// It will be reloaded from these files (#194, Phase 4), and a
+    /// history that remembers what was said but not what was done is
+    /// the gap this exists to close.
     ///
     /// The storage shape is decided inside [`SessionStore::append`]:
     /// tool results go to the workspace-external cache, oversized tool
@@ -946,8 +947,12 @@ impl Agent {
                     // half-persisted pair is worse than neither: the
                     // in-memory history is correct either way and gets
                     // rebuilt next turn, but a tool_result alone on disk
-                    // chains onto the preceding user message and bricks
-                    // the session file for good.
+                    // chains onto the preceding user message with no
+                    // tool_use before it. `repair_tool_pairing` keeps the
+                    // session loadable by dropping that orphan on
+                    // reload — not a brick, but the record of what the
+                    // tool returned is gone either way, so there is
+                    // nothing to gain by writing it in the first place.
                     let tool_use_persisted = self.persist(&session_id, &msg);
 
                     // Execute tools concurrently. Each task gets the
@@ -1041,7 +1046,7 @@ impl Agent {
                         .or_default()
                         .push(msg.clone());
                     if tool_use_persisted {
-                        self.persist(&session_id, &msg);
+                        let _ = self.persist(&session_id, &msg);
                     }
                 }
             }

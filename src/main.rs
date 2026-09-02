@@ -459,7 +459,7 @@ async fn main() -> Result<()> {
             // Resolves once at startup, degrading to `None` on a missing
             // platform cache dir or an open failure (e.g. read-only
             // `~/.cache` / `%LOCALAPPDATA%`) rather than aborting startup
-            // — mirrors `image_cache` above. A daemon whose whole design
+            // — mirrors `image_cache` below. A daemon whose whole design
             // premise is that losing a cache is survivable must not make
             // its boot path the one place where it isn't: this cache
             // being unavailable would otherwise stop `/rpc`, Matrix,

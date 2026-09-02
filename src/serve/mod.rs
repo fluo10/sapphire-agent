@@ -5064,36 +5064,31 @@ mod tests {
         )
         .await;
 
-        let stored = state
+        // Read the raw JSONL rather than `load_session`: `load_session`
+        // runs `repair_tool_pairing`, which synthesises a MISSING_RESULT
+        // stand-in for an orphaned `tool_use` on the way out. That would
+        // make this test pass even if the `tool_result` append were
+        // silently dropped — it would prove only "the tool_use reached
+        // disk and something answers it after loading", not "both
+        // halves reached disk". Reading raw is the same technique
+        // `a_failed_tool_use_append_suppresses_the_tool_result_append_too`
+        // uses against the ACP store, and for the same reason (see its
+        // own comment).
+        let path = state
             .cross_device_session_store
-            .load_session(&sid)
-            .unwrap_or_default();
-
-        // Same position-based check as the ACP test above: pins the
-        // order on disk, not just presence, so a tool_result written
-        // ahead of its tool_use (rejected by the API on reload) would
-        // still fail this.
-        let use_at = stored
-            .iter()
-            .position(|m| {
-                m.parts
-                    .iter()
-                    .any(|p| matches!(p, ContentPart::ToolUse { id, .. } if id == "call-1"))
-            })
-            .expect("the tool_use was persisted");
-        let result_at = stored
-            .iter()
-            .position(|m| {
-                m.parts.iter().any(|p| {
-                    matches!(p, ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == "call-1")
-                })
-            })
-            .expect("the matching tool_result was persisted");
-
+            .absolute_path_for(&sid)
+            .expect("the session file exists");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let use_at = raw
+            .find("ToolUse")
+            .expect("the tool_use never reached disk");
+        let result_at = raw.find("ToolResultRef").expect(
+            "the tool_result never reached disk — repair_tool_pairing \
+             would hide this on a load",
+        );
         assert!(
             use_at < result_at,
-            "the tool_use (message {use_at}) must land before its tool_result \
-             (message {result_at}) on disk"
+            "the pair is out of order on disk:\n{raw}"
         );
     }
 
