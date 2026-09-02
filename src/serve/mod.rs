@@ -2212,7 +2212,7 @@ pub(crate) struct TurnPersistence {
 impl TurnPersistence {
     /// Append one message. There is nothing here for a caller to gate a
     /// paired append on — that bookkeeping belongs to
-    /// `append_acp_only`, whose doc explains it; this method's own
+    /// `append_message_paired`, whose doc explains it; this method's own
     /// caller (the final assistant message, which pairs with nothing)
     /// discards any return value, so there is none.
     fn append_message(&self, msg: &ChatMessage) {
@@ -2229,22 +2229,18 @@ impl TurnPersistence {
     /// caller may go on to persist a message that must be paired with
     /// this one.
     ///
-    /// ACP sessions persist tool traffic; the other stores do not (see
-    /// #194). Their line format has no reference form for a result, so
-    /// writing one raw would put the content into the workspace and the
-    /// retrieve index — which is exactly what the ACP store's external
-    /// cache exists to avoid. Unlike [`Self::append_message`], the
-    /// non-ACP branch writes nothing at all rather than falling back to
-    /// `store.append` — hence the separate method.
-    ///
-    /// `true` when nothing was written at all: there is no pairing to
-    /// break, so a `tool_result` must not be skipped just because its
-    /// `tool_use` was never a candidate for the store.
-    fn append_acp_only(&self, msg: &ChatMessage) -> bool {
-        if !self.is_acp {
-            return true;
-        }
-        match self.acp_store.append_message(&self.session_id, msg) {
+    /// `false` only when the append was attempted and failed. Every
+    /// store persists tool traffic now (#194), so there is no longer a
+    /// transport that skips this — what used to be the `is_acp` branch
+    /// here always returned `true` for the four `SessionStore` kinds
+    /// precisely because they wrote nothing at all.
+    fn append_message_paired(&self, msg: &ChatMessage) -> bool {
+        let result = if self.is_acp {
+            self.acp_store.append_message(&self.session_id, msg)
+        } else {
+            self.store.append(&self.session_id, msg)
+        };
+        match result {
             Ok(()) => true,
             Err(e) => {
                 warn!("Failed to persist a message: {e}");
@@ -2442,19 +2438,13 @@ impl TurnLoop<'_> {
                     let msg =
                         ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
                     history.push(msg.clone());
-                    // ACP sessions persist tool traffic; the other stores do
-                    // not (see #194). Their line format has no reference
-                    // form for a result, so writing one raw would put the
-                    // content into the workspace and the retrieve index —
-                    // which is exactly what the ACP store's external cache
-                    // exists to avoid.
-                    //
-                    // Whether this append actually landed is captured and
-                    // carried down to the `tool_result` append below: the
-                    // two must not be skipped independently of each other
+                    // Whether this append landed is captured and carried
+                    // down to the `tool_result` append below: the two
+                    // must not be skipped independently of each other
                     // (see the comment there for why).
-                    let tool_use_persisted =
-                        self.persistence.is_none_or(|p| p.append_acp_only(&msg));
+                    let tool_use_persisted = self
+                        .persistence
+                        .is_none_or(|p| p.append_message_paired(&msg));
 
                     // Notify client of each tool starting
                     for call in &tool_calls {
@@ -2670,7 +2660,7 @@ impl TurnLoop<'_> {
                     // than neither, so skip this append too rather than
                     // leaving only the result on disk.
                     if tool_use_persisted && let Some(p) = self.persistence {
-                        p.append_acp_only(&result_msg);
+                        p.append_message_paired(&result_msg);
                     }
                 }
             }
@@ -5034,12 +5024,13 @@ mod tests {
         );
     }
 
-    /// `/rpc` and the other transports keep today's behaviour: their
-    /// stores have no reference form for a tool result, so writing one
-    /// raw would put the content in the workspace and the retrieve
-    /// index. Tracked as #194.
+    /// `/rpc` used to skip tool traffic entirely (its store had no
+    /// reference form for a tool result, so writing one raw would put
+    /// the content in the workspace and the retrieve index). The four
+    /// `SessionStore` kinds now have the same workspace-external cache
+    /// ACP does, so `/rpc` persists both halves too. Tracked as #194.
     #[tokio::test]
-    async fn an_rpc_turn_still_does_not_persist_tool_calls() {
+    async fn an_rpc_turn_now_persists_its_tool_calls_too() {
         let state = ServeState::for_test_scripted(
             true,
             vec![
@@ -5077,12 +5068,83 @@ mod tests {
             .cross_device_session_store
             .load_session(&sid)
             .unwrap_or_default();
+
+        // Same position-based check as the ACP test above: pins the
+        // order on disk, not just presence, so a tool_result written
+        // ahead of its tool_use (rejected by the API on reload) would
+        // still fail this.
+        let use_at = stored
+            .iter()
+            .position(|m| {
+                m.parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::ToolUse { id, .. } if id == "call-1"))
+            })
+            .expect("the tool_use was persisted");
+        let result_at = stored
+            .iter()
+            .position(|m| {
+                m.parts.iter().any(|p| {
+                    matches!(p, ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == "call-1")
+                })
+            })
+            .expect("the matching tool_result was persisted");
+
         assert!(
-            !stored.iter().flat_map(|m| m.parts.iter()).any(|p| matches!(
-                p,
-                ContentPart::ToolUse { .. } | ContentPart::ToolResult { .. }
-            )),
-            "the /rpc store must still hold no tool traffic"
+            use_at < result_at,
+            "the tool_use (message {use_at}) must land before its tool_result \
+             (message {result_at}) on disk"
+        );
+    }
+
+    /// The four SessionStore kinds persist tool traffic now, so a /rpc
+    /// session's tool_use and tool_result both reach disk (#194).
+    #[test]
+    fn a_non_acp_session_persists_both_halves_of_a_tool_call() {
+        let base = tempfile::TempDir::new().unwrap();
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = crate::tool_result_cache::ToolResultCache::open(cache_dir.path().to_path_buf())
+            .unwrap();
+        let store = SessionStore::new(base.path().join("sessions"), "rpc", Some(cache));
+        let key = ("s1".to_string(), None);
+        store
+            .ensure_session("s1", &key, "rpc", None, "default")
+            .unwrap();
+
+        store
+            .append(
+                "s1",
+                &ChatMessage::assistant_with_tools(
+                    None,
+                    vec![crate::provider::ToolCall {
+                        id: "c1".to_string(),
+                        name: "file_read".to_string(),
+                        input: serde_json::json!({}),
+                    }],
+                ),
+            )
+            .unwrap();
+        store
+            .append(
+                "s1",
+                &ChatMessage::tool_results_with_images(
+                    vec![("c1".to_string(), "contents".to_string())],
+                    Vec::new(),
+                ),
+            )
+            .unwrap();
+
+        let loaded = store.load_session("s1").expect("the session loads");
+        assert!(
+            loaded
+                .iter()
+                .flat_map(|m| &m.parts)
+                .any(|p| matches!(p, ContentPart::ToolUse { id, .. } if id == "c1")),
+            "tool_use missing: {loaded:?}"
+        );
+        assert!(
+            loaded.iter().flat_map(|m| &m.parts).any(|p| matches!(p, ContentPart::ToolResult { tool_use_id, content } if tool_use_id == "c1" && content == "contents")),
+            "tool_result missing: {loaded:?}"
         );
     }
 

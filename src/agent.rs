@@ -519,51 +519,39 @@ impl Agent {
         }
     }
 
-    /// Persist `msg` to the session store. No-op if session creation failed.
+    /// Persist `msg` to the session store. Returns whether it landed, so
+    /// a caller holding the other half of a `tool_use` / `tool_result`
+    /// pair can decline to write it alone.
     ///
-    /// `ToolUse` / `ToolResult` parts are stripped before write: tool
-    /// payloads can be arbitrarily large (file contents, etc.) and raw
-    /// history is never reloaded across restarts, so persisting them
-    /// would only bloat the JSONL — context survives via compaction
-    /// summaries. The assistant's *text* alongside a tool call is kept,
-    /// however, since that's what the user actually saw and removing it
-    /// makes the session log a misleading record of the conversation.
-    /// A message that becomes empty after stripping is dropped entirely
-    /// (e.g. pure tool-result turns).
+    /// Tool parts used to be stripped here — raw history was never
+    /// reloaded, so persisting them would only have bloated the JSONL.
+    /// It is reloaded now (#194), and a history that remembers what was
+    /// said but not what was done is the gap this exists to close.
     ///
-    /// Image scrubbing (raw base64 → `[image: <media_type> sha256=...]` text
-    /// marker) happens centrally inside [`SessionStore::append`] so every
-    /// persist path (agent, A2A, MCP) inherits the same on-disk shape.
-    fn persist(&self, session_id: &str, msg: &ChatMessage) {
+    /// The storage shape is decided inside [`SessionStore::append`]:
+    /// tool results go to the workspace-external cache, oversized tool
+    /// inputs are elided, images become hash markers. Every persist path
+    /// (agent, `/rpc`, `/a2a`, MCP) inherits it.
+    ///
+    /// A no-op returns `true`: there is no pairing to break when nothing
+    /// was ever a candidate for the store.
+    fn persist(&self, session_id: &str, msg: &ChatMessage) -> bool {
         if session_id.is_empty() {
-            return;
+            return true;
         }
-        let kept: Vec<ContentPart> = msg
-            .parts
-            .iter()
-            .filter(|p| {
-                !matches!(
-                    p,
-                    ContentPart::ToolUse { .. } | ContentPart::ToolResult { .. }
-                )
-            })
-            .cloned()
-            .collect();
-        let has_content = kept.iter().any(|p| match p {
+        let has_content = msg.parts.iter().any(|p| match p {
             ContentPart::Text(t) => !t.is_empty(),
             _ => true,
         });
         if !has_content {
-            return;
+            return true;
         }
-        let filtered = ChatMessage {
-            role: msg.role.clone(),
-            parts: kept,
-            input_kind: msg.input_kind.clone(),
-            user_id: msg.user_id.clone(),
-        };
-        if let Err(e) = self.session_store.append(session_id, &filtered) {
-            warn!("Failed to persist message: {e}");
+        match self.session_store.append(session_id, msg) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to persist message: {e}");
+                false
+            }
         }
     }
 
@@ -804,7 +792,7 @@ impl Agent {
                 .entry(key.clone())
                 .or_default()
                 .push(msg.clone());
-            self.persist(&session_id, &msg);
+            let _ = self.persist(&session_id, &msg);
         }
         // Mark activity for the idle-flush loop. Done after the message
         // is queued so a freshly-active key won't be culled by a flush
@@ -935,7 +923,7 @@ impl Agent {
                         .entry(key.clone())
                         .or_default()
                         .push(msg.clone());
-                    self.persist(&session_id, &msg);
+                    let _ = self.persist(&session_id, &msg);
                     if !text.is_empty() {
                         accumulated_text.push(text);
                     }
@@ -954,7 +942,13 @@ impl Agent {
                         .entry(key.clone())
                         .or_default()
                         .push(msg.clone());
-                    self.persist(&session_id, &msg);
+                    // Carried down to the tool_result append below. A
+                    // half-persisted pair is worse than neither: the
+                    // in-memory history is correct either way and gets
+                    // rebuilt next turn, but a tool_result alone on disk
+                    // chains onto the preceding user message and bricks
+                    // the session file for good.
+                    let tool_use_persisted = self.persist(&session_id, &msg);
 
                     // Execute tools concurrently. Each task gets the
                     // room's memory namespace via task_local so the
@@ -1046,7 +1040,9 @@ impl Agent {
                         .entry(key.clone())
                         .or_default()
                         .push(msg.clone());
-                    self.persist(&session_id, &msg);
+                    if tool_use_persisted {
+                        self.persist(&session_id, &msg);
+                    }
                 }
             }
         };

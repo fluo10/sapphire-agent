@@ -13,14 +13,12 @@
 //! placeholder that keeps the history valid; the model can call the tool
 //! again if it needs to.
 //!
-//! **Not yet wired into `run_llm_turn`.** Tool calls are not persisted
-//! at all today — `run_llm_turn` skips both `tool_use` and
-//! `tool_result` messages when appending to the session store, so
-//! nothing in the current request path ever calls `put`/`get` here.
-//! This cache, `StoredPart::ToolUse` and `StoredPart::ToolResultRef`
-//! exist for the replay design tracked as
-//! [#191](https://github.com/fluo10/sapphire-agent/issues/191), not for
-//! anything currently reachable.
+//! Wired into every transport now (#194): `run_llm_turn` and
+//! `Agent::persist` both append `tool_use`/`tool_result` messages
+//! instead of skipping them, and `SessionStore::append` routes each
+//! `tool_result` through `put` here, replacing it with a
+//! `ContentPart::ToolResultRef`. Loading a session calls `get` to
+//! hydrate the reference back into the result the provider expects.
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
