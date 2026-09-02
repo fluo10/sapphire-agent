@@ -9,6 +9,7 @@ mod agents;
 mod ambient;
 mod channel;
 mod cli_device;
+mod cli_init;
 mod config;
 mod config_layer;
 mod context_compression;
@@ -90,6 +91,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Seed a workspace with the files the agent reads.
+    Init {
+        /// Directory to seed. Created if missing; defaults to the current one.
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
     /// Validate the config file and exit
     Verify,
     /// Manage the devices that authenticate to this agent.
@@ -163,6 +170,13 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Before the config load below: `init` is what an operator runs when there
+    // is no host config yet, so requiring one to reach it would make the
+    // command unusable exactly when it is needed.
+    if let Some(Command::Init { path }) = &cli.command {
+        return cli_init::run(path.clone());
+    }
+
     let config_path = cli.config.unwrap_or_else(Config::default_path);
     let LoadedConfig {
         config,
@@ -212,6 +226,8 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
+        // Returned above, before the config was loaded.
+        Some(Command::Init { .. }) => unreachable!("`init` is dispatched ahead of the config load"),
         Some(Command::Verify) => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
             let profile_errors = config.validate_profiles();
