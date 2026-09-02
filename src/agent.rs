@@ -3,7 +3,7 @@ use crate::config::{Config, SessionPolicy};
 use crate::context_compression::{generate_summary, maybe_compress};
 use crate::image_cache::{ImageCache, hydrate_history, scrub_history_inplace};
 use crate::provider::registry::ProviderRegistry;
-use crate::provider::{ChatMessage, ContentPart, Provider, Role, ToolCall};
+use crate::provider::{ChatMessage, ContentPart, Provider, ToolCall};
 use crate::session::{ConversationKey, SessionStore, local_date_for_timestamp};
 use crate::tools::ToolSet;
 use crate::workspace::Workspace;
@@ -658,19 +658,7 @@ impl Agent {
             warn!("Failed to persist boundary summary for {session_id}: {e}");
         }
 
-        let stub = vec![
-            ChatMessage {
-                role: Role::User,
-                parts: vec![ContentPart::Text(format!(
-                    "[Context Summary — prior-day messages were compacted]\n\n{summary}"
-                ))],
-                input_kind: None,
-                user_id: None,
-            },
-            ChatMessage::assistant(
-                "Understood. I have the context from the prior day's conversation.",
-            ),
-        ];
+        let stub = crate::context_compression::compaction_stub(&summary);
 
         self.history.lock().await.insert(key.clone(), stub);
         // Refresh the system prompt snapshot so it rebuilds with today's date.
