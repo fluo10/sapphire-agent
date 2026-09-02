@@ -83,6 +83,25 @@ use tracing::warn;
 
 pub(crate) const SUBAGENT_TOOL_NAME: &str = "subagent";
 
+/// Read `key` out of `input` as an optional string, distinguishing
+/// "absent" (or explicit JSON `null`) from "present but not a string".
+///
+/// `agent` and `resume` used to go through a bare
+/// `.get(key).and_then(|v| v.as_str())`, which conflates those two
+/// cases: a non-string value quietly becomes `None`, the same as never
+/// having been given at all. That is not just an unhelpful error
+/// message — `{"agent": 123, "resume": "h", "prompt": "x"}` would slip
+/// straight past the mutual-exclusivity check in `execute` and resume
+/// silently, even though `agent` was very much present. Bailing here,
+/// before that check ever runs, is what closes it.
+fn string_field<'a>(input: &'a serde_json::Value, key: &str) -> anyhow::Result<Option<&'a str>> {
+    match input.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => anyhow::bail!("'{key}' must be a string"),
+    }
+}
+
 /// A subagent's whole system prompt.
 ///
 /// The definition's body, plus the date — and nothing else is baked
@@ -370,8 +389,8 @@ impl Tool for SubagentTool {
 
     async fn execute(&self, input: &serde_json::Value) -> anyhow::Result<String> {
         let prompt = input["prompt"].as_str().context("missing 'prompt'")?;
-        let agent = input.get("agent").and_then(|v| v.as_str());
-        let resume = input.get("resume").and_then(|v| v.as_str());
+        let agent = string_field(input, "agent")?;
+        let resume = string_field(input, "resume")?;
 
         // Neither given, or both given, is a recoverable error naming
         // the rule rather than guessing which one was meant.
@@ -414,8 +433,19 @@ impl SubagentTool {
         let handle = uuid::Uuid::now_v7().to_string();
         let created_at = chrono::Utc::now();
 
+        // Nothing is on disk yet under this fresh handle, so an
+        // over-cap `put` here just means the handle never becomes
+        // resumable at all — there is no earlier, shorter copy for the
+        // model to be misled by (contrast `resume`'s own message).
         Ok(self
-            .run_and_store(&ctx, def, &handle, created_at, &mut history)
+            .run_and_store(
+                &ctx,
+                def,
+                &handle,
+                created_at,
+                &mut history,
+                "history exceeded the cache limit",
+            )
             .await)
     }
 
@@ -454,15 +484,23 @@ impl SubagentTool {
         };
 
         let Some(def) = self.agents.iter().find(|a| a.name == stored.agent) else {
-            // The definition this handle belongs to is gone (renamed,
-            // deleted, or the operator's `.md` edit dropped it) — the
-            // entry can never be resumed again, so it is not worth
-            // keeping around; drop it rather than leaving a permanent
-            // orphan for `prune_before` to eventually find.
-            cache.remove(handle);
+            // The definition this handle belongs to does not currently
+            // resolve — a rename, a deletion, or simply a `.md` that
+            // failed to parse this time around. That last case is not
+            // permanent: `agents::load_agents_dir` skips a single file
+            // it can't read or parse (a `warn!`, nothing more) rather
+            // than failing the whole load, so a definition can vanish
+            // on one restart — mid-save, a YAML typo — and come back on
+            // the next once it's fixed, with this same handle still
+            // valid. Deleting the stored child here on what might be a
+            // transient miss would make that restart unrecoverable
+            // instead of merely inconvenient, so this only bails; the
+            // entry is left for `prune_before` to retire on its own
+            // schedule if the definition truly never comes back.
             anyhow::bail!(
                 "the '{}' agent definition that handle '{handle}' belongs \
-                 to no longer exists; dispatch a new agent instead",
+                 to does not currently exist; dispatch a new agent instead, \
+                 or try resuming again once it's back",
                 stored.agent
             );
         };
@@ -470,8 +508,27 @@ impl SubagentTool {
         let mut history = stored.history;
         history.push(ChatMessage::user(prompt));
 
+        // Unlike `dispatch`, this handle already resolves to a shorter,
+        // previously-`put` history on disk — an over-cap `put` here
+        // writes nothing, leaving that earlier copy in place. Left
+        // unremarked, a model reading only "not resumable: history
+        // exceeded the cache limit" would have no way to know the
+        // handle still resolves, just not to what it was told: a later
+        // resume would silently rewind past this exact exchange, losing
+        // this prompt and its answer with no signal that anything
+        // diverged. Name that explicitly rather than reusing dispatch's
+        // message.
         Ok(self
-            .run_and_store(&ctx, def, handle, stored.created_at, &mut history)
+            .run_and_store(
+                &ctx,
+                def,
+                handle,
+                stored.created_at,
+                &mut history,
+                "this exchange exceeded the cache limit and was not saved; \
+                 the stored copy still ends before it, so a later resume \
+                 will not include this prompt or its answer",
+            )
             .await)
     }
 
@@ -480,8 +537,10 @@ impl SubagentTool {
     /// that store attempt means for resumability. Shared by
     /// [`Self::dispatch`] (a freshly generated handle) and
     /// [`Self::resume`] (the same handle it was given), so this
-    /// run-then-persist sequence — and the "not resumable" fallback
-    /// when `put` refuses an over-cap entry — is written once.
+    /// run-then-persist sequence is written once — `over_cap_reason` is
+    /// the one thing the two callers have to say differently, since
+    /// only `resume` risks leaving a stale, shorter copy behind when
+    /// `put` refuses.
     async fn run_and_store(
         &self,
         ctx: &crate::serve::TurnContext,
@@ -489,6 +548,7 @@ impl SubagentTool {
         handle: &str,
         created_at: chrono::DateTime<chrono::Utc>,
         history: &mut Vec<ChatMessage>,
+        over_cap_reason: &'static str,
     ) -> String {
         // A typo, a renamed tool, or a name that was never registered
         // yields a subagent silently missing it — no warning at load,
@@ -552,6 +612,7 @@ impl SubagentTool {
             &def.name,
             history,
             created_at,
+            over_cap_reason,
         );
         prefixed(&def.name, resumability, &answer)
     }
@@ -574,12 +635,19 @@ enum Resumability {
 /// entry unloadable rather than merely shorter). So `Ok(false)` here
 /// still returns the answer normally; only the resumability marker
 /// changes.
+///
+/// `over_cap_reason` is the caller's choice of wording for that
+/// `Ok(false)` case specifically — `dispatch` and `resume` need
+/// different ones, since only `resume` risks leaving a stale, shorter
+/// copy on disk when `put` refuses to overwrite it (see `resume`'s own
+/// comment at its call site).
 fn persist(
     cache: Option<&crate::subagent_cache::SubagentCache>,
     handle: &str,
     agent_name: &str,
     history: Vec<ChatMessage>,
     created_at: chrono::DateTime<chrono::Utc>,
+    over_cap_reason: &'static str,
 ) -> Resumability {
     let Some(cache) = cache else {
         return Resumability::NotResumable("no resume cache is configured on this deployment");
@@ -592,7 +660,7 @@ fn persist(
     };
     match cache.put(handle, &child) {
         Ok(true) => Resumability::Resumable(handle.to_string()),
-        Ok(false) => Resumability::NotResumable("history exceeded the cache limit"),
+        Ok(false) => Resumability::NotResumable(over_cap_reason),
         Err(e) => {
             warn!("subagent cache: failed to store handle '{handle}': {e:#}");
             Resumability::NotResumable("could not be saved to the resume cache")
@@ -1357,5 +1425,165 @@ mod tests {
 
         assert!(out.contains("not resumable"), "got: {out}");
         assert!(out.contains("the answer"), "answer was lost: {out}");
+    }
+
+    /// Unlike `dispatch`'s over-cap case (nothing was ever on disk, so
+    /// there is no earlier copy to be misled by), a resume that
+    /// overflows the cap leaves the *previous*, shorter history in
+    /// place — the handle keeps resolving, just not to what this call
+    /// just returned. The marker has to name that divergence, not
+    /// reuse dispatch's plain "history exceeded the cache limit".
+    #[tokio::test]
+    async fn a_resume_over_cap_names_the_divergence_not_just_the_cap() {
+        let mut state = crate::serve::ServeState::for_test(false);
+        let cache_dir = tempfile::tempdir().unwrap();
+        let tiny_cache =
+            crate::subagent_cache::SubagentCache::open(cache_dir.path().to_path_buf(), 1_000)
+                .unwrap();
+        std::sync::Arc::get_mut(&mut state)
+            .expect("uniquely owned immediately after construction")
+            .subagent_cache = Some(tiny_cache);
+
+        let tool = SubagentTool::new(defs());
+
+        // Small enough that the dispatch itself fits comfortably under
+        // the 1,000-byte cap.
+        let dispatch_provider = ScriptedProvider::new(vec![text_response("dispatch ok")]);
+        let dispatch_input = serde_json::json!({"agent": "reviewer", "prompt": "go"});
+        let dispatched = crate::serve::scope_turn_context(
+            turn_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&dispatch_provider)
+                    as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+            ),
+            tool.execute(&dispatch_input),
+        )
+        .await
+        .unwrap();
+        assert!(
+            dispatched.contains("handle"),
+            "the dispatch itself must have fit under the cap, or this \
+             test isn't isolating the resume-path case: {dispatched}"
+        );
+        let handle = extract_handle(&dispatched);
+
+        // Large enough that appending it (plus the reply) pushes the
+        // stored history over the same cap on resume.
+        let resume_provider = ScriptedProvider::new(vec![text_response("resume ok")]);
+        let huge_prompt = "y".repeat(5_000);
+        let resume_input = serde_json::json!({"resume": handle, "prompt": huge_prompt});
+        let out = crate::serve::scope_turn_context(
+            turn_context(
+                state,
+                std::sync::Arc::clone(&resume_provider)
+                    as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+            ),
+            tool.execute(&resume_input),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("not resumable"), "got: {out}");
+        assert!(
+            out.contains("will not include"),
+            "the resume-path message must name the divergence — that the \
+             stored copy still ends before this exchange — not just \
+             repeat dispatch's plain cap message: {out}"
+        );
+    }
+
+    /// `agent`/`resume` present but not a string must be reported as
+    /// what it is — a type error on that key — not silently treated the
+    /// same as the key never having been given at all. See
+    /// `string_field`'s doc.
+    #[tokio::test]
+    async fn a_non_string_agent_is_a_type_error_not_treated_as_absent() {
+        let tool = SubagentTool::new(defs());
+        let err = tool
+            .execute(&serde_json::json!({"agent": 123, "prompt": "x"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("agent"), "got: {err}");
+        assert!(err.contains("string"), "got: {err}");
+    }
+
+    /// The bug this closes: with a bare `.and_then(|v| v.as_str())`, a
+    /// present-but-wrong-typed `agent` was indistinguishable from an
+    /// absent one, so `{"agent": 123, "resume": "h", ...}` would slip
+    /// past the mutual-exclusivity check in `execute` and resume
+    /// silently — even though `agent` was very much present. It must
+    /// instead be reported as a type error before that check ever runs.
+    #[tokio::test]
+    async fn a_wrong_typed_agent_cannot_smuggle_a_resume_past_the_exclusivity_check() {
+        let tool = SubagentTool::new(defs());
+        let err = tool
+            .execute(&serde_json::json!({"agent": 123, "resume": "h", "prompt": "x"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("agent") && err.contains("string"),
+            "must be reported as a type error on 'agent', not silently \
+             resumed: got: {err}"
+        );
+    }
+
+    /// `TerminalReservation` leaked its slot this exact way on an
+    /// earlier branch, which is why it is a `Drop` guard rather than a
+    /// remember-to-remove-the-entry pattern — see its own doc
+    /// (`src/tools/acp_client.rs`) and the precedent this mirrors,
+    /// `client_tools::tests::a_dropped_reservation_does_not_leak_the_slot`.
+    /// Confirms `ResumeGuard` has the same property: a resume cancelled
+    /// mid-flight (the future simply dropped — ACP treats that as
+    /// routine, no different from an Escape in the editor or a dropped
+    /// socket) still releases the handle, rather than leaving it
+    /// refused forever.
+    #[tokio::test]
+    async fn a_cancelled_resume_releases_the_busy_guard() {
+        let tool = SubagentTool::new(defs());
+        let state = crate::serve::ServeState::for_test(false);
+
+        let dispatch_provider = ScriptedProvider::new(vec![text_response("dispatch answer")]);
+        let dispatch_input = serde_json::json!({"agent": "reviewer", "prompt": "go"});
+        let dispatched = crate::serve::scope_turn_context(
+            turn_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&dispatch_provider)
+                    as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+            ),
+            tool.execute(&dispatch_input),
+        )
+        .await
+        .unwrap();
+        let handle = extract_handle(&dispatched);
+
+        let resume_provider = ScriptedProvider::new(vec![text_response("resume answer")]);
+        let resume_input = serde_json::json!({"resume": handle.clone(), "prompt": "x"});
+        let ctx = turn_context(
+            std::sync::Arc::clone(&state),
+            std::sync::Arc::clone(&resume_provider)
+                as std::sync::Arc<dyn crate::provider::Provider>,
+            Vec::new(),
+        );
+        // Scoped in its own block rather than an explicit `drop(fut)`:
+        // `tokio::pin!` shadows `fut` with a `Pin<&mut T>` pointing at a
+        // second, hidden owned local holding the real future — dropping
+        // the visible `fut` only drops that reference wrapper, not the
+        // future itself (and, with it, the `ResumeGuard` inside), which
+        // stays alive until its own (hidden) binding's scope ends. This
+        // block gives it one that ends before the assertion below runs,
+        // so the drop this test is checking for has actually happened
+        // by the time it checks.
+        {
+            let fut = crate::serve::scope_turn_context(ctx, tool.execute(&resume_input));
+            tokio::pin!(fut);
+            assert!(futures_util::poll!(fut.as_mut()).is_pending());
+            assert!(tool.busy_handles.lock().unwrap().contains(&handle));
+        }
+        assert!(tool.busy_handles.lock().unwrap().is_empty());
     }
 }

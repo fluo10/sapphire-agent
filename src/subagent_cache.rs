@@ -146,6 +146,23 @@ impl SubagentCache {
 
     /// Drop the entry for `handle`, if any. Not an error if it was
     /// already absent.
+    ///
+    /// No production caller as of Task 6's fix round 1: `subagent.rs`'s
+    /// `resume` used to call this when a stored child's agent
+    /// definition failed to resolve, on the theory that such an entry
+    /// could never be resumed again — but `agents::load_agents_dir`
+    /// only *skips* a `.md` it can't read or parse rather than failing
+    /// the whole load, so that miss can be transient (a restart mid-
+    /// save, a YAML typo since fixed) and the deletion was destroying
+    /// conversations a later, successful load would have made resumable
+    /// again. `resume` now only bails, and leaves the entry for
+    /// `prune_before` to retire on its own schedule instead. Kept
+    /// (rather than deleted) for the cache round-trip test below and
+    /// because a real caller may still turn up — e.g. an explicit
+    /// "forget this conversation" operator action — without reopening
+    /// the question of *when* to call it that the deletion above got
+    /// wrong.
+    #[allow(dead_code)]
     pub fn remove(&self, handle: &str) {
         if let Ok(path) = self.path_for(handle) {
             let _ = std::fs::remove_file(path);
