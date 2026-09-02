@@ -11,14 +11,6 @@
 
 use anyhow::{Context, Result, bail};
 
-// This module's whole public surface is unused until the `skill` /
-// `skill_install` / `skill_uninstall` ACP tools (a later task) call into
-// it — clippy's default (non-`--all-targets`) profile does not see the
-// `#[cfg(test)]` module below, so every item here reads as dead code to
-// it in the meantime. `#[allow(dead_code)]` on each item records that
-// this is expected, not a decision to drop coverage; every item is
-// exercised by the unit tests in this file's own `mod tests`.
-
 #[derive(Debug)]
 pub struct SkillEntry {
     pub name: String,
@@ -92,7 +84,6 @@ printf 'NO_SKILLS_DIR\n'
 /// without `HOME` (a service, a stripped-down environment) could still
 /// match it and silently create under a system-wide path instead of
 /// falling through to the XDG-based candidate below.
-#[allow(dead_code)]
 pub const RESOLVE_OR_CREATE_SH: &str = r#"
 set -eu
 if [ -n "${SAPPHIRE_AGENT_SKILLS_DIR:-}" ]; then
@@ -164,7 +155,6 @@ pub fn parse_index(stdout: &str) -> Result<SkillIndex> {
 
 /// Parse the output of [`RESOLVE_OR_CREATE_SH`]: a single
 /// `SKILLS_DIR\t<path>` line. Errors if that line is absent.
-#[allow(dead_code)]
 pub fn parse_resolved_dir(stdout: &str) -> Result<String> {
     stdout
         .lines()
@@ -182,7 +172,6 @@ pub fn parse_resolved_dir(stdout: &str) -> Result<String> {
 /// enumeration that could miss one. A leading `-` is rejected first so
 /// nothing here can be mistaken for a flag by whatever eventually runs
 /// `git clone` with this string.
-#[allow(dead_code)]
 pub fn validate_source_url(url: &str) -> Result<()> {
     if url.is_empty() || url.starts_with('-') || !url.starts_with("https://") {
         bail!("'{url}' is not an https:// source URL");
@@ -193,7 +182,6 @@ pub fn validate_source_url(url: &str) -> Result<()> {
 /// Derive a destination directory name from a source URL: the final
 /// non-empty path segment (after the `scheme://host` part), with a
 /// trailing `.git` stripped, validated as a skills-directory entry name.
-#[allow(dead_code)]
 pub fn destination_name(url: &str) -> Result<String> {
     let after_scheme = url.split("://").nth(1).unwrap_or(url);
     let path = after_scheme.split_once('/').map_or("", |(_, rest)| rest);
@@ -210,7 +198,6 @@ pub fn destination_name(url: &str) -> Result<String> {
 /// (`src/digest_cache.rs`) for why this closed, decades-stable Win32 set
 /// needs its own check: `"CON"` is three ordinary ASCII letters, so an
 /// allow-listed charset alone does not exclude it.
-#[allow(dead_code)]
 const RESERVED_WINDOWS_NAMES: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
@@ -237,7 +224,6 @@ const RESERVED_WINDOWS_NAMES: &[&str] = &[
 /// - Windows silently strips a trailing `.` (and trailing spaces),
 ///   so `"superpowers."` would otherwise collide with an existing
 ///   `"superpowers"`.
-#[allow(dead_code)]
 pub fn validate_entry_name(name: &str) -> Result<()> {
     let stem = name.split('.').next().unwrap_or(name);
     let reserved = RESERVED_WINDOWS_NAMES

@@ -20,16 +20,20 @@
 //! the resolver script.
 
 use crate::provider::ToolSpec;
-use crate::skills::{RESOLVE_AND_INDEX_SH, SkillEntry, SkillIndex, parse_index};
+use crate::skills::{
+    RESOLVE_AND_INDEX_SH, RESOLVE_OR_CREATE_SH, SkillEntry, SkillIndex, destination_name,
+    parse_index, parse_resolved_dir, validate_entry_name, validate_source_url,
+};
 use crate::tools::acp_client::{AcpClient, ExitStatus, current_acp_client};
-use crate::tools::client_exec::run_client_command;
+use crate::tools::client_exec::{ClientRun, run_client_command};
 use crate::tools::client_tools::format_exit_status;
 use crate::tools::{Tool, ToolKind};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The editor is not reachable: no ACP client is scoped to this call.
 /// Worded the same as `client_tools::no_editor_error` on purpose — same
@@ -38,6 +42,16 @@ use std::sync::{Arc, Mutex};
 /// needs it.
 fn no_editor_error() -> anyhow::Error {
     anyhow::anyhow!("no editor is connected to this session; this tool only works over ACP")
+}
+
+/// The session key `SkillTool`'s cache (see its doc) is keyed on for
+/// the turn currently executing. Shared by `skill`, `skill_install`,
+/// `skill_update` and `skill_uninstall` so each derives it the same
+/// way — `None` for a turn with no session to key on (no reachable
+/// `TurnContext`, or a subagent's nested call, where
+/// `TurnPersistence` is `None`), which the cache never writes under.
+fn current_session_key() -> Option<String> {
+    crate::serve::current_turn_context().and_then(|ctx| ctx.session_id.clone())
 }
 
 /// How long to wait for the client's shell to resolve and index the
@@ -103,20 +117,10 @@ impl SkillTool {
     /// re-resolve and re-index the directory instead of reusing the
     /// cached copy. Other sessions' cache entries are untouched.
     ///
-    /// This task has no caller for it: `skill` never changes what's on
-    /// disk. It exists for `skill_install`/`skill_update`/
-    /// `skill_uninstall` (a later task), which do — without this, a
+    /// Called by `skill_install`/`skill_update`/`skill_uninstall` after
+    /// any successful change to what is on disk — without this, a
     /// skill installed mid-session would stay invisible to `skill()`
     /// until the process restarted.
-    ///
-    /// `#[allow(dead_code)]`: this crate builds as a binary, so an
-    /// unused `pub` method is still dead code to clippy's default
-    /// (non-`--all-targets`) profile — nothing outside `#[cfg(test)]`
-    /// calls this until `skill_install`/`skill_update`/
-    /// `skill_uninstall` (a later task) do. It is exercised by
-    /// `invalidating_the_cache_forces_a_re_resolve` in this file's own
-    /// `mod tests` in the meantime.
-    #[allow(dead_code)]
     pub fn invalidate_cache(&self, session_key: &str) {
         self.cache.lock().unwrap().remove(session_key);
     }
@@ -304,8 +308,7 @@ impl Tool for SkillTool {
         // a subagent's nested call, which has a turn context but no
         // session behind it) means `resolve_index` re-resolves every
         // time rather than risking a shared cache slot.
-        let session_key =
-            crate::serve::current_turn_context().and_then(|ctx| ctx.session_id.clone());
+        let session_key = current_session_key();
         let index = self.resolve_index(&client, session_key.as_deref()).await?;
 
         match input.get("name").and_then(|v| v.as_str()) {
@@ -322,6 +325,503 @@ impl Tool for SkillTool {
                 ))
             }
         }
+    }
+}
+
+/// Lets one `Arc<SkillTool>` back two independent `ToolSet` registrations
+/// (the `skill` slot here and the `skill_install`/`skill_update`/
+/// `skill_uninstall` slots below) that all read and invalidate the same
+/// cache, rather than each `Box<dyn Tool>` owning its own disconnected
+/// copy of `SkillTool`.
+#[async_trait]
+impl Tool for Arc<SkillTool> {
+    fn kind(&self) -> ToolKind {
+        (**self).kind()
+    }
+
+    fn spec(&self) -> &ToolSpec {
+        (**self).spec()
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        (**self).execute(input).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// skill_install / skill_update / skill_uninstall
+//
+// These three are what actually changes the directory `skill` only ever
+// reads. All the guard code below exists because of two facts that don't
+// go away just because the URL or the name came from a model rather than
+// a person: `git clone` against a model-chosen URL is an arbitrary-code
+// delivery path (`ext::` URLs make git execute a command by design), and
+// `skill_uninstall`'s `name` is a path component about to be joined onto
+// a real directory and handed to `rm -rf`.
+// ---------------------------------------------------------------------------
+
+/// How long to wait for a local, non-network operation on the editor's
+/// machine: resolving/creating the directory, checking `git status`, an
+/// existence probe, `rm -rf`. Reuses `CLIENT_TIMEOUT` — these all cost
+/// about as little as the reads `skill()` already waits `CLIENT_TIMEOUT`
+/// for.
+const LOCAL_TIMEOUT: Duration = CLIENT_TIMEOUT;
+
+/// How long to wait for a `git` operation that talks to a remote:
+/// `clone`, `pull`, `remote get-url`. Generous relative to what a small
+/// skills checkout costs, because this is a round trip over whatever
+/// network the editor's machine is on, not this crate's own latency.
+const GIT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Interpret a finished [`ClientRun`]: bail on a timeout or a failing
+/// exit status, otherwise return the command's output (with any
+/// release warning appended). `status` is `None` exactly when the
+/// command timed out — checking that, rather than trusting whatever
+/// output happened to arrive, is what Task 3 got wrong once already.
+fn finish_run(run: ClientRun, context: &str, timeout: Duration) -> Result<String> {
+    if run.timed_out_handle.is_some() {
+        anyhow::bail!(
+            "timed out {context} on the editor's machine after {}s",
+            timeout.as_secs()
+        );
+    }
+    let status = run
+        .status
+        .expect("run_client_command always sets `status` when it does not time out");
+    if SkillTool::command_failed(&status) {
+        anyhow::bail!(
+            "{context} failed on the editor's machine: {}",
+            format_exit_status(&status).trim()
+        );
+    }
+    let mut out = run.output.output;
+    if let Some(warning) = run.release_warning {
+        out.push('\n');
+        out.push_str(&warning);
+    }
+    Ok(out)
+}
+
+/// Run `git <args>` on the editor's machine with credential prompting
+/// disabled.
+///
+/// `AcpClient::create_terminal` has no environment parameter (confirmed
+/// at `src/tools/acp_client.rs:91`), so `GIT_TERMINAL_PROMPT=0` is
+/// supplied by running `env` as the command instead of `git` directly.
+/// Without it, a repository needing credentials prompts in a terminal
+/// the model cannot answer, and the one-shot timeout becomes the only
+/// thing that ends the call — a stall rather than a refusal.
+async fn run_git(
+    client: &Arc<dyn AcpClient>,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<ClientRun> {
+    let mut full: Vec<String> = Vec::with_capacity(args.len() + 2);
+    full.push("GIT_TERMINAL_PROMPT=0".to_string());
+    full.push("git".to_string());
+    full.extend(args.iter().map(|s| s.to_string()));
+    run_client_command(client, "env", &full, None, timeout).await
+}
+
+/// Single-quote `s` for embedding in a POSIX shell command line run on
+/// the editor's machine. The resolved skills directory can contain
+/// spaces (an `Application Support`/`Application Data`-shaped path is
+/// the common case, not an edge one) and, in principle, an embedded
+/// single quote — both are closed here rather than assumed away.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Resolve the skills directory on the editor's machine, creating it if
+/// this is the first thing to touch it. Shared by all three tools below
+/// — `skill_install` is the only one that can legitimately be the first
+/// write, but `mkdir -p` is idempotent, so `skill_update` and
+/// `skill_uninstall` reuse the same call rather than a second, read-only
+/// resolver.
+async fn resolve_or_create_dir(client: &Arc<dyn AcpClient>) -> Result<String> {
+    let run = run_client_command(
+        client,
+        "sh",
+        &["-c".to_string(), RESOLVE_OR_CREATE_SH.to_string()],
+        None,
+        LOCAL_TIMEOUT,
+    )
+    .await?;
+    let stdout = finish_run(run, "resolving the skills directory", LOCAL_TIMEOUT)?;
+    parse_resolved_dir(&stdout)
+}
+
+/// The distinct top-level directory names an index's skills live under —
+/// one per thing `skill_install` could have installed, whether that is a
+/// single hand-written skill (`<dir>/<name>/SKILL.md`) or a bundle that
+/// installs many skills under one git checkout
+/// (`<dir>/<source>/skills/<name>/SKILL.md`). This is what
+/// `skill_update` with no `name` updates: every checkout, not every
+/// individual skill a checkout happens to contain.
+fn top_level_entries(index: &SkillIndex) -> Vec<String> {
+    let prefix = format!("{}/", index.dir);
+    let mut names: Vec<String> = index
+        .skills
+        .iter()
+        .filter_map(|s| {
+            s.path
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.split('/').next())
+                .map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+// ---------------------------------------------------------------------------
+// skill_install
+// ---------------------------------------------------------------------------
+
+/// Install a skill source: `git clone` a checkout onto the editor's
+/// machine, into the skills directory `skill()` reads from.
+pub struct SkillInstallTool {
+    spec: ToolSpec,
+    skill_tool: Arc<SkillTool>,
+}
+
+impl SkillInstallTool {
+    pub fn new(skill_tool: Arc<SkillTool>) -> Self {
+        Self {
+            spec: build_install_spec(),
+            skill_tool,
+        }
+    }
+}
+
+fn build_install_spec() -> ToolSpec {
+    ToolSpec {
+        name: "skill_install".into(),
+        description: "Install a skill source onto the editor's machine by cloning an \
+            https:// git URL into the skills directory `skill()` reads from. Only plain \
+            https:// URLs are accepted. Refuses if that source is already installed — use \
+            skill_update instead."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "An https:// URL to clone, e.g. https://github.com/obra/superpowers"
+                }
+            },
+            "required": ["url"]
+        }),
+    }
+}
+
+#[async_trait]
+impl Tool for SkillInstallTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Execute
+    }
+
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let url = input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .context("missing 'url'")?;
+
+        // Refused before any process starts: `validate_source_url` and
+        // `destination_name` (which itself validates the derived name)
+        // are pure checks against the string the model supplied, run
+        // before this function ever looks for a client to talk to.
+        validate_source_url(url)?;
+        let name = destination_name(url)?;
+
+        let client = current_acp_client().ok_or_else(no_editor_error)?;
+
+        let dir = resolve_or_create_dir(&client).await?;
+        let dest = format!("{dir}/{name}");
+
+        // A directory-existence check ACP has no direct call for, done
+        // as a probe whose exit code is always 0 (the `||` branch
+        // covers "does not exist") so `finish_run`'s "nonzero exit is a
+        // failure" reading isn't tripped by the ordinary case.
+        let probe = run_client_command(
+            &client,
+            "sh",
+            &[
+                "-c".to_string(),
+                format!(
+                    "test -d {} && echo EXISTS || echo ABSENT",
+                    shell_quote(&dest)
+                ),
+            ],
+            None,
+            LOCAL_TIMEOUT,
+        )
+        .await?;
+        let probe_out = finish_run(
+            probe,
+            "checking whether the destination exists",
+            LOCAL_TIMEOUT,
+        )?;
+        if probe_out.contains("EXISTS") {
+            anyhow::bail!(
+                "'{name}' is already installed at {dest}. Use skill_update to pull its \
+                 latest changes, or skill_uninstall then skill_install to replace it."
+            );
+        }
+
+        // The URL goes after `--` so it cannot be reparsed as an option
+        // even if a check upstream were ever missed.
+        let clone = run_git(
+            &client,
+            &["clone", "--depth", "1", "--", url, &dest],
+            GIT_TIMEOUT,
+        )
+        .await?;
+        let output = finish_run(clone, &format!("cloning {url}"), GIT_TIMEOUT)?;
+
+        if let Some(key) = current_session_key() {
+            self.skill_tool.invalidate_cache(&key);
+        }
+
+        Ok(format!("Installed '{name}' to {dest}.\n{output}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// skill_update
+// ---------------------------------------------------------------------------
+
+/// Pull the latest changes for one installed skill source, or — with no
+/// `name` — every source `skill()`'s index finds.
+pub struct SkillUpdateTool {
+    spec: ToolSpec,
+    skill_tool: Arc<SkillTool>,
+}
+
+impl SkillUpdateTool {
+    pub fn new(skill_tool: Arc<SkillTool>) -> Self {
+        Self {
+            spec: build_update_spec(),
+            skill_tool,
+        }
+    }
+
+    /// Update one entry: re-check its stored remote before pulling —
+    /// `skill_install` only ever writes an `https` remote, but
+    /// `.git/config` is an ordinary file on the person's machine, and
+    /// `git pull` against a `.git/config` doctored to hold an `ext::`
+    /// remote executes a command exactly as `git clone` would.
+    async fn update_one(client: &Arc<dyn AcpClient>, dir: &str, name: &str) -> Result<String> {
+        validate_entry_name(name)?;
+        let dest = format!("{dir}/{name}");
+
+        let remote_run = run_git(
+            client,
+            &["-C", &dest, "remote", "get-url", "origin"],
+            LOCAL_TIMEOUT,
+        )
+        .await?;
+        let remote = finish_run(
+            remote_run,
+            &format!("checking {name}'s remote"),
+            LOCAL_TIMEOUT,
+        )?;
+        validate_source_url(remote.trim())?;
+
+        let pull_run = run_git(client, &["-C", &dest, "pull", "--ff-only"], GIT_TIMEOUT).await?;
+        finish_run(pull_run, &format!("updating {name}"), GIT_TIMEOUT)
+    }
+}
+
+fn build_update_spec() -> ToolSpec {
+    ToolSpec {
+        name: "skill_update".into(),
+        description: "Pull the latest changes for a skill source installed with \
+            skill_install. Omit `name` to update every installed source; one entry's \
+            failure does not stop the others, and the result names every entry and what \
+            happened to it."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The installed source to update. Omit to update everything installed."
+                }
+            }
+        }),
+    }
+}
+
+#[async_trait]
+impl Tool for SkillUpdateTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Execute
+    }
+
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let client = current_acp_client().ok_or_else(no_editor_error)?;
+
+        match input.get("name").and_then(|v| v.as_str()) {
+            Some(name) if !name.is_empty() => {
+                validate_entry_name(name)?;
+                let dir = resolve_or_create_dir(&client).await?;
+                let result = Self::update_one(&client, &dir, name).await?;
+                if let Some(key) = current_session_key() {
+                    self.skill_tool.invalidate_cache(&key);
+                }
+                Ok(format!("Updated '{name}':\n{result}"))
+            }
+            _ => {
+                let session_key = current_session_key();
+                let index = self
+                    .skill_tool
+                    .resolve_index(&client, session_key.as_deref())
+                    .await?;
+                let names = top_level_entries(&index);
+                if names.is_empty() {
+                    return Ok(format!("No skill sources found in {}.", index.dir));
+                }
+
+                let mut lines = Vec::with_capacity(names.len());
+                let mut any_ok = false;
+                for name in &names {
+                    match Self::update_one(&client, &index.dir, name).await {
+                        Ok(msg) => {
+                            any_ok = true;
+                            lines.push(format!("{name}: {msg}"));
+                        }
+                        Err(e) => lines.push(format!("{name}: failed — {e}")),
+                    }
+                }
+
+                if any_ok && let Some(key) = session_key {
+                    self.skill_tool.invalidate_cache(&key);
+                }
+
+                Ok(lines.join("\n"))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// skill_uninstall
+// ---------------------------------------------------------------------------
+
+/// Remove an installed skill source from the editor's machine.
+pub struct SkillUninstallTool {
+    spec: ToolSpec,
+    skill_tool: Arc<SkillTool>,
+}
+
+impl SkillUninstallTool {
+    pub fn new(skill_tool: Arc<SkillTool>) -> Self {
+        Self {
+            spec: build_uninstall_spec(),
+            skill_tool,
+        }
+    }
+}
+
+fn build_uninstall_spec() -> ToolSpec {
+    ToolSpec {
+        name: "skill_uninstall".into(),
+        description: "Remove a skill source installed with skill_install from the editor's \
+            machine. Refuses if the checkout has local changes unless `force` is set."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The installed source to remove."
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Remove even if the checkout has local changes. Default: false."
+                }
+            },
+            "required": ["name"]
+        }),
+    }
+}
+
+#[async_trait]
+impl Tool for SkillUninstallTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Delete
+    }
+
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        let name = input
+            .get("name")
+            .and_then(|v| v.as_str())
+            .context("missing 'name'")?;
+        // `skill_uninstall` takes a name, not a path: validated the same
+        // way `skill_install`'s derived name is, and only ever joined
+        // below to the resolver's own output — never to anything a
+        // model could have supplied directly — so this cannot address
+        // anything that is not a direct child of the skills directory.
+        validate_entry_name(name)?;
+        let force = input
+            .get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let client = current_acp_client().ok_or_else(no_editor_error)?;
+
+        let dir = resolve_or_create_dir(&client).await?;
+        let dest = format!("{dir}/{name}");
+
+        if !force {
+            let status_run = run_git(
+                &client,
+                &["-C", &dest, "status", "--porcelain"],
+                LOCAL_TIMEOUT,
+            )
+            .await?;
+            let status_out = finish_run(
+                status_run,
+                &format!("checking {name} for local changes"),
+                LOCAL_TIMEOUT,
+            )?;
+            if !status_out.trim().is_empty() {
+                anyhow::bail!(
+                    "'{name}' has local changes and was not removed:\n{status_out}\n\
+                     Pass force: true to remove it anyway."
+                );
+            }
+        }
+
+        let rm = run_client_command(
+            &client,
+            "rm",
+            &["-rf".to_string(), dest.clone()],
+            None,
+            LOCAL_TIMEOUT,
+        )
+        .await?;
+        finish_run(rm, &format!("removing {name}"), LOCAL_TIMEOUT)?;
+
+        if let Some(key) = current_session_key() {
+            self.skill_tool.invalidate_cache(&key);
+        }
+
+        Ok(format!("Uninstalled '{name}' from {dest}."))
     }
 }
 
@@ -631,5 +1131,254 @@ mod tests {
             exit_code: None,
             signal: None,
         }));
+    }
+
+    // -----------------------------------------------------------------
+    // skill_install / skill_update / skill_uninstall
+    // -----------------------------------------------------------------
+
+    const RESOLVED_DIR_STDOUT: &str = "SKILLS_DIR\t/home/user/.local/share/sapphire-agent/skills\n";
+
+    async fn install_with(client: Arc<FakeClient>, url: &str) -> Result<String> {
+        let tool = SkillInstallTool::new(Arc::new(SkillTool::new()));
+        scope_acp_client(client, async { tool.execute(&json!({"url": url})).await }).await
+    }
+
+    /// A client that resolves the directory, then reports the
+    /// destination as already present — so the tool must bail without
+    /// ever reaching a third (`git clone`) call.
+    async fn install_existing(url: &str) -> Result<String> {
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout(RESOLVED_DIR_STDOUT);
+        client.queue_terminal_stdout("EXISTS\n");
+        let tool = SkillInstallTool::new(Arc::new(SkillTool::new()));
+        scope_acp_client(client, async { tool.execute(&json!({"url": url})).await }).await
+    }
+
+    /// A client that resolves the directory, then answers the stored
+    /// remote's `git remote get-url origin` with `remote` — used to
+    /// drive `skill_update`'s pre-pull remote check without a `git
+    /// pull` ever being reached when that remote is rejected.
+    async fn update_where_remote_is(remote: &str) -> Result<String> {
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout(RESOLVED_DIR_STDOUT);
+        client.queue_terminal_stdout(&format!("{remote}\n"));
+        let tool = SkillUpdateTool::new(Arc::new(SkillTool::new()));
+        scope_acp_client(client, async {
+            tool.execute(&json!({"name": "superpowers"})).await
+        })
+        .await
+    }
+
+    /// Drives `skill_update` with no `name` against `entries`: each
+    /// `(name, outcome)` becomes one top-level entry in the resolved
+    /// index (so `skill_update` discovers it without a directory
+    /// listing ACP cannot provide), a queued `remote get-url origin`
+    /// answer of a valid https remote, and then either a successful
+    /// `git pull` line or a failing one.
+    async fn update_all_where(entries: &[(&str, Result<&str, &str>)]) -> Result<String> {
+        let client = Arc::new(FakeClient::default());
+        let mut index_stdout = String::from("SKILLS_DIR\t/skills\n");
+        for (name, _) in entries {
+            index_stdout.push_str(&format!(
+                "SKILL\t/skills/{name}/SKILL.md\nFM\tname: {name}\nFM\tdescription: d\n"
+            ));
+        }
+        client.queue_terminal_stdout(&index_stdout);
+        for (_, outcome) in entries {
+            client.queue_terminal_stdout("https://github.com/obra/superpowers\n");
+            match outcome {
+                Ok(text) => client.queue_terminal_stdout(text),
+                Err(text) => client.queue_terminal_result(text, Some(1)),
+            }
+        }
+        let tool = SkillUpdateTool::new(Arc::new(SkillTool::new()));
+        scope_acp_client(client, async { tool.execute(&json!({})).await }).await
+    }
+
+    /// A client that resolves the directory, then (unless `force`)
+    /// answers `git status --porcelain` with `status`, then a
+    /// successful `rm -rf`.
+    async fn uninstall_where_status(status: &str, force: bool) -> Result<String> {
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout(RESOLVED_DIR_STDOUT);
+        if !force {
+            client.queue_terminal_stdout(status);
+        }
+        client.queue_terminal_stdout("");
+        let tool = SkillUninstallTool::new(Arc::new(SkillTool::new()));
+        scope_acp_client(client, async {
+            tool.execute(&json!({"name": "brainstorming", "force": force}))
+                .await
+        })
+        .await
+    }
+
+    /// No client scoped at all: a `name` that `validate_entry_name`
+    /// rejects must fail before this tool ever looks for one.
+    async fn uninstall(name: &str) -> Result<String> {
+        let tool = SkillUninstallTool::new(Arc::new(SkillTool::new()));
+        tool.execute(&json!({"name": name})).await
+    }
+
+    #[tokio::test]
+    async fn install_refuses_every_non_https_source_before_running_anything() {
+        // `git clone` against an `ext::` URL executes a command, so this
+        // must be refused without a process ever starting — assert on the
+        // client having been asked for nothing, not just on the error.
+        for bad in [
+            "ext::sh -c evil",
+            "file:///etc",
+            "git@github.com:x/y",
+            "--upload-pack=/bin/sh",
+            "http://x/y",
+        ] {
+            let client = fake_client_returning("");
+            let err = install_with(client.clone(), bad).await.unwrap_err();
+            assert!(err.to_string().contains("https"), "{bad}: {err}");
+            assert_eq!(client.terminal_count(), 0, "{bad} started a process");
+        }
+    }
+
+    #[tokio::test]
+    async fn install_refuses_a_source_that_is_already_present() {
+        let err = install_existing("https://github.com/obra/superpowers")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("skill_update"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn update_rejects_a_stored_remote_that_is_not_https() {
+        // `skill_install` only ever writes an https remote, but
+        // `.git/config` is an ordinary file on the person's machine and
+        // `git pull` against an `ext::` remote executes a command.
+        let err = update_where_remote_is("ext::sh -c evil").await.unwrap_err();
+        assert!(err.to_string().contains("https"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn update_without_a_name_continues_past_one_failed_entry() {
+        let out = update_all_where(&[
+            ("a", Ok("Already up to date.")),
+            ("b", Err("Not possible to fast-forward")),
+            ("c", Ok("Updating 1234..5678")),
+        ])
+        .await
+        .unwrap();
+        assert!(out.contains("a"), "{out}");
+        assert!(out.contains("b"), "{out}");
+        assert!(out.contains("c"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn uninstall_refuses_a_checkout_with_local_changes_unless_forced() {
+        let err = uninstall_where_status("M skills/brainstorming/SKILL.md", false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("SKILL.md"), "got: {err}");
+        assert!(
+            uninstall_where_status("M skills/brainstorming/SKILL.md", true)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn uninstall_will_not_address_anything_outside_the_skills_directory() {
+        for bad in ["..", "../../etc", "/etc", "a/b", "con"] {
+            assert!(uninstall(bad).await.is_err(), "accepted {bad}");
+        }
+    }
+
+    /// A `Provider` that is never actually called — it only exists to
+    /// satisfy `TurnContext`'s field so a session id can be scoped for
+    /// the cache-invalidation test below.
+    struct UnusedProvider;
+    #[async_trait]
+    impl crate::provider::Provider for UnusedProvider {
+        fn name(&self) -> &str {
+            "unused"
+        }
+        async fn chat(
+            &self,
+            _system: Option<&str>,
+            _messages: &[crate::provider::ChatMessage],
+            _tools: Option<&[ToolSpec]>,
+        ) -> Result<crate::provider::ChatResponse> {
+            anyhow::bail!("UnusedProvider::chat must never be called by this test")
+        }
+    }
+
+    /// A minimal `TurnContext` scoped under `session_id`, so
+    /// `current_session_key` (which `skill_install`/`skill_update`/
+    /// `skill_uninstall` read to invalidate `SkillTool`'s cache) resolves
+    /// to it. Every field but `session_id` is a stand-in never exercised
+    /// by the test that uses this.
+    fn test_turn_context(session_id: &str) -> Arc<crate::serve::TurnContext> {
+        Arc::new(crate::serve::TurnContext {
+            state: crate::serve::ServeState::for_test(true),
+            provider: Arc::new(UnusedProvider),
+            progress: Arc::new(crate::serve::NullProgress),
+            visible_specs: Arc::from(Vec::<ToolSpec>::new()),
+            timer_origin: None,
+            session_id: Some(session_id.to_string()),
+        })
+    }
+
+    /// A successful install must invalidate that session's cached
+    /// index, or a freshly installed skill stays invisible to `skill()`
+    /// for the rest of the session.
+    #[tokio::test]
+    async fn a_successful_install_invalidates_the_sessions_cache() {
+        let skill_tool = Arc::new(SkillTool::new());
+        let dyn_client: Arc<dyn AcpClient> = fake_client_returning(INDEX_STDOUT);
+        skill_tool
+            .resolve_index(&dyn_client, Some("session-a"))
+            .await
+            .unwrap();
+
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout(RESOLVED_DIR_STDOUT);
+        client.queue_terminal_stdout("ABSENT\n");
+        client.queue_terminal_stdout("Cloning into 'superpowers'...\ndone.");
+        let install = SkillInstallTool::new(Arc::clone(&skill_tool));
+
+        crate::serve::scope_turn_context(test_turn_context("session-a"), async {
+            scope_acp_client(client, async {
+                install
+                    .execute(&json!({"url": "https://github.com/obra/superpowers"}))
+                    .await
+            })
+            .await
+        })
+        .await
+        .unwrap();
+
+        // The cache must have been cleared: a fresh `resolve_index` call
+        // hits the client again rather than reusing the stale copy.
+        let client2 = fake_client_returning(INDEX_STDOUT);
+        let dyn_client2: Arc<dyn AcpClient> = client2.clone();
+        skill_tool
+            .resolve_index(&dyn_client2, Some("session-a"))
+            .await
+            .unwrap();
+        assert_eq!(client2.terminal_count(), 1);
+    }
+
+    #[test]
+    fn the_kinds_are_set_deliberately() {
+        assert_eq!(
+            SkillInstallTool::new(Arc::new(SkillTool::new())).kind(),
+            ToolKind::Execute
+        );
+        assert_eq!(
+            SkillUpdateTool::new(Arc::new(SkillTool::new())).kind(),
+            ToolKind::Execute
+        );
+        assert_eq!(
+            SkillUninstallTool::new(Arc::new(SkillTool::new())).kind(),
+            ToolKind::Delete
+        );
     }
 }

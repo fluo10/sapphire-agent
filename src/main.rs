@@ -451,8 +451,31 @@ async fn main() -> Result<()> {
             // on the editor's machine and is resolved per session.
             // `visible_tool_predicate` plus the namespace switch decide
             // whether it is ever offered.
+            //
+            // `skill_install`/`skill_update`/`skill_uninstall` share the
+            // same `SkillTool` the read-only `skill` uses (via `Arc`,
+            // wrapped in a `Box<dyn Tool>` each `ToolSet` slot owns
+            // independently) so a successful change can invalidate the
+            // one cache all four read from — see `SkillTool::cache`'s
+            // doc.
+            let skill_tool = Arc::new(tools::skill_tools::SkillTool::new());
             tool_set
-                .register_tool(Box::new(tools::skill_tools::SkillTool::new()))
+                .register_tool(Box::new(Arc::clone(&skill_tool)))
+                .await;
+            tool_set
+                .register_tool(Box::new(tools::skill_tools::SkillInstallTool::new(
+                    Arc::clone(&skill_tool),
+                )))
+                .await;
+            tool_set
+                .register_tool(Box::new(tools::skill_tools::SkillUpdateTool::new(
+                    Arc::clone(&skill_tool),
+                )))
+                .await;
+            tool_set
+                .register_tool(Box::new(tools::skill_tools::SkillUninstallTool::new(
+                    skill_tool,
+                )))
                 .await;
 
             // ── Session store base directory ────────────────────────────────
