@@ -38,9 +38,16 @@ pub struct SkillIndex {
 ///
 /// The candidate order mirrors `directories::BaseDirs::data_dir()`,
 /// which `init_app_ctx` already uses for this crate's own directories
-/// on the server side. `-d` gates every candidate, so the list is safe
-/// to try in the same order on every platform: a macOS path simply
-/// does not exist on Linux.
+/// on the server side. Each candidate is skipped when its own base
+/// variable is unset, *before* any path is assembled from it — not by
+/// pattern-matching the assembled string afterward. Guarding the input
+/// closes every candidate that would otherwise collapse to a shorter,
+/// unintended (and on some candidates, real and existing) path when its
+/// base variable is empty; guarding the assembled string's shape only
+/// ever closes the one case someone happened to write a pattern for.
+/// `-d` then gates the fully-assembled candidate, so trying every
+/// surviving candidate in the same order on every platform is safe: a
+/// macOS path simply does not exist on Linux.
 ///
 /// Frontmatter is emitted raw, one `FM` line per line of it, and parsed
 /// by `serde_yaml` in `parse_index`. Parsing YAML in `sed` would break
@@ -48,13 +55,9 @@ pub struct SkillIndex {
 #[allow(dead_code)]
 pub const RESOLVE_AND_INDEX_SH: &str = r#"
 set -u
-for d in "${SAPPHIRE_AGENT_SKILLS_DIR:-}" \
-         "${APPDATA:-}/sapphire-agent/skills" \
-         "${HOME:-}/Library/Application Support/sapphire-agent/skills" \
-         "${XDG_DATA_HOME:-${HOME:-}/.local/share}/sapphire-agent/skills"
-do
-  case "$d" in ""|"/sapphire-agent/skills") continue ;; esac
-  [ -d "$d" ] || continue
+emit() {
+  d="$1"
+  [ -d "$d" ] || return 1
   printf 'SKILLS_DIR\t%s\n' "$d"
   for f in "$d"/*/SKILL.md "$d"/*/skills/*/SKILL.md; do
     [ -f "$f" ] || continue
@@ -63,14 +66,35 @@ do
          inside && $0=="---" {exit}
          inside {print "FM\t" $0}' "$f"
   done
+  return 0
+}
+if [ -n "${SAPPHIRE_AGENT_SKILLS_DIR:-}" ] && emit "$SAPPHIRE_AGENT_SKILLS_DIR"; then
   exit 0
-done
+fi
+if [ -n "${APPDATA:-}" ] && emit "$APPDATA/sapphire-agent/skills"; then
+  exit 0
+fi
+if [ -n "${HOME:-}" ] && emit "$HOME/Library/Application Support/sapphire-agent/skills"; then
+  exit 0
+fi
+if { [ -n "${XDG_DATA_HOME:-}" ] || [ -n "${HOME:-}" ]; } \
+   && emit "${XDG_DATA_HOME:-$HOME/.local/share}/sapphire-agent/skills"; then
+  exit 0
+fi
 printf 'NO_SKILLS_DIR\n'
 "#;
 
 /// Resolve the skills directory for writing, creating it when absent.
 /// Used only by `skill_install`, which is the one operation allowed to
 /// bring the directory into existence.
+///
+/// The macOS branch requires `HOME` to be non-empty *before* testing
+/// `-d`. Without that guard, an unset `HOME` collapses the test to
+/// `-d "/Library/Application Support"` — a directory that exists on
+/// every real macOS install regardless of `HOME` — so a client spawned
+/// without `HOME` (a service, a stripped-down environment) could still
+/// match it and silently create under a system-wide path instead of
+/// falling through to the XDG-based candidate below.
 #[allow(dead_code)]
 pub const RESOLVE_OR_CREATE_SH: &str = r#"
 set -eu
@@ -78,7 +102,7 @@ if [ -n "${SAPPHIRE_AGENT_SKILLS_DIR:-}" ]; then
   d="$SAPPHIRE_AGENT_SKILLS_DIR"
 elif [ -n "${APPDATA:-}" ]; then
   d="$APPDATA/sapphire-agent/skills"
-elif [ -d "${HOME:-}/Library/Application Support" ]; then
+elif [ -n "${HOME:-}" ] && [ -d "$HOME/Library/Application Support" ]; then
   d="$HOME/Library/Application Support/sapphire-agent/skills"
 else
   d="${XDG_DATA_HOME:-${HOME:-}/.local/share}/sapphire-agent/skills"
@@ -203,15 +227,32 @@ const RESERVED_WINDOWS_NAMES: &[&str] = &[
 /// paths, and a leading `-` that some downstream command could read as
 /// a flag) plus a deny-list of the fixed reserved-device-name set,
 /// which the charset alone cannot exclude.
+///
+/// Unlike `DigestCache::path_for`'s charset, this one allows `.` — repo
+/// names like `my.skills` are legitimate, and `destination_name` feeds
+/// this validator with names derived from a URL's final path segment.
+/// That reopens two things `DigestCache`'s doc comment calls out as
+/// covered "regardless of case or extension":
+///
+/// - Windows resolves `CON.txt` (and `CON.tar.gz`, ...) to the `CON`
+///   device, not a path component, so the reserved-name check must
+///   also match the segment before the first `.`, not just the whole
+///   string.
+/// - Windows silently strips a trailing `.` (and trailing spaces),
+///   so `"superpowers."` would otherwise collide with an existing
+///   `"superpowers"`.
 #[allow(dead_code)]
 pub fn validate_entry_name(name: &str) -> Result<()> {
+    let stem = name.split('.').next().unwrap_or(name);
     let reserved = RESERVED_WINDOWS_NAMES
         .iter()
-        .any(|n| n.eq_ignore_ascii_case(name));
+        .any(|n| n.eq_ignore_ascii_case(name) || n.eq_ignore_ascii_case(stem));
     if name.is_empty()
         || name == "."
         || name == ".."
         || name.starts_with('-')
+        || name.ends_with('.')
+        || name.ends_with(' ')
         || reserved
         || !name
             .chars()
@@ -318,6 +359,8 @@ mod tests {
         assert!(destination_name("https://example.com/x/CON.git").is_err());
         assert!(destination_name("https://example.com/x/..").is_err());
         assert!(destination_name("https://example.com/").is_err());
+        // No path at all, and no trailing slash either.
+        assert!(destination_name("https://example.com").is_err());
     }
 
     #[test]
@@ -325,6 +368,22 @@ mod tests {
         assert!(validate_entry_name("superpowers").is_ok());
         for bad in ["..", ".", "", "a/b", "a\\b", "/abs", "-x", "nul", "COM1"] {
             assert!(validate_entry_name(bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    /// `.` stayed in the charset (repo names like `my.skills` are
+    /// legitimate), which reopens two things Windows normalises away:
+    /// `CON.txt` still resolves to the `CON` device, and a trailing `.`
+    /// is stripped, so `"superpowers."` would collide with an existing
+    /// `"superpowers"`. Positive controls (`my.skills`, `superpowers.io`)
+    /// confirm the fix doesn't reject legitimate dotted names.
+    #[test]
+    fn dotted_names_windows_would_collapse_are_refused() {
+        for bad in ["CON.txt", "Con.tar.gz", "superpowers.", "con.", "nul.log"] {
+            assert!(validate_entry_name(bad).is_err(), "accepted {bad}");
+        }
+        for good in ["my.skills", "superpowers.io"] {
+            assert!(validate_entry_name(good).is_ok(), "rejected {good}");
         }
     }
 
@@ -393,5 +452,65 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "NO_SKILLS_DIR");
+    }
+
+    /// With every base env var unset, `${APPDATA:-}/sapphire-agent/skills`
+    /// collapses to `/sapphire-agent/skills`, `${HOME:-}/Library/...`
+    /// collapses to `/Library/Application Support/sapphire-agent/skills`,
+    /// and the XDG candidate collapses to `/.local/share/sapphire-agent/
+    /// skills`. The macOS one is the real danger: `/Library/Application
+    /// Support` exists on every macOS install, so a client spawned
+    /// without `HOME` could match it and silently resolve to a
+    /// system-wide path instead of reporting nothing found. Each
+    /// candidate must be skipped because its *base variable* is unset,
+    /// not because the assembled string happens to match a known-bad
+    /// shape.
+    #[test]
+    fn the_resolver_reports_absence_when_every_base_var_is_unset() {
+        let Some(sh) = sh() else { return };
+        let out = Command::new(sh)
+            .arg("-c")
+            .arg(RESOLVE_AND_INDEX_SH)
+            .env_remove("SAPPHIRE_AGENT_SKILLS_DIR")
+            .env_remove("APPDATA")
+            .env_remove("HOME")
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap().trim(),
+            "NO_SKILLS_DIR",
+            "must not silently match a collapsed candidate such as \
+             \"/Library/Application Support/sapphire-agent/skills\""
+        );
+    }
+
+    /// `RESOLVE_OR_CREATE_SH`'s macOS branch has the same collapse
+    /// hazard as the resolver above: `-d "${HOME:-}/Library/Application
+    /// Support"` with `HOME` unset tests the real, always-present
+    /// `/Library/Application Support`. With `HOME` and `APPDATA` both
+    /// unset and `XDG_DATA_HOME` pointed at a scratch directory, a fixed
+    /// script must skip the macOS branch (guarded on `HOME` being set,
+    /// not on `-d`'s result) and fall through to the XDG candidate
+    /// rather than the unrelated system path.
+    #[test]
+    fn resolve_or_create_falls_back_to_xdg_when_home_is_unset() {
+        let Some(sh) = sh() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let xdg = tmp.path().join("xdg");
+        let out = Command::new(sh)
+            .arg("-c")
+            .arg(RESOLVE_OR_CREATE_SH)
+            .env_remove("SAPPHIRE_AGENT_SKILLS_DIR")
+            .env_remove("APPDATA")
+            .env_remove("HOME")
+            .env("XDG_DATA_HOME", &xdg)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let dir = parse_resolved_dir(&stdout).unwrap();
+        let expected = xdg.join("sapphire-agent").join("skills");
+        assert_eq!(std::path::Path::new(&dir), expected, "stdout was:\n{stdout}");
+        assert!(expected.is_dir(), "resolver should have created it");
     }
 }
