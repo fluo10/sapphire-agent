@@ -541,94 +541,68 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Load all sessions from disk on startup.
+    /// Load every active session from disk on startup.
     ///
-    /// For each `ConversationKey`, picks the latest ULID-ordered session that
-    /// does **not** have a `closed_at` marker (i.e. is still active).
-    ///
-    /// Raw message history is intentionally NOT reconstructed into in-memory
-    /// history: Anthropic's API requires paired tool_use/tool_result, and we
-    /// skip persisting tool messages to disk, so reloading would break that
-    /// invariant. Instead, callers get:
+    /// For each `ConversationKey`, picks the latest session that has no
+    /// `closed_at` marker. Returns:
     ///
     /// - `active`: which session file is current per conversation
-    /// - `summaries`: the latest `SummaryLine` per conversation (when present)
-    /// - `fallback_messages`: raw `ChatMessage` list for active sessions that
-    ///   have NO summary yet — Agent bootstrap uses these to synthesize a
-    ///   summary on startup (e.g. after a crash that skipped graceful shutdown)
-    #[allow(clippy::type_complexity)]
+    /// - `histories`: that session's conversation as the model should
+    ///   see it — the latest compaction summary as a stub, the messages
+    ///   it did not absorb, tool results hydrated, pairing repaired
+    ///
+    /// Raw history used to be withheld on the grounds that Anthropic
+    /// requires paired tool traffic and none was persisted. Both halves
+    /// of that changed (#194), so the restart summary this replaced is
+    /// gone: a summary costs a model call, throws the turn structure
+    /// away, and answers a question the log now answers directly.
     pub fn load_all(
         &self,
     ) -> (
         HashMap<ConversationKey, String>,
-        HashMap<ConversationKey, String>,
         HashMap<ConversationKey, Vec<ChatMessage>>,
     ) {
-        type SessionEntry = (
-            String,
-            ConversationKey,
-            Vec<StoredMessage>,
-            bool,
-            Option<String>,
-        );
-        let mut entries: Vec<SessionEntry> = Vec::new();
+        let mut entries: Vec<(String, ConversationKey)> = Vec::new();
 
         for path in collect_session_files(&self.base_dir, self.kind) {
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) => s.to_string(),
-                None => continue,
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
             };
-            if let Some(loaded) = load_session_file(&path) {
-                let key: ConversationKey =
-                    (loaded.meta.room_id.clone(), loaded.meta.thread_id.clone());
-                if !loaded.is_closed {
-                    // Seed the path cache for active sessions so the first
-                    // `append` after bootstrap doesn't pay a scan.
-                    if let Ok(mut cache) = self.path_cache.lock() {
-                        cache.insert(stem.clone(), path.clone());
-                    }
-                }
-                entries.push((
-                    stem,
-                    key,
-                    loaded.messages,
-                    loaded.is_closed,
-                    loaded.latest_summary.map(|s| s.summary),
-                ));
+            let Some(loaded) = load_session_file(&path) else {
+                continue;
+            };
+            if loaded.is_closed {
+                continue;
             }
+            // Seed the path cache so the first append after bootstrap
+            // doesn't pay a scan.
+            if let Ok(mut cache) = self.path_cache.lock() {
+                cache.insert(stem.to_string(), path.clone());
+            }
+            entries.push((
+                stem.to_string(),
+                (loaded.meta.room_id.clone(), loaded.meta.thread_id.clone()),
+            ));
         }
 
+        // Session ids are UUIDv7, so the newest file for a key sorts last.
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut active: HashMap<ConversationKey, String> = HashMap::new();
-        let mut summaries: HashMap<ConversationKey, String> = HashMap::new();
-        let mut fallback: HashMap<ConversationKey, Vec<ChatMessage>> = HashMap::new();
-
-        for (session_id, key, messages, is_closed, summary) in entries {
-            if !is_closed {
-                active.insert(key.clone(), session_id);
-                match summary {
-                    Some(s) => {
-                        summaries.insert(key.clone(), s);
-                        fallback.remove(&key);
-                    }
-                    None => {
-                        summaries.remove(&key);
-                        if !messages.is_empty() {
-                            let chat_messages: Vec<ChatMessage> = messages
-                                .into_iter()
-                                .map(|m| m.into_chat_message())
-                                .collect();
-                            fallback.insert(key, chat_messages);
-                        } else {
-                            fallback.remove(&key);
-                        }
-                    }
+        let mut histories: HashMap<ConversationKey, Vec<ChatMessage>> = HashMap::new();
+        for (session_id, key) in entries {
+            match self.load_session(&session_id) {
+                Some(history) if !history.is_empty() => {
+                    histories.insert(key.clone(), history);
+                }
+                _ => {
+                    histories.remove(&key);
                 }
             }
+            active.insert(key, session_id);
         }
 
-        (active, summaries, fallback)
+        (active, histories)
     }
 
     /// List metadata for all sessions in this store (used by API for session listing).
@@ -2309,5 +2283,40 @@ mod tests {
                 })
         });
         assert!(!stray, "an unpaired tool_result survived: {loaded:?}");
+    }
+
+    /// The point of the whole change: a restarted room remembers what it
+    /// did, not just what was said.
+    #[test]
+    fn load_all_restores_tool_traffic_for_an_active_session() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &ChatMessage::user("read a.rs")).unwrap();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store
+            .append(&sid, &tool_result_msg("c1", "fn main() {}"))
+            .unwrap();
+
+        let (active, histories) = store.load_all();
+        let key = ("!room:example.org".to_string(), None);
+        assert_eq!(active.get(&key).map(String::as_str), Some(sid.as_str()));
+
+        let history = histories.get(&key).expect("history restored");
+        assert!(
+            history.iter().flat_map(|m| &m.parts).any(|p| matches!(p, ContentPart::ToolResult { tool_use_id, content } if tool_use_id == "c1" && content == "fn main() {}")),
+            "the tool result did not come back: {history:?}"
+        );
+    }
+
+    /// A closed session is not resumed — the day boundary rotated it on
+    /// purpose.
+    #[test]
+    fn load_all_skips_closed_sessions() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &ChatMessage::user("hi")).unwrap();
+        store.close_session(&sid).unwrap();
+
+        let (active, histories) = store.load_all();
+        assert!(active.is_empty(), "{active:?}");
+        assert!(histories.is_empty(), "{histories:?}");
     }
 }

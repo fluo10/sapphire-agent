@@ -54,8 +54,8 @@ pub struct Agent {
     /// what #190 exists to stop.
     digest_cache: Option<Arc<crate::digest_cache::DigestCache>>,
     /// In-memory conversation history, keyed by (room_id, thread_id).
-    /// Starts empty on process startup; raw history from disk is never reloaded
-    /// (see `restart_summaries` for how prior context is carried across restarts).
+    /// Seeded at startup from the session log — including tool traffic,
+    /// which is why there is no restart summary any more (#194).
     history: Mutex<HashMap<ConversationKey, Vec<ChatMessage>>>,
     /// Maps each ConversationKey to its current active session file (ULID string).
     active_sessions: Mutex<HashMap<ConversationKey, String>>,
@@ -63,14 +63,6 @@ pub struct Agent {
     snapshots: Mutex<HashMap<ConversationKey, SystemSnapshot>>,
     /// Background prefetch cache: workspace search results for the next turn.
     prefetch_cache: Mutex<HashMap<ConversationKey, String>>,
-    /// Compacted recap of the prior run per ConversationKey. Injected into the
-    /// system prompt on the first message after restart, then consumed.
-    restart_summaries: Mutex<HashMap<ConversationKey, String>>,
-    /// Active sessions whose on-disk history has no `SummaryLine` yet (e.g.
-    /// server crashed before graceful shutdown). `bootstrap()` synthesizes a
-    /// summary from these raw messages and moves the result into
-    /// `restart_summaries`.
-    pending_fallback: Mutex<HashMap<ConversationKey, Vec<ChatMessage>>>,
     /// Local date on which the last day-boundary action fired for each key.
     /// Prevents re-firing within the same day for policies that don't rotate
     /// the session file (Compact, None).
@@ -99,12 +91,11 @@ impl Agent {
         image_cache: Option<Arc<ImageCache>>,
         digest_cache: Option<Arc<crate::digest_cache::DigestCache>>,
     ) -> Self {
-        let (active_sessions, summaries, fallback) = session_store.load_all();
+        let (active_sessions, histories) = session_store.load_all();
         info!(
-            "Loaded {} session(s) from disk ({} with summary, {} awaiting fallback summarization)",
+            "Restored {} active session(s) from disk ({} with history)",
             active_sessions.len(),
-            summaries.len(),
-            fallback.len(),
+            histories.len(),
         );
         Self {
             config,
@@ -115,122 +106,31 @@ impl Agent {
             session_store,
             image_cache,
             digest_cache,
-            history: Mutex::new(HashMap::new()),
+            history: Mutex::new(histories),
             active_sessions: Mutex::new(active_sessions),
             snapshots: Mutex::new(HashMap::new()),
             prefetch_cache: Mutex::new(HashMap::new()),
-            restart_summaries: Mutex::new(summaries),
-            pending_fallback: Mutex::new(fallback),
             boundary_handled: Mutex::new(HashMap::new()),
             last_activity_at: Mutex::new(HashMap::new()),
             last_flushed_at: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Drain `pending_fallback` and synthesize summaries for any active session
-    /// whose prior run did not produce a `SummaryLine` (e.g. crash). Each
-    /// generated summary is appended to the JSONL file and placed into
-    /// `restart_summaries` for the next turn.
+    /// Publish an intra-day digest for each active session so the
+    /// cross-session today block picks up what they covered before we
+    /// went down.
     ///
-    /// Only sessions whose room_id is in the configured room/channel list are
-    /// processed. Sessions from unconfigured rooms (e.g. test rooms that share
-    /// the same sessions directory) are left as-is so a production restart
-    /// never triggers LLM calls for rooms this instance doesn't own.
-    /// Exception: if no room IDs are configured (Discord with channel_ids = []),
-    /// all sessions are processed (preserving the "listen to all channels"
-    /// semantics).
-    pub async fn bootstrap(self: &Arc<Self>) {
-        let pending: Vec<(ConversationKey, Vec<ChatMessage>)> = {
-            let mut map = self.pending_fallback.lock().await;
-            map.drain().collect()
-        };
-
-        if pending.is_empty() {
+    /// No `SummaryLine` here any more. That one existed to bridge a
+    /// restart, and the log now carries the conversation itself (#194).
+    /// A summary written here would be worse than useless: it would
+    /// establish a checkpoint covering the whole session, so the next
+    /// start would replay a stub instead of the history it just gained.
+    /// Compaction still writes one — that is what bounds context, and it
+    /// is written at a point where the history really was compacted.
+    async fn flush_digests_on_shutdown(&self) {
+        let Some(cache) = self.digest_cache.clone() else {
             return;
-        }
-
-        // Build the set of room/channel IDs this instance is configured
-        // to handle. If any configured channel uses the "listen
-        // everywhere" wildcard (Discord with channel_ids = []), treat
-        // the whole agent as unrestricted — narrowing to only the other
-        // channel's explicit set would silently drop everything that
-        // channel was supposed to handle.
-        let mut wildcard = false;
-        let allowed: std::collections::HashSet<String> = {
-            let mut set = std::collections::HashSet::new();
-            if let Some(m) = &self.config.matrix {
-                if m.room_ids.is_empty() {
-                    wildcard = true;
-                } else {
-                    set.extend(m.room_ids.iter().cloned());
-                }
-            }
-            if let Some(d) = &self.config.discord {
-                if d.channel_ids.is_empty() {
-                    wildcard = true;
-                } else {
-                    set.extend(d.channel_ids.iter().cloned());
-                }
-            }
-            set
         };
-
-        let (to_process, skipped): (Vec<(ConversationKey, Vec<ChatMessage>)>, usize) =
-            if wildcard || allowed.is_empty() {
-                // No restriction configured — process all sessions.
-                (pending, 0)
-            } else {
-                let (yes, no): (Vec<_>, Vec<_>) = pending
-                    .into_iter()
-                    .partition(|(key, _)| allowed.contains(&key.0));
-                let skipped = no.len();
-                (yes, skipped)
-            };
-
-        if skipped > 0 {
-            info!(
-                "Bootstrap: skipping {} session(s) in unconfigured rooms",
-                skipped
-            );
-        }
-        if to_process.is_empty() {
-            return;
-        }
-
-        info!(
-            "Bootstrap: synthesizing summaries for {} session(s) without a SummaryLine",
-            to_process.len()
-        );
-
-        for (key, messages) in to_process {
-            if messages.len() < 2 {
-                continue;
-            }
-            let session_id = {
-                let sessions = self.active_sessions.lock().await;
-                match sessions.get(&key) {
-                    Some(id) if !id.is_empty() => id.clone(),
-                    _ => continue,
-                }
-            };
-            let provider = self.provider_for(&key.0);
-            match generate_summary(&*provider, &messages).await {
-                Ok(summary) if !summary.trim().is_empty() => {
-                    if let Err(e) = self.session_store.append_summary(&session_id, &summary, 0) {
-                        warn!("Failed to persist fallback summary for {session_id}: {e}");
-                    }
-                    self.restart_summaries.lock().await.insert(key, summary);
-                }
-                Ok(_) => warn!("Fallback summary for {session_id} was empty; skipping"),
-                Err(e) => warn!("Fallback summary generation failed for {session_id}: {e:#}"),
-            }
-        }
-    }
-
-    /// Summarize each active session's current in-memory history and persist
-    /// the result to disk. Called on graceful shutdown so the next process
-    /// can pick up where this one left off.
-    async fn summarize_on_shutdown(&self) {
         let snapshot: Vec<(ConversationKey, String, Vec<ChatMessage>)> = {
             let history = self.history.lock().await;
             let sessions = self.active_sessions.lock().await;
@@ -254,7 +154,7 @@ impl Agent {
         }
 
         info!(
-            "Graceful shutdown: summarizing {} active session(s)",
+            "Graceful shutdown: digesting {} active session(s)",
             snapshot.len()
         );
 
@@ -262,24 +162,12 @@ impl Agent {
             let provider = self.provider_for(&key.0);
             match generate_summary(&*provider, &messages).await {
                 Ok(summary) if !summary.trim().is_empty() => {
-                    if let Err(e) = self.session_store.append_summary(&session_id, &summary, 0) {
-                        warn!("Failed to persist shutdown summary for {session_id}: {e}");
-                    }
-                    // Also publish an intra-day digest so the
-                    // cross-session today block picks up what this
-                    // session covered before we went down. It goes to
-                    // the workspace-external cache, not the session's
-                    // own JSONL (#190).
-                    if let Some(cache) = self.digest_cache.as_ref()
-                        && let Err(e) = cache.put(&session_id, &summary, None)
-                    {
-                        warn!(
-                            "Failed to cache the shutdown intra-day digest for {session_id}: {e}"
-                        );
+                    if let Err(e) = cache.put(&session_id, &summary, None) {
+                        warn!("Failed to cache the shutdown digest for {session_id}: {e}");
                     }
                 }
-                Ok(_) => warn!("Shutdown summary for {session_id} was empty; skipping"),
-                Err(e) => warn!("Shutdown summary generation failed for {session_id}: {e:#}"),
+                Ok(_) => warn!("Shutdown digest for {session_id} was empty; skipping"),
+                Err(e) => warn!("Shutdown digest generation failed for {session_id}: {e:#}"),
             }
         }
     }
@@ -369,7 +257,7 @@ impl Agent {
             }
         }
 
-        self.summarize_on_shutdown().await;
+        self.flush_digests_on_shutdown().await;
         listen_handle.abort();
         if let Some(h) = idle_flush_handle {
             h.abort();
@@ -751,25 +639,6 @@ impl Agent {
                 format!("{sys}\n\n---\n\n<memory-context>\n{ctx}\n</memory-context>"),
             ),
             (sys, _) => sys,
-        };
-
-        // First-turn-after-restart injection: if a compacted recap of the
-        // prior run exists for this conversation, paste it into the system
-        // prompt and consume the entry. Raw history is never reloaded across
-        // restarts, so this summary is the sole bridge.
-        let system_with_context = {
-            let restart_summary = self.restart_summaries.lock().await.remove(&key);
-            match (system_with_context, restart_summary) {
-                (sys, Some(summary)) if !summary.trim().is_empty() => {
-                    let base = sys.unwrap_or_default();
-                    Some(format!(
-                        "{base}\n\n---\n\n<prior-session-recap>\nサーバー再起動のため直前のやり取り自体は失われています。\
-                         以下は前回セッションの要約です。これと今回の発言のみを頼りに応答してください。\
-                         必要なら「再起動直後で記憶が曖昧」と率直に述べて構いません。\n\n{summary}\n</prior-session-recap>"
-                    ))
-                }
-                (sys, _) => sys,
-            }
         };
 
         // Append user message

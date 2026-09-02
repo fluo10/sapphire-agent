@@ -729,7 +729,7 @@ async fn main() -> Result<()> {
             timer_manager.set_serve_state(Arc::downgrade(&serve_state));
 
             // Captured below so main can await the agent's graceful shutdown
-            // (summarize_on_shutdown) before returning. Without this, the
+            // (flush_digests_on_shutdown) before returning. Without this, the
             // tokio runtime drops the spawned task the moment serve::run
             // returns, cancelling any in-flight LLM call (#48).
             let mut agent_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -842,7 +842,6 @@ async fn main() -> Result<()> {
                     image_cache.clone(),
                     digest_cache_for_agent.clone(),
                 ));
-                agent.bootstrap().await;
                 // Wire the agent into the timer manager so chat-origin
                 // timers fire through `Agent::trigger`.
                 timer_manager.set_agent(Arc::downgrade(&agent));
@@ -965,7 +964,7 @@ async fn main() -> Result<()> {
             serve::run(addr, Arc::clone(&serve_state), ambient_routes).await?;
 
             // Wait for the agent task's graceful shutdown to finish so its
-            // summarize_on_shutdown LLM call isn't aborted by runtime drop.
+            // flush_digests_on_shutdown LLM call isn't aborted by runtime drop.
             if let Some(handle) = agent_handle
                 && let Err(e) = handle.await
             {
