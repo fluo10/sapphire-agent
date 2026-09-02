@@ -183,14 +183,18 @@ struct TitleLine {
     session_title: String,
 }
 
-/// Compacted recap of a session, appended whenever an in-memory compression
-/// fires and on graceful shutdown. Restart uses the latest `SummaryLine` to
-/// inject context into the system prompt without replaying the raw (and
-/// potentially tool-unpaired) message history.
+/// Compacted recap of a session, appended whenever a compaction fires.
+/// `covers_through` makes the latest `SummaryLine` the restore cursor: a
+/// reload replays this summary as a stub, followed only by the messages it
+/// did not absorb, rather than the whole raw history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryLine {
     pub summary_at: DateTime<Utc>,
     pub summary: String,
+    /// Unused: always written as `None` and read nowhere. `covers_through`
+    /// took over its stated job as the restore cursor. Kept (rather than
+    /// removed) because removing a field is a format change; don't
+    /// implement against this one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub up_to_timestamp: Option<DateTime<Utc>>,
     /// The last message this summary absorbed. A restore replays the
@@ -638,35 +642,31 @@ impl SessionStore {
         ))
     }
 
-    /// Load a session preserving wall-clock timestamps and
-    /// `report_meta` provenance, alongside the latest `SummaryLine`
-    /// if one has been written. Used by `recall_memory`: the summary
-    /// becomes `project_summary` (older content compacted) and the
-    /// messages provide the recent verbatim reports. Plain
-    /// `load_session` is unsuitable because the `ChatMessage`
-    /// conversion drops both fields.
+    /// Load a session's messages exactly as written, preserving wall-clock
+    /// timestamps and `report_meta` provenance, alongside the latest
+    /// `SummaryLine` if one has been written. Two callers:
+    ///
+    /// - `recall_memory` (`serve/mcp.rs`), which filters to messages with
+    ///   `report_meta.is_some()` — only `append_report` sets that field,
+    ///   as a single `ContentPart::Text`, so `ContentPart::ToolResultRef`
+    ///   never reaches it either way.
+    /// - `handle_get_session` (`serve/mod.rs`), the client-facing "show me
+    ///   this session" RPC, which hands the record back to the party that
+    ///   wrote it and surfaces `ToolResultRef`'s cache key rather than
+    ///   pulling potentially-large content out of the cache into a
+    ///   response body.
+    ///
+    /// Unlike `load_session`, this does not hydrate `ToolResultRef` back
+    /// into `ToolResult`, does not trim to a compaction checkpoint, and
+    /// does not run `repair_tool_pairing` — it isn't assembling a history
+    /// for a provider, so there's nothing to hydrate or repair for.
     pub fn load_session_full(
         &self,
         session_id: &str,
     ) -> Option<(Vec<StoredMessage>, Option<SummaryLine>)> {
         let path = self.resolve_path(session_id)?;
         let loaded = load_session_file(&path)?;
-        let summary = loaded.latest_summary;
-        let hydrated = loaded
-            .messages
-            .into_iter()
-            .map(|mut m| {
-                let one = self.hydrate(vec![ChatMessage {
-                    role: m.role.clone(),
-                    parts: std::mem::take(&mut m.parts),
-                    input_kind: None,
-                    user_id: None,
-                }]);
-                m.parts = one.into_iter().next().map(|c| c.parts).unwrap_or_default();
-                m
-            })
-            .collect();
-        Some((hydrated, summary))
+        Some((loaded.messages, loaded.latest_summary))
     }
 
     /// Create a new MCP-driven session for a logical `project`. Unlike

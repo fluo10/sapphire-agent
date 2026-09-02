@@ -838,7 +838,17 @@ async fn handle_initialize(
 
     let (session_id, is_new) = match resolved {
         Some(id) => {
-            let exists = state.cross_device_session_store.load_session(&id).is_some();
+            // Existence only — `load_session` would parse the file,
+            // prepend the compaction stub, hydrate every tool result out
+            // of the cache, and run `repair_tool_pairing`'s two passes,
+            // none of which this needs. `load_session` returns `Some` for
+            // any file whose meta line parses, which is exactly what
+            // `absolute_path_for` (a `resolve_path` lookup) already
+            // answers.
+            let exists = state
+                .cross_device_session_store
+                .absolute_path_for(&id)
+                .is_some();
             (id, !exists)
         }
         None => (uuid::Uuid::now_v7().to_string(), true),
@@ -5408,5 +5418,73 @@ mod tests {
              before this turn"
         );
         assert_eq!(outcome.text.as_deref(), Some("ok"));
+    }
+
+    /// `handle_get_session` must hand back the record exactly as written —
+    /// not `load_session`'s model view, which trims everything a
+    /// checkpoint covers and prefixes a synthetic summary stub the client
+    /// never sent. This was already gotten wrong once during this
+    /// branch's development (see 789c5f0) and nothing else pins it:
+    /// swapping `load_session_full` for `load_session` here still
+    /// compiles and still passes the rest of the suite.
+    #[tokio::test]
+    async fn get_session_returns_the_full_record_even_past_a_checkpoint() {
+        let state = ServeState::for_test(true);
+        let sid = "get-session-full".to_string();
+        let key: ConversationKey = (sid.clone(), None);
+        state
+            .cross_device_session_store
+            .ensure_session(&sid, &key, "rpc", None, "default")
+            .unwrap();
+
+        state
+            .cross_device_session_store
+            .append(&sid, &ChatMessage::user("first"))
+            .unwrap();
+        state
+            .cross_device_session_store
+            .append(&sid, &ChatMessage::assistant("second"))
+            .unwrap();
+
+        // A checkpoint with keep_recent = 0 covers everything appended so
+        // far, the same shape a day-boundary compaction writes.
+        state
+            .cross_device_session_store
+            .append_summary(&sid, "earlier stuff happened", 0)
+            .unwrap();
+
+        state
+            .cross_device_session_store
+            .append(&sid, &ChatMessage::user("third"))
+            .unwrap();
+
+        let response = handle_get_session(Arc::clone(&state), json!(1), Some(sid.clone())).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let messages = v["result"]["messages"].as_array().expect("messages array");
+
+        assert_eq!(
+            messages.len(),
+            3,
+            "the endpoint must return every message as written, not the \
+             model's post-checkpoint view: {v}"
+        );
+        let has_stub = messages.iter().any(|m| {
+            m["parts"].as_array().is_some_and(|parts| {
+                parts.iter().any(|p| {
+                    p["type"] == "text"
+                        && p["text"]
+                            .as_str()
+                            .is_some_and(|t| t.starts_with("[Context Summary"))
+                })
+            })
+        });
+        assert!(
+            !has_stub,
+            "the synthetic compaction stub must never appear in a \
+             client-facing get_session response: {v}"
+        );
     }
 }

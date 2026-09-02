@@ -152,10 +152,12 @@ pub struct AcpSessionStore {
     /// `None` when the tool-result cache directory could not be opened
     /// at startup (read-only or missing `~/.cache` / `%LOCALAPPDATA%`).
     /// Degrades rather than making the whole store unusable: a session
-    /// must still load. See `store_part`'s `None` arm for what this
-    /// costs — currently nothing reachable in production, since
-    /// `run_llm_turn` does not persist `tool_use`/`tool_result` at all
-    /// yet (issue #191).
+    /// must still load. ACP has persisted tool traffic since #191, and
+    /// #194 put every transport on this cache, so `None` is live here in
+    /// production: `store_part`'s `ToolResult` arm writes a
+    /// `ToolResultRef` with no hash instead of the content, and a reload
+    /// reads that back as `MISSING_RESULT` — the pairing survives, only
+    /// the result body is lost.
     cache: Option<Arc<ToolResultCache>>,
     /// `session_id` → the id of the last event written.
     ///

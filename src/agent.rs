@@ -91,7 +91,57 @@ impl Agent {
         image_cache: Option<Arc<ImageCache>>,
         digest_cache: Option<Arc<crate::digest_cache::DigestCache>>,
     ) -> Self {
-        let (active_sessions, histories) = session_store.load_all();
+        let (active_sessions, mut histories) = session_store.load_all();
+
+        // Restrict *histories only* to rooms this instance is configured
+        // to serve. `active_sessions` stays complete — it's cheap, and
+        // `get_or_create_session` reads it regardless of room.
+        //
+        // This isn't a correctness guard: `ConversationKey` is
+        // `(room_id, thread_id)`, so a foreign room's history could never
+        // be served to a message this instance handles. It's here to cap
+        // startup I/O and retained memory, which otherwise scale with an
+        // unbounded and never-cleaned count of stale session files (e.g.
+        // test rooms sharing the same sessions directory as production).
+        // Don't "simplify" this away as pointless — it's a resource guard,
+        // not a safety one.
+        //
+        // If any configured channel uses the "listen everywhere" wildcard
+        // (empty room_ids / channel_ids), the whole agent is unrestricted
+        // — narrowing to only the other channel's explicit set would
+        // silently drop everything the wildcard channel was supposed to
+        // handle.
+        let mut wildcard = false;
+        let allowed_rooms: std::collections::HashSet<String> = {
+            let mut set = std::collections::HashSet::new();
+            if let Some(m) = &config.matrix {
+                if m.room_ids.is_empty() {
+                    wildcard = true;
+                } else {
+                    set.extend(m.room_ids.iter().cloned());
+                }
+            }
+            if let Some(d) = &config.discord {
+                if d.channel_ids.is_empty() {
+                    wildcard = true;
+                } else {
+                    set.extend(d.channel_ids.iter().cloned());
+                }
+            }
+            set
+        };
+        if !wildcard && !allowed_rooms.is_empty() {
+            let before = histories.len();
+            histories.retain(|key, _| allowed_rooms.contains(&key.0));
+            let skipped = before - histories.len();
+            if skipped > 0 {
+                info!(
+                    "Startup: skipping {} restored session history entries in unconfigured room(s)",
+                    skipped
+                );
+            }
+        }
+
         info!(
             "Restored {} active session(s) from disk ({} with history)",
             active_sessions.len(),
