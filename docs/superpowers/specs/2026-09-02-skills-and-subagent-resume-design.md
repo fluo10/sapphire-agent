@@ -138,17 +138,35 @@ A `data_dir` is a place applications manage, not a place a person conveniently
 able to populate it would leave the one manual step in the least comfortable
 possible location, so installation is a tool the model can be asked to run.
 
-Two tools, because they need different permission classes:
+Three tools, split by what they do rather than for symmetry:
 
 - **`skill_install(url)`** — `ToolKind::Execute`. Clones into the skills
-  directory, creating it first if no candidate exists. Run against a URL that is
-  already installed, it updates instead (`git pull --ff-only`), which is the
-  whole reason for not vendoring in the first place.
+  directory, creating it first if no candidate exists.
+- **`skill_update(name?)`** — `ToolKind::Execute`. `git pull --ff-only` on one
+  installed entry, or on every one when the name is omitted. Reports which
+  entries moved and to what.
 - **`skill_uninstall(name)`** — `ToolKind::Delete`. Removes one installed entry.
 
-Both are gated by the same namespace switch as `skill`, and both go through the
-ordinary permission path — `Execute` is asked about in `Default` and
-`AcceptEdits`, so an install is never silent outside `Bypass`.
+**Update is addressed by name, not by URL.** Folding it into `skill_install`
+would have meant that keeping skills current required remembering the URL each
+entry came from, which is exactly the friction that makes people stop updating.
+Tracking upstream is the reason this design does not vendor superpowers, so the
+update path has to be the cheapest one in the set: "update my skills" with no
+argument at all.
+
+`--ff-only` is deliberate. A checkout that has diverged — most likely because
+someone edited a skill in place — fails the fast-forward and says so, rather
+than producing a merge nobody asked for.
+
+**The stored remote is re-validated before the pull.** `skill_install` only ever
+writes an `https` remote, but `.git/config` is an ordinary file on the person's
+machine, and `git pull` against an `ext::` remote executes a command. Checking
+the resolved remote against the same rules the install applies costs nothing and
+removes the asymmetry.
+
+All three are gated by the same namespace switch as `skill`, and all three go
+through the ordinary permission path — `Execute` is asked about in `Default` and
+`AcceptEdits`, so neither an install nor an update is silent outside `Bypass`.
 
 Installation is `git`, not a tarball download: `git` is already required by the
 SDD scripts, and it is what makes an update a `pull`.
@@ -273,7 +291,10 @@ required for it.
 | No candidate directory exists on the client | Recoverable error naming the candidates tried, the `$SAPPHIRE_AGENT_SKILLS_DIR` override, and `skill_install` — which is the fix in the common case of a machine that has never had skills installed. |
 | The directory resolves but is empty | Same, pointing at `skill_install`. |
 | `skill_install` given a non-`https` or option-shaped URL | Refused before any process starts, naming which rule it broke. |
-| `skill_install` on an already-installed URL | Updates it with `git pull --ff-only`; a diverged checkout fails the fast-forward and says so rather than merging. |
+| `skill_install` on an already-installed URL | Refused, naming the entry and pointing at `skill_update`. |
+| `skill_update` on a diverged or locally-edited checkout | The fast-forward fails; reported per entry, and with no name given the other entries still update. |
+| `skill_update` where the stored remote is not `https` | Refused for that entry, naming the remote. |
+| `skill_update` with no name and nothing installed | Recoverable error pointing at `skill_install`. |
 | `skill_uninstall` on a checkout with local modifications | Refused, naming the modified files. `force` overrides. |
 | `skill_uninstall` on an unknown name | Recoverable error listing what is installed. |
 | `fs/read_text_file` refuses the path | Retry through the terminal; only then report. |
