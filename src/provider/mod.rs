@@ -70,8 +70,29 @@ pub enum ContentPart {
         tool_use_id: String,
         content: String,
     },
+    /// Reference to a tool call's `input`, stored in the
+    /// workspace-external tool-payload cache. **A storage-boundary form
+    /// only**, like [`ContentPart::ToolResultRef`] below and for the
+    /// same reason: a `file_write` call carries the file's contents just
+    /// as a `file_read` result does, and `<workspace>/sessions` is
+    /// walked by the retrieve indexer line by line.
+    ///
+    /// `name` stays inline. It is short, and it is what
+    /// `generate_summary` renders as `[Called tool: {name}]` — putting
+    /// it behind the hash would make a summary of an evicted session say
+    /// nothing at all about what the agent did.
+    ///
+    /// `sha256: None` means the input had nowhere to be stored — the
+    /// cache was unavailable when the line was written. A reader treats
+    /// that the same as a hash whose entry has since been evicted.
+    ToolUseRef {
+        id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+    },
     /// Reference to a tool result stored in the workspace-external
-    /// tool-result cache. **A storage-boundary form only.** Unlike
+    /// tool-payload cache. **A storage-boundary form only.** Unlike
     /// [`ContentPart::ImageRef`], which stays in long-lived in-memory
     /// history so images are not re-billed, this variant never lives in
     /// memory: a tool result has to be whole when the model sees it, so

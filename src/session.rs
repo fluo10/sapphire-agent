@@ -254,14 +254,15 @@ pub struct SessionStore {
     /// `resolve_path` (filesystem scan) and eagerly by `create_session` /
     /// `ensure_session`. Avoids re-scanning per `append` call.
     path_cache: Mutex<HashMap<String, PathBuf>>,
-    /// Workspace-external, content-addressed store for tool results.
+    /// Workspace-external, content-addressed store for both halves of a
+    /// tool call — the `input` and the result.
     ///
     /// `None` when the platform cache directory could not be opened at
-    /// startup. Degrades rather than failing: a result written without a
-    /// cache is recorded as a `ToolResultRef` with no hash, which reads
-    /// back as `MISSING_RESULT`. Losing the content is survivable;
-    /// losing the pairing is not.
-    tool_results: Option<Arc<crate::tool_result_cache::ToolResultCache>>,
+    /// startup. Degrades rather than failing: a payload written without
+    /// a cache is recorded as a `ToolUseRef` / `ToolResultRef` with no
+    /// hash, which reads back as the corresponding stand-in. Losing the
+    /// content is survivable; losing the pairing is not.
+    tool_payloads: Option<Arc<crate::tool_payload_cache::ToolPayloadCache>>,
 }
 
 impl SessionStore {
@@ -269,14 +270,14 @@ impl SessionStore {
     pub fn new(
         base_dir: PathBuf,
         kind: &'static str,
-        tool_results: Option<Arc<crate::tool_result_cache::ToolResultCache>>,
+        tool_payloads: Option<Arc<crate::tool_payload_cache::ToolPayloadCache>>,
     ) -> Self {
         Self {
             base_dir,
             kind,
             ws_state: None,
             path_cache: Mutex::new(HashMap::new()),
-            tool_results,
+            tool_payloads,
         }
     }
 
@@ -284,14 +285,14 @@ impl SessionStore {
         base_dir: PathBuf,
         kind: &'static str,
         ws_state: Arc<Mutex<WorkspaceState>>,
-        tool_results: Option<Arc<crate::tool_result_cache::ToolResultCache>>,
+        tool_payloads: Option<Arc<crate::tool_payload_cache::ToolPayloadCache>>,
     ) -> Self {
         Self {
             base_dir,
             kind,
             ws_state: Some(ws_state),
             path_cache: Mutex::new(HashMap::new()),
-            tool_results,
+            tool_payloads,
         }
     }
 
@@ -1041,11 +1042,27 @@ impl SessionStore {
                     };
                     ContentPart::Text(format!("[image: {media_type} sha256={hash}]"))
                 }
-                ContentPart::ToolUse { id, name, input } => ContentPart::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: crate::session_storage::elide_oversized_input(input),
-                },
+                ContentPart::ToolUse { id, name, input } => {
+                    // Same treatment as a result, for the same reason: a
+                    // `file_write` call carries the file's contents, and
+                    // this line is about to land in the retrieve index.
+                    // `name` stays inline — see `ContentPart::ToolUseRef`.
+                    let sha256 = match &self.tool_payloads {
+                        Some(cache) => match cache.put_input(input) {
+                            Ok(sha) => Some(sha),
+                            Err(e) => {
+                                warn!("Failed to cache the input of tool call '{id}': {e}");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    ContentPart::ToolUseRef {
+                        id: id.clone(),
+                        name: name.clone(),
+                        sha256,
+                    }
+                }
                 ContentPart::ToolResult {
                     tool_use_id,
                     content,
@@ -1055,7 +1072,7 @@ impl SessionStore {
                     // `tool_use` with no matching `tool_result`, which
                     // the API rejects outright — the session would fail
                     // to load rather than load thinner.
-                    let sha256 = match &self.tool_results {
+                    let sha256 = match &self.tool_payloads {
                         Some(cache) => match cache.put(content) {
                             Ok(sha) => Some(sha),
                             Err(e) => {
@@ -1081,15 +1098,37 @@ impl SessionStore {
         })
     }
 
-    /// Turn every `ToolResultRef` back into the result the model needs
-    /// to see. A miss is a placeholder, not an error.
+    /// Turn every `ToolUseRef` and `ToolResultRef` back into the call
+    /// the model needs to see. A miss is a stand-in, not an error.
     pub(crate) fn hydrate(&self, msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        // Every pre-existing session file, and every one that has not
+        // used a tool yet, holds nothing to hydrate — and this runs on
+        // the startup path for each restored session. Ask once before
+        // cloning the history.
+        if !msgs.iter().any(|m| {
+            m.parts.iter().any(|p| {
+                matches!(
+                    p,
+                    ContentPart::ToolUseRef { .. } | ContentPart::ToolResultRef { .. }
+                )
+            })
+        }) {
+            return msgs;
+        }
         msgs.into_iter()
             .map(|m| ChatMessage {
                 parts: m
                     .parts
                     .iter()
                     .map(|p| match p {
+                        ContentPart::ToolUseRef { id, name, sha256 } => ContentPart::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: sha256
+                                .as_ref()
+                                .and_then(|s| self.tool_payloads.as_ref()?.get_input(s))
+                                .unwrap_or_else(crate::session_storage::missing_input),
+                        },
                         ContentPart::ToolResultRef {
                             tool_use_id,
                             sha256,
@@ -1097,7 +1136,7 @@ impl SessionStore {
                             tool_use_id: tool_use_id.clone(),
                             content: sha256
                                 .as_ref()
-                                .and_then(|s| self.tool_results.as_ref()?.get(s))
+                                .and_then(|s| self.tool_payloads.as_ref()?.get(s))
                                 .unwrap_or_else(|| {
                                     crate::session_storage::MISSING_RESULT.to_string()
                                 }),
@@ -1841,8 +1880,9 @@ mod tests {
     fn cached_store() -> (tempfile::TempDir, tempfile::TempDir, SessionStore, String) {
         let sessions = tempfile::TempDir::new().unwrap();
         let cache_dir = tempfile::TempDir::new().unwrap();
-        let cache = crate::tool_result_cache::ToolResultCache::open(cache_dir.path().to_path_buf())
-            .unwrap();
+        let cache =
+            crate::tool_payload_cache::ToolPayloadCache::open(cache_dir.path().to_path_buf())
+                .unwrap();
         let store = SessionStore::new(sessions.path().to_path_buf(), "channel", Some(cache));
         let key = ("!room:example.org".to_string(), None);
         let sid = store.create_session(&key, "matrix", "default").unwrap();
@@ -1955,12 +1995,13 @@ mod tests {
         assert!(answered, "the tool_use must still be answered: {loaded:?}");
     }
 
-    /// An oversized tool input is elided rather than written whole — the
-    /// session file is indexed and there is no cache indirection for it.
+    /// A tool input goes to the cache whatever its size, for the same
+    /// reason a result does: a `file_write` call carries the file's
+    /// contents, and this line lands in the retrieve index.
     #[test]
-    fn an_oversized_tool_input_is_elided_on_disk() {
+    fn a_tool_input_never_reaches_the_session_file() {
         let (_s, _c, store, sid) = cached_store();
-        let huge = "x".repeat(crate::tools::OUTPUT_CAP_BYTES + 1);
+        let huge = "SECRET-INPUT-CANARY".repeat(64);
         store
             .append(
                 &sid,
@@ -1979,14 +2020,78 @@ mod tests {
 
         let raw = fs::read_to_string(store.absolute_path_for(&sid).unwrap()).unwrap();
         assert!(
-            raw.contains("_elided"),
-            "expected elision:\n{}",
+            !raw.contains("SECRET-INPUT-CANARY"),
+            "the input leaked into the indexed file:\n{}",
             &raw[..raw.len().min(400)]
         );
+        assert!(raw.contains("ToolUseRef"), "expected a reference:\n{raw}");
         assert!(
-            raw.len() < 4000,
-            "the line was written whole ({} bytes)",
-            raw.len()
+            raw.contains("file_write"),
+            "the tool name must stay inline:\n{raw}"
+        );
+
+        // ...and comes back whole, byte-for-byte, which elision never did.
+        let loaded = store.load_session(&sid).expect("the session loads");
+        let input = loaded.iter().flat_map(|m| &m.parts).find_map(|p| match p {
+            ContentPart::ToolUse { id, input, .. } if id == "c1" => Some(input.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            input,
+            Some(serde_json::json!({ "content": huge })),
+            "the input must round-trip exactly: {loaded:?}"
+        );
+    }
+
+    /// No cache at write time keeps the call and loses only its
+    /// arguments. Dropping the part would orphan the result answering it.
+    #[test]
+    fn no_cache_at_write_time_still_keeps_the_call() {
+        let sessions = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(sessions.path().to_path_buf(), "channel", None);
+        let key = ("!room:example.org".to_string(), None);
+        let sid = store.create_session(&key, "matrix", "default").unwrap();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+
+        let loaded = store.load_session(&sid).expect("the session loads");
+        let call = loaded.iter().flat_map(|m| &m.parts).find_map(|p| match p {
+            ContentPart::ToolUse { id, name, input } if id == "c1" => {
+                Some((name.clone(), input.clone()))
+            }
+            _ => None,
+        });
+        let (name, input) = call.expect("the call survives: {loaded:?}");
+        assert_eq!(name, "file_read", "the tool name must survive");
+        assert!(
+            input.get("_unavailable").is_some(),
+            "expected the stand-in input, got {input}"
+        );
+    }
+
+    /// An evicted input degrades to the stand-in, keeping the call. The
+    /// model then knows it asked `file_read` something without knowing
+    /// what — thinner than a lost result, which it could simply re-run,
+    /// which is why `name` is kept out of the cache.
+    #[test]
+    fn an_evicted_input_keeps_the_call_and_loses_its_arguments() {
+        let (_s, cache_dir, store, sid) = cached_store();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        for entry in fs::read_dir(cache_dir.path()).unwrap().flatten() {
+            fs::remove_file(entry.path()).unwrap();
+        }
+
+        let loaded = store.load_session(&sid).expect("the session still loads");
+        let call = loaded.iter().flat_map(|m| &m.parts).find_map(|p| match p {
+            ContentPart::ToolUse { id, name, input } if id == "c1" => {
+                Some((name.clone(), input.clone()))
+            }
+            _ => None,
+        });
+        let (name, input) = call.expect("the call survives an evicted input");
+        assert_eq!(name, "file_read");
+        assert!(
+            input.get("_unavailable").is_some(),
+            "expected the stand-in input, got {input}"
         );
     }
 
@@ -2014,15 +2119,16 @@ mod tests {
             parts.iter().all(|p| matches!(
                 p,
                 ContentPart::Text(_)
-                    | ContentPart::ToolUse { .. }
+                    | ContentPart::ToolUseRef { .. }
                     | ContentPart::ToolResultRef { .. }
             )),
-            "no hydrated tool result may appear: {parts:?}"
+            "no hydrated tool payload may appear: {parts:?}"
         );
         assert!(
-            !parts
-                .iter()
-                .any(|p| matches!(p, ContentPart::ToolResult { .. })),
+            !parts.iter().any(|p| matches!(
+                p,
+                ContentPart::ToolResult { .. } | ContentPart::ToolUse { .. }
+            )),
             "sessions_for_day must not hydrate: {parts:?}"
         );
     }

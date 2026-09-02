@@ -1730,10 +1730,10 @@ mod tests {
         let sessions_base = td.path().join("sessions");
         let channel_store = SessionStore::new(sessions_base.join("channel"), "channel", None);
 
-        let tool_result_cache =
-            crate::tool_result_cache::ToolResultCache::open(td.path().join("tool-results"))
+        let tool_payload_cache =
+            crate::tool_payload_cache::ToolPayloadCache::open(td.path().join("tool-payloads"))
                 .unwrap();
-        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), Some(tool_result_cache));
+        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), Some(tool_payload_cache));
         let digest_cache = DigestCache::open(td.path().join("digests")).unwrap();
 
         acp_store.create("s1", "work", "/p").unwrap();
@@ -1792,10 +1792,10 @@ mod tests {
     fn merge_test_stores(td: &tempfile::TempDir) -> (SessionStore, AcpSessionStore) {
         let sessions_base = td.path().join("sessions");
         let channel_store = SessionStore::new(sessions_base.join("channel"), "channel", None);
-        let tool_result_cache =
-            crate::tool_result_cache::ToolResultCache::open(td.path().join("tool-results"))
+        let tool_payload_cache =
+            crate::tool_payload_cache::ToolPayloadCache::open(td.path().join("tool-payloads"))
                 .unwrap();
-        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), Some(tool_result_cache));
+        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), Some(tool_payload_cache));
         (channel_store, acp_store)
     }
 

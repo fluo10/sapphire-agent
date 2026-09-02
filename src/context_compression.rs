@@ -10,7 +10,7 @@
 
 use crate::config::CompressionConfig;
 use crate::provider::{ChatMessage, ContentPart, Provider, Role};
-use crate::session_storage::MISSING_RESULT;
+use crate::session_storage::{MISSING_RESULT, missing_input};
 use tracing::{info, warn};
 
 /// Rough token estimate for a string.
@@ -59,7 +59,10 @@ fn estimate_message_tokens(msg: &ChatMessage) -> usize {
             }
             ContentPart::ToolResult { content, .. } => estimate_tokens(content),
             // Hydration happens before this runs on any real path, so
-            // this is the un-hydrated form only — a placeholder's worth.
+            // these are the un-hydrated forms only — a stand-in's worth.
+            ContentPart::ToolUseRef { name, .. } => {
+                estimate_tokens(name) + estimate_tokens(&missing_input().to_string())
+            }
             ContentPart::ToolResultRef { .. } => estimate_tokens(MISSING_RESULT),
         })
         .sum()
@@ -230,7 +233,9 @@ pub async fn generate_summary(
                         "{role_label}: [image: {media_type} sha256={sha256}]\n\n"
                     ));
                 }
-                ContentPart::ToolUse { name, .. } => {
+                // `name` survives the storage boundary precisely so an
+                // un-hydrated call still reads as something here.
+                ContentPart::ToolUse { name, .. } | ContentPart::ToolUseRef { name, .. } => {
                     transcript.push_str(&format!("{role_label}: [Called tool: {name}]\n\n"));
                 }
                 ContentPart::ToolResult { content, .. } => {

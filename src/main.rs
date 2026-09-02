@@ -27,7 +27,7 @@ mod serve;
 mod session;
 mod session_storage;
 mod timer;
-mod tool_result_cache;
+mod tool_payload_cache;
 mod tools;
 mod voice;
 mod workspace;
@@ -464,10 +464,11 @@ async fn main() -> Result<()> {
             // ── Session store base directory ────────────────────────────────
             let sessions_base = config.resolved_sessions_dir(&workspace_dir);
 
-            // ── Tool-result cache (workspace-external, content-addressed) ──
+            // ── Tool-payload cache (workspace-external, content-addressed) ──
             // Every session store below — cross-device, device-default,
             // mcp, channel — and the ACP store further down keep tool
-            // results out of the JSONL itself, content-addressed by hash,
+            // both halves of a tool call out of the JSONL itself,
+            // content-addressed by hash,
             // for the same reason images are. Built here, before any of
             // them, so the same `Option<Arc<...>>` can be handed to all
             // four SessionStore kinds plus AcpSessionStore.
@@ -485,26 +486,26 @@ async fn main() -> Result<()> {
             // Every session store persists tool traffic now, so this
             // cache is on the request path of every transport — not just
             // ACP. `None` still degrades rather than aborting startup: a
-            // result written without it keeps its pairing and reads back
-            // as a placeholder, which is a thinner session rather than an
-            // unloadable one.
-            let tool_result_cache: Option<Arc<tool_result_cache::ToolResultCache>> =
-                match tool_result_cache::ToolResultCache::default_dir() {
-                    Some(dir) => match tool_result_cache::ToolResultCache::open(dir.clone()) {
+            // payload written without it keeps its call and its pairing
+            // and reads back as a stand-in, which is a thinner session
+            // rather than an unloadable one.
+            let tool_payload_cache: Option<Arc<tool_payload_cache::ToolPayloadCache>> =
+                match tool_payload_cache::ToolPayloadCache::default_dir() {
+                    Some(dir) => match tool_payload_cache::ToolPayloadCache::open(dir.clone()) {
                         Ok(cache) => {
-                            tracing::info!("Tool-result cache opened at {dir:?}");
+                            tracing::info!("Tool-payload cache opened at {dir:?}");
                             Some(cache)
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "Tool-result cache open failed ({e:?}); tool results will not be cached"
+                                "Tool-payload cache open failed ({e:?}); tool payloads will not be cached"
                             );
                             None
                         }
                     },
                     None => {
                         tracing::warn!(
-                            "No platform cache dir resolvable; tool-result cache disabled"
+                            "No platform cache dir resolvable; tool-payload cache disabled"
                         );
                         None
                     }
@@ -529,7 +530,7 @@ async fn main() -> Result<()> {
                 sessions_base.clone(),
                 "cross-device",
                 Arc::clone(&ws_state),
-                tool_result_cache.clone(),
+                tool_payload_cache.clone(),
             ));
 
             // ── Device-default session store (sessions/<ns>/device-default/) ─
@@ -540,7 +541,7 @@ async fn main() -> Result<()> {
                 sessions_base.clone(),
                 "device-default",
                 Arc::clone(&ws_state),
-                tool_result_cache.clone(),
+                tool_payload_cache.clone(),
             ));
 
             // ── MCP session store (sessions/<namespace>/mcp/) ──────────────
@@ -552,7 +553,7 @@ async fn main() -> Result<()> {
                 sessions_base.clone(),
                 "mcp",
                 Arc::clone(&ws_state),
-                tool_result_cache.clone(),
+                tool_payload_cache.clone(),
             ));
 
             // ── Voice providers + ServeState (built early) ──────────────────
@@ -687,11 +688,11 @@ async fn main() -> Result<()> {
             // cache rather than inline, for the same reason images are.
             let acp_session_store = Arc::new(acp_session::AcpSessionStore::new(
                 sessions_base.clone(),
-                tool_result_cache.clone(),
+                tool_payload_cache.clone(),
             ));
 
             // ── Intra-day digest cache (workspace-external, store-agnostic) ─
-            // Same directory family as the tool-result cache above, and
+            // Same directory family as the tool-payload cache above, and
             // the same degrade-not-abort treatment — a session must
             // still load and every transport must still serve even
             // without a place to cache "today's digest." `None` costs
@@ -759,7 +760,7 @@ async fn main() -> Result<()> {
                     sessions_base.clone(),
                     "channel",
                     Arc::clone(&ws_state),
-                    tool_result_cache.clone(),
+                    tool_payload_cache.clone(),
                 ));
 
                 let mut channel_list: Vec<(String, Arc<dyn channel::Channel>)> = Vec::new();
