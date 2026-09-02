@@ -118,7 +118,6 @@ impl SubagentCache {
     /// either way unparseable. A rename within one directory is atomic
     /// on both Unix and Windows, so no reader ever sees anything but the
     /// old content or the new content, never a half-written one.
-    #[allow(dead_code)] // wired into `subagent` in Task 6
     pub fn put(&self, handle: &str, child: &StoredChild) -> Result<bool> {
         let path = self.path_for(handle)?;
         let body = serde_json::to_string(child)?;
@@ -133,7 +132,6 @@ impl SubagentCache {
         Ok(true)
     }
 
-    #[allow(dead_code)] // wired into `subagent` in Task 6
     pub fn get(&self, handle: &str) -> Option<StoredChild> {
         let path = self.path_for(handle).ok()?;
         let text = std::fs::read_to_string(path).ok()?;
@@ -148,7 +146,6 @@ impl SubagentCache {
 
     /// Drop the entry for `handle`, if any. Not an error if it was
     /// already absent.
-    #[allow(dead_code)] // wired into `subagent` in Task 6
     pub fn remove(&self, handle: &str) {
         if let Ok(path) = self.path_for(handle) {
             let _ = std::fs::remove_file(path);
