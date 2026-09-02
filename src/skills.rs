@@ -306,8 +306,8 @@ mod tests {
 
     #[test]
     fn a_resolved_dir_is_parsed_from_a_single_line() {
-        let dir = parse_resolved_dir("SKILLS_DIR\t/home/u/.local/share/sapphire-agent/skills\n")
-            .unwrap();
+        let dir =
+            parse_resolved_dir("SKILLS_DIR\t/home/u/.local/share/sapphire-agent/skills\n").unwrap();
         assert_eq!(dir, "/home/u/.local/share/sapphire-agent/skills");
     }
 
@@ -447,7 +447,10 @@ mod tests {
             .env("XDG_DATA_HOME", tmp.path().join("xdg"))
             .output()
             .unwrap();
-        assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "NO_SKILLS_DIR");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap().trim(),
+            "NO_SKILLS_DIR"
+        );
     }
 
     /// With every base env var unset, `${APPDATA:-}/sapphire-agent/skills`
@@ -506,7 +509,11 @@ mod tests {
         let stdout = String::from_utf8(out.stdout).unwrap();
         let dir = parse_resolved_dir(&stdout).unwrap();
         let expected = xdg.join("sapphire-agent").join("skills");
-        assert_eq!(std::path::Path::new(&dir), expected, "stdout was:\n{stdout}");
+        assert_eq!(
+            std::path::Path::new(&dir),
+            expected,
+            "stdout was:\n{stdout}"
+        );
         assert!(expected.is_dir(), "resolver should have created it");
     }
 }

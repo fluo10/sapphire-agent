@@ -204,8 +204,10 @@ fn clamp_timeout(requested: Option<u64>) -> std::time::Duration {
 /// Render an exit status the same way regardless of caller —
 /// `format_finished` (the one-shot path) and `ClientShellOutput` (the
 /// long-running path) both need this tail, and duplicating the
-/// three-way match would let the two drift apart.
-fn format_exit_status(status: &ExitStatus) -> String {
+/// three-way match would let the two drift apart. `pub(crate)` so
+/// `skill_tools`'s terminal-fallback and index-resolver failures are
+/// worded the same way rather than inventing a second phrasing.
+pub(crate) fn format_exit_status(status: &ExitStatus) -> String {
     match (&status.exit_code, &status.signal) {
         (Some(code), _) => format!("\n[exit code: {code}]"),
         (None, Some(signal)) => format!("\n[terminated by signal: {signal}]"),

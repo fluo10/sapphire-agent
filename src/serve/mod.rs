@@ -2291,6 +2291,14 @@ pub(crate) struct TurnContext {
     /// subagent is even defined.
     pub visible_specs: Arc<[ToolSpec]>,
     pub timer_origin: Option<crate::timer::TimerOrigin>,
+    /// The session this round's turn is persisting to, or `None` for a
+    /// subagent's nested turn (`persistence` is `None` there — see
+    /// `TurnPersistence`'s doc). `tools::skill_tools::SkillTool` keys
+    /// its per-editor resolved-index cache on this: the tool is
+    /// registered once into the `ToolSet` shared by every connection
+    /// through `ServeState`, so without a session key two different
+    /// editors' `skill()` calls would collide on one cache entry.
+    pub session_id: Option<String>,
 }
 
 tokio::task_local! {
@@ -2586,6 +2594,7 @@ impl TurnLoop<'_> {
                         progress: Arc::clone(progress),
                         visible_specs: Arc::clone(&visible_specs),
                         timer_origin: timer_origin.clone(),
+                        session_id: self.persistence.map(|p| p.session_id.clone()),
                     });
                     let mut results: Vec<(String, crate::tools::ToolOutput)> =
                         futures_util::future::join_all(permitted.into_iter().map(|c| {
@@ -2874,7 +2883,10 @@ pub(crate) async fn run_llm_turn(
                 return false;
             }
             if !skills_enabled
-                && matches!(name, "skill" | "skill_install" | "skill_update" | "skill_uninstall")
+                && matches!(
+                    name,
+                    "skill" | "skill_install" | "skill_update" | "skill_uninstall"
+                )
             {
                 return false;
             }
