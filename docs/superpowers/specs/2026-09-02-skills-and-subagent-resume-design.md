@@ -64,6 +64,7 @@ is the contract superpowers' own non-Claude manifests ask for. Updating becomes
 |---|---|
 | Where does the checkout live? | **Client side.** The SDD scripts (`review-package`, `task-brief`, `sdd-workspace`) run `git` against the repository under review, and `find-polluter.sh` runs its test suite. They must execute where the repository is, which is the editor's machine. |
 | How does the agent find it? | **A convention resolved on the client**, with a client-side environment override. The server stores no path: it serves clients on several machines and operating systems, so a path in its config is right for at most one of them. |
+| How does anything get into it? | **`skill_install` / `skill_uninstall`.** A `data_dir` is managed by applications, not by hand, so the agent populates it on request. Sources are restricted to `https://` and every install is a permissioned action. |
 | Who may see skills? | **Per memory namespace.** A development namespace opts in; the everyday one does not. This avoids writing "development means ACP" into the code — an overstatement made once already in the subagents spec and corrected during review. |
 | Scope of this spec | **Skills, plus subagent resume.** SDD's fix rounds 1-3 resume a specific implementer; without that the loop silently degrades to a fresh implementer every round. |
 | Where do resumed children live? | **A cache**, alongside `digest_cache` and `tool_result_cache`. |
@@ -129,6 +130,74 @@ so the agent learns the path by being told it, never by assuming it. The
 resolved directory is cached for the session and reused for every subsequent
 `skill(name)`. A `skill(name)` that arrives before any index call resolves
 first.
+
+### Installing and removing skills
+
+A `data_dir` is a place applications manage, not a place a person conveniently
+`cd`s into and clones a repository. Resolving the convention without also being
+able to populate it would leave the one manual step in the least comfortable
+possible location, so installation is a tool the model can be asked to run.
+
+Two tools, because they need different permission classes:
+
+- **`skill_install(url)`** — `ToolKind::Execute`. Clones into the skills
+  directory, creating it first if no candidate exists. Run against a URL that is
+  already installed, it updates instead (`git pull --ff-only`), which is the
+  whole reason for not vendoring in the first place.
+- **`skill_uninstall(name)`** — `ToolKind::Delete`. Removes one installed entry.
+
+Both are gated by the same namespace switch as `skill`, and both go through the
+ordinary permission path — `Execute` is asked about in `Default` and
+`AcceptEdits`, so an install is never silent outside `Bypass`.
+
+Installation is `git`, not a tarball download: `git` is already required by the
+SDD scripts, and it is what makes an update a `pull`.
+
+#### What the URL is allowed to be
+
+The model chooses this string, so `git clone` is an arbitrary-code delivery path
+unless it is constrained. Only `https://` is accepted. Rejected explicitly:
+
+| Rejected | Why |
+|---|---|
+| `ext::…` | `git` treats it as a command to execute. Remote code execution by design. |
+| `file://`, `git://`, `ssh://`, `user@host:path` | Not `https`; the scp-like form is easy to mistake for a path. |
+| Anything beginning with `-` | It is an argument, not a URL — `--upload-pack=…` is the classic. |
+
+The URL is passed after a `--` separator so it cannot be reparsed as an option
+even if a check is ever missed.
+
+#### Where it lands
+
+The destination directory name is **derived by the agent** from the URL's final
+path segment, never taken from the model. It is then constrained to
+`[A-Za-z0-9._-]`, rejected if empty, if it is `.` or `..`, if it begins with
+`-`, or if it matches a Windows reserved device name (`CON`, `PRN`, `AUX`,
+`NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`).
+
+That last clause is here because ruling that an alphanumeric allow-list is
+sufficient was wrong once already, during the client-side tools work: `CON` is
+alphanumeric.
+
+`skill_uninstall` takes a name rather than a path, and applies the same rules
+before it is joined to the resolved directory, so a removal cannot address
+anything that is not a direct child of the skills directory.
+
+**A checkout with uncommitted changes is not removed.** If `git status
+--porcelain` is non-empty, uninstall refuses and says so; the person may have
+edited a skill in place. An explicit `force` overrides.
+
+#### The two layouts the index accepts
+
+A checkout is not itself a skill. superpowers declares `"skills": "./skills/"`,
+so its skills are one level deeper than the clone root. The index therefore
+walks two shapes:
+
+- `<dir>/<name>/SKILL.md` — a skill directory placed there directly
+- `<dir>/<repo>/skills/<name>/SKILL.md` — a cloned bundle
+
+This accepts both without parsing anyone's plugin manifest, and it means a
+hand-written local skill can sit beside an installed bundle.
 
 ### The `skill` tool
 
@@ -201,8 +270,12 @@ required for it.
 | Condition | Behaviour |
 |---|---|
 | The namespace has not opted in | The tool is not offered. Same path as the gate. |
-| No candidate directory exists on the client | Recoverable error listing every candidate that was tried, and naming `$SAPPHIRE_AGENT_SKILLS_DIR` as the override. The model can relay that to the user, who is the only one who can fix it. |
-| The directory resolves but is empty | Recoverable error naming the resolved path. |
+| No candidate directory exists on the client | Recoverable error naming the candidates tried, the `$SAPPHIRE_AGENT_SKILLS_DIR` override, and `skill_install` — which is the fix in the common case of a machine that has never had skills installed. |
+| The directory resolves but is empty | Same, pointing at `skill_install`. |
+| `skill_install` given a non-`https` or option-shaped URL | Refused before any process starts, naming which rule it broke. |
+| `skill_install` on an already-installed URL | Updates it with `git pull --ff-only`; a diverged checkout fails the fast-forward and says so rather than merging. |
+| `skill_uninstall` on a checkout with local modifications | Refused, naming the modified files. `force` overrides. |
+| `skill_uninstall` on an unknown name | Recoverable error listing what is installed. |
 | `fs/read_text_file` refuses the path | Retry through the terminal; only then report. |
 | Unknown skill name | Recoverable error listing the known names — the convention `subagent` already follows. |
 | No client (a non-ACP transport in an enabled namespace) | Not offered. Skills are client-side by construction. |
@@ -218,6 +291,13 @@ resolved directory across calls in one session, and the gate on and off.
 The candidate list itself is shell running on someone else's machine, so it is
 covered by an executable test of the script against a fixture tree rather than
 by asserting on Rust that never evaluates it.
+
+Install and uninstall are mostly guard code, and the guards are what get tested
+directly: every rejected URL form from the table above; a derived destination
+name for ordinary and awkward URLs (trailing slash, `.git` suffix, a repo named
+`con`); a name containing a separator or `..` refused before any join; uninstall
+refused on a dirty checkout and permitted under `force`; and the index finding
+skills through both accepted layouts, including one of each side by side.
 
 ---
 
@@ -333,6 +413,11 @@ not written.
 - **A plugin system** — hooks, slash commands, a marketplace, bundled MCP
   servers. Nothing in superpowers needs it; `"hooks": {}` is what its own
   non-Claude manifest declares.
+- **A registry, search, or version pinning for installs.** `skill_install` takes
+  a URL the person names and tracks that checkout's default branch. Discovering
+  skills, pinning a tag, or rolling one back are all `git` operations the person
+  can run in the same directory, and none of them is needed to make superpowers
+  work.
 - **Server-side skills.** Rejected during design: scripts must run where the
   repository is.
 - **brainstorming's visual companion.** It runs a Node server and expects a
@@ -347,6 +432,12 @@ not written.
   Windows, where it depends on a Git Bash or WSL `bash` being on `PATH`. There
   is no configuration escape from this by design; the honest fallback is that
   the model reads the skills through `client_shell` itself.
+- **A private repository can hang the install.** `git clone` over `https` against
+  a repository needing credentials will try to prompt, in a terminal the model
+  cannot answer. The install therefore runs with prompting disabled
+  (`GIT_TERMINAL_PROMPT=0`) and under the one-shot terminal's timeout, so the
+  failure is a clear refusal rather than a stall. Private sources are not a
+  goal.
 - **The candidate list is a reimplementation of `directories`' rules in shell**,
   and it can drift from that crate's behaviour — most plausibly on a Linux
   desktop with an unusual `XDG_DATA_HOME`, or on Windows where a roaming
