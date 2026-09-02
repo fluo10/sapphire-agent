@@ -51,7 +51,8 @@ emit() {
   for f in "$d"/*/SKILL.md "$d"/*/skills/*/SKILL.md; do
     [ -f "$f" ] || continue
     printf 'SKILL\t%s\n' "$f"
-    awk 'NR==1 && $0=="---" {inside=1; next}
+    awk '{ sub(/\r$/, "") }
+         NR==1 && $0=="---" {inside=1; next}
          inside && $0=="---" {exit}
          inside {print "FM\t" $0}' "$f"
   done
@@ -73,24 +74,73 @@ fi
 printf 'NO_SKILLS_DIR\n'
 "#;
 
-/// Resolve the skills directory for writing, creating it when absent.
-/// Used only by `skill_install`, which is the one operation allowed to
-/// bring the directory into existence.
+/// Resolve the skills directory for writing: the first candidate that
+/// **already exists** wins, exactly like [`RESOLVE_AND_INDEX_SH`] — the
+/// two must agree, because `skill()` and this script's caller
+/// (`resolve_or_create_dir`, shared by `skill_install`, `skill_update`
+/// and `skill_uninstall`) are both being asked "where is the skills
+/// directory," just for different purposes. Only when *none* of the
+/// four candidates exists does this fall back to a second pass that
+/// creates the first *eligible* one — base variable set, existence not
+/// required — in the same order.
+///
+/// Earlier, this script picked its candidate on eligibility alone (base
+/// variable set, no existence test), which could disagree with
+/// `RESOLVE_AND_INDEX_SH` about where an already-populated checkout
+/// lives: `$APPDATA` set but `%APPDATA%\sapphire-agent\skills` never
+/// created, with a real, hand-made checkout sitting under the XDG
+/// candidate instead, used to make this script `mkdir -p` a second,
+/// empty directory under `%APPDATA%` and use *that* — silently
+/// orphaning the real checkout from every mutating tool while `skill()`
+/// kept listing it from the XDG path.
 ///
 /// The macOS branch requires `HOME` to be non-empty *before* testing
-/// `-d`. Without that guard, an unset `HOME` collapses the test to
-/// `-d "/Library/Application Support"` — a directory that exists on
-/// every real macOS install regardless of `HOME` — so a client spawned
-/// without `HOME` (a service, a stripped-down environment) could still
-/// match it and silently create under a system-wide path instead of
-/// falling through to the XDG-based candidate below.
+/// `-d`, in both passes. Without that guard, an unset `HOME` collapses
+/// the test to `-d "/Library/Application Support"` — a directory that
+/// exists on every real macOS install regardless of `HOME` — so a
+/// client spawned without `HOME` (a service, a stripped-down
+/// environment) could still match it and silently create under a
+/// system-wide path instead of falling through to the XDG-based
+/// candidate below.
+///
+/// **What a typo'd `$SAPPHIRE_AGENT_SKILLS_DIR` does now:** nothing
+/// special. It is tested for existence in the same first pass as every
+/// other candidate, so a typo that points nowhere is simply skipped in
+/// favor of whichever real candidate already has a directory — the same
+/// outcome `RESOLVE_AND_INDEX_SH` reaches for `skill()`. Only if *no*
+/// candidate exists anywhere does the override win the creation pass,
+/// same as before: it is the one variable whose entire purpose is "use
+/// this exact path," so once creation is actually reached it still goes
+/// first.
 pub const RESOLVE_OR_CREATE_SH: &str = r#"
 set -eu
-if [ -n "${SAPPHIRE_AGENT_SKILLS_DIR:-}" ]; then
+exists() {
+  [ -d "$1" ]
+}
+d=""
+if [ -n "${SAPPHIRE_AGENT_SKILLS_DIR:-}" ] && exists "$SAPPHIRE_AGENT_SKILLS_DIR"; then
+  d="$SAPPHIRE_AGENT_SKILLS_DIR"
+elif [ -n "${APPDATA:-}" ] && exists "$APPDATA/sapphire-agent/skills"; then
+  d="$APPDATA/sapphire-agent/skills"
+elif [ -n "${HOME:-}" ] && exists "$HOME/Library/Application Support/sapphire-agent/skills"; then
+  d="$HOME/Library/Application Support/sapphire-agent/skills"
+elif { [ -n "${XDG_DATA_HOME:-}" ] || [ -n "${HOME:-}" ]; } \
+     && exists "${XDG_DATA_HOME:-$HOME/.local/share}/sapphire-agent/skills"; then
+  d="${XDG_DATA_HOME:-$HOME/.local/share}/sapphire-agent/skills"
+elif [ -n "${SAPPHIRE_AGENT_SKILLS_DIR:-}" ]; then
   d="$SAPPHIRE_AGENT_SKILLS_DIR"
 elif [ -n "${APPDATA:-}" ]; then
   d="$APPDATA/sapphire-agent/skills"
 elif [ -n "${HOME:-}" ] && [ -d "$HOME/Library/Application Support" ]; then
+  # Eligibility for the macOS candidate is not just "HOME is set" —
+  # `$HOME/Library/Application Support` (one level up from the skills
+  # subdirectory this pass is about to create) existing is the proxy for
+  # "this is macOS" the whole script relies on, since there is no
+  # `$OSTYPE` to check from POSIX sh. Skipping this test here would let
+  # a non-macOS client with only `HOME` set — no `APPDATA`, no
+  # `XDG_DATA_HOME` — silently create under an "Application Support"
+  # tree that was never a real convention on its OS, instead of falling
+  # through to the XDG candidate below.
   d="$HOME/Library/Application Support/sapphire-agent/skills"
 else
   d="${XDG_DATA_HOME:-${HOME:-}/.local/share}/sapphire-agent/skills"
@@ -233,6 +283,17 @@ pub fn validate_entry_name(name: &str) -> Result<()> {
         || name == "."
         || name == ".."
         || name.starts_with('-')
+        // A leading dot makes `stem` (everything before the first `.`)
+        // empty, so the reserved-name check above would never see it —
+        // `".git".split('.').next()` is `""`, not `"git"`. Rejecting a
+        // leading dot outright closes that regardless of what follows
+        // it. `.git` is one direct child of the skills directory (never
+        // a traversal — `validate_entry_name` never sees a path with a
+        // separator in it), but there is no legitimate reason a skill
+        // source's derived or supplied name should start with one, and
+        // letting `skill_uninstall(".git")` reach `rm -rf` on it is
+        // reachable, model-choosable, and pointless to allow.
+        || name.starts_with('.')
         || name.ends_with('.')
         || name.ends_with(' ')
         || reserved
@@ -353,6 +414,22 @@ mod tests {
         }
     }
 
+    /// A leading dot makes `stem` (`name.split('.').next()`) empty, so
+    /// the reserved-name check never sees the segment after it —
+    /// `".git".split('.').next()` is `""`, not `"git"`. Closed directly
+    /// rather than folded into the reserved-name check, because the
+    /// point isn't reserved device names here, it's `.git` itself:
+    /// `skill_uninstall(".git")` addresses a single direct child of the
+    /// skills directory (never a traversal — this validator never sees
+    /// a path with a separator in it), but it is reachable,
+    /// model-choosable, and pointless to allow.
+    #[test]
+    fn a_leading_dot_is_refused() {
+        for bad in [".git", ".ssh", ".superpowers"] {
+            assert!(validate_entry_name(bad).is_err(), "accepted {bad}");
+        }
+    }
+
     /// `.` stayed in the charset (repo names like `my.skills` are
     /// legitimate), which reopens two things Windows normalises away:
     /// `CON.txt` still resolves to the `CON` device, and a trailing `.`
@@ -450,6 +527,15 @@ mod tests {
     /// candidate must be skipped because its *base variable* is unset,
     /// not because the assembled string happens to match a known-bad
     /// shape.
+    ///
+    /// **This can only actually fail on macOS.** The collapsed macOS
+    /// path, `/Library/Application Support/sapphire-agent/skills`, is
+    /// only a real, pre-existing directory (well, its parent is) on an
+    /// actual macOS machine — on Linux and Windows CI none of the three
+    /// collapsed candidates exists, so the assertion passes whether or
+    /// not the guard this test is pinning is even present. Do not read
+    /// a green run of this test on non-macOS CI as coverage of the
+    /// thing it is named for.
     #[test]
     fn the_resolver_reports_absence_when_every_base_var_is_unset() {
         let Some(sh) = sh() else { return };
@@ -478,6 +564,15 @@ mod tests {
     /// script must skip the macOS branch (guarded on `HOME` being set,
     /// not on `-d`'s result) and fall through to the XDG candidate
     /// rather than the unrelated system path.
+    ///
+    /// **This can only actually fail on macOS**, for the same reason as
+    /// `the_resolver_reports_absence_when_every_base_var_is_unset`
+    /// above: `/Library/Application Support` is only a real,
+    /// pre-existing directory on an actual macOS machine. On Linux and
+    /// Windows CI the unguarded, buggy version of this branch would
+    /// have failed its own `-d` test anyway and fallen through to XDG
+    /// regardless, so a green run there is not coverage of the guard
+    /// this test exists to pin.
     #[test]
     fn resolve_or_create_falls_back_to_xdg_when_home_is_unset() {
         let Some(sh) = sh() else { return };
@@ -501,5 +596,74 @@ mod tests {
             "stdout was:\n{stdout}"
         );
         assert!(expected.is_dir(), "resolver should have created it");
+    }
+
+    /// Blocking 1's own regression: candidate 2's *base variable*
+    /// (`APPDATA`) is set but the path it names does not exist, while
+    /// candidate 4's (`$XDG_DATA_HOME/sapphire-agent/skills`) both is
+    /// eligible and already has a real, populated directory on disk —
+    /// the shape of "person cloned superpowers by hand into the
+    /// XDG-default location, and `%APPDATA%\sapphire-agent\skills` was
+    /// simply never created." Before this fix, `RESOLVE_OR_CREATE_SH`
+    /// selected on eligibility alone and would have settled on
+    /// candidate 2 (and `mkdir -p`'d an empty directory there),
+    /// disagreeing with `RESOLVE_AND_INDEX_SH`, which requires the
+    /// assembled path to exist and would have found the real checkout
+    /// at candidate 4. Both resolvers must now agree.
+    ///
+    /// `XDG_DATA_HOME` rather than `HOME` carries candidate 4 here
+    /// deliberately: `HOME` is one of the environment variables MSYS's
+    /// own shell startup can reassert to the real value even after
+    /// `env_remove`/`env`, which would make a strict path comparison
+    /// against an `env`-supplied `HOME` flaky on a Windows/Git-Bash
+    /// host — `resolve_or_create_falls_back_to_xdg_when_home_is_unset`
+    /// above avoids the same trap the same way.
+    #[test]
+    fn both_resolvers_agree_when_a_base_var_is_set_but_its_path_is_absent() {
+        let Some(sh) = sh() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let xdg = tmp.path().join("xdg");
+        let real = xdg.join("sapphire-agent").join("skills");
+        std::fs::create_dir_all(&real).unwrap();
+        // Set, but nothing was ever created under it.
+        let appdata_base = tmp.path().join("appdata-never-created");
+
+        let index_out = Command::new(sh)
+            .arg("-c")
+            .arg(RESOLVE_AND_INDEX_SH)
+            .env_remove("SAPPHIRE_AGENT_SKILLS_DIR")
+            .env("APPDATA", &appdata_base)
+            .env_remove("HOME")
+            .env("XDG_DATA_HOME", &xdg)
+            .output()
+            .unwrap();
+        let index_stdout = String::from_utf8(index_out.stdout).unwrap();
+        let index_dir = parse_index(&index_stdout).unwrap().dir;
+
+        let create_out = Command::new(sh)
+            .arg("-c")
+            .arg(RESOLVE_OR_CREATE_SH)
+            .env_remove("SAPPHIRE_AGENT_SKILLS_DIR")
+            .env("APPDATA", &appdata_base)
+            .env_remove("HOME")
+            .env("XDG_DATA_HOME", &xdg)
+            .output()
+            .unwrap();
+        let create_stdout = String::from_utf8(create_out.stdout).unwrap();
+        let create_dir = parse_resolved_dir(&create_stdout).unwrap();
+
+        assert_eq!(
+            std::path::Path::new(&index_dir),
+            real,
+            "the read-only resolver must find the real, hand-made checkout: \
+             stdout was:\n{index_stdout}"
+        );
+        assert_eq!(
+            std::path::Path::new(&create_dir),
+            real,
+            "the create-or-resolve resolver must agree, not mkdir -p a \
+             second directory under APPDATA just because that base \
+             variable happens to be set: stdout was:\n{create_stdout}"
+        );
     }
 }

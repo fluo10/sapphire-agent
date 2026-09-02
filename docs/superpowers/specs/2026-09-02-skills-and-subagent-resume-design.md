@@ -93,9 +93,12 @@ retain_days = 7
 
 Enablement hangs off `MemoryNamespaceConfig`, which `resolve_namespace_chain`
 already computes per turn. A namespace with `skills = true` offers the tool; the
-rest do not. `visible_tool_predicate` takes only booleans today, so it gains one
-more — resolved from the turn's namespace by the caller, in the same place the
-client capabilities are resolved.
+rest do not. `visible_tool_predicate` itself gains no parameter for this: it is
+also called from `src/agent.rs`, which this branch may not edit, so the
+namespace check is composed as a closure wrapping its result at the
+`run_llm_turn` call site (`serve/mod.rs:2869-2903`), in the same place the
+client capabilities are resolved — see `## 実装時の訂正` for why this differs
+from an earlier version of this section.
 
 ### Where the skills directory is, without the server knowing
 
@@ -320,7 +323,7 @@ name for ordinary and awkward URLs (trailing slash, `.git` suffix, a repo named
 `con`); a name containing a separator or `..` refused before any join; install
 refusing a URL that is already present; update rejecting a non-`https` stored
 remote, and continuing past one failed entry when no name was given; uninstall
-refused on a dirty checkout and permitted under `force`; and the index finding
+refused outright on a dirty checkout, with no override; and the index finding
 skills through both accepted layouts, including one of each side by side.
 
 ---
@@ -478,17 +481,17 @@ not written.
 
 ## 実装時の訂正
 
-Four places where implementation proved this spec wrong, or changed a
+Five places where implementation proved this spec wrong, or changed a
 decision it recorded. Left here rather than silently edited into the
 sections above, because a spec that still asserts something the branch
 disproved is worse than no spec.
 
 **`force` never shipped as a `skill_uninstall` parameter — it was removed
 before merge.** This spec's "A checkout with uncommitted changes is not
-removed" prose and its failure-mode table both originally said a dirty
-checkout is refused "unless `force` overrides" (both corrected in place
-above, pointing back here). That was implemented and then taken back out,
-because
+removed" prose, its failure-mode table, and its Testing section summary all
+originally said a dirty checkout is refused "unless `force` overrides" (all
+three corrected in place above, pointing back here). That was implemented
+and then taken back out, because
 `policy::decide` returns `Allow` for `ToolKind::Delete` under
 `Origin::Acp(AcceptEdits)`, while `ToolKind::Execute` returns `Ask` there —
 so an uninstall does not prompt in `accept_edits` mode the way an install or
@@ -581,3 +584,17 @@ own schedule if the definition truly never comes back.
 it, and a real caller (an explicit "forget this conversation" operator
 action, say) may yet want it — but nothing in this branch calls it in
 production any more.
+
+**`visible_tool_predicate` did not gain a sixth boolean parameter for
+skills, despite what the Configuration section above originally said.**
+That section claimed the namespace check would be "resolved from the
+turn's namespace by the caller" as one more parameter on
+`visible_tool_predicate` itself. It could not be: that function is also
+called from `src/agent.rs`, which this branch may not edit, so widening its
+signature would have forced a matching change there too. The
+implementation instead composes the namespace check as a closure wrapping
+`visible_tool_predicate`'s own result, at the one `run_llm_turn` call site
+that needs it (`serve/mod.rs:2869-2903`), in the same place the client
+capability flags are already resolved. `visible_tool_predicate`'s own
+signature is unchanged from before this branch. The Configuration section
+above has been corrected to match.

@@ -493,12 +493,22 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Resolve the skills directory on the editor's machine, creating it if
-/// this is the first thing to touch it. Shared by all three tools below
-/// — `skill_install` is the only one that can legitimately be the first
-/// write, but `mkdir -p` is idempotent, so `skill_update` and
-/// `skill_uninstall` reuse the same call rather than a second, read-only
-/// resolver.
+/// Resolve the skills directory on the editor's machine, creating it
+/// only if none of the candidates already exists. Shared by all three
+/// tools below — `skill_install` is the only one that can legitimately
+/// be the first write, but what makes it safe for `skill_update` and
+/// `skill_uninstall` to reuse the same call (rather than a second,
+/// read-only resolver) is not that `mkdir -p` is idempotent — creation
+/// only ever happens when nothing exists is the property that matters,
+/// and it is what `RESOLVE_OR_CREATE_SH` walking candidates in the same
+/// existence-first order as `RESOLVE_AND_INDEX_SH` guarantees. A
+/// resolver that instead created under the first candidate whose base
+/// variable was merely *set* — without testing for an existing
+/// directory first — could disagree with the read-only resolver about
+/// where an already-populated checkout lives, and `skill_update`/
+/// `skill_uninstall` would then silently operate on a second, empty
+/// directory beside the real one instead of refusing or finding it. See
+/// `RESOLVE_OR_CREATE_SH`'s own doc in `crate::skills`.
 async fn resolve_or_create_dir(client: &Arc<dyn AcpClient>) -> Result<String> {
     let run = run_client_command(
         client,
@@ -940,32 +950,81 @@ impl Tool for SkillUninstallTool {
 
         if probe_out.contains("ABSENT") {
             anyhow::bail!("'{name}' is not installed at {dest}. Nothing to uninstall.");
-        }
-        if probe_out.contains("GITREPO") {
+        } else if probe_out.contains("GITREPO") {
             let status_run = run_git(
                 &client,
                 &["-C", &dest, "status", "--porcelain"],
                 LOCAL_TIMEOUT,
             )
             .await?;
-            let status_out = finish_run(
-                status_run,
-                &format!("checking {name} for local changes"),
-                LOCAL_TIMEOUT,
-            )?
-            .output;
-            if !status_out.trim().is_empty() {
+            // Deliberately *not* `finish_run`/`command_failed` here, even
+            // though every other call in this file uses them. Those treat
+            // an unreported exit status (`exit_code: None, signal: None`)
+            // as success — the right default for a read, where the worst
+            // case is trusting output that, in every case actually seen,
+            // was fine. This call is the one thing standing between a
+            // model-issued `skill_uninstall` and `rm -rf`: if the editor
+            // never says whether `git status --porcelain` succeeded, "no
+            // evidence of local changes" must not be read as "confirmed
+            // no local changes." So an unreported status refuses here,
+            // where `command_failed` would have let it through.
+            if status_run.timed_out_handle.is_some() {
+                anyhow::bail!(
+                    "timed out checking {name} for local changes on the \
+                     editor's machine after {}s",
+                    LOCAL_TIMEOUT.as_secs()
+                );
+            }
+            let status = status_run
+                .status
+                .expect("run_client_command always sets `status` when it does not time out");
+            if status.exit_code.is_none() && status.signal.is_none() {
+                anyhow::bail!(
+                    "could not determine whether '{name}' at {dest} has local \
+                     changes: the editor did not report an exit status for \
+                     `git status --porcelain`. Refusing to remove it rather \
+                     than guessing it is clean — try again, or check and \
+                     remove it yourself on the editor's machine."
+                );
+            }
+            if SkillTool::command_failed(&status) {
+                anyhow::bail!(
+                    "checking {name} for local changes failed on the editor's \
+                     machine: {}\n{}",
+                    format_exit_status(&status).trim(),
+                    status_run.output.output.trim()
+                );
+            }
+            if !status_run.output.output.trim().is_empty() {
                 anyhow::bail!(
                     "'{name}' has local changes and was not removed:\n{}\n\
                      Resolve them on the editor's machine — commit, stash, or remove the \
                      directory yourself — then try again. There is no override.",
-                    status_out.trim()
+                    status_run.output.output.trim()
                 );
             }
+        } else if probe_out.contains("PLAIN") {
+            // A hand-written entry with no `.git` directory at all — not
+            // version-controlled, so there is no "local changes" question
+            // to ask and nothing blocks removal.
+        } else {
+            // Neither ABSENT, GITREPO nor PLAIN: the editor answered the
+            // existence probe with something this tool doesn't recognise
+            // — most plausibly an empty string after a flaked round trip,
+            // or a client that reports `exitStatus` without `exitCode`
+            // (optional in the ACP schema) alongside truncated output.
+            // Previously this fell straight through to `rm -rf` — an
+            // unrecognised answer must instead be treated the same as
+            // "cannot determine": a refusal, not a guess in the direction
+            // of deleting something.
+            anyhow::bail!(
+                "could not determine whether '{name}' at {dest} exists or is \
+                 a git checkout: the editor's answer to the existence probe \
+                 was not recognised ({probe_out:?}). Refusing to remove it \
+                 rather than guessing — try again, or check and remove it \
+                 yourself on the editor's machine."
+            );
         }
-        // `PLAIN`: a hand-written entry with no `.git` directory at
-        // all — not version-controlled, so there is no "local changes"
-        // question to ask and nothing blocks removal.
 
         // `--` so a name that were somehow still just a `-`-prefixed
         // string (validate_entry_name already refuses one) could not be
@@ -1499,12 +1558,25 @@ mod tests {
     }
 
     /// `null` is treated the same as an absent `name`: an "update
-    /// everything" call, not a rejection.
+    /// everything" call, not a rejection. Sends `{"name": null}`
+    /// explicitly — routing through `update_all_where`, which calls
+    /// `execute(&json!({}))` (no `name` key at all, not `name: null`),
+    /// would leave this green even if the `.filter(|v| !v.is_null())`
+    /// in `execute` were deleted, since an absent key never needed it.
     #[tokio::test]
     async fn update_treats_a_null_name_as_omitted() {
-        let out = update_all_where(&[("a", Ok("Already up to date."))])
-            .await
-            .unwrap();
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout(
+            "SKILLS_DIR\t/skills\nSKILL\t/skills/a/SKILL.md\nFM\tname: a\nFM\tdescription: d\n",
+        );
+        client.queue_terminal_stdout("https://github.com/obra/superpowers\n");
+        client.queue_terminal_stdout("Already up to date.");
+        let tool = SkillUpdateTool::new(Arc::new(SkillTool::new()));
+        let out = scope_acp_client(Arc::clone(&client) as Arc<dyn AcpClient>, async {
+            tool.execute(&json!({"name": null})).await
+        })
+        .await
+        .unwrap();
         assert!(out.contains("a: Already up to date."), "{out}");
     }
 
@@ -1701,6 +1773,63 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("not installed"), "got: {err}");
         assert_eq!(client.terminal_count(), 2, "must not attempt rm -rf");
+    }
+
+    /// Blocking 2: the old code tested the existence probe's output with
+    /// `contains("ABSENT")` / `contains("GITREPO")`, neither of which
+    /// matches an empty string — the shape a flaked round trip or a
+    /// client that never wrote anything would produce. That let control
+    /// fall through both `if`s straight to `rm -rf`. An unrecognised
+    /// answer must now refuse instead, before ever reaching `git status`
+    /// or the removal itself.
+    #[tokio::test]
+    async fn uninstall_refuses_on_an_unrecognised_probe_answer() {
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout(RESOLVED_DIR_STDOUT);
+        client.queue_terminal_stdout("");
+        let tool = SkillUninstallTool::new(Arc::new(SkillTool::new()));
+        let err = scope_acp_client(Arc::clone(&client) as Arc<dyn AcpClient>, async {
+            tool.execute(&json!({"name": "superpowers"})).await
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not recognised"), "got: {err}");
+        assert_eq!(
+            client.terminal_count(),
+            2,
+            "must not fall through to git status or rm -rf on an \
+             unrecognised probe answer"
+        );
+    }
+
+    /// Blocking 2, the second way the guard failed open: `finish_run`/
+    /// `command_failed` treat an unreported exit status (`exit_code:
+    /// None, signal: None` — an ACP client that reports `exitStatus`
+    /// without `exitCode`, which the protocol allows) as success. That
+    /// is the right default for a read, but this call is what stands
+    /// between a model-issued uninstall and `rm -rf`, so "the editor
+    /// didn't say" must not be read as "confirmed clean."
+    #[tokio::test]
+    async fn uninstall_refuses_when_the_status_check_reports_no_exit_status() {
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout(RESOLVED_DIR_STDOUT);
+        client.queue_terminal_stdout("GITREPO\n");
+        client.queue_terminal_result("", None);
+        let tool = SkillUninstallTool::new(Arc::new(SkillTool::new()));
+        let err = scope_acp_client(Arc::clone(&client) as Arc<dyn AcpClient>, async {
+            tool.execute(&json!({"name": "superpowers"})).await
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("could not determine"),
+            "got: {err}"
+        );
+        assert_eq!(
+            client.terminal_count(),
+            3,
+            "must refuse before ever running rm -rf"
+        );
     }
 
     /// A `Provider` that is never actually called — it only exists to

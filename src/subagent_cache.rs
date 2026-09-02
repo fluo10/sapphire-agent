@@ -172,6 +172,23 @@ impl SubagentCache {
     /// Drop every entry not touched since before `cutoff`. Returns how
     /// many went. Called once per day-boundary tick from the same
     /// heartbeat sweep that prunes `DigestCache`.
+    ///
+    /// `.tmp` files (`put`'s sibling-temp-file-and-rename write) get a
+    /// separate rule, judged by filesystem mtime rather than by parsing
+    /// their content as a `StoredChild`. A `.tmp` left behind by a `put`
+    /// that crashed *before* its rename is ordinary, complete JSON and
+    /// would parse fine either way — but one that crashed *during* the
+    /// write can be truncated, unparseable JSON, and the "unparseable
+    /// entry is corrupt or mid-write, not provably stale, so don't
+    /// delete it" reasoning below is exactly backwards for that case: it
+    /// was written to protect a `put` that is still in flight *right
+    /// now*, racing this same scan, not to protect a file whose writer
+    /// is long gone and never coming back to finish it or overwrite it
+    /// (nothing ever `put`s to the same randomly-`Uuid::now_v7()`-named
+    /// `.tmp` path twice). Left alone, that reasoning makes an
+    /// unparseable `.tmp` orphan permanent — it can never age past
+    /// "might still be mid-write" under a rule that only ever looks at
+    /// its content, not its age.
     pub fn prune_before(&self, cutoff: DateTime<Utc>) -> usize {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return 0;
@@ -179,16 +196,28 @@ impl SubagentCache {
         let mut removed = 0;
         for entry in entries.flatten() {
             let path = entry.path();
-            let stale = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|t| serde_json::from_str::<StoredChild>(&t).ok())
-                .map(|child| child.updated_at < cutoff)
-                // An entry that fails to parse is corrupt or mid-write
-                // (a `put` races this scan), not provably stale — do
-                // not delete it. `get()` already treats it as a miss,
-                // and the next `put` for that handle overwrites it, so
-                // leaving it costs nothing but a wasted file.
-                .unwrap_or(false);
+            let is_tmp = path.extension().is_some_and(|ext| ext == "tmp");
+            let stale = if is_tmp {
+                entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|modified| DateTime::<Utc>::from(modified) < cutoff)
+                    // Can't stat it — treat like any other unreadable
+                    // entry: not provably stale, leave it for a later
+                    // sweep.
+                    .unwrap_or(false)
+            } else {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<StoredChild>(&t).ok())
+                    .map(|child| child.updated_at < cutoff)
+                    // An entry that fails to parse is corrupt or mid-write
+                    // (a `put` races this scan), not provably stale — do
+                    // not delete it. `get()` already treats it as a miss,
+                    // and the next `put` for that handle overwrites it, so
+                    // leaving it costs nothing but a wasted file.
+                    .unwrap_or(false)
+            };
             if stale && std::fs::remove_file(&path).is_ok() {
                 removed += 1;
             }
@@ -312,6 +341,43 @@ mod tests {
         let cutoff = Utc::now() + chrono::Duration::days(1);
         assert_eq!(c.prune_before(cutoff), 0);
         assert!(d.path().join("h3.json").exists());
+    }
+
+    /// An orphaned `.tmp` file — left behind by a `put` that crashed
+    /// mid-write, so its content may not even be valid JSON — must
+    /// still age out once it's old enough, judged by filesystem mtime
+    /// rather than by parsing it. Without the `.tmp`-specific arm, an
+    /// unparseable orphan is "not provably stale" forever, since that
+    /// rule only ever looks at content, never age.
+    #[test]
+    fn an_orphaned_tmp_file_is_pruned_by_age_even_when_unparseable() {
+        let d = tempfile::tempdir().unwrap();
+        let c = SubagentCache::open(d.path().into(), 1_000_000).unwrap();
+        let tmp_path = d.path().join("h4.json.0198f-orphan.tmp");
+        std::fs::write(&tmp_path, "{ not even valid json").unwrap();
+
+        // Backdate it past the cutoff — a fresh write must survive a
+        // prune (it could be a `put` racing this exact scan).
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let old_time = filetime::FileTime::from_system_time(old);
+        filetime::set_file_mtime(&tmp_path, old_time).unwrap();
+
+        assert_eq!(c.prune_before(Utc::now()), 1);
+        assert!(!tmp_path.exists());
+    }
+
+    /// The counterpart: a `.tmp` orphan younger than the cutoff must not
+    /// be swept up just because it's unparseable — the writer that
+    /// created it may still be mid-write.
+    #[test]
+    fn a_fresh_tmp_file_survives_a_prune() {
+        let d = tempfile::tempdir().unwrap();
+        let c = SubagentCache::open(d.path().into(), 1_000_000).unwrap();
+        let tmp_path = d.path().join("h5.json.0198f-inflight.tmp");
+        std::fs::write(&tmp_path, "{ not even valid json").unwrap();
+
+        assert_eq!(c.prune_before(Utc::now() - chrono::Duration::days(1)), 0);
+        assert!(tmp_path.exists());
     }
 
     #[test]

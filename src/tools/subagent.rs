@@ -470,10 +470,21 @@ impl SubagentTool {
         // being cancelled mid-flight.
         let _guard = ResumeGuard::claim(&self.busy_handles, handle)?;
 
+        // Worded differently from the "no subagent is stored under this
+        // handle" miss just below on purpose: that one means a real
+        // cache was checked and came up empty for this handle. This one
+        // means there is no cache at all on this deployment, so *no*
+        // handle could ever resolve — reporting it identically would
+        // read as "this particular handle is unknown," which invites
+        // retrying with a different one, when the real fix is dispatch.
+        // `persist`'s `Resumability::NotResumable("no resume cache is
+        // configured on this deployment")` already words its equivalent
+        // this way; this matches it.
         let Some(cache) = &ctx.state.subagent_cache else {
             anyhow::bail!(
-                "no subagent is stored under handle '{handle}' — dispatch a \
-                 new one instead, with `agent` set"
+                "resume is not available: no resume cache is configured on \
+                 this deployment. Dispatch a new subagent instead, with \
+                 `agent` set."
             );
         };
         let Some(stored) = cache.get(handle) else {
@@ -1144,20 +1155,45 @@ mod tests {
     /// this also stands as the regression test for that: if resume ever
     /// started pulling from anything other than the stored child, this
     /// assertion is where it would first show up as unexpected text.
+    ///
+    /// The isolation half of that used to assert `!texts.iter().any(|t|
+    /// t.contains("PARENT ONLY"))` against text that appeared nowhere in
+    /// the fixture (or the crate) — an assertion that could not fail
+    /// regardless of what the code did. To make it a real regression
+    /// test, a real parent turn's own stored history — `state.sessions`,
+    /// keyed by `TurnContext::session_id`, never read by
+    /// `SubagentTool` directly — is seeded with a `"PARENT ONLY"`
+    /// marker and both calls run under a `TurnContext` whose
+    /// `session_id` actually names that session, the way the outer call
+    /// into `SubagentTool::execute` looks in production (unlike the
+    /// `None` `turn_context()` helper below, which matches what a
+    /// *subagent's own nested* `TurnLoop` sees, not this boundary).
     #[tokio::test]
     async fn a_resumed_child_continues_its_own_history() {
         let tool = SubagentTool::new(resumable_defs());
         let state = crate::serve::ServeState::for_test(false);
+        state.sessions.lock().await.insert(
+            "parent-session".to_string(),
+            vec![ChatMessage::user(
+                "PARENT ONLY — the parent's own conversation, never sent to a subagent",
+            )],
+        );
+        let parent_ctx = |provider: std::sync::Arc<dyn crate::provider::Provider>| {
+            std::sync::Arc::new(crate::serve::TurnContext {
+                state: std::sync::Arc::clone(&state),
+                provider,
+                progress: std::sync::Arc::new(crate::serve::NullProgress),
+                visible_specs: Vec::<ToolSpec>::new().into(),
+                timer_origin: None,
+                session_id: Some("parent-session".to_string()),
+            })
+        };
 
         let dispatch_provider = ScriptedProvider::new(vec![text_response("dispatch answer")]);
         let dispatch_input = serde_json::json!({"agent": "impl", "prompt": "first task"});
         let dispatched = crate::serve::scope_turn_context(
-            turn_context(
-                std::sync::Arc::clone(&state),
-                std::sync::Arc::clone(&dispatch_provider)
-                    as std::sync::Arc<dyn crate::provider::Provider>,
-                Vec::new(),
-            ),
+            parent_ctx(std::sync::Arc::clone(&dispatch_provider)
+                as std::sync::Arc<dyn crate::provider::Provider>),
             tool.execute(&dispatch_input),
         )
         .await
@@ -1167,12 +1203,8 @@ mod tests {
         let resume_provider = ScriptedProvider::new(vec![text_response("resume answer")]);
         let resume_input = serde_json::json!({"resume": handle, "prompt": "second instruction"});
         crate::serve::scope_turn_context(
-            turn_context(
-                std::sync::Arc::clone(&state),
-                std::sync::Arc::clone(&resume_provider)
-                    as std::sync::Arc<dyn crate::provider::Provider>,
-                Vec::new(),
-            ),
+            parent_ctx(std::sync::Arc::clone(&resume_provider)
+                as std::sync::Arc<dyn crate::provider::Provider>),
             tool.execute(&resume_input),
         )
         .await
@@ -1282,6 +1314,38 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("dispatch"), "got: {err}");
+    }
+
+    /// A deployment with no `subagent_cache` at all must say so, not
+    /// report the same "no subagent is stored under handle '…'" message
+    /// `an_unknown_handle_is_recoverable_and_says_what_to_do` gets for a
+    /// genuine miss against a real, empty cache — that phrasing invites
+    /// retrying with a different handle, when no handle could ever
+    /// resolve here.
+    #[tokio::test]
+    async fn resume_says_no_cache_is_configured_rather_than_a_phantom_miss() {
+        let mut state = crate::serve::ServeState::for_test(false);
+        std::sync::Arc::get_mut(&mut state)
+            .expect("uniquely owned immediately after construction")
+            .subagent_cache = None;
+
+        let tool = SubagentTool::new(defs());
+        let provider = ScriptedProvider::new(Vec::new());
+        let input = serde_json::json!({"resume": "some-handle", "prompt": "x"});
+
+        let err = crate::serve::scope_turn_context(
+            turn_context(
+                state,
+                std::sync::Arc::clone(&provider) as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+            ),
+            tool.execute(&input),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("no resume cache is configured"), "got: {err}");
     }
 
     /// Two turns resuming one handle at once would interleave writes

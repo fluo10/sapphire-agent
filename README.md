@@ -221,8 +221,10 @@ retain_days = 7                # the default
 - **`retain_days`** is how long a child may sit untouched before the daily
   heartbeat sweep prunes it.
 
-**A resume against a handle already running is refused**, so two turns can
-never interleave writes into one stored history.
+**A resume against a handle already running is refused**, so two turns in
+this process can never interleave writes into one stored history —
+`busy_handles` is an in-process `HashSet`, not a lock shared across
+processes or machines.
 
 **The offered tool list is recomputed on every resume, not restored.** Only
 the agent's *name* is stored; its definition is reloaded from
@@ -670,6 +672,17 @@ directory and index are cached per ACP session (keyed by
 subagent's own nested tool call) always re-resolves rather than risking a
 shared cache entry.
 
+`skill_install`/`skill_update`/`skill_uninstall` resolve the directory
+through a second script rather than this read-only one, because they are
+also the ones allowed to create it — but that script walks the same four
+candidates in the same order, and picks the same **first-existing-wins**
+one this table describes. It only falls back to creating the first
+*eligible* candidate (base variable set) when none of the four already
+exists. The two scripts used to disagree — the write side picked on
+eligibility alone, with no existence check — which could make a mutating
+call `mkdir -p` a second, empty directory beside a real, already-populated
+one instead of finding it; they are kept in sync now, on purpose.
+
 ### Enabling skills
 
 Off by default, per memory namespace — the same discipline `using-superpowers`
@@ -686,9 +699,15 @@ skills = true   # default false
 | Tool | `ToolKind` | Does |
 |---|---|---|
 | `skill()` / `skill(name)` | `Read` | No argument: lists every skill's name and description. With a name: returns that skill's `SKILL.md` body, prefixed with the skill's absolute directory on the editor's machine (skills reference sibling files by relative path — `./implementer-prompt.md`, `references/…` — so the model needs to be told where it is to resolve those). |
-| `skill_install(url)` | `Execute` | `git clone`s an `https://` URL into the skills directory, creating the directory first if nothing has touched it yet. Refuses if that source is already installed. |
+| `skill_install(url)` | `Execute` | `git clone`s an `https://` URL into the skills directory. Refuses if that source is already installed. |
 | `skill_update(name?)` | `Execute` | `git pull --ff-only` on one installed source, or on every installed source when `name` is omitted; one entry failing does not stop the rest. |
 | `skill_uninstall(name)` | `Delete` | Removes one installed source. **No `force` parameter exists.** A checkout with uncommitted local changes is always refused — full stop, no override — and the person resolves it themselves (`git stash`, a commit, or their own `rm -rf`) on their own machine. This is deliberate: `ToolKind::Delete` is *allowed* rather than asked about under `Origin::Acp(AcceptEdits)` (unlike `Execute`, which is asked), so a model-settable `force` would let the model discard someone's uncommitted edits with nobody asked. |
+
+All three — not just `skill_install` — resolve the skills directory through
+the create-or-resolve script above, so `skill_update(name)` and
+`skill_uninstall(name)` will also `mkdir -p` it if (and only if) none of the
+four candidates exists yet, before going on to report that `name` isn't
+installed there.
 
 Install/update/uninstall all run through the same permission path as any
 other `Execute`/`Delete` call, per the [permission table](#permission-and-modes)

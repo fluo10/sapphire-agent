@@ -1333,6 +1333,15 @@ mod tests {
             out.contains("no such terminal"),
             "the release failure must be surfaced too, not swallowed: {out}"
         );
+        // Order, not just presence: `.contains(...)` alone would not
+        // have caught a regression that put the release warning first —
+        // exactly what Fix 1's first round did, and had to be repaired.
+        // The finished command's own output and exit status must read
+        // before the unrelated warning about releasing its terminal.
+        assert!(
+            out.find("[exit status unknown]").unwrap() < out.find("[warning:").unwrap(),
+            "the exit status must be rendered before the release warning: {out}"
+        );
         assert_eq!(
             state
                 .acp_terminals
