@@ -2363,16 +2363,14 @@ impl TurnLoop<'_> {
         // deep clone of every `ToolSpec` — schemas included — on every
         // round of every turn.
         let visible_specs: Arc<[ToolSpec]> = Arc::from(tool_specs);
+        // Rounds this turn, not tool calls in `history`. `history` can
+        // arrive already seeded with a restored session's prior tool
+        // traffic, so counting the whole thing would spend a session's
+        // entire budget on what it did before this turn started — and the
+        // check runs before compaction, so nothing could ever trim it
+        // back.
+        let mut round = 0usize;
         let (final_text, stop) = loop {
-            let round = history
-                .iter()
-                .filter(|m| {
-                    m.parts
-                        .iter()
-                        .any(|p| matches!(p, ContentPart::ToolUse { .. }))
-                })
-                .count();
-
             if round >= MAX_TOOL_ROUNDS {
                 warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS})");
                 // `None` for the text, as before — callers that predate ACP
@@ -2441,6 +2439,7 @@ impl TurnLoop<'_> {
                     break (Some(accumulated_text.join("\n\n")), TurnStop::Replied);
                 }
                 Ok(resp) => {
+                    round += 1;
                     let tool_calls = resp.tool_calls.clone();
                     if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
                         accumulated_text.push(t.clone());
@@ -5354,5 +5353,60 @@ mod tests {
                 "{name} should be hidden"
             );
         }
+    }
+
+    /// The bug this pins: `round` used to be counted over the whole
+    /// history, which restoring a session now seeds with everything it
+    /// did before this turn started. A session that arrives with more
+    /// than `MAX_TOOL_ROUNDS` tool_use messages already in it — exactly
+    /// what a restored, long-lived room looks like — tripped the budget
+    /// check on the very first iteration, before the provider was ever
+    /// called, and broke silently (`text: None`, nothing sent). It must
+    /// still get an ordinary reply: the budget is rounds *this turn*.
+    #[tokio::test]
+    async fn a_session_restored_with_more_than_the_round_budget_still_replies() {
+        let state = ServeState::for_test(true);
+
+        // More than MAX_TOOL_ROUNDS assistant messages carrying a
+        // ToolUse part, paired with their tool_results, as a restored
+        // session's history would arrive already hydrated.
+        let mut history = Vec::new();
+        for i in 0..(MAX_TOOL_ROUNDS + 1) {
+            let id = format!("old-{i}");
+            history.push(ChatMessage::assistant_with_tools(
+                None,
+                vec![crate::provider::ToolCall {
+                    id: id.clone(),
+                    name: "file_read".to_string(),
+                    input: json!({}),
+                }],
+            ));
+            history.push(ChatMessage::tool_results_with_images(
+                vec![(id, "contents".to_string())],
+                Vec::new(),
+            ));
+        }
+        state
+            .sessions
+            .lock()
+            .await
+            .insert("s-restored".to_string(), history);
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-restored".to_string(),
+            ChatMessage::user("still there?"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome.stop, TurnStop::Replied),
+            "a fresh turn on a restored session must reach the provider \
+             and reply normally, not exhaust its budget on history from \
+             before this turn"
+        );
+        assert_eq!(outcome.text.as_deref(), Some("ok"));
     }
 }

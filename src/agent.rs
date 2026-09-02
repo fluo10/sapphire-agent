@@ -134,9 +134,17 @@ impl Agent {
         let snapshot: Vec<(ConversationKey, String, Vec<ChatMessage>)> = {
             let history = self.history.lock().await;
             let sessions = self.active_sessions.lock().await;
+            let activity = self.last_activity_at.lock().await;
             history
                 .iter()
                 .filter_map(|(key, msgs)| {
+                    // Restored from disk, `history` holds every active
+                    // session under this store, including rooms that were
+                    // silent this run and rooms this instance doesn't even
+                    // own (test rooms sharing the directory). Only a key
+                    // `last_activity_at` recorded — written on every
+                    // inbound message — actually spoke to this process.
+                    activity.get(key)?;
                     if msgs.len() < 2 {
                         return None;
                     }
@@ -694,6 +702,12 @@ impl Agent {
 
         // Tool-calling loop
         let mut accumulated_text: Vec<String> = Vec::new();
+        // Rounds this turn, not tool calls in the history. History is
+        // restored from disk now, so counting the whole thing would spend a
+        // room's entire budget on what it did before the process started —
+        // and the check runs before compaction, so nothing could ever trim
+        // it back.
+        let mut round = 0usize;
         let final_text = loop {
             let messages = {
                 self.history
@@ -703,15 +717,6 @@ impl Agent {
                     .cloned()
                     .unwrap_or_default()
             };
-
-            let round = messages
-                .iter()
-                .filter(|m| {
-                    m.parts
-                        .iter()
-                        .any(|p| matches!(p, ContentPart::ToolUse { .. }))
-                })
-                .count();
 
             if round >= MAX_TOOL_ROUNDS {
                 warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS}), stopping");
@@ -789,6 +794,7 @@ impl Agent {
                     break Some(accumulated_text.join("\n\n"));
                 }
                 Ok(resp) => {
+                    round += 1;
                     let tool_calls = resp.tool_calls.clone();
                     if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
                         accumulated_text.push(t.clone());

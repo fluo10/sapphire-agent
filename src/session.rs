@@ -2319,4 +2319,37 @@ mod tests {
         assert!(active.is_empty(), "{active:?}");
         assert!(histories.is_empty(), "{histories:?}");
     }
+
+    /// The subtlest property in `load_all`: when a key has more than one
+    /// active session file, the newest wins — both for `active` (which
+    /// file gets appended to next) and for `histories` (the older
+    /// session's history must not leak through just because it happened
+    /// to load first). A newer session that is itself empty must evict
+    /// whatever the older one contributed, not merely fail to overwrite
+    /// it.
+    #[test]
+    fn load_all_prefers_the_newest_session_and_drops_history_when_it_is_empty() {
+        let (_s, _c, store, old_sid) = cached_store();
+        store.append(&old_sid, &ChatMessage::user("old")).unwrap();
+
+        let key = ("!room:example.org".to_string(), None);
+        let new_sid = store.create_session(&key, "matrix", "default").unwrap();
+        assert!(
+            new_sid > old_sid,
+            "UUIDv7 ids must sort newer-last for this test to mean anything: \
+             {old_sid} vs {new_sid}"
+        );
+
+        let (active, histories) = store.load_all();
+        assert_eq!(
+            active.get(&key),
+            Some(&new_sid),
+            "the newest session file must be the active one"
+        );
+        assert!(
+            !histories.contains_key(&key),
+            "the newer, empty session must evict the older session's \
+             history, not lose to it: {histories:?}"
+        );
+    }
 }
