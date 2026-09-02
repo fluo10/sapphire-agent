@@ -23,6 +23,7 @@ A personal AI assistant agent that lives in a [`sapphire-framework`](https://git
 - **Editor integration**: `/acp` endpoint speaks the Agent Client Protocol over WebSocket, so Zed can drive the running agent — enable via `[acp].enabled = true`; see [Zed / ACP](#zed--acp) below.
 - **Commands**:
   - `sapphire-agent` — start the channel listeners + JSON-RPC HTTP control API (`/rpc`, `/mcp`, `/a2a`, `/acp`)
+  - `sapphire-agent init [PATH]` — seed a workspace with the files the agent reads (`AGENTS.md`, `SOUL.md`, …), then print the host-local config to paste; never overwrites an existing file
   - `sapphire-agent verify` — validate config and report loaded workspace files, including the device -> room_profile bindings
   - `sapphire-agent device add|list|rotate|retire` — register a device, mint or replace its bearer token, or stop it; `device add` prints the token to stdout and the `[room_profile.<n>].devices` line to paste to stderr
   - `sapphire-agent user add|list` — register the person or agent a device belongs to
@@ -44,7 +45,27 @@ cargo build --release
 
 ## Configure
 
-Copy `config.example.toml` to your config directory (`~/.config/sapphire-agent/config.toml` on Linux) and fill in the Anthropic API key, workspace path, and whichever channels you actually want.
+Start with an empty workspace:
+
+```sh
+sapphire-agent init ~/sapphire-workspace
+```
+
+This seeds the files the agent reads — `AGENTS.md`, `SOUL.md`, `IDENTITY.md`,
+`USER.md`, `TOOLS.md`, `BOOTSTRAP.md`, the `memory/default/` tree, an example
+heartbeat task, and a `.sapphire-agent/config.toml` listing the settings the
+workspace layer is allowed to set. Most are deliberately blank: `BOOTSTRAP.md`
+is a first-run ritual that has the agent ask what to call it, write its answers
+into `IDENTITY.md` and `SOUL.md`, and then delete itself.
+
+`init` never overwrites, so it is safe to re-run — that is also how a workspace
+made by an older build picks up a file added since.
+
+It writes nothing outside the workspace. Credentials and machine paths are
+host-local, so rather than writing that file `init` prints it for you to place
+at `~/.config/sapphire-agent/config.toml` (on Linux). See `config.example.toml`
+for everything else it can hold — channels, bind addresses, MCP servers,
+STT/TTS model paths.
 
 Then:
 
