@@ -313,6 +313,33 @@ system_prompt = "You are a helpful personal assistant."
 # If a server fails to connect at startup the agent logs a warning
 # and continues without its tools — startup is not aborted.
 #
+# `trust` — how far this server's tools are trusted:
+#
+#   - `"none"` (default) — the tools are unclassified, which the
+#     permission policy treats as its strictest bucket. Chat channels
+#     (Matrix, Discord) refuse them, and so does the heartbeat's chat
+#     leg; `/acp` asks before each call. Leave it here unless you mean
+#     to change that.
+#   - `"read"` — the tools are reads: allowed on every origin, never
+#     asked. For a server that only looks things up.
+#   - `"edit"` — the tools are edits: allowed unasked on chat channels
+#     and on `/rpc`, `/a2a` and voice, still asked in `/acp`'s default
+#     mode. The same treatment `file_write` gets. This is what lets a
+#     Matrix message or a heartbeat task record something.
+#
+# It is the *operator's* declaration, not the server's. MCP servers can
+# annotate their own tools (`readOnlyHint`, `destructiveHint`) more
+# finely, but those are self-reported — and the channel restriction
+# exists precisely because a channel turn carries untrusted input that
+# nobody can be asked about, so letting the far side declare itself safe
+# would invert what is being defended. You are the one who decided to
+# connect to that server; this is where you say how much that means.
+#
+# It is per server rather than per tool for the same kind of reason: a
+# list of tool names would go stale the moment the server adds a tool,
+# and it would go stale silently — the new tool would fall back to
+# `none` and be refused, which looks like the server being broken.
+#
 # [tools]
 # tavily_api_key = "tvly-..."
 #
@@ -325,6 +352,7 @@ system_prompt = "You are a helpful personal assistant."
 # type    = "http"
 # url     = "https://mcp.example.com/mcp"
 # api_key = "ghp_..."                       # optional; sent as Bearer
+#                                           # trust omitted -> "none"
 #
 # # Example: stdio transport, launching a local server via npx.
 # [[tools.mcp_servers]]
@@ -333,6 +361,14 @@ system_prompt = "You are a helpful personal assistant."
 # command = "npx"
 # args    = ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/work"]
 # env     = { NODE_ENV = "production" }     # optional; merged into child env
+#
+# # Example: a server you host yourself and mean to drive from chat and
+# # from heartbeat tasks — so its tools must not be refused there.
+# [[tools.mcp_servers]]
+# name    = "ledger"
+# type    = "http"
+# url     = "http://127.0.0.1:3838/mcp"
+# trust   = "edit"                          # "none" (default) | "read" | "edit"
 
 # ─────────────────────────────────────────────────────────────────────
 # Voice pipeline (optional)
@@ -584,6 +620,8 @@ steps  = [
 # allow" answers are recorded in the host-local
 # ~/.config/sapphire-agent/acp-permissions.json — delete it to be asked
 # everything again. Chat channels (Matrix, Discord) are never asked: they
-# simply cannot call shell or MCP tools.
+# cannot call shell at all, and can reach an MCP server's tools only when
+# that server carries a `trust` of "read" or "edit" (see
+# `[[tools.mcp_servers]]` above).
 [acp]
 enabled = false
