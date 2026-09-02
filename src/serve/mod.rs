@@ -1043,9 +1043,14 @@ async fn handle_get_session(
         }
     };
 
+    // `load_session` is the model's view — a compaction checkpoint trims
+    // covered messages and prefixes a synthetic summary stub the client
+    // never sent. This endpoint hands the record back to the client that
+    // wrote it, so it must read the untrimmed, unsummarised record instead.
     let messages = state
         .store_for_session(&session_id)
-        .load_session(&session_id)
+        .load_session_full(&session_id)
+        .map(|(messages, _summary)| messages)
         .unwrap_or_default();
 
     let items: Vec<Value> = messages

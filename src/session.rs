@@ -644,6 +644,13 @@ impl SessionStore {
     /// One session as the model should see it: the latest compaction
     /// summary rendered as a stub, then the messages it did not absorb,
     /// with tool results hydrated and any broken pairing repaired.
+    ///
+    /// This is the model's view, not the record as written — a checkpoint
+    /// silently drops every covered message and adds a summary stub the
+    /// caller never sent. A reader that wants the record as written (e.g.
+    /// a client-facing endpoint handing a session back to the party that
+    /// wrote it) should use `load_session_full` instead, which does not
+    /// trim.
     pub fn load_session(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
         let path = self.resolve_path(session_id)?;
         let loaded = load_session_file(&path)?;
@@ -1402,12 +1409,15 @@ fn message_ids_in_order(path: &Path) -> Vec<Option<Uuid>> {
         if value.get("timestamp").is_none() {
             continue;
         }
-        out.push(
-            value
-                .get("id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| Uuid::parse_str(s).ok()),
-        );
+        // Must agree with `load_session_file` on what counts as a
+        // message: a timestamped line that fails to deserialize as a
+        // `StoredMessage` is skipped there too (with a warning), so a
+        // cursor must never be computed against one here — the reader
+        // would not find it and would fall back to replaying everything.
+        let Ok(stored) = serde_json::from_value::<StoredMessage>(value) else {
+            continue;
+        };
+        out.push(stored.id);
     }
     out
 }
@@ -2128,6 +2138,96 @@ mod tests {
         assert!(texts[0].contains("what happened"), "stub first: {texts:?}");
         assert!(texts.iter().any(|t| t == "after"), "{texts:?}");
         assert!(!texts.iter().any(|t| t == "before"), "{texts:?}");
+    }
+
+    /// A file with two legacy summary lines must use the count at the
+    /// *latest* one, not the first — a bug that captured the count only
+    /// once (at the first summary) would still pass a test with a single
+    /// legacy line, but would silently replay messages the newer summary
+    /// already covers.
+    #[test]
+    fn a_second_legacy_summary_uses_its_own_count_not_the_first() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &ChatMessage::user("m0")).unwrap();
+
+        let path = store.absolute_path_for(&sid).unwrap();
+        let first = r#"{"summary_at":"2026-04-06T11:00:00Z","summary":"first summary"}"#;
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{first}").unwrap();
+        drop(f);
+
+        store.append(&sid, &ChatMessage::user("m1")).unwrap();
+
+        let second = r#"{"summary_at":"2026-04-06T12:00:00Z","summary":"second summary"}"#;
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{second}").unwrap();
+        drop(f);
+
+        store.append(&sid, &ChatMessage::user("m2")).unwrap();
+
+        let loaded = store.load_session(&sid).unwrap();
+        let texts: Vec<String> = loaded
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts[0].contains("second summary"),
+            "stub must be the latest summary: {texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "m2"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t == "m1"),
+            "must not replay what the second summary already covers: {texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t == "m0"), "{texts:?}");
+    }
+
+    /// A checkpoint id that is not in the file (corruption, or a partial
+    /// sync) must not silently return nothing — the whole file replays
+    /// behind the stub instead, same as a file with no checkpoint at all.
+    /// This is the failure mode `model_history`'s fallback branch exists
+    /// to prevent.
+    #[test]
+    fn a_checkpoint_not_found_in_the_file_replays_everything() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &ChatMessage::user("m0")).unwrap();
+        store.append(&sid, &ChatMessage::user("m1")).unwrap();
+
+        let path = store.absolute_path_for(&sid).unwrap();
+        let missing = Uuid::now_v7();
+        let line = serde_json::to_string(&SummaryLine {
+            summary_at: Utc::now(),
+            summary: "stale checkpoint".to_string(),
+            up_to_timestamp: None,
+            covers_through: Some(missing),
+        })
+        .unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{line}").unwrap();
+        drop(f);
+
+        let loaded = store.load_session(&sid).expect("the session still loads");
+        let texts: Vec<String> = loaded
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts[0].contains("stale checkpoint"),
+            "stub first: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "m0"),
+            "checkpoint miss must fall back to replaying everything: {texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "m1"), "{texts:?}");
     }
 
     /// keep_recent = 0 is the day-boundary compaction: it replaced the
