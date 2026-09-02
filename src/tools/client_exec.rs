@@ -6,9 +6,9 @@
 //! message — stays with the caller in `client_tools.rs`; this module
 //! moves mechanism, not presentation.
 
+use crate::tools::OUTPUT_CAP_BYTES;
 use crate::tools::acp_client::{ExitStatus, TerminalHandle, TerminalOutput};
 use crate::tools::client_tools::cap_error;
-use crate::tools::OUTPUT_CAP_BYTES;
 
 /// The result of running one command to completion, or to its timeout.
 pub(crate) struct ClientRun {
@@ -17,6 +17,11 @@ pub(crate) struct ClientRun {
     pub status: Option<ExitStatus>,
     /// Set when the command outlived the timeout and was left running.
     pub timed_out_handle: Option<TerminalHandle>,
+    /// Set when the command finished and its output was collected, but
+    /// releasing the terminal afterwards failed. Rendered by the caller
+    /// *after* `format_finished`, so a finished command's output and exit
+    /// status still read first.
+    pub release_warning: Option<String>,
 }
 
 /// Run a command on the machine the editor is running on, and wait for
@@ -80,6 +85,7 @@ pub(crate) async fn run_client_command(
                         output,
                         status: Some(status),
                         timed_out_handle: None,
+                        release_warning: None,
                     })
                 }
                 Err(e) => {
@@ -90,17 +96,15 @@ pub(crate) async fn run_client_command(
                     // tracked (over-counting is recoverable; losing
                     // a finished build's output is not), so the
                     // model can retry `client_shell_kill` to free it.
-                    let mut output = output;
-                    output.output = format!(
-                        "{}\n[warning: the command finished, but releasing terminal \
-                         {handle} failed: {e}. It may still be tracked; use \
-                         client_shell_kill to free it.]",
-                        output.output
-                    );
                     Ok(ClientRun {
                         output,
                         status: Some(status),
                         timed_out_handle: None,
+                        release_warning: Some(format!(
+                            "[warning: the command finished, but releasing terminal \
+                             {handle} failed: {e}. It may still be tracked; use \
+                             client_shell_kill to free it.]"
+                        )),
                     })
                 }
             }
@@ -116,6 +120,7 @@ pub(crate) async fn run_client_command(
                 output: TerminalOutput::default(),
                 status: None,
                 timed_out_handle: Some(handle),
+                release_warning: None,
             })
         }
     }

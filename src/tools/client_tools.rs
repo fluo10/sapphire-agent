@@ -362,17 +362,21 @@ impl Tool for ClientShell {
 
         let client = current_acp_client().ok_or_else(no_editor_error)?;
 
-        let run = crate::tools::client_exec::run_client_command(
-            &client, command, &args, cwd, timeout,
-        )
-        .await?;
+        let run =
+            crate::tools::client_exec::run_client_command(&client, command, &args, cwd, timeout)
+                .await?;
         match run.timed_out_handle {
             Some(h) => Ok(format_timed_out(&h, timeout)),
             None => {
                 let status = run
                     .status
                     .expect("run_client_command always sets `status` when it does not time out");
-                Ok(format_finished(&run.output, &status))
+                let mut out = format_finished(&run.output, &status);
+                if let Some(warning) = run.release_warning {
+                    out.push('\n');
+                    out.push_str(&warning);
+                }
+                Ok(out)
             }
         }
     }
