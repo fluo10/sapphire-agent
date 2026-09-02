@@ -204,8 +204,10 @@ fn clamp_timeout(requested: Option<u64>) -> std::time::Duration {
 /// Render an exit status the same way regardless of caller —
 /// `format_finished` (the one-shot path) and `ClientShellOutput` (the
 /// long-running path) both need this tail, and duplicating the
-/// three-way match would let the two drift apart.
-fn format_exit_status(status: &ExitStatus) -> String {
+/// three-way match would let the two drift apart. `pub(crate)` so
+/// `skill_tools`'s terminal-fallback and index-resolver failures are
+/// worded the same way rather than inventing a second phrasing.
+pub(crate) fn format_exit_status(status: &ExitStatus) -> String {
     match (&status.exit_code, &status.signal) {
         (Some(code), _) => format!("\n[exit code: {code}]"),
         (None, Some(signal)) => format!("\n[terminated by signal: {signal}]"),
@@ -222,6 +224,19 @@ fn format_finished(output: &TerminalOutput, status: &ExitStatus) -> String {
     }
     out.push_str(&format_exit_status(status));
     out
+}
+
+/// Render the message for a one-shot command that outlived its
+/// timeout: the terminal was left running rather than killed, and the
+/// model must not re-run the command because of this call alone. See
+/// [`ClientShell`]'s doc for why releasing on timeout would be wrong.
+fn format_timed_out(handle: &TerminalHandle, timeout: std::time::Duration) -> String {
+    format!(
+        "[timed out after {}s — the command is still running as terminal {handle}. \
+         It was not killed. Use client_shell_output to check on it, or \
+         client_shell_kill to stop it. Do not re-run the command.]",
+        timeout.as_secs()
+    )
 }
 
 /// Run a command on the machine the editor is running on, and wait for
@@ -349,86 +364,21 @@ impl Tool for ClientShell {
 
         let client = current_acp_client().ok_or_else(no_editor_error)?;
 
-        // Same cap, same check, as `ClientShellStart`: a timed-out call
-        // below leaves a handle tracked, so without this a model
-        // looping `client_shell` with a short `timeout_secs` could
-        // accumulate unbounded live processes — see this tool's doc.
-        //
-        // Reserve-then-create, not read-then-write: `run_llm_turn` runs
-        // a turn's permitted calls concurrently, so one assistant
-        // message with several `client_shell`/`client_shell_start`
-        // calls must not let them all read the count before any of
-        // them wrote it back. `try_reserve_terminal_slot` does the
-        // check and the reservation in one lock span so that cannot
-        // happen. See its doc.
-        let reservation = client
-            .try_reserve_terminal_slot()
-            .await
-            .map_err(|held| cap_error(&held))?;
-
-        // If `create_terminal` errors, or this whole call is cancelled
-        // before it returns — the turn's future dropped mid-RPC, which
-        // is exactly the cancellation ACP treats as routine (Escape in
-        // an editor, a dropped socket) — `reservation` is dropped here
-        // without ever reaching `track_terminal` below. Its `Drop`
-        // frees the slot itself; nothing further to do on this path.
-        // See `TerminalReservation`'s doc.
-        let handle = client
-            .create_terminal(command, &args, cwd, Some(OUTPUT_CAP_BYTES as u64))
-            .await?;
-        // Tracked immediately, before anything that can fail or be
-        // dropped: a `wait_for_terminal_exit` error below, or this
-        // whole future being dropped mid-wait (turn cancellation), must
-        // not lose a command that is genuinely still running on the
-        // user's machine. This also consumes `reservation`, resolving
-        // it into the real handle so its `Drop` won't also try to free
-        // the slot out from under the now-tracked handle.
-        client.track_terminal(reservation, handle.clone()).await;
-
-        match tokio::time::timeout(timeout, client.wait_for_terminal_exit(&handle)).await {
-            Ok(status) => {
-                // On error, the handle stays tracked (already tracked
-                // above) rather than being lost — the command may still
-                // be running and a transient RPC error here is not
-                // proof otherwise. See `ClientShellOutput`'s doc for the
-                // same reasoning applied to polling.
-                let status = status?;
-                let output = client.terminal_output(&handle).await?;
-                match client.release_terminal(&handle).await {
-                    Ok(()) => {
-                        client.untrack_terminal(&handle).await;
-                        Ok(format_finished(&output, &status))
-                    }
-                    Err(e) => {
-                        // The command finished and its output was
-                        // already collected successfully — that must
-                        // not be thrown away just because the release
-                        // that follows failed. The handle is left
-                        // tracked (over-counting is recoverable; losing
-                        // a finished build's output is not), so the
-                        // model can retry `client_shell_kill` to free it.
-                        Ok(format!(
-                            "{}\n[warning: the command finished, but releasing terminal \
-                             {handle} failed: {e}. It may still be tracked; use \
-                             client_shell_kill to free it.]",
-                            format_finished(&output, &status)
-                        ))
-                    }
+        let run =
+            crate::tools::client_exec::run_client_command(&client, command, &args, cwd, timeout)
+                .await?;
+        match run.timed_out_handle {
+            Some(h) => Ok(format_timed_out(&h, timeout)),
+            None => {
+                let status = run
+                    .status
+                    .expect("run_client_command always sets `status` when it does not time out");
+                let mut out = format_finished(&run.output, &status);
+                if let Some(warning) = run.release_warning {
+                    out.push('\n');
+                    out.push_str(&warning);
                 }
-            }
-            Err(_elapsed) => {
-                // Already tracked above — the handle escapes this call
-                // still running, so it has to stay in the same
-                // session-keyed tracking `client_shell_start` uses,
-                // otherwise it would count against nothing, the cap
-                // would never see it, and the model would have no way
-                // to list it in order to clean it up.
-                Ok(format!(
-                    "[timed out after {}s — the command is still running as terminal {handle}. \
-                     It was not killed. Use client_shell_output to check on it, or \
-                     client_shell_kill to stop it. Do not re-run the command.]",
-                    timeout.as_secs()
-                ))
+                Ok(out)
             }
         }
     }
@@ -1382,6 +1332,15 @@ mod tests {
         assert!(
             out.contains("no such terminal"),
             "the release failure must be surfaced too, not swallowed: {out}"
+        );
+        // Order, not just presence: `.contains(...)` alone would not
+        // have caught a regression that put the release warning first —
+        // exactly what Fix 1's first round did, and had to be repaired.
+        // The finished command's own output and exit status must read
+        // before the unrelated warning about releasing its terminal.
+        assert!(
+            out.find("[exit status unknown]").unwrap() < out.find("[warning:").unwrap(),
+            "the exit status must be rendered before the release warning: {out}"
         );
         assert_eq!(
             state

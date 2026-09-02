@@ -19,7 +19,8 @@ A personal AI assistant agent that lives in a [`sapphire-framework`](https://git
 - **Ambient audio ingest**: optional always-on capture from a wearable/pendant device — `POST /audio/ingest` takes raw audio (metadata in query params, no JSON/base64 framing) from a bearer-authenticated device, re-gates it, transcribes it, attributes it to a speaker against reference audio curated in the workspace, and stores the transcript outside the workspace. Records without answering: nothing in this path starts an LLM turn. `transcript_read`, `speaker_candidates` and `speaker_promote` expose the result as agent tools. Disabled by default — enable via `[ambient].enabled = true`; see `config.example.toml`.
 - **Agent-to-agent**: `/a2a` endpoint speaks the v1 A2A protocol (JSON-RPC `SendMessage`, AgentCard) with per-device bearer-token auth — enable via `[a2a].enabled = true`.
 - **External AI integration**: `/mcp` endpoint publishes `write_report` and `recall_memory` tools so Claude Code (and other MCP clients) can share project context with the agent — see [docs/mcp-integration.md](docs/mcp-integration.md).
-- **Subagents**: `<workspace>/agents/<name>.md` definitions the main agent can delegate a task to via the `subagent` tool — its own system prompt, its own tool loop, only the final answer comes back. See [Subagents](#subagents) below.
+- **Subagents**: `<workspace>/agents/<name>.md` definitions the main agent can delegate a task to via the `subagent` tool — its own system prompt, its own tool loop, only the final answer comes back, and it can be resumed by handle for a later round. See [Subagents](#subagents) below.
+- **Skills**: written procedures (planning, TDD, debugging, code review, …) loaded on request from a checkout on the *editor's* machine, over ACP. Requires an ACP client that declared terminal support — off entirely for Matrix, Discord and voice. See [Skills](#skills) below.
 - **Editor integration**: `/acp` endpoint speaks the Agent Client Protocol over WebSocket, so Zed can drive the running agent — enable via `[acp].enabled = true`; see [Zed / ACP](#zed--acp) below.
 - **Commands**:
   - `sapphire-agent` — start the channel listeners + JSON-RPC HTTP control API (`/rpc`, `/mcp`, `/a2a`, `/acp`)
@@ -190,6 +191,77 @@ Matrix and Discord — cannot call `subagent` at all. See the
 doesn't read it either, currently. Both are tracked together in
 [#199](https://github.com/fluo10/sapphire-agent/issues/199); when that
 lands, subagents get it too.
+
+### Resuming a subagent
+
+A dispatch's answer is prefixed with a handle:
+
+```
+[subagent reviewer · handle 0198f...]
+<the child's answer>
+```
+
+Call `subagent` again with `resume` (the handle) and a new `prompt` — instead
+of `agent` — to continue that exact child conversation: its own prior
+history, its own system prompt, picking up where it left off. `agent` and
+`resume` are mutually exclusive; giving both, or neither, is a recoverable
+error.
+
+**Resume is best-effort.** A handle can stop resolving — pruned by age, the
+process restarted with no cache directory resolvable, or a history that grew
+past the cache's byte cap and was never written. Any of those is a
+recoverable error telling the model to dispatch a fresh child instead; there
+is no other recovery path, and none is needed — a fresh dispatch is the
+answer SDD's own fix loop already gives for rounds 4-5.
+
+**The child's history lives outside the workspace**, at
+`~/.cache/sapphire-agent/subagents/<handle>.json` (`dirs::cache_dir()`,
+beside the digest and tool-result caches) — never under
+`<workspace>/sessions`. That is deliberate: `sessions` is in the retrieve
+search index, and a subagent's full internal transcript — tool calls,
+intermediate reasoning, false starts — is the single most effective way to
+skew a search over it. Losing the cache directory costs only the ability to
+resume in-flight children, nothing else.
+
+Two config knobs, under `[subagent_cache]`, both optional:
+
+```toml
+[subagent_cache]
+max_history_bytes = 8388608   # 8 MiB, the default
+retain_days = 7                # the default
+```
+
+- **`max_history_bytes`** caps one child's *serialized* history. Over the
+  cap, the history is not written at all — never truncated, because dropping
+  the oldest messages can leave a `tool_use` with no matching `tool_result`,
+  which the provider API rejects outright and makes the whole history
+  unloadable. The child's answer still comes back normally; only the handle
+  line says it is not resumable (and, for a resume that itself went over the
+  cap, that the *previously* stored copy — ending before this exchange — is
+  what a later resume would still see).
+- **`retain_days`** is how long a child may sit untouched before the daily
+  heartbeat sweep prunes it.
+
+**A resume against a handle already running is refused**, so two turns in
+this process can never interleave writes into one stored history —
+`busy_handles` is an in-process `HashSet`, not a lock shared across
+processes or machines.
+
+**The offered tool list is recomputed on every resume, not restored.** Only
+the agent's *name* is stored; its definition is reloaded from
+`<workspace>/agents/` each time, so an edit to the `.md` is picked up and —
+more importantly — a resumed child cannot carry forward a wider tool list
+than its current definition (or the current parent turn) allows. If the
+definition no longer resolves — renamed, deleted, or simply a `.md` that
+failed to parse on this particular load — resume fails with a recoverable
+error rather than silently restoring a stale tool set.
+
+**A missing definition does not delete the stored child.** `load_agents_dir`
+skips a single unparseable `.md` with only a warning rather than failing the
+whole load, so "the definition doesn't currently resolve" can be transient —
+a mid-save YAML typo, fixed a moment later. Resume bails and leaves the
+handle for `retain_days` to retire on its own schedule, rather than
+destroying a conversation over what might be a one-off glitch.
 
 ## Zed / ACP
 
@@ -612,6 +684,153 @@ answers `401` before the WebSocket upgrade. Write it bare:
 
 `-H` takes multiple values, so it has to come *after* the URL or it
 swallows it.
+
+## Skills
+
+A skill is a written procedure for a kind of work — planning, TDD,
+debugging, code review, finishing a branch — that the model can pull up and
+follow instead of improvising. Skills come from a checkout that lives on the
+**editor's** machine, not this agent's: this crate has no lib and no
+built-in skill content of its own, and the checkout is intended to be
+[obra/superpowers](https://github.com/obra/superpowers) or a compatible
+directory, though nothing here names that project in code.
+
+**Skills require an ACP client whose editor declared terminal support.**
+There is no ACP call to list a directory — no list, glob or stat exists in
+the agent→client surface — so resolving and indexing the skills directory
+always runs a shell script on the client over its terminal capability. That
+makes every skill tool, including the read-only `skill`, depend on it. In
+practice this means Matrix, Discord and voice never see any skill tool at
+all: `Agent::handle_message` (`src/agent.rs`) passes every client
+capability flag as `false`, and `src/agent.rs` is not touched by this
+feature. Enforcement is in two places, deliberately:
+
+- an arm in `visible_tool_predicate` (`src/serve/mod.rs`) gating
+  `skill`/`skill_install`/`skill_update`/`skill_uninstall` on
+  `has_client && client_terminal` — the same function `src/agent.rs` calls,
+  which is what closes off the channel transports without editing that
+  file;
+- a per-namespace switch composed at the `run_llm_turn` call site
+  (`src/serve/mod.rs`), layered on top, so skills can be off for a
+  namespace even on a fully client-capable ACP connection.
+
+### Where the directory lives
+
+The server stores no path — it serves editors on different machines and
+operating systems, so any path in its own config would be right for at most
+one of them. Instead, a fixed shell script runs on the client and resolves
+one of these, first hit wins:
+
+| Order | Candidate |
+|---|---|
+| 1 | `$SAPPHIRE_AGENT_SKILLS_DIR`, if set |
+| 2 | `$APPDATA/sapphire-agent/skills` (Windows) |
+| 3 | `$HOME/Library/Application Support/sapphire-agent/skills` (macOS) |
+| 4 | `${XDG_DATA_HOME:-$HOME/.local/share}/sapphire-agent/skills` (Linux / BSD) |
+
+`SAPPHIRE_AGENT_SKILLS_DIR` is set **on the client**, by whoever's machine it
+is — it is the escape hatch for a checkout that already lives somewhere
+else, or for a client environment (a stripped-down service account, an
+unusual `XDG_DATA_HOME`) the convention above gets wrong. The resolved
+directory and index are cached per ACP session (keyed by
+`TurnContext::session_id`, capped at 128 sessions) and reused for later
+`skill()` calls in the same session; a call with no session to key on (a
+subagent's own nested tool call) always re-resolves rather than risking a
+shared cache entry.
+
+`skill_install`/`skill_update`/`skill_uninstall` resolve the directory
+through a second script rather than this read-only one, because they are
+also the ones allowed to create it — but that script walks the same four
+candidates in the same order, and picks the same **first-existing-wins**
+one this table describes. It only falls back to creating the first
+*eligible* candidate (base variable set) when none of the four already
+exists. The two scripts used to disagree — the write side picked on
+eligibility alone, with no existence check — which could make a mutating
+call `mkdir -p` a second, empty directory beside a real, already-populated
+one instead of finding it; they are kept in sync now, on purpose.
+
+### Enabling skills
+
+Off by default, per memory namespace — the same discipline `using-superpowers`
+imposes (check for a relevant skill before answering *at all*) is right for
+development work and wrong for an everyday conversation:
+
+```toml
+[memory_namespace.dev]
+skills = true   # default false
+```
+
+### The four tools
+
+| Tool | `ToolKind` | Does |
+|---|---|---|
+| `skill()` / `skill(name)` | `Read` | No argument: lists every skill's name and description. With a name: returns that skill's `SKILL.md` body, prefixed with the skill's absolute directory on the editor's machine (skills reference sibling files by relative path — `./implementer-prompt.md`, `references/…` — so the model needs to be told where it is to resolve those). |
+| `skill_install(url)` | `Execute` | `git clone`s an `https://` URL into the skills directory. Refuses if that source is already installed. |
+| `skill_update(name?)` | `Execute` | `git pull --ff-only` on one installed source, or on every installed source when `name` is omitted; one entry failing does not stop the rest. |
+| `skill_uninstall(name)` | `Delete` | Removes one installed source. **No `force` parameter exists.** A checkout with uncommitted local changes is always refused — full stop, no override — and the person resolves it themselves (`git stash`, a commit, or their own `rm -rf`) on their own machine. This is deliberate: `ToolKind::Delete` is *allowed* rather than asked about under `Origin::Acp(AcceptEdits)` (unlike `Execute`, which is asked), so a model-settable `force` would let the model discard someone's uncommitted edits with nobody asked. |
+
+All three — not just `skill_install` — resolve the skills directory through
+the create-or-resolve script above, so `skill_update(name)` and
+`skill_uninstall(name)` will also `mkdir -p` it if (and only if) none of the
+four candidates exists yet, before going on to report that `name` isn't
+installed there.
+
+Install/update/uninstall all run through the same permission path as any
+other `Execute`/`Delete` call, per the [permission table](#permission-and-modes)
+above: `default` asks about all three; `accept_edits` still asks for
+`skill_install`/`skill_update` (`Execute`) but runs `skill_uninstall`
+(`Delete`) unasked, the same as any other edit or delete once edits are
+accepted; `bypass` runs all three unasked.
+
+**Only `https://` source URLs are accepted** for `skill_install`, and the
+same check re-validates the stored remote before `skill_update` pulls.
+Rejected: `ext::…` (git treats it as a command to run — remote code
+execution by design), `file://`, `git://`, `ssh://`, scp-like
+`user@host:path`, and anything starting with `-` (which could be
+reparsed as a flag). The URL is passed after a `--` separator on the `git`
+command line regardless, so a check that was somehow missed still can't turn
+it into an option.
+
+The destination directory name (`skill_install`) and the entry name
+(`skill_uninstall`) are never taken from the model as a path — they are
+derived (from the URL's final path segment) or supplied as a bare name, then
+constrained to `[A-Za-z0-9._-]`, rejected if empty, `.`, `..`, leading `-`,
+trailing `.`/space, or a Windows reserved device name (`CON`, `PRN`, `AUX`,
+`NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, matched case-insensitively and against
+the segment before the first `.` too, so `CON.txt` is caught as well as
+`CON`).
+
+**Installing needs `git` and a shell on the editor's machine.** Every `git`
+invocation runs with `GIT_TERMINAL_PROMPT=0` (so a private repository
+refuses cleanly instead of hanging a terminal the model can't answer) and
+`GIT_ALLOW_PROTOCOL=https` — the setting that actually closes every
+config-based route to a non-`https` transport (`branch.<current>.remote`,
+`url.<base>.insteadOf`), enforced by git itself at the point it opens a
+transport regardless of which config field carried the bad URL. The
+pre-pull remote-URL re-check (above) is a cheap, specific sanity check on
+top of that, not what makes a doctored `.git/config` safe on its own — see
+`docs/superpowers/specs/2026-09-02-skills-and-subagent-resume-design.md`'s
+`## 実装時の訂正` section for the detail. `git pull` also runs the
+checkout's own `.git/hooks/post-merge` if the pull changed anything; no URL
+or protocol guard prevents that, and none is meant to — it's the person's
+own machine and their own checkout.
+
+### The two accepted layouts
+
+A checkout is not itself a skill — the index walks two shapes, so a
+hand-written local skill can sit beside an installed bundle:
+
+- `<dir>/<name>/SKILL.md` — a skill placed directly under the skills
+  directory.
+- `<dir>/<repo>/skills/<name>/SKILL.md` — a cloned bundle that declares its
+  own `skills/` subdirectory (the shape superpowers itself uses).
+
+### How a skill's body is read
+
+`fs/read_text_file` first, falling back to `cat` over the client terminal on
+any failure. This is the expected path, not a fallback for a rare case: an
+editor may scope `fs/read_text_file` to the open project, and the skills
+checkout is deliberately outside it.
 
 ## License
 

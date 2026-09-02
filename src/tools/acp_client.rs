@@ -371,6 +371,24 @@ pub(crate) mod tests {
         /// for tests that never look at a `ServeState`.
         pub(crate) terminal_session: String,
         pub(crate) terminals: TerminalRegistry,
+        /// (stdout, exit_code) pairs queued for successive
+        /// `create_terminal` calls, consumed in call order — the n-th
+        /// queued entry becomes what `terminal_output` and
+        /// `wait_for_terminal_exit` report for the n-th terminal
+        /// created. Used by `skill_tools`'s tests, where the
+        /// skills-index resolver and its `cat` fallback are two
+        /// distinct `create_terminal` round trips that must answer
+        /// with two different bodies (and, for the exit-status tests,
+        /// two different outcomes). Everything that doesn't queue
+        /// anything keeps the pre-existing defaults: empty output,
+        /// `exit_code: None`.
+        terminal_queue: Mutex<std::collections::VecDeque<(String, Option<u32>)>>,
+        /// A queued (stdout, exit_code) pair committed to a specific
+        /// handle id by `create_terminal` once it consumes from
+        /// `terminal_queue`, so a later `terminal_output`/
+        /// `wait_for_terminal_exit` call for that handle can look it
+        /// back up.
+        handle_result: Mutex<HashMap<String, (String, Option<u32>)>>,
     }
 
     impl FakeClient {
@@ -421,6 +439,34 @@ pub(crate) mod tests {
         /// while the command it was asked about kept running.
         pub(crate) fn make_wait_fail_with(&self, message: &str) {
             *self.wait_error.lock().unwrap() = Some(message.to_string());
+        }
+
+        /// Queue `text` as the stdout the next `create_terminal` call's
+        /// terminal will report via `terminal_output`, with a
+        /// successful exit code (`Some(0)`) — the common case, where a
+        /// test only cares about the command's output. Consumed in
+        /// call order — see `terminal_queue`'s doc.
+        pub(crate) fn queue_terminal_stdout(&self, text: &str) {
+            self.queue_terminal_result(text, Some(0));
+        }
+
+        /// Like [`queue_terminal_stdout`](Self::queue_terminal_stdout),
+        /// but with an explicit exit code instead of the default
+        /// success — for a test simulating a command that ran but
+        /// failed (e.g. `cat` on a path that turns out not to exist).
+        pub(crate) fn queue_terminal_result(&self, text: &str, exit_code: Option<u32>) {
+            self.terminal_queue
+                .lock()
+                .unwrap()
+                .push_back((text.to_string(), exit_code));
+        }
+
+        /// How many terminals this client has been asked to create —
+        /// what `skill_tools`'s cache test uses to prove the skills
+        /// index is resolved once and reused, not re-resolved on every
+        /// call.
+        pub(crate) fn terminal_count(&self) -> usize {
+            self.creates.lock().unwrap().len()
         }
     }
 
@@ -486,15 +532,25 @@ pub(crate) mod tests {
             } else {
                 "t1".to_string()
             };
+            if let Some(result) = self.terminal_queue.lock().unwrap().pop_front() {
+                self.handle_result
+                    .lock()
+                    .unwrap()
+                    .insert(id.clone(), result);
+            }
             Ok(TerminalHandle(id))
         }
-        async fn terminal_output(&self, _t: &TerminalHandle) -> anyhow::Result<TerminalOutput> {
+        async fn terminal_output(&self, t: &TerminalHandle) -> anyhow::Result<TerminalOutput> {
             if let Some(message) = self.output_error.lock().unwrap().clone() {
                 return Err(anyhow::anyhow!(message));
             }
-            Ok(TerminalOutput::default())
+            let mut out = TerminalOutput::default();
+            if let Some((stdout, _)) = self.handle_result.lock().unwrap().get(&t.0).cloned() {
+                out.output = stdout;
+            }
+            Ok(out)
         }
-        async fn wait_for_terminal_exit(&self, _t: &TerminalHandle) -> anyhow::Result<ExitStatus> {
+        async fn wait_for_terminal_exit(&self, t: &TerminalHandle) -> anyhow::Result<ExitStatus> {
             if let Some(message) = self.wait_error.lock().unwrap().clone() {
                 return Err(anyhow::anyhow!(message));
             }
@@ -502,7 +558,16 @@ pub(crate) mod tests {
                 // Never resolves — see `make_exit_never_return`.
                 std::future::pending::<()>().await;
             }
-            Ok(ExitStatus::default())
+            let exit_code = self
+                .handle_result
+                .lock()
+                .unwrap()
+                .get(&t.0)
+                .and_then(|(_, code)| *code);
+            Ok(ExitStatus {
+                exit_code,
+                signal: None,
+            })
         }
         async fn kill_terminal(&self, t: &TerminalHandle) -> anyhow::Result<()> {
             self.killed.lock().unwrap().push(t.clone());

@@ -26,6 +26,8 @@ mod provider;
 mod serve;
 mod session;
 mod session_storage;
+mod skills;
+mod subagent_cache;
 mod timer;
 mod tool_payload_cache;
 mod tools;
@@ -461,6 +463,39 @@ async fn main() -> Result<()> {
                     .await;
             }
 
+            // ── Skills ────────────────────────────────────────────────────
+            // Registered unconditionally: unlike subagents there is
+            // nothing to load at startup, because the directory lives
+            // on the editor's machine and is resolved per session.
+            // `visible_tool_predicate` plus the namespace switch decide
+            // whether it is ever offered.
+            //
+            // `skill_install`/`skill_update`/`skill_uninstall` share the
+            // same `SkillTool` the read-only `skill` uses (via `Arc`,
+            // wrapped in a `Box<dyn Tool>` each `ToolSet` slot owns
+            // independently) so a successful change can invalidate the
+            // one cache all four read from — see `SkillTool::cache`'s
+            // doc.
+            let skill_tool = Arc::new(tools::skill_tools::SkillTool::new());
+            tool_set
+                .register_tool(Box::new(Arc::clone(&skill_tool)))
+                .await;
+            tool_set
+                .register_tool(Box::new(tools::skill_tools::SkillInstallTool::new(
+                    Arc::clone(&skill_tool),
+                )))
+                .await;
+            tool_set
+                .register_tool(Box::new(tools::skill_tools::SkillUpdateTool::new(
+                    Arc::clone(&skill_tool),
+                )))
+                .await;
+            tool_set
+                .register_tool(Box::new(tools::skill_tools::SkillUninstallTool::new(
+                    skill_tool,
+                )))
+                .await;
+
             // ── Session store base directory ────────────────────────────────
             let sessions_base = config.resolved_sessions_dir(&workspace_dir);
 
@@ -722,6 +757,34 @@ async fn main() -> Result<()> {
                     }
                 };
 
+            // ── Subagent child-conversation cache (workspace-external) ──────
+            // Same directory family and degrade-not-abort treatment as the
+            // digest cache above. `None` costs the ability to resume a
+            // subagent across calls — the `subagent` tool falls back to
+            // one-shot and tells the model so — not startup.
+            let subagent_cache: Option<Arc<subagent_cache::SubagentCache>> =
+                match subagent_cache::SubagentCache::default_dir() {
+                    Some(dir) => match subagent_cache::SubagentCache::open(
+                        dir.clone(),
+                        config.subagent_cache.max_history_bytes,
+                    ) {
+                        Ok(cache) => {
+                            tracing::info!("Subagent cache opened at {dir:?}");
+                            Some(cache)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Subagent cache open failed ({e:?}); subagents will not be resumable"
+                            );
+                            None
+                        }
+                    },
+                    None => {
+                        tracing::warn!("No platform cache dir resolvable; subagent cache disabled");
+                        None
+                    }
+                };
+
             // Cloned before `ServeState` takes ownership: the channel
             // agent writes its own rooms' digests here too, now that
             // they no longer go into the session JSONL (#190).
@@ -740,6 +803,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&device_auth),
                 acp_session_store,
                 digest_cache,
+                subagent_cache,
             ));
             // Wire serve_state into the timer manager so voice-origin
             // timers can push fire messages back to their satellite.

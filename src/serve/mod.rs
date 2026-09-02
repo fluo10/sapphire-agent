@@ -22,6 +22,7 @@ use crate::digest_cache::DigestCache;
 use crate::provider::registry::ProviderRegistry;
 use crate::provider::{ChatMessage, ContentPart, Provider, ToolSpec, UserInputKind};
 use crate::session::{ConversationKey, SessionStore};
+use crate::subagent_cache::SubagentCache;
 use crate::tools::ToolSet;
 use crate::voice::VoiceProviders;
 use crate::workspace::Workspace;
@@ -159,6 +160,12 @@ pub struct ServeState {
     /// no-op (logged), and the ACP digest sweep skips its tick
     /// entirely — a session must still load and serve without one.
     pub(crate) digest_cache: Option<Arc<DigestCache>>,
+    /// Workspace-external cache of resumable subagent child
+    /// conversations (`subagent_cache::SubagentCache`). `None` under the
+    /// same conditions, and with the same degrade-not-abort treatment,
+    /// as `digest_cache`: a resumed subagent falls back to one-shot
+    /// rather than the process failing to start.
+    pub(crate) subagent_cache: Option<Arc<SubagentCache>>,
     /// Terminals the model started and has not cleaned up, per agent
     /// session id.
     ///
@@ -197,6 +204,7 @@ impl ServeState {
         device_auth: Arc<crate::device_auth::DeviceAuth>,
         acp_session_store: Arc<AcpSessionStore>,
         digest_cache: Option<Arc<DigestCache>>,
+        subagent_cache: Option<Arc<SubagentCache>>,
     ) -> Self {
         // Scan once on startup: each MCP session's first-line meta
         // carries `namespace` + `project`, so this reproduces the
@@ -243,6 +251,7 @@ impl ServeState {
             acp_session_store,
             acp_sessions: tokio::sync::Mutex::new(HashSet::new()),
             digest_cache,
+            subagent_cache,
             acp_terminals: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -2211,6 +2220,15 @@ pub(crate) fn visible_tool_predicate(
             "client_shell" | "client_shell_start" | "client_shell_output" | "client_shell_kill" => {
                 has_client && client_terminal
             }
+            // The skills directory lives on the editor's machine and is
+            // located by running a script there, so every skill tool
+            // needs both a client and its terminal. Listing a directory
+            // is not expressible in ACP at all — there is no list, glob
+            // or stat in the agent→client surface — which is why even
+            // the read-only `skill` depends on the terminal.
+            "skill" | "skill_install" | "skill_update" | "skill_uninstall" => {
+                has_client && client_terminal
+            }
             _ => true,
         }
     }
@@ -2308,6 +2326,14 @@ pub(crate) struct TurnContext {
     /// subagent is even defined.
     pub visible_specs: Arc<[ToolSpec]>,
     pub timer_origin: Option<crate::timer::TimerOrigin>,
+    /// The session this round's turn is persisting to, or `None` for a
+    /// subagent's nested turn (`persistence` is `None` there — see
+    /// `TurnPersistence`'s doc). `tools::skill_tools::SkillTool` keys
+    /// its per-editor resolved-index cache on this: the tool is
+    /// registered once into the `ToolSet` shared by every connection
+    /// through `ServeState`, so without a session key two different
+    /// editors' `skill()` calls would collide on one cache entry.
+    pub session_id: Option<String>,
 }
 
 tokio::task_local! {
@@ -2594,6 +2620,7 @@ impl TurnLoop<'_> {
                         progress: Arc::clone(progress),
                         visible_specs: Arc::clone(&visible_specs),
                         timer_origin: timer_origin.clone(),
+                        session_id: self.persistence.map(|p| p.session_id.clone()),
                     });
                     let mut results: Vec<(String, crate::tools::ToolOutput)> =
                         futures_util::future::join_all(permitted.into_iter().map(|c| {
@@ -2856,15 +2883,41 @@ pub(crate) async fn run_llm_turn(
     let has_client = progress.acp_client().is_some();
     let (client_fs_read, client_fs_write) = progress.client_fs_caps();
     let client_terminal = progress.client_terminal_cap();
+    // Skills are additionally gated on the turn's namespace. This is
+    // composed here rather than added as a sixth parameter to
+    // `visible_tool_predicate`, because that function is also called
+    // from `src/agent.rs`, which this branch may not edit. The channel
+    // path needs no namespace check anyway: it passes every client flag
+    // as false, so the arm above already hides all four tools there.
+    let skills_enabled = state
+        .config
+        .memory_namespaces
+        .get(&namespace)
+        .map(|ns| ns.skills)
+        .unwrap_or(false);
+    let base = visible_tool_predicate(
+        host_access_enabled,
+        has_client,
+        client_fs_read,
+        client_fs_write,
+        client_terminal,
+    );
     let tool_specs = state
         .tools
-        .specs_filtered(visible_tool_predicate(
-            host_access_enabled,
-            has_client,
-            client_fs_read,
-            client_fs_write,
-            client_terminal,
-        ))
+        .specs_filtered(move |name: &str| {
+            if !base(name) {
+                return false;
+            }
+            if !skills_enabled
+                && matches!(
+                    name,
+                    "skill" | "skill_install" | "skill_update" | "skill_uninstall"
+                )
+            {
+                return false;
+            }
+            true
+        })
         .await;
     let persistence = TurnPersistence {
         store: Arc::clone(&store),
@@ -3557,6 +3610,10 @@ rooms    = []
             Some(tool_payload_cache),
         ));
         let digest_cache = Some(DigestCache::open(base.join("digests")).unwrap());
+        let subagent_cache = Some(
+            SubagentCache::open(base.join("subagents"), 8_388_608)
+                .expect("test subagent_cache fixture should open"),
+        );
 
         Arc::new(Self {
             config,
@@ -3593,6 +3650,7 @@ rooms    = []
             acp_session_store,
             acp_sessions: Default::default(),
             digest_cache,
+            subagent_cache,
             acp_terminals: Default::default(),
         })
     }
@@ -4540,6 +4598,7 @@ mod tests {
                 crate::config::MemoryNamespaceConfig {
                     include: Vec::new(),
                     background_profile: Some("work-bg".to_string()),
+                    skills: false,
                 },
             );
             state_mut.config.profiles.insert(
@@ -5370,6 +5429,25 @@ mod tests {
                 "{name} should be hidden"
             );
         }
+    }
+
+    /// Channels reach `visible_tool_predicate` with every client flag
+    /// false (see `src/agent.rs`), so gating on the terminal capability
+    /// is also what keeps skills off Matrix and Discord — without
+    /// changing this function's signature, which `src/agent.rs` calls
+    /// and which this branch may not edit.
+    #[test]
+    fn skill_tools_need_a_client_with_a_terminal() {
+        let none = visible_tool_predicate(false, false, false, false, false);
+        for t in ["skill", "skill_install", "skill_update", "skill_uninstall"] {
+            assert!(!none(t), "{t} offered with no client");
+        }
+        let full = visible_tool_predicate(false, true, true, true, true);
+        for t in ["skill", "skill_install", "skill_update", "skill_uninstall"] {
+            assert!(full(t), "{t} hidden from a fully capable editor");
+        }
+        let no_term = visible_tool_predicate(false, true, true, true, false);
+        assert!(!no_term("skill"), "skill offered without a terminal");
     }
 
     /// The bug this pins: `round` used to be counted over the whole

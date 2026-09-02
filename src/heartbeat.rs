@@ -319,6 +319,23 @@ impl Heartbeat {
                 }
             }
 
+            // Subagent child conversations are pruned once per
+            // day-boundary tick too — not gated on `daily_log_enabled`,
+            // since they have no permanent-record equivalent to hand
+            // off to; a conversation just goes stale on its own clock.
+            if let Some(cache) = self
+                .serve_state
+                .as_ref()
+                .and_then(|s| s.subagent_cache.as_ref())
+            {
+                let cutoff = chrono::Utc::now()
+                    - Duration::days(self.config.subagent_cache.retain_days.into());
+                let removed = cache.prune_before(cutoff);
+                if removed > 0 {
+                    info!("Pruned {removed} stale subagent child conversation(s)");
+                }
+            }
+
             if self.memory_compaction_enabled {
                 for ns in self.config.all_memory_namespaces() {
                     let provider = self.provider_for_namespace(&ns);
