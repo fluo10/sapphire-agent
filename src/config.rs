@@ -769,9 +769,51 @@ pub struct HostAccess {
 pub struct McpServerConfig {
     /// Human-readable name (used in tool prefix: `mcp__<name>__<tool>`).
     pub name: String,
+    /// How far this server's tools are trusted. See `McpTrust`.
+    #[serde(default)]
+    pub trust: McpTrust,
     /// Transport configuration.
     #[serde(flatten)]
     pub transport: McpTransportConfig,
+}
+
+/// How far the operator trusts an outbound MCP server's tools.
+///
+/// Every tool a server lists is classified by this one value, which
+/// becomes the tool's `ToolKind` and so decides what the permission
+/// policy does with it. Coarse on purpose, and declared here rather than
+/// read from the server, for two reasons:
+///
+/// - **The operator, not the server.** MCP's own annotations
+///   (`readOnlyHint`, `destructiveHint`) are finer, but they are
+///   *self-reported*. The channel restriction exists precisely because a
+///   channel turn carries untrusted input and cannot be approved
+///   interactively; letting the far side declare its own tools safe
+///   would invert the thing being defended. This field is written by the
+///   person who already decided to connect to that server.
+/// - **Per server, not per tool.** A list of tool names in the config
+///   goes stale the moment the server adds a tool, and it goes stale
+///   *silently*: the new tool falls back to `Other`, is refused, and
+///   looks like the server being broken. Per-server is coarser but
+///   cannot rot.
+///
+/// Annotations could later refine classification *within* a trusted
+/// server — reads as `Read`, writes as `Edit`, inside a server marked
+/// `edit`. That only makes sense once this gate exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTrust {
+    /// Tools are `Other` — the strictest bucket. Channels refuse them
+    /// and ACP asks. The default, so adding this field changes nothing
+    /// for an existing config.
+    #[default]
+    None,
+    /// Tools are `Read`: safe on every origin, never asked.
+    Read,
+    /// Tools are `Edit`: allowed unasked on channels and trusted
+    /// transports, asked in ACP's `default` mode — the same treatment
+    /// `file_write` gets.
+    Edit,
 }
 
 /// Transport configuration for connecting to an MCP server.
@@ -1687,6 +1729,59 @@ mod tests {
 [anthropic]
 api_key = "test"
 "#;
+
+    /// The default is `none`: an existing config gains nothing, and the
+    /// server's tools stay `Other` — refused on a channel. This is the
+    /// property that makes the field safe to add.
+    #[test]
+    fn an_mcp_server_without_trust_is_untrusted() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[[tools.mcp_servers]]
+name = "ledger"
+type = "http"
+url  = "http://127.0.0.1:3838/mcp"
+"#,
+        );
+        let server = &cfg.tools.mcp_servers[0];
+        assert_eq!(server.trust, McpTrust::None);
+    }
+
+    /// The operator's declaration, spelled the way `config.example.toml`
+    /// spells it. `trust` sits beside the flattened transport fields, so
+    /// this also pins that the two do not collide during deserialisation.
+    #[test]
+    fn trust_is_read_from_the_server_entry() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[[tools.mcp_servers]]
+name  = "reader"
+type  = "http"
+url   = "http://127.0.0.1:3838/mcp"
+trust = "read"
+
+[[tools.mcp_servers]]
+name    = "writer"
+type    = "stdio"
+command = "ledger-mcp"
+trust   = "edit"
+"#,
+        );
+        let servers = &cfg.tools.mcp_servers;
+        assert_eq!(servers[0].trust, McpTrust::Read);
+        assert_eq!(servers[1].trust, McpTrust::Edit);
+        // The transport still deserialises alongside it.
+        assert!(matches!(
+            servers[1].transport,
+            McpTransportConfig::Stdio { .. }
+        ));
+    }
 
     #[test]
     fn no_profiles_means_no_resolution() {

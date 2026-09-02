@@ -5,9 +5,9 @@
 
 pub mod transport;
 
-use crate::config::{McpServerConfig, McpTransportConfig};
+use crate::config::{McpServerConfig, McpTransportConfig, McpTrust};
 use crate::provider::ToolSpec;
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolKind};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -106,6 +106,11 @@ impl McpClient {
     /// The server name (used as the tool namespace prefix).
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// How far the operator declared this server's tools to be trusted.
+    pub fn trust(&self) -> McpTrust {
+        self.config.trust
     }
 
     /// Check and clear the `tools_changed` flag.
@@ -306,12 +311,20 @@ pub struct McpTool {
     client: Arc<McpClient>,
     spec: ToolSpec,
     remote_tool_name: String,
+    /// Resolved from the server's `trust` at build time rather than read
+    /// from the client on every call: the classification must not change
+    /// under a tool that is already mid-permission-check.
+    kind: ToolKind,
 }
 
 #[async_trait]
 impl Tool for McpTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
+    }
+
+    fn kind(&self) -> ToolKind {
+        self.kind
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
@@ -344,11 +357,25 @@ impl Tool for McpTool {
 // Factory helpers
 // ---------------------------------------------------------------------------
 
+/// The `ToolKind` an operator's `trust` declaration buys a server's tools.
+///
+/// `None` maps to `Other` — not because MCP is dangerous, but because
+/// `Other` is what "unclassified" means here, and the policy's strictest
+/// bucket is the right place for it.
+fn kind_for_trust(trust: McpTrust) -> ToolKind {
+    match trust {
+        McpTrust::None => ToolKind::Other,
+        McpTrust::Read => ToolKind::Read,
+        McpTrust::Edit => ToolKind::Edit,
+    }
+}
+
 /// Build `McpTool` instances from a connected client's tool list.
 pub fn build_tools_for_client(
     client: &Arc<McpClient>,
     remote_tools: Vec<RemoteToolSpec>,
 ) -> Vec<Box<dyn Tool>> {
+    let kind = kind_for_trust(client.trust());
     remote_tools
         .into_iter()
         .map(|rt| {
@@ -361,6 +388,7 @@ pub fn build_tools_for_client(
                     input_schema: rt.input_schema,
                 },
                 remote_tool_name: rt.name,
+                kind,
             }) as Box<dyn Tool>
         })
         .collect()
@@ -404,4 +432,111 @@ pub async fn create_mcp_tools(
     }
 
     (tools, clients)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client over the HTTP transport, which connects lazily — nothing
+    /// here reaches the network.
+    async fn client_with(trust: McpTrust) -> Arc<McpClient> {
+        let config = McpServerConfig {
+            name: "ledger".to_string(),
+            transport: McpTransportConfig::Http {
+                url: "http://127.0.0.1:1/mcp".to_string(),
+                api_key: None,
+            },
+            trust,
+        };
+        Arc::new(
+            McpClient::new(&config, "/tmp")
+                .await
+                .expect("http transport is lazy"),
+        )
+    }
+
+    fn remote(name: &str) -> RemoteToolSpec {
+        RemoteToolSpec {
+            name: name.to_string(),
+            description: "a remote tool".to_string(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    async fn kinds_for(trust: McpTrust) -> Vec<(String, ToolKind)> {
+        let client = client_with(trust).await;
+        build_tools_for_client(&client, vec![remote("list"), remote("record")])
+            .iter()
+            .map(|t| (t.spec().name.to_string(), t.kind()))
+            .collect()
+    }
+
+    /// The default, and the behaviour every existing config keeps: the
+    /// server's tools are `Other`, the strictest bucket, so a channel
+    /// refuses them.
+    #[tokio::test]
+    async fn an_untrusted_server_classifies_its_tools_as_other() {
+        for (name, kind) in kinds_for(McpTrust::None).await {
+            assert_eq!(kind, ToolKind::Other, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_trusted_server_classifies_its_tools_as_read() {
+        for (name, kind) in kinds_for(McpTrust::Read).await {
+            assert_eq!(kind, ToolKind::Read, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_edit_trusted_server_classifies_its_tools_as_edit() {
+        for (name, kind) in kinds_for(McpTrust::Edit).await {
+            assert_eq!(kind, ToolKind::Edit, "{name}");
+        }
+    }
+
+    /// The point of the field, stated as the policy outcome rather than
+    /// the classification: an untrusted server stays unreachable from a
+    /// channel — which is the heartbeat's chat leg too — and a trusted
+    /// one becomes reachable, without `decide` changing at all.
+    #[tokio::test]
+    async fn trust_decides_whether_a_channel_can_reach_the_server() {
+        use crate::tools::policy::{Decision, Origin, SessionMode, decide};
+
+        let kind = |kinds: Vec<(String, ToolKind)>| kinds[0].1;
+
+        let untrusted = kind(kinds_for(McpTrust::None).await);
+        assert_eq!(decide(Origin::Channel, untrusted), Decision::Deny);
+
+        let read = kind(kinds_for(McpTrust::Read).await);
+        assert_eq!(decide(Origin::Channel, read), Decision::Allow);
+        assert_eq!(
+            decide(Origin::Acp(SessionMode::Default), read),
+            Decision::Allow,
+            "a read is safe on every origin"
+        );
+
+        let edit = kind(kinds_for(McpTrust::Edit).await);
+        assert_eq!(
+            decide(Origin::Channel, edit),
+            Decision::Allow,
+            "chat-driven recording is the case this unblocks"
+        );
+        assert_eq!(
+            decide(Origin::Acp(SessionMode::Default), edit),
+            Decision::Ask,
+            "an editor still asks before a write, as it does for file_write"
+        );
+    }
+
+    /// The classification is per server, not per tool: `trust` is coarse
+    /// on purpose, so a tool the server adds later cannot silently fall
+    /// back to `Other` and look like the server being broken.
+    #[tokio::test]
+    async fn trust_applies_to_every_tool_the_server_lists() {
+        let kinds = kinds_for(McpTrust::Edit).await;
+        let names: Vec<&str> = kinds.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["mcp__ledger__list", "mcp__ledger__record"]);
+    }
 }

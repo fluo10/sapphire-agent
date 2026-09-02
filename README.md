@@ -247,7 +247,7 @@ Tool calls from the editor are gated. Each tool declares what it does (read,
 search, edit, delete, execute), and what happens next depends on the session's
 mode:
 
-| Mode | Reads, searches, fetches | Edits and deletes | Commands, MCP tools |
+| Mode | Reads, searches, fetches | Edits and deletes | Commands, unclassified tools |
 |---|---|---|---|
 | `default` | run | **ask** | **ask** |
 | `accept_edits` | run | run | **ask** |
@@ -272,9 +272,11 @@ Declining a tool does not end the turn. The model is told the call was
 refused and can try another route.
 
 **Chat channels are not asked — they are restricted.** Matrix and Discord
-cannot call `shell` or any MCP tool at all. A chat turn is asynchronous, so
-holding one open waiting for a human could hang it for hours; and routing the
-question through the model would let it broker its own permission request.
+cannot call `shell` at all, and reach an outbound MCP server's tools only if
+the operator declared that server trusted (see "Trusting an outbound MCP
+server" below). A chat turn is asynchronous, so holding one open waiting for
+a human could hang it for hours; and routing the question through the model
+would let it broker its own permission request.
 `/rpc`, the voice pipeline and `/a2a` are unchanged in how *this* gate treats
 them — they are still never asked. But none of the three can reach the seven
 host-machine tools either, once `[tools.host_access] enabled = false` (the
@@ -283,14 +285,57 @@ See "The agent's own filesystem and shell are opt-in" below.
 
 **The heartbeat's chat leg counts as a channel.** A scheduled task under
 `<workspace>/heartbeat/` runs through the same path as a chat message when it
-replies to a room, so it cannot call `shell` or MCP tools either. This is
-deliberate rather than an oversight: heartbeat task bodies are workspace files,
-and `file_write` is an edit, which a channel may perform without being asked
-*when host access is on* — so trusting that path would let a chat message
-write itself a task that runs a command on the next tick. With host access
-off (the default), `file_write` is one of the seven host-machine tools and is
-refused for every origin before this reasoning is even reached — but it still
-governs the moment host access is turned on.
+replies to a room, so it cannot call `shell`, and it reaches an MCP server's
+tools on the same terms a chat message does. This is deliberate rather than an
+oversight: heartbeat task bodies are workspace files, and `file_write` is an
+edit, which a channel may perform without being asked *when host access is
+on* — so trusting that path would let a chat message write itself a task that
+runs a command on the next tick. With host access off (the default),
+`file_write` is one of the seven host-machine tools and is refused for every
+origin before this reasoning is even reached — but it still governs the moment
+host access is turned on.
+
+#### Trusting an outbound MCP server
+
+Tools from `[[tools.mcp_servers]]` carry no classification of their own, so by
+default they are unclassified — the strictest bucket — and a channel refuses
+every one of them. That is the fail-safe working as designed, not a judgement
+that MCP is dangerous, but it means a heartbeat task and a chat message alike
+cannot call any MCP tool.
+
+`trust` on the server entry is how the operator supplies the missing
+classification:
+
+| `trust` | Tools are classified | Chat channels and the heartbeat | `/acp` in `default` |
+|---|---|---|---|
+| `"none"` (default) | unclassified | **refused** | **ask** |
+| `"read"` | reads | run | run |
+| `"edit"` | edits | run | **ask** |
+
+```toml
+[[tools.mcp_servers]]
+name  = "ledger"
+type  = "http"
+url   = "http://127.0.0.1:3838/mcp"
+trust = "edit"
+```
+
+It is declared by the operator rather than read from the server for the reason
+the channel restriction exists at all. MCP servers can annotate their own tools
+(`readOnlyHint`, `destructiveHint`) more finely than one value per server —
+but those annotations are *self-reported*, and a channel turn carries untrusted
+input that nobody can be asked about. Letting the far side declare its own
+tools safe would invert the thing being defended. Whoever wrote the config has
+already decided to connect to that server; this is where they say how much that
+decision was worth.
+
+It is per server rather than per tool for a smaller reason: a list of tool
+names would go stale the moment the server added a tool, and it would go stale
+*silently* — the new tool falls back to `none`, is refused, and looks like the
+server being broken. Coarser, but it cannot rot.
+
+Nothing about `decide` changes. A `read` server's tools take the same path
+`workspace_search` already takes, and an `edit` server's take `file_write`'s.
 
 ### Client-side tools: whose machine
 
