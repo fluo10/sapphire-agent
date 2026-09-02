@@ -6,9 +6,7 @@
 //! facts about the workspace and the Anthropic API that neither store is
 //! free to decide for itself:
 //!
-//! - a lost tool result gets one specific sentence, not each store's own
-//! - a tool input has nowhere to go but the (indexed) session file, so
-//!   an oversized one is elided rather than written
+//! - a lost tool payload gets one specific stand-in, not each store's own
 //! - `tool_use` and `tool_result` must be adjacent, whatever gaps a
 //!   crash or a partial sync left behind
 
@@ -25,25 +23,21 @@ use std::collections::HashSet;
 pub const MISSING_RESULT: &str =
     "[this tool result is no longer stored; call the tool again if you need it]";
 
-/// Storage-path-only transformation: never touches the in-memory value,
-/// only what gets written to the JSONL.
+/// The `input` a `tool_use` gets when its payload is no longer cached.
 ///
-/// Unlike a result, an input has nowhere to go but the session file
-/// itself — there is no cache/hash indirection for it. That file lives
-/// under `<workspace>/sessions`, which the retrieve indexer walks, so an
-/// unbounded input (a multi-megabyte `file_write`, say) would put its
-/// whole content into the index — exactly what the external tool-result
-/// cache exists to keep out.
+/// An object rather than a sentence, because `input` is typed as JSON
+/// and a bare string would not round-trip through the same field. The
+/// API does not validate a replayed `input` against the tool's schema,
+/// so any object is accepted here.
 ///
-/// Elide rather than truncate: truncated JSON does not parse, and a
-/// reload needs `input` to still be valid JSON of the same shape.
-pub fn elide_oversized_input(input: &Value) -> Value {
-    let size = serde_json::to_string(input).map(|s| s.len()).unwrap_or(0);
-    if size <= crate::tools::OUTPUT_CAP_BYTES {
-        return input.clone();
-    }
+/// This degrades worse than a missing result and it is worth being
+/// honest about which: the model can answer a missing result by calling
+/// the tool again, but a missing input leaves it knowing it made a call
+/// without knowing what it asked for. The `name` beside it is what
+/// keeps that from being nothing at all.
+pub fn missing_input() -> Value {
     serde_json::json!({
-        "_elided": format!("{size} bytes of tool input, too large to store")
+        "_unavailable": "the arguments to this call are no longer stored"
     })
 }
 
@@ -203,21 +197,18 @@ fn ordered_tool_use_ids(msg: &ChatMessage) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// The stand-in has to be an object, because it goes back into a
+    /// field typed as the tool's JSON `input` — a bare string would not
+    /// round-trip through the same slot.
     #[test]
-    fn a_small_input_passes_through_unchanged() {
-        let input = serde_json::json!({ "path": "src/main.rs" });
-        assert_eq!(elide_oversized_input(&input), input);
-    }
-
-    /// The elided form has to remain valid JSON of the same type, or a
-    /// reload produces a `ToolUse` that will not deserialize.
-    #[test]
-    fn an_oversized_input_becomes_a_small_valid_object() {
-        let big = serde_json::json!({ "content": "x".repeat(crate::tools::OUTPUT_CAP_BYTES + 1) });
-        let elided = elide_oversized_input(&big);
-        assert!(elided.is_object(), "must stay an object: {elided}");
-        assert!(elided.get("_elided").is_some(), "missing marker: {elided}");
-        assert!(serde_json::to_string(&elided).unwrap().len() < 200);
+    fn the_missing_input_stand_in_is_a_small_object() {
+        let placeholder = missing_input();
+        assert!(placeholder.is_object(), "must be an object: {placeholder}");
+        assert!(
+            placeholder.get("_unavailable").is_some(),
+            "missing marker: {placeholder}"
+        );
+        assert!(serde_json::to_string(&placeholder).unwrap().len() < 200);
     }
 
     fn tool_use(id: &str) -> ContentPart {

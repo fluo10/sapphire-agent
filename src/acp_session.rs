@@ -19,8 +19,8 @@
 
 use crate::provider::{ChatMessage, ContentPart, Role};
 use crate::session::{IntradayDigestLine, SessionMeta, StoredMessage};
-use crate::session_storage::{MISSING_RESULT, elide_oversized_input};
-use crate::tool_result_cache::ToolResultCache;
+use crate::session_storage::{MISSING_RESULT, missing_input};
+use crate::tool_payload_cache::ToolPayloadCache;
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -89,10 +89,30 @@ pub enum EventBody {
 #[serde(rename_all = "snake_case")]
 pub enum StoredPart {
     Text(String),
+    /// **Legacy, read-only.** What this store wrote before inputs were
+    /// cached (#212). Nothing produces it any more; it stays so that a
+    /// session file written by an earlier build still loads its calls
+    /// instead of silently dropping them — and dropping a `tool_use`
+    /// while keeping its `tool_result` is exactly the orphan the repair
+    /// pass then has to clean up.
+    ///
+    /// Delete it once no reachable session predates the change.
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
+    },
+    ToolUseRef {
+        id: String,
+        /// Stays inline. It is short, and it is what `generate_summary`
+        /// renders as `[Called tool: {name}]` — behind the hash, a
+        /// summary of an evicted session would say nothing at all about
+        /// what the agent did.
+        name: String,
+        /// `None` means the input had nowhere to be stored, exactly as
+        /// for a result below.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
     },
     ToolResultRef {
         tool_use_id: String,
@@ -149,7 +169,7 @@ enum Line {
 
 pub struct AcpSessionStore {
     base_dir: PathBuf,
-    /// `None` when the tool-result cache directory could not be opened
+    /// `None` when the tool-payload cache directory could not be opened
     /// at startup (read-only or missing `~/.cache` / `%LOCALAPPDATA%`).
     /// Degrades rather than making the whole store unusable: a session
     /// must still load. ACP has persisted tool traffic since #191, and
@@ -158,7 +178,7 @@ pub struct AcpSessionStore {
     /// `ToolResultRef` with no hash instead of the content, and a reload
     /// reads that back as `MISSING_RESULT` — the pairing survives, only
     /// the result body is lost.
-    cache: Option<Arc<ToolResultCache>>,
+    cache: Option<Arc<ToolPayloadCache>>,
     /// `session_id` → the id of the last event written.
     ///
     /// An append needs its parent, and re-reading the whole file to
@@ -168,7 +188,7 @@ pub struct AcpSessionStore {
 }
 
 impl AcpSessionStore {
-    pub fn new(base_dir: PathBuf, cache: Option<Arc<ToolResultCache>>) -> Self {
+    pub fn new(base_dir: PathBuf, cache: Option<Arc<ToolPayloadCache>>) -> Self {
         Self {
             base_dir,
             cache,
@@ -351,27 +371,34 @@ impl AcpSessionStore {
         })
     }
 
-    /// A tool result's content goes to the cache; the log keeps a hash.
+    /// Both halves of a tool call go to the cache; the log keeps hashes.
     fn store_part(&self, part: &ContentPart) -> Result<StoredPart> {
         Ok(match part {
             ContentPart::Text(t) => StoredPart::Text(t.clone()),
-            ContentPart::ToolUse { id, name, input } => StoredPart::ToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                // Unlike a result, an input has nowhere to go but the
-                // JSONL itself — there is no cache/hash indirection for
-                // it. That file lives under `workspace_dir/sessions`,
-                // which the retrieve indexer walks, so an unbounded
-                // input (e.g. a multi-megabyte `file_write`) would put
-                // its whole content into the index — exactly what the
-                // ACP store's external cache exists to keep out for
-                // results (see the `ToolResult` arm below), and what an
-                // uncapped `input` would silently reintroduce. Elide
-                // rather than truncate: truncated JSON does not parse,
-                // and a reload needs `input` to still be valid JSON of
-                // the same shape.
-                input: elide_oversized_input(input),
-            },
+            ContentPart::ToolUse { id, name, input } => {
+                // An input is cached for the same reason a result is: a
+                // `file_write` call carries the file's contents, this
+                // file lives under `workspace_dir/sessions`, and the
+                // retrieve indexer walks it line by line. It used to be
+                // written inline and merely elided above a size
+                // threshold, which bounded the worst case without
+                // addressing what the requirement actually was (#212).
+                let sha256 = match &self.cache {
+                    Some(cache) => Some(cache.put_input(input)?),
+                    None => {
+                        warn!(
+                            "Tool-payload cache unavailable; recording the input of \
+                             '{id}' with no content"
+                        );
+                        None
+                    }
+                };
+                StoredPart::ToolUseRef {
+                    id: id.clone(),
+                    name: name.clone(),
+                    sha256,
+                }
+            }
             ContentPart::ToolResult {
                 tool_use_id,
                 content,
@@ -386,7 +413,7 @@ impl AcpSessionStore {
                     Some(cache) => Some(cache.put(content)?),
                     None => {
                         warn!(
-                            "Tool-result cache unavailable; recording '{tool_use_id}' \
+                            "Tool-payload cache unavailable; recording '{tool_use_id}' \
                              with no content"
                         );
                         None
@@ -650,10 +677,23 @@ impl AcpSessionStore {
     fn load_part(&self, part: &StoredPart) -> ContentPart {
         match part {
             StoredPart::Text(t) => ContentPart::Text(t.clone()),
+            // Legacy: the input is inline, so there is nothing to fetch.
             StoredPart::ToolUse { id, name, input } => ContentPart::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
                 input: input.clone(),
+            },
+            StoredPart::ToolUseRef { id, name, sha256 } => ContentPart::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                // Absent either way — no hash was ever written, or the
+                // hash's entry is gone. The call itself survives, which
+                // is what the pairing needs; `name` keeps the record of
+                // what was attempted from being nothing at all.
+                input: sha256
+                    .as_ref()
+                    .and_then(|sha| self.cache.as_ref()?.get_input(sha))
+                    .unwrap_or_else(missing_input),
             },
             StoredPart::ToolResultRef {
                 tool_use_id,
@@ -942,7 +982,7 @@ mod tests {
     fn store() -> (tempfile::TempDir, AcpSessionStore) {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
-        let cache = crate::tool_result_cache::ToolResultCache::open(cache_dir).unwrap();
+        let cache = crate::tool_payload_cache::ToolPayloadCache::open(cache_dir).unwrap();
         let store = AcpSessionStore::new(dir.path().join("sessions"), Some(cache));
         (dir, store)
     }
@@ -1140,15 +1180,13 @@ mod tests {
         assert_eq!(evicted[1].parts, never[1].parts);
     }
 
-    /// Fix 4/#194: a tool *input* has no cache/hash indirection the way a
-    /// result does, so an unbounded input (e.g. a multi-megabyte
-    /// `file_write`) would otherwise go straight into the JSONL — which
-    /// lives under `workspace_dir/sessions` and is walked by the
-    /// retrieve indexer. It must be elided on the way to disk, and the
-    /// elided form must still be valid, well-shaped JSON so a reload
-    /// still produces a `ToolUse`.
+    /// #212: a tool *input* is cached exactly the way a result is, at
+    /// any size. A `file_write` call carries the file's contents, and
+    /// the JSONL lives under `workspace_dir/sessions`, which the
+    /// retrieve indexer walks line by line. It must not reach disk, and
+    /// it must come back whole.
     #[test]
-    fn an_oversized_tool_input_is_elided_on_the_way_to_disk() {
+    fn a_tool_input_is_cached_rather_than_written_to_the_jsonl() {
         let (_d, store) = store();
         store.create("s1", "default", "/p").unwrap();
 
@@ -1175,24 +1213,81 @@ mod tests {
             "the oversized input must not reach the (indexed) JSONL verbatim"
         );
 
+        assert!(
+            raw.contains("file_write"),
+            "the tool name must stay inline so a summary can still name it"
+        );
+
         let history = store.history("s1").expect("the session loads");
         match &history[0].parts[0] {
             ContentPart::ToolUse { id, name, input } => {
                 assert_eq!(id, "c1");
                 assert_eq!(name, "file_write");
-                assert!(
-                    input.get("_elided").is_some(),
-                    "the reloaded input must carry the elision marker: {input:?}"
+                assert_eq!(
+                    input,
+                    &serde_json::json!({ "content": huge }),
+                    "the input must round-trip byte-for-byte"
                 );
             }
             other => panic!("expected a ToolUse, got {other:?}"),
         }
     }
 
-    /// The elision in the test above must not fire on an ordinary,
-    /// well-under-the-cap input — the common case is untouched.
+    /// A file written before inputs were cached holds `{"tool_use": …}`
+    /// with the arguments inline. It must still load its call: dropping
+    /// the part would leave the `tool_result` answering it orphaned, and
+    /// the repair pass would then delete that too — turning a readable
+    /// old session into a conversation with a hole where the work was.
     #[test]
-    fn an_ordinary_tool_input_is_stored_unchanged() {
+    fn a_legacy_inline_tool_use_still_loads() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("do it"))
+            .unwrap();
+
+        let parent = store.events("s1").unwrap().last().unwrap().id;
+        let legacy = serde_json::json!({
+            "kind": "message",
+            "id": Uuid::now_v7(),
+            "parent": parent,
+            "at": Utc::now(),
+            "role": "assistant",
+            "parts": [{"tool_use": {
+                "id": "c1",
+                "name": "file_read",
+                "input": {"path": "a.rs"},
+            }}],
+        });
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.path_for_test("s1"))
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{legacy}").unwrap();
+        drop(f);
+
+        let history = store.history("s1").expect("the session loads");
+        let call = history.iter().flat_map(|m| &m.parts).find_map(|p| match p {
+            ContentPart::ToolUse { id, name, input } if id == "c1" => {
+                Some((name.clone(), input.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            call,
+            Some((
+                "file_read".to_string(),
+                serde_json::json!({ "path": "a.rs" })
+            )),
+            "the legacy call must load with its inline input: {history:?}"
+        );
+    }
+
+    /// An ordinary input takes the same path — there is no size
+    /// threshold any more, so the common case must round-trip too.
+    #[test]
+    fn an_ordinary_tool_input_round_trips() {
         let (_d, store) = store();
         store.create("s1", "default", "/p").unwrap();
 

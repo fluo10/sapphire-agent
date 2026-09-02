@@ -278,7 +278,7 @@ fn convert_user_message(msg: &ChatMessage) -> Vec<ApiMessage> {
                     tool_call_id: Some(tool_use_id.clone()),
                 });
             }
-            ContentPart::ToolUse { .. } => {
+            ContentPart::ToolUse { .. } | ContentPart::ToolUseRef { .. } => {
                 // Should not appear on User messages — silently skip.
             }
             // See the Anthropic provider's arm: hydration failed
@@ -333,6 +333,19 @@ fn convert_assistant_message(msg: &ChatMessage) -> ApiMessage {
                     function: ApiAssistantToolFunction {
                         name: name.clone(),
                         arguments: serde_json::to_string(input)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    },
+                });
+            }
+            // See the Anthropic provider's arm: hydration failed
+            // upstream, and the call matters more than its arguments.
+            ContentPart::ToolUseRef { id, name, .. } => {
+                tool_calls.push(ApiAssistantToolCall {
+                    id: id.clone(),
+                    kind: "function",
+                    function: ApiAssistantToolFunction {
+                        name: name.clone(),
+                        arguments: serde_json::to_string(&crate::session_storage::missing_input())
                             .unwrap_or_else(|_| "{}".to_string()),
                     },
                 });

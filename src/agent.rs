@@ -476,9 +476,9 @@ impl Agent {
     /// the gap this exists to close.
     ///
     /// The storage shape is decided inside [`SessionStore::append`]:
-    /// tool results go to the workspace-external cache, oversized tool
-    /// inputs are elided, images become hash markers. Every persist path
-    /// (agent, `/rpc`, `/a2a`, MCP) inherits it.
+    /// both halves of a tool call go to the workspace-external cache,
+    /// images become hash markers. Every persist path (agent, `/rpc`,
+    /// `/a2a`, MCP) inherits it.
     ///
     /// A no-op returns `true`: there is no pairing to break when nothing
     /// was ever a candidate for the store.

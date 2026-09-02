@@ -1087,6 +1087,12 @@ async fn handle_get_session(
                     ContentPart::ToolUse { id, name, input } => {
                         json!({ "type": "tool_use", "id": id, "name": name, "input": input })
                     }
+                    ContentPart::ToolUseRef { id, name, sha256 } => {
+                        // Same shape as tool_use, with the cache key
+                        // surfaced instead of arguments a caller cannot
+                        // be handed from a listing anyway.
+                        json!({ "type": "tool_use", "id": id, "name": name, "sha256": sha256 })
+                    }
                     ContentPart::ToolResult { tool_use_id, content } => {
                         json!({ "type": "tool_result", "tool_use_id": tool_use_id, "content": content })
                     }
@@ -3544,11 +3550,11 @@ rooms    = []
         // Same base directory as the cross-device store above: the ACP
         // store puts itself in an `acp/` subtree per namespace, so
         // sharing `base.join("sessions")` doesn't collide with `rpc/`.
-        let tool_result_cache =
-            crate::tool_result_cache::ToolResultCache::open(base.join("tool-results")).unwrap();
+        let tool_payload_cache =
+            crate::tool_payload_cache::ToolPayloadCache::open(base.join("tool-payloads")).unwrap();
         let acp_session_store = Arc::new(AcpSessionStore::new(
             base.join("sessions"),
-            Some(tool_result_cache),
+            Some(tool_payload_cache),
         ));
         let digest_cache = Some(DigestCache::open(base.join("digests")).unwrap());
 
@@ -5024,7 +5030,7 @@ mod tests {
         let has_use = events.iter().any(|e| match &e.body {
             EventBody::Message { parts, .. } => parts
                 .iter()
-                .any(|p| matches!(p, StoredPart::ToolUse { id, .. } if id == "call-1")),
+                .any(|p| matches!(p, StoredPart::ToolUseRef { id, .. } if id == "call-1")),
             _ => false,
         });
         let has_result = events.iter().any(|e| match &e.body {
@@ -5117,8 +5123,9 @@ mod tests {
     fn a_non_acp_session_persists_both_halves_of_a_tool_call() {
         let base = tempfile::TempDir::new().unwrap();
         let cache_dir = tempfile::TempDir::new().unwrap();
-        let cache = crate::tool_result_cache::ToolResultCache::open(cache_dir.path().to_path_buf())
-            .unwrap();
+        let cache =
+            crate::tool_payload_cache::ToolPayloadCache::open(cache_dir.path().to_path_buf())
+                .unwrap();
         let store = SessionStore::new(base.path().join("sessions"), "rpc", Some(cache));
         let key = ("s1".to_string(), None);
         store
