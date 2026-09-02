@@ -496,6 +496,12 @@ pub struct MemoryNamespaceConfig {
     ///   3. plain Anthropic
     #[serde(default)]
     pub background_profile: Option<String>,
+    /// Whether conversations under this namespace are offered the
+    /// skill tools. Off by default: `using-superpowers` asks the model
+    /// to check for a relevant skill before answering at all, which is
+    /// right for development and wrong for an ordinary conversation.
+    #[serde(default)]
+    pub skills: bool,
 }
 
 /// Voice pipeline preset — references a named STT provider and TTS provider

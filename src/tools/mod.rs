@@ -4,6 +4,7 @@ pub mod builtin_tools;
 pub mod client_exec;
 pub mod client_tools;
 pub mod policy;
+pub mod skill_tools;
 pub mod subagent;
 pub mod timer_tools;
 pub mod workspace_tools;

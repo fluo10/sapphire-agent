@@ -445,6 +445,16 @@ async fn main() -> Result<()> {
                     .await;
             }
 
+            // ── Skills ────────────────────────────────────────────────────
+            // Registered unconditionally: unlike subagents there is
+            // nothing to load at startup, because the directory lives
+            // on the editor's machine and is resolved per session.
+            // `visible_tool_predicate` plus the namespace switch decide
+            // whether it is ever offered.
+            tool_set
+                .register_tool(Box::new(tools::skill_tools::SkillTool::new()))
+                .await;
+
             // ── Session store base directory ────────────────────────────────
             let sessions_base = config.resolved_sessions_dir(&workspace_dir);
 

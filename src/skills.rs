@@ -20,7 +20,6 @@ use anyhow::{Context, Result, bail};
 // exercised by the unit tests in this file's own `mod tests`.
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct SkillEntry {
     pub name: String,
     pub description: String,
@@ -28,7 +27,6 @@ pub struct SkillEntry {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct SkillIndex {
     pub dir: String,
     pub skills: Vec<SkillEntry>,
@@ -52,7 +50,6 @@ pub struct SkillIndex {
 /// Frontmatter is emitted raw, one `FM` line per line of it, and parsed
 /// by `serde_yaml` in `parse_index`. Parsing YAML in `sed` would break
 /// on the quoted descriptions superpowers actually ships.
-#[allow(dead_code)]
 pub const RESOLVE_AND_INDEX_SH: &str = r#"
 set -u
 emit() {
@@ -112,7 +109,6 @@ printf 'SKILLS_DIR\t%s\n' "$d"
 "#;
 
 /// Parse the output of [`RESOLVE_AND_INDEX_SH`].
-#[allow(dead_code)]
 pub fn parse_index(stdout: &str) -> Result<SkillIndex> {
     let mut dir: Option<String> = None;
     let mut skills = Vec::new();

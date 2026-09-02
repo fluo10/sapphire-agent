@@ -371,6 +371,19 @@ pub(crate) mod tests {
         /// for tests that never look at a `ServeState`.
         pub(crate) terminal_session: String,
         pub(crate) terminals: TerminalRegistry,
+        /// Stdout text queued for successive `create_terminal` calls,
+        /// consumed in call order — the n-th queued entry becomes what
+        /// `terminal_output` reports for the n-th terminal created.
+        /// Used by `skill_tools`'s tests, where the skills-index
+        /// resolver and its `cat` fallback are two distinct
+        /// `create_terminal` round trips that must answer with two
+        /// different bodies. Everything that doesn't queue anything
+        /// keeps the pre-existing default: empty output.
+        terminal_stdout_queue: Mutex<std::collections::VecDeque<String>>,
+        /// Stdout committed to a specific handle id by `create_terminal`
+        /// once it consumes from `terminal_stdout_queue`, so a later
+        /// `terminal_output(&handle)` call can look it back up.
+        handle_stdout: Mutex<HashMap<String, String>>,
     }
 
     impl FakeClient {
@@ -421,6 +434,24 @@ pub(crate) mod tests {
         /// while the command it was asked about kept running.
         pub(crate) fn make_wait_fail_with(&self, message: &str) {
             *self.wait_error.lock().unwrap() = Some(message.to_string());
+        }
+
+        /// Queue `text` as the stdout the next `create_terminal` call's
+        /// terminal will report via `terminal_output`. Consumed in call
+        /// order — see `terminal_stdout_queue`'s doc.
+        pub(crate) fn queue_terminal_stdout(&self, text: &str) {
+            self.terminal_stdout_queue
+                .lock()
+                .unwrap()
+                .push_back(text.to_string());
+        }
+
+        /// How many terminals this client has been asked to create —
+        /// what `skill_tools`'s cache test uses to prove the skills
+        /// index is resolved once and reused, not re-resolved on every
+        /// call.
+        pub(crate) fn terminal_count(&self) -> usize {
+            self.creates.lock().unwrap().len()
         }
     }
 
@@ -486,13 +517,20 @@ pub(crate) mod tests {
             } else {
                 "t1".to_string()
             };
+            if let Some(stdout) = self.terminal_stdout_queue.lock().unwrap().pop_front() {
+                self.handle_stdout.lock().unwrap().insert(id.clone(), stdout);
+            }
             Ok(TerminalHandle(id))
         }
-        async fn terminal_output(&self, _t: &TerminalHandle) -> anyhow::Result<TerminalOutput> {
+        async fn terminal_output(&self, t: &TerminalHandle) -> anyhow::Result<TerminalOutput> {
             if let Some(message) = self.output_error.lock().unwrap().clone() {
                 return Err(anyhow::anyhow!(message));
             }
-            Ok(TerminalOutput::default())
+            let mut out = TerminalOutput::default();
+            if let Some(stdout) = self.handle_stdout.lock().unwrap().get(&t.0).cloned() {
+                out.output = stdout;
+            }
+            Ok(out)
         }
         async fn wait_for_terminal_exit(&self, _t: &TerminalHandle) -> anyhow::Result<ExitStatus> {
             if let Some(message) = self.wait_error.lock().unwrap().clone() {
