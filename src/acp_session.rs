@@ -19,6 +19,7 @@
 
 use crate::provider::{ChatMessage, ContentPart, Role};
 use crate::session::{IntradayDigestLine, SessionMeta, StoredMessage};
+use crate::session_storage::{MISSING_RESULT, elide_oversized_input};
 use crate::tool_result_cache::ToolResultCache;
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -32,16 +33,6 @@ use uuid::Uuid;
 
 /// The directory name under `<sessions>/<namespace>/`.
 const KIND: &str = "acp";
-
-/// What the model is told when a tool result is no longer in the cache.
-///
-/// The pairing between `tool_use` and `tool_result` is what the API
-/// validates, not the content — so a placeholder keeps the history
-/// valid and the conversation's shape intact. This is why the store
-/// needs no resume summary: a summary would cost a model call and throw
-/// the turn structure away to solve a problem a sentence solves.
-pub const MISSING_RESULT: &str =
-    "[this tool result is no longer stored; call the tool again if you need it]";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionHeader {
@@ -312,7 +303,7 @@ impl AcpSessionStore {
                 // rather than truncate: truncated JSON does not parse,
                 // and a reload needs `input` to still be valid JSON of
                 // the same shape.
-                input: self.elide_oversized_input(input),
+                input: elide_oversized_input(input),
             },
             ContentPart::ToolResult {
                 tool_use_id,
@@ -343,26 +334,6 @@ impl AcpSessionStore {
             // marker rather than dropped, so a message that was only an
             // image does not read back as an empty one.
             _ => StoredPart::Other,
-        })
-    }
-
-    /// Storage-path-only transformation: never touches the in-memory
-    /// value, only what gets written to the JSONL — the same shape as
-    /// the result hashing right above it. An oversized input becomes a
-    /// small marker object instead of being written verbatim, so a
-    /// single large tool call cannot dump its whole payload into the
-    /// (indexed) session file. Still valid JSON, so the `input` field's
-    /// type is unchanged and a reload still produces a well-formed
-    /// `ToolUse`.
-    fn elide_oversized_input(&self, input: &serde_json::Value) -> serde_json::Value {
-        let size = serde_json::to_string(input).map(|s| s.len()).unwrap_or(0);
-        if size <= crate::tools::OUTPUT_CAP_BYTES {
-            return input.clone();
-        }
-        serde_json::json!({
-            "_elided": format!(
-                "{size} bytes of tool input, too large to store"
-            )
         })
     }
 }
