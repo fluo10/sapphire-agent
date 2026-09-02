@@ -25,6 +25,7 @@ mod provider;
 mod serve;
 mod session;
 mod skills;
+mod subagent_cache;
 mod timer;
 mod tool_result_cache;
 mod tools;
@@ -725,6 +726,34 @@ async fn main() -> Result<()> {
                     }
                 };
 
+            // ── Subagent child-conversation cache (workspace-external) ──────
+            // Same directory family and degrade-not-abort treatment as the
+            // digest cache above. `None` costs the ability to resume a
+            // subagent across calls — the `subagent` tool falls back to
+            // one-shot and tells the model so — not startup.
+            let subagent_cache: Option<Arc<subagent_cache::SubagentCache>> =
+                match subagent_cache::SubagentCache::default_dir() {
+                    Some(dir) => match subagent_cache::SubagentCache::open(
+                        dir.clone(),
+                        config.subagent_cache.max_history_bytes,
+                    ) {
+                        Ok(cache) => {
+                            tracing::info!("Subagent cache opened at {dir:?}");
+                            Some(cache)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Subagent cache open failed ({e:?}); subagents will not be resumable"
+                            );
+                            None
+                        }
+                    },
+                    None => {
+                        tracing::warn!("No platform cache dir resolvable; subagent cache disabled");
+                        None
+                    }
+                };
+
             let serve_state = Arc::new(serve::ServeState::new(
                 config.clone(),
                 Arc::clone(&registry),
@@ -738,6 +767,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&device_auth),
                 acp_session_store,
                 digest_cache,
+                subagent_cache,
             ));
             // Wire serve_state into the timer manager so voice-origin
             // timers can push fire messages back to their satellite.

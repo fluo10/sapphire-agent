@@ -125,6 +125,12 @@ pub struct Config {
     /// Periodic log digest configuration (weekly / monthly / yearly).
     #[serde(default)]
     pub digest: DigestConfig,
+    /// Workspace-external cache of resumable subagent child
+    /// conversations. See `subagent_cache::SubagentCache`'s module doc
+    /// for why this lives outside the workspace rather than in the
+    /// session store.
+    #[serde(default)]
+    pub subagent_cache: SubagentCacheConfig,
     /// Voice pipeline presets, referenced by `[room_profile.<n>].voice_pipeline`.
     #[serde(default, rename = "voice_pipeline")]
     pub voice_pipelines: HashMap<String, VoicePipelineConfig>,
@@ -1072,6 +1078,38 @@ fn default_digest_monthly_items() -> usize {
 
 fn default_digest_yearly_items() -> usize {
     5
+}
+
+/// Configuration for `subagent_cache::SubagentCache`, the
+/// workspace-external store that lets a resumed subagent pick its
+/// child conversation back up.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SubagentCacheConfig {
+    /// Cap on a single child's serialized history, in bytes. A `put`
+    /// over this cap is refused wholesale rather than truncated — see
+    /// `SubagentCache::put`'s doc.
+    #[serde(default = "default_subagent_cache_max_history_bytes")]
+    pub max_history_bytes: usize,
+    /// Days a child conversation may go untouched before it is pruned.
+    #[serde(default = "default_subagent_cache_retain_days")]
+    pub retain_days: u32,
+}
+
+impl Default for SubagentCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_history_bytes: default_subagent_cache_max_history_bytes(),
+            retain_days: default_subagent_cache_retain_days(),
+        }
+    }
+}
+
+fn default_subagent_cache_max_history_bytes() -> usize {
+    8_388_608
+}
+
+fn default_subagent_cache_retain_days() -> u32 {
+    7
 }
 
 impl Config {

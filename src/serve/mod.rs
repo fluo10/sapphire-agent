@@ -22,6 +22,7 @@ use crate::digest_cache::DigestCache;
 use crate::provider::registry::ProviderRegistry;
 use crate::provider::{ChatMessage, ContentPart, Provider, ToolSpec, UserInputKind};
 use crate::session::{ConversationKey, SessionStore};
+use crate::subagent_cache::SubagentCache;
 use crate::tools::ToolSet;
 use crate::voice::VoiceProviders;
 use crate::workspace::Workspace;
@@ -159,6 +160,12 @@ pub struct ServeState {
     /// no-op (logged), and the ACP digest sweep skips its tick
     /// entirely — a session must still load and serve without one.
     pub(crate) digest_cache: Option<Arc<DigestCache>>,
+    /// Workspace-external cache of resumable subagent child
+    /// conversations (`subagent_cache::SubagentCache`). `None` under the
+    /// same conditions, and with the same degrade-not-abort treatment,
+    /// as `digest_cache`: a resumed subagent falls back to one-shot
+    /// rather than the process failing to start.
+    pub(crate) subagent_cache: Option<Arc<SubagentCache>>,
     /// Terminals the model started and has not cleaned up, per agent
     /// session id.
     ///
@@ -197,6 +204,7 @@ impl ServeState {
         device_auth: Arc<crate::device_auth::DeviceAuth>,
         acp_session_store: Arc<AcpSessionStore>,
         digest_cache: Option<Arc<DigestCache>>,
+        subagent_cache: Option<Arc<SubagentCache>>,
     ) -> Self {
         // Scan once on startup: each MCP session's first-line meta
         // carries `namespace` + `project`, so this reproduces the
@@ -243,6 +251,7 @@ impl ServeState {
             acp_session_store,
             acp_sessions: tokio::sync::Mutex::new(HashSet::new()),
             digest_cache,
+            subagent_cache,
             acp_terminals: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -3584,6 +3593,10 @@ rooms    = []
             Some(tool_result_cache),
         ));
         let digest_cache = Some(DigestCache::open(base.join("digests")).unwrap());
+        let subagent_cache = Some(
+            SubagentCache::open(base.join("subagents"), 8_388_608)
+                .expect("test subagent_cache fixture should open"),
+        );
 
         Arc::new(Self {
             config,
@@ -3615,6 +3628,7 @@ rooms    = []
             acp_session_store,
             acp_sessions: Default::default(),
             digest_cache,
+            subagent_cache,
             acp_terminals: Default::default(),
         })
     }
