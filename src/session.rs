@@ -444,11 +444,24 @@ impl SessionStore {
     /// entry per session, overwritten in place. It used to be appended
     /// to the session's own JSONL, which put a dozen near-identical
     /// restatements of the same afternoon inside a file the retrieve
-    /// indexer walks (#190).
+    /// indexer walks (#190). This read path no longer treats the file as
+    /// canonical: a cache hit is used as-is. Moving the write side off
+    /// the file too is a separate change.
     ///
-    /// A digest line still present in the file is read as a fallback, so
-    /// the upgrade does not blank out the day it lands on. Nothing
-    /// writes those lines any more.
+    /// A digest line still present in the file is read as a fallback for
+    /// a session the cache has nothing for yet, so the upgrade does not
+    /// blank out the day it lands on.
+    ///
+    /// There is deliberately no mtime pre-filter here. One used to skip
+    /// files last touched before `day_start`, on the reasoning that a
+    /// quiet session has no digest today — but that only held while
+    /// writing a digest meant appending to the file, which refreshed its
+    /// mtime. A digest written to the cache leaves the file, and its
+    /// mtime, untouched, so the filter would silently drop a session
+    /// that fell quiet just before the day boundary and got its digest
+    /// just after it. The performance the filter bought is recovered
+    /// instead by reading only the meta line before touching the cache,
+    /// and scanning the rest of the file only on a cache miss.
     pub fn intraday_digests_for_day(
         &self,
         date: NaiveDate,
@@ -458,21 +471,13 @@ impl SessionStore {
         let (day_start, day_end) = day_window(date, boundary_hour);
         let mut out = Vec::new();
         for path in collect_session_files(&self.base_dir, self.kind) {
-            // mtime pre-filter: a file last touched before day_start
-            // belongs to a session that said nothing today, and a
-            // session that said nothing today has no digest for today.
-            if let Ok(meta_fs) = path.metadata()
-                && let Ok(mtime) = meta_fs.modified()
-            {
-                let mtime_utc: DateTime<Utc> = mtime.into();
-                if mtime_utc < day_start {
-                    continue;
-                }
-            }
-            let Some((meta, file_digest)) = load_meta_and_latest_intraday_digest(&path) else {
+            let Some(meta) = load_session_meta(&path) else {
                 continue;
             };
-            let digest = cache.and_then(|c| c.get(&meta.session_id)).or(file_digest);
+            let digest = match cache.and_then(|c| c.get(&meta.session_id)) {
+                Some(d) => Some(d),
+                None => load_latest_intraday_digest(&path),
+            };
             let Some(d) = digest else { continue };
             if d.digest_at >= day_start && d.digest_at < day_end {
                 out.push((meta, d));
@@ -1148,17 +1153,25 @@ fn load_session_file(
     Some((meta, messages, is_closed, latest_summary))
 }
 
-/// Minimal-cost variant of `load_session_file`: returns just the metadata
-/// and the latest `IntradayDigestLine`, skipping message accumulation.
-fn load_meta_and_latest_intraday_digest(
-    path: &Path,
-) -> Option<(SessionMeta, Option<IntradayDigestLine>)> {
+/// Read just the first line of a session file: its `SessionMeta`. Cheap
+/// enough to call for every session before deciding whether a full scan
+/// for a fallback digest is even needed (see `intraday_digests_for_day`).
+fn load_session_meta(path: &Path) -> Option<SessionMeta> {
     let file = fs::File::open(path).ok()?;
     let mut lines = BufReader::new(file).lines();
-
     let first = lines.next()?.ok()?;
     let meta_line: MetaLine = serde_json::from_str(first.trim()).ok()?;
-    let meta = meta_line.meta;
+    Some(meta_line.meta)
+}
+
+/// Scan a session file for its latest `IntradayDigestLine`, skipping
+/// message accumulation. Only worth calling when the digest cache has no
+/// entry for the session — the transition-era fallback in
+/// `intraday_digests_for_day` (#190).
+fn load_latest_intraday_digest(path: &Path) -> Option<IntradayDigestLine> {
+    let file = fs::File::open(path).ok()?;
+    let mut lines = BufReader::new(file).lines();
+    let _ = lines.next()?; // meta line, already consumed by `load_session_meta`
 
     let mut latest: Option<IntradayDigestLine> = None;
     for raw in lines.map_while(Result::ok) {
@@ -1176,7 +1189,7 @@ fn load_meta_and_latest_intraday_digest(
             latest = Some(d);
         }
     }
-    Some((meta, latest))
+    latest
 }
 
 #[cfg(test)]
@@ -1548,5 +1561,35 @@ mod tests {
         let today = local_date_for_timestamp(Local::now(), 4);
         let got = store.intraday_digests_for_day(today, 4, Some(&cache));
         assert_eq!(got[0].1.digest, "fresh");
+    }
+
+    /// A digest lives in the cache now, so the session file is not touched
+    /// when one is written. A room that fell quiet just before the day
+    /// boundary and got its digest just after it has an old file and a
+    /// fresh digest — and must still appear in today's block.
+    #[test]
+    fn a_fresh_cached_digest_survives_an_old_file_mtime() {
+        let (_tmp, store, sid) = store_with_one_session();
+        let path = store.absolute_path_for(&sid).unwrap();
+        let two_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 3600);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = crate::digest_cache::DigestCache::open(cache_dir.path().to_path_buf()).unwrap();
+        cache.put(&sid, "quiet room, late digest", None).unwrap();
+
+        let today = local_date_for_timestamp(Local::now(), 4);
+        let got = store.intraday_digests_for_day(today, 4, Some(&cache));
+        assert_eq!(
+            got.len(),
+            1,
+            "an old file must not hide a fresh cached digest: {got:?}"
+        );
     }
 }
