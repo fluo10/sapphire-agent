@@ -699,6 +699,7 @@ impl AcpSessionStore {
                             return None;
                         }
                         Some(StoredMessage {
+                            id: None,
                             timestamp: e.at,
                             role: role.clone(),
                             parts: text,

@@ -84,6 +84,26 @@ pub struct SessionMeta {
 /// A single stored message: `ChatMessage` + wall-clock timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
+    /// Stable identity for this line, generated at write time.
+    ///
+    /// The compaction checkpoint (`SummaryLine::covers_through`) points
+    /// at one of these. A timestamp would be the obvious cursor and is a
+    /// worse one: coarse system clocks repeat a value across two rapid
+    /// appends, and an NTP step backwards makes timestamps non-monotonic,
+    /// either of which silently drops messages from a replay.
+    ///
+    /// `None` on lines written before this field existed; readers fall
+    /// back to file order there. File order is what orders a session —
+    /// this is an identity, not a sort key, and no reader compares two
+    /// of them.
+    ///
+    /// Deliberately no `parent`. Unlike the ACP store, this format keeps
+    /// one file per session, so file order survives as a reconstruction
+    /// hint — a file written before `parent` existed cannot contain a
+    /// fork, because a fork needs two writers that both record one. See
+    /// decision 3.1 of the design doc.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub id: Option<Uuid>,
     pub timestamp: DateTime<Utc>,
     pub role: Role,
     pub parts: Vec<ContentPart>,
@@ -126,6 +146,7 @@ pub struct ReportMeta {
 impl StoredMessage {
     pub fn from_chat(msg: &ChatMessage) -> Self {
         Self {
+            id: Some(Uuid::now_v7()),
             timestamp: Utc::now(),
             role: msg.role.clone(),
             parts: msg.parts.clone(),
@@ -648,6 +669,7 @@ impl SessionStore {
         meta: ReportMeta,
     ) -> anyhow::Result<()> {
         let stored = StoredMessage {
+            id: Some(Uuid::now_v7()),
             timestamp: Utc::now(),
             role: Role::User,
             parts: vec![ContentPart::Text(rendered_text.to_string())],
@@ -1172,6 +1194,34 @@ fn load_latest_intraday_digest(path: &Path) -> Option<IntradayDigestLine> {
 mod tests {
     use super::*;
 
+    /// Every newly written message carries an id. The compaction
+    /// checkpoint points at one, so a message without one cannot be a
+    /// cursor.
+    #[test]
+    fn a_new_stored_message_gets_an_id() {
+        let stored = StoredMessage::from_chat(&ChatMessage::user("hi"));
+        assert!(stored.id.is_some(), "from_chat must stamp an id");
+    }
+
+    /// Distinct messages get distinct ids. The checkpoint looks its
+    /// cursor up by position, so what it needs is uniqueness, not order —
+    /// file order is what orders a session, here and in the future
+    /// `parent` migration (decision 3.1).
+    #[test]
+    fn each_message_gets_its_own_id() {
+        let a = StoredMessage::from_chat(&ChatMessage::user("first"));
+        let b = StoredMessage::from_chat(&ChatMessage::user("second"));
+        assert_ne!(a.id.unwrap(), b.id.unwrap());
+    }
+
+    /// Legacy JSONL predates the field and must still load.
+    #[test]
+    fn a_stored_message_without_an_id_deserializes_as_none() {
+        let legacy = r#"{"timestamp":"2026-04-08T11:30:22.372570890Z","role":"user","parts":[{"Text":"hello"}]}"#;
+        let msg: StoredMessage = serde_json::from_str(legacy).expect("legacy JSONL parses");
+        assert!(msg.id.is_none());
+    }
+
     #[test]
     fn scrub_returns_none_when_no_images() {
         let msg = ChatMessage::user("plain text");
@@ -1261,6 +1311,7 @@ mod tests {
     #[test]
     fn stored_message_omits_none_fields_on_serialize() {
         let msg = StoredMessage {
+            id: None,
             timestamp: Utc::now(),
             role: Role::Assistant,
             parts: vec![ContentPart::Text("hi".to_string())],
@@ -1286,6 +1337,7 @@ mod tests {
     #[test]
     fn stored_message_text_input_kind_round_trip() {
         let original = StoredMessage {
+            id: None,
             timestamp: Utc::now(),
             role: Role::User,
             parts: vec![ContentPart::Text("hi".to_string())],
@@ -1304,6 +1356,7 @@ mod tests {
     #[test]
     fn stored_message_voice_input_kind_round_trip() {
         let original = StoredMessage {
+            id: None,
             timestamp: Utc::now(),
             role: Role::User,
             parts: vec![ContentPart::Text("hello there".to_string())],
