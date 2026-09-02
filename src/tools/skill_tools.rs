@@ -373,12 +373,36 @@ const LOCAL_TIMEOUT: Duration = CLIENT_TIMEOUT;
 /// network the editor's machine is on, not this crate's own latency.
 const GIT_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// A finished (not timed-out, not failing-exit) [`ClientRun`], with the
+/// command's own output kept separate from any release-terminal
+/// warning.
+///
+/// Kept apart deliberately: a caller that tests `output` for meaning —
+/// `skill_uninstall`'s dirty-checkout check, `skill_install`'s
+/// existence probe — must see exactly the command's own text, not that
+/// text with a release warning appended after it. A clean checkout
+/// whose *unrelated* terminal-release call happened to fail must not
+/// read as dirty just because the warning string was folded into the
+/// same value the emptiness check runs against — which is what this
+/// type replaced. `warning` is for callers building a message to show
+/// the model, appended after the meaningful part of that message, not
+/// before it.
+struct FinishedRun {
+    output: String,
+    warning: Option<String>,
+}
+
 /// Interpret a finished [`ClientRun`]: bail on a timeout or a failing
-/// exit status, otherwise return the command's output (with any
-/// release warning appended). `status` is `None` exactly when the
+/// exit status, otherwise return the command's output and any release
+/// warning as a [`FinishedRun`]. `status` is `None` exactly when the
 /// command timed out — checking that, rather than trusting whatever
 /// output happened to arrive, is what Task 3 got wrong once already.
-fn finish_run(run: ClientRun, context: &str, timeout: Duration) -> Result<String> {
+///
+/// A failure's message includes the command's own output (trimmed)
+/// alongside the exit status: an exit code alone ("failed: [exit code:
+/// 128]") tells the model nothing about *why*, and every caller in this
+/// file wants that reason surfaced, not just the number.
+fn finish_run(run: ClientRun, context: &str, timeout: Duration) -> Result<FinishedRun> {
     if run.timed_out_handle.is_some() {
         anyhow::bail!(
             "timed out {context} on the editor's machine after {}s",
@@ -390,34 +414,71 @@ fn finish_run(run: ClientRun, context: &str, timeout: Duration) -> Result<String
         .expect("run_client_command always sets `status` when it does not time out");
     if SkillTool::command_failed(&status) {
         anyhow::bail!(
-            "{context} failed on the editor's machine: {}",
-            format_exit_status(&status).trim()
+            "{context} failed on the editor's machine: {}\n{}",
+            format_exit_status(&status).trim(),
+            run.output.output.trim()
         );
     }
-    let mut out = run.output.output;
-    if let Some(warning) = run.release_warning {
-        out.push('\n');
-        out.push_str(&warning);
+    Ok(FinishedRun {
+        output: run.output.output,
+        warning: run.release_warning,
+    })
+}
+
+/// Append `warning` (if any) to `output` for display to the model —
+/// the one place a [`FinishedRun`]'s two fields are recombined, kept
+/// separate from every call site that instead needs `output` alone to
+/// test its meaning. See [`FinishedRun`]'s doc.
+fn with_warning(mut output: String, warning: Option<String>) -> String {
+    if let Some(w) = warning {
+        output.push('\n');
+        output.push_str(&w);
     }
-    Ok(out)
+    output
 }
 
 /// Run `git <args>` on the editor's machine with credential prompting
-/// disabled.
+/// disabled and its choice of transport pinned to `https`.
 ///
 /// `AcpClient::create_terminal` has no environment parameter (confirmed
-/// at `src/tools/acp_client.rs:91`), so `GIT_TERMINAL_PROMPT=0` is
-/// supplied by running `env` as the command instead of `git` directly.
-/// Without it, a repository needing credentials prompts in a terminal
-/// the model cannot answer, and the one-shot timeout becomes the only
-/// thing that ends the call — a stall rather than a refusal.
+/// at `src/tools/acp_client.rs:91`), so both env vars below are
+/// supplied by running `env` as the command instead of `git` directly:
+///
+/// - `GIT_TERMINAL_PROMPT=0` — without it, a repository needing
+///   credentials prompts in a terminal the model cannot answer, and the
+///   one-shot timeout becomes the only thing that ends the call: a
+///   stall rather than a refusal.
+/// - `GIT_ALLOW_PROTOCOL=https` — the one setting that closes every
+///   config-based route to a non-https transport at once, rather than
+///   the one `update_one`'s own remote check happens to string-match.
+///   `git pull` with no repository argument does not necessarily
+///   consult `remote.origin.url` at all: it resolves from
+///   `branch.<current>.remote`, falling back to `origin` only when that
+///   is unset — so a `.git/config` doctored with `[branch "main"]
+///   remote = evil` and an `ext::` URL on `evil`, leaving
+///   `remote.origin.url` honest, would pass that check and still reach
+///   `git pull`. `url.<base>.insteadOf` is a second such path:
+///   `remote get-url` reports the URL as stored, unrewritten, while the
+///   rewrite happens later, at transport time. `GIT_ALLOW_PROTOCOL` is
+///   enforced by git itself at the point it actually opens a transport,
+///   so it catches both regardless of which config field carried the
+///   bad URL.
+///
+/// **What this does not close:** `git pull` runs the checkout's own
+/// `.git/hooks/post-merge` if the pull changed anything, and no URL or
+/// protocol guard can prevent that. This is the person's own machine
+/// and their own checkout, so a hook already sitting in it is inherent
+/// to running `git pull` there at all — not a hole this tool opens —
+/// but it is worth writing down rather than leaving for the next
+/// reader to rediscover.
 async fn run_git(
     client: &Arc<dyn AcpClient>,
     args: &[&str],
     timeout: Duration,
 ) -> Result<ClientRun> {
-    let mut full: Vec<String> = Vec::with_capacity(args.len() + 2);
+    let mut full: Vec<String> = Vec::with_capacity(args.len() + 3);
     full.push("GIT_TERMINAL_PROMPT=0".to_string());
+    full.push("GIT_ALLOW_PROTOCOL=https".to_string());
     full.push("git".to_string());
     full.extend(args.iter().map(|s| s.to_string()));
     run_client_command(client, "env", &full, None, timeout).await
@@ -447,8 +508,19 @@ async fn resolve_or_create_dir(client: &Arc<dyn AcpClient>) -> Result<String> {
         LOCAL_TIMEOUT,
     )
     .await?;
-    let stdout = finish_run(run, "resolving the skills directory", LOCAL_TIMEOUT)?;
-    parse_resolved_dir(&stdout)
+    let stdout = finish_run(run, "resolving the skills directory", LOCAL_TIMEOUT)?.output;
+    let dir = parse_resolved_dir(&stdout)?;
+    // A client answering a bare `SKILLS_DIR\t` line (no path after the
+    // tab) parses successfully — `parse_resolved_dir` only requires the
+    // line to exist — and would otherwise make every caller's `<dir>/
+    // <name>` a path rooted at `/`. Deliberately not a leading-`/`
+    // check: `$APPDATA`-derived paths are legitimately relative-looking
+    // on the wire (`C:\Users\...\Roaming/sapphire-agent/skills`) and
+    // must not be rejected here.
+    if dir.is_empty() {
+        anyhow::bail!("the editor's machine reported an empty skills directory");
+    }
+    Ok(dir)
 }
 
 /// The distinct top-level directory names an index's skills live under —
@@ -566,7 +638,8 @@ impl Tool for SkillInstallTool {
             probe,
             "checking whether the destination exists",
             LOCAL_TIMEOUT,
-        )?;
+        )?
+        .output;
         if probe_out.contains("EXISTS") {
             anyhow::bail!(
                 "'{name}' is already installed at {dest}. Use skill_update to pull its \
@@ -582,13 +655,16 @@ impl Tool for SkillInstallTool {
             GIT_TIMEOUT,
         )
         .await?;
-        let output = finish_run(clone, &format!("cloning {url}"), GIT_TIMEOUT)?;
+        let result = finish_run(clone, &format!("cloning {url}"), GIT_TIMEOUT)?;
 
         if let Some(key) = current_session_key() {
             self.skill_tool.invalidate_cache(&key);
         }
 
-        Ok(format!("Installed '{name}' to {dest}.\n{output}"))
+        Ok(with_warning(
+            format!("Installed '{name}' to {dest}.\n{}", result.output),
+            result.warning,
+        ))
     }
 }
 
@@ -611,11 +687,23 @@ impl SkillUpdateTool {
         }
     }
 
-    /// Update one entry: re-check its stored remote before pulling —
-    /// `skill_install` only ever writes an `https` remote, but
-    /// `.git/config` is an ordinary file on the person's machine, and
-    /// `git pull` against a `.git/config` doctored to hold an `ext::`
-    /// remote executes a command exactly as `git clone` would.
+    /// Update one entry: re-check its stored `origin` remote before
+    /// pulling — `skill_install` only ever writes an `https` remote,
+    /// but `.git/config` is an ordinary file on the person's machine.
+    ///
+    /// This is a cheap, specific sanity check, not what actually makes
+    /// a doctored `.git/config` safe to pull from: `git pull` with no
+    /// repository argument does not necessarily consult
+    /// `remote.origin.url` at all (see `run_git`'s doc for
+    /// `branch.<current>.remote` and `url.<base>.insteadOf`), so a
+    /// config doctored through either of those would pass this check
+    /// and still reach `git pull` with a bad transport. What actually
+    /// closes that is `GIT_ALLOW_PROTOCOL=https`, set on every `git`
+    /// invocation by `run_git` itself. What this check adds on top: a
+    /// clear, specific refusal — naming the bad remote — for the common
+    /// case where `origin` is what got doctored, rather than leaving
+    /// that case to surface however `GIT_ALLOW_PROTOCOL` happens to
+    /// fail the subsequent `git pull`.
     async fn update_one(client: &Arc<dyn AcpClient>, dir: &str, name: &str) -> Result<String> {
         validate_entry_name(name)?;
         let dest = format!("{dir}/{name}");
@@ -630,11 +718,13 @@ impl SkillUpdateTool {
             remote_run,
             &format!("checking {name}'s remote"),
             LOCAL_TIMEOUT,
-        )?;
+        )?
+        .output;
         validate_source_url(remote.trim())?;
 
         let pull_run = run_git(client, &["-C", &dest, "pull", "--ff-only"], GIT_TIMEOUT).await?;
-        finish_run(pull_run, &format!("updating {name}"), GIT_TIMEOUT)
+        let result = finish_run(pull_run, &format!("updating {name}"), GIT_TIMEOUT)?;
+        Ok(with_warning(result.output, result.warning))
     }
 }
 
@@ -669,19 +759,42 @@ impl Tool for SkillUpdateTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // Validated before `current_acp_client()` is even consulted, so
+        // this tool shares the "refuse before touching the client"
+        // property `skill_install`/`skill_uninstall` already have. A
+        // present-but-not-a-string `name` (`{"name": 123}`) must be
+        // rejected outright rather than falling through `.as_str()`
+        // returning `None` into the "no name" branch, which would
+        // silently turn a malformed single-entry update into "update
+        // everything installed" — the opposite of what was asked.
+        // `null` is treated the same as an absent key: both mean
+        // "omitted".
+        let name = match input.get("name").filter(|v| !v.is_null()) {
+            Some(v) => {
+                let name = v.as_str().filter(|s| !s.is_empty()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "'name' must be a non-empty string, or omitted to update every \
+                         installed source"
+                    )
+                })?;
+                validate_entry_name(name)?;
+                Some(name.to_string())
+            }
+            None => None,
+        };
+
         let client = current_acp_client().ok_or_else(no_editor_error)?;
 
-        match input.get("name").and_then(|v| v.as_str()) {
-            Some(name) if !name.is_empty() => {
-                validate_entry_name(name)?;
+        match name {
+            Some(name) => {
                 let dir = resolve_or_create_dir(&client).await?;
-                let result = Self::update_one(&client, &dir, name).await?;
+                let result = Self::update_one(&client, &dir, &name).await?;
                 if let Some(key) = current_session_key() {
                     self.skill_tool.invalidate_cache(&key);
                 }
                 Ok(format!("Updated '{name}':\n{result}"))
             }
-            _ => {
+            None => {
                 let session_key = current_session_key();
                 let index = self
                     .skill_tool
@@ -719,6 +832,17 @@ impl Tool for SkillUpdateTool {
 // ---------------------------------------------------------------------------
 
 /// Remove an installed skill source from the editor's machine.
+///
+/// There is no `force` override. A dirty checkout — uncommitted local
+/// changes — is always refused, full stop; the person resolves it
+/// themselves on their own machine, where their own uncommitted work
+/// lives and `git stash`, a commit, or their own `rm -rf` are all one
+/// command away. `ToolKind::Delete` is `Allow`ed rather than asked
+/// about under `Origin::Acp(AcceptEdits)` (unlike `Execute`, which is
+/// asked), so a model-settable `force` boolean here would have let the
+/// model discard someone's uncommitted edits with nobody asked — and
+/// uncommitted edits to a skill are exactly what a person would be
+/// angriest to lose without being consulted.
 pub struct SkillUninstallTool {
     spec: ToolSpec,
     skill_tool: Arc<SkillTool>,
@@ -737,7 +861,9 @@ fn build_uninstall_spec() -> ToolSpec {
     ToolSpec {
         name: "skill_uninstall".into(),
         description: "Remove a skill source installed with skill_install from the editor's \
-            machine. Refuses if the checkout has local changes unless `force` is set."
+            machine. Always refuses if the checkout has local (uncommitted) changes — \
+            there is no override. Tell the person to commit, stash, or remove it \
+            themselves on their own machine if that happens."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -745,10 +871,6 @@ fn build_uninstall_spec() -> ToolSpec {
                 "name": {
                     "type": "string",
                     "description": "The installed source to remove."
-                },
-                "force": {
-                    "type": "boolean",
-                    "description": "Remove even if the checkout has local changes. Default: false."
                 }
             },
             "required": ["name"]
@@ -776,18 +898,50 @@ impl Tool for SkillUninstallTool {
         // below to the resolver's own output — never to anything a
         // model could have supplied directly — so this cannot address
         // anything that is not a direct child of the skills directory.
+        // Validated before `current_acp_client()`, so a bad name is
+        // refused with no process started, the same as `skill_install`.
         validate_entry_name(name)?;
-        let force = input
-            .get("force")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
 
         let client = current_acp_client().ok_or_else(no_editor_error)?;
 
         let dir = resolve_or_create_dir(&client).await?;
         let dest = format!("{dir}/{name}");
 
-        if !force {
+        // One probe, always exiting 0 (each branch of the `if` prints
+        // and nothing after it can fail), answers two questions ACP has
+        // no direct call for: does `<dest>` exist at all, and — if so —
+        // is it a git checkout `git status` can even be asked about. A
+        // hand-written skill (`<dir>/<name>/SKILL.md` with no `.git`)
+        // is a legitimate, installable entry that is simply not
+        // version-controlled; treating `git status`'s "not a git
+        // repository" failure as this tool's own failure would refuse
+        // to remove it at all. Text-matching that failure's stderr was
+        // the alternative and was rejected: it is locale-dependent, and
+        // this probe answers both questions in one call without relying
+        // on git's wording for either.
+        let probe = run_client_command(
+            &client,
+            "sh",
+            &[
+                "-c".to_string(),
+                format!(
+                    "if [ ! -d {d} ]; then echo ABSENT; \
+                     elif [ -d {d}/.git ]; then echo GITREPO; \
+                     else echo PLAIN; fi",
+                    d = shell_quote(&dest)
+                ),
+            ],
+            None,
+            LOCAL_TIMEOUT,
+        )
+        .await?;
+        let probe_out =
+            finish_run(probe, "checking whether the entry exists", LOCAL_TIMEOUT)?.output;
+
+        if probe_out.contains("ABSENT") {
+            anyhow::bail!("'{name}' is not installed at {dest}. Nothing to uninstall.");
+        }
+        if probe_out.contains("GITREPO") {
             let status_run = run_git(
                 &client,
                 &["-C", &dest, "status", "--porcelain"],
@@ -798,30 +952,42 @@ impl Tool for SkillUninstallTool {
                 status_run,
                 &format!("checking {name} for local changes"),
                 LOCAL_TIMEOUT,
-            )?;
+            )?
+            .output;
             if !status_out.trim().is_empty() {
                 anyhow::bail!(
-                    "'{name}' has local changes and was not removed:\n{status_out}\n\
-                     Pass force: true to remove it anyway."
+                    "'{name}' has local changes and was not removed:\n{}\n\
+                     Resolve them on the editor's machine — commit, stash, or remove the \
+                     directory yourself — then try again. There is no override.",
+                    status_out.trim()
                 );
             }
         }
+        // `PLAIN`: a hand-written entry with no `.git` directory at
+        // all — not version-controlled, so there is no "local changes"
+        // question to ask and nothing blocks removal.
 
+        // `--` so a name that were somehow still just a `-`-prefixed
+        // string (validate_entry_name already refuses one) could not be
+        // reparsed as an option, matching the clone's own `--`.
         let rm = run_client_command(
             &client,
             "rm",
-            &["-rf".to_string(), dest.clone()],
+            &["-rf".to_string(), "--".to_string(), dest.clone()],
             None,
             LOCAL_TIMEOUT,
         )
         .await?;
-        finish_run(rm, &format!("removing {name}"), LOCAL_TIMEOUT)?;
+        let result = finish_run(rm, &format!("removing {name}"), LOCAL_TIMEOUT)?;
 
         if let Some(key) = current_session_key() {
             self.skill_tool.invalidate_cache(&key);
         }
 
-        Ok(format!("Uninstalled '{name}' from {dest}."))
+        Ok(with_warning(
+            format!("Uninstalled '{name}' from {dest}."),
+            result.warning,
+        ))
     }
 }
 
@@ -1196,29 +1362,36 @@ mod tests {
         scope_acp_client(client, async { tool.execute(&json!({})).await }).await
     }
 
-    /// A client that resolves the directory, then (unless `force`)
-    /// answers `git status --porcelain` with `status`, then a
+    /// A client that resolves the directory, answers the existence
+    /// probe as an existing git checkout, then answers `git status
+    /// --porcelain` with `status`, then (if `status` is clean) a
     /// successful `rm -rf`.
-    async fn uninstall_where_status(status: &str, force: bool) -> Result<String> {
+    async fn uninstall_where_status(status: &str) -> Result<String> {
         let client = Arc::new(FakeClient::default());
         client.queue_terminal_stdout(RESOLVED_DIR_STDOUT);
-        if !force {
-            client.queue_terminal_stdout(status);
-        }
+        client.queue_terminal_stdout("GITREPO\n");
+        client.queue_terminal_stdout(status);
         client.queue_terminal_stdout("");
         let tool = SkillUninstallTool::new(Arc::new(SkillTool::new()));
         scope_acp_client(client, async {
-            tool.execute(&json!({"name": "brainstorming", "force": force}))
-                .await
+            tool.execute(&json!({"name": "brainstorming"})).await
         })
         .await
     }
 
     /// No client scoped at all: a `name` that `validate_entry_name`
-    /// rejects must fail before this tool ever looks for one.
-    async fn uninstall(name: &str) -> Result<String> {
+    /// rejects must fail before this tool ever looks for one — and
+    /// `terminal_count() == 0` proves that, rather than just an `Err`
+    /// that could equally come from "no editor is connected" (which a
+    /// valid name would also see here, since no client is scoped).
+    async fn uninstall(name: &str) -> (Result<String>, usize) {
+        let client = Arc::new(FakeClient::default());
         let tool = SkillUninstallTool::new(Arc::new(SkillTool::new()));
-        tool.execute(&json!({"name": name})).await
+        let result = scope_acp_client(Arc::clone(&client) as Arc<dyn AcpClient>, async {
+            tool.execute(&json!({"name": name})).await
+        })
+        .await;
+        (result, client.terminal_count())
     }
 
     #[tokio::test]
@@ -1266,29 +1439,268 @@ mod tests {
         ])
         .await
         .unwrap();
-        assert!(out.contains("a"), "{out}");
-        assert!(out.contains("b"), "{out}");
-        assert!(out.contains("c"), "{out}");
+        // Substrings that pin success vs. failure per entry, not just
+        // the entry's name — `out.contains("b")` alone would pass just
+        // as happily whether "b" succeeded or failed, and would not
+        // catch a regression that reported the wrong outcome for it.
+        assert!(out.contains("a: Already up to date."), "{out}");
+        assert!(out.contains("b: failed"), "{out}");
+        assert!(out.contains("c: Updating 1234..5678"), "{out}");
     }
 
+    /// No `force` override exists: a dirty checkout is always refused.
+    /// The person resolves it themselves — `git stash`, a commit, or
+    /// removing it by hand are all one command away on their own
+    /// machine, where their uncommitted work actually is.
     #[tokio::test]
-    async fn uninstall_refuses_a_checkout_with_local_changes_unless_forced() {
-        let err = uninstall_where_status("M skills/brainstorming/SKILL.md", false)
+    async fn uninstall_refuses_a_checkout_with_local_changes() {
+        let err = uninstall_where_status("M skills/brainstorming/SKILL.md")
             .await
             .unwrap_err();
         assert!(err.to_string().contains("SKILL.md"), "got: {err}");
-        assert!(
-            uninstall_where_status("M skills/brainstorming/SKILL.md", true)
-                .await
-                .is_ok()
-        );
     }
 
     #[tokio::test]
     async fn uninstall_will_not_address_anything_outside_the_skills_directory() {
+        // Asserts on `terminal_count() == 0`, not just on an `Err` —
+        // removing the `validate_entry_name` call at the top of
+        // `execute` would still return an `Err` here (there is no
+        // scoped client, so it would be "no editor is connected"
+        // instead), and a test that only checked `is_err()` would not
+        // catch that the guard itself was gone.
         for bad in ["..", "../../etc", "/etc", "a/b", "con"] {
-            assert!(uninstall(bad).await.is_err(), "accepted {bad}");
+            let (result, terminals) = uninstall(bad).await;
+            assert!(result.is_err(), "accepted {bad}");
+            assert_eq!(terminals, 0, "{bad} started a process");
         }
+    }
+
+    /// A malformed single-entry update (`name` present but not a
+    /// string) must be rejected outright, not silently reinterpreted as
+    /// "no name" and turned into an update-everything call — the
+    /// opposite of what was asked. Also proves the client is never
+    /// touched, matching the other two tools' "refuse before touching
+    /// the client" property.
+    #[tokio::test]
+    async fn update_rejects_a_present_but_non_string_name() {
+        let client = fake_client_returning("");
+        let tool = SkillUpdateTool::new(Arc::new(SkillTool::new()));
+        let err = scope_acp_client(Arc::clone(&client) as Arc<dyn AcpClient>, async {
+            tool.execute(&json!({"name": 123})).await
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("string"), "got: {err}");
+        assert_eq!(
+            client.terminal_count(),
+            0,
+            "a malformed name started a process"
+        );
+    }
+
+    /// `null` is treated the same as an absent `name`: an "update
+    /// everything" call, not a rejection.
+    #[tokio::test]
+    async fn update_treats_a_null_name_as_omitted() {
+        let out = update_all_where(&[("a", Ok("Already up to date."))])
+            .await
+            .unwrap();
+        assert!(out.contains("a: Already up to date."), "{out}");
+    }
+
+    /// `parse_resolved_dir` only requires the `SKILLS_DIR\t` line to
+    /// exist, not that anything follows the tab — a client answering a
+    /// bare line like that would otherwise make every `<dir>/<name>`
+    /// path in this file resolve to `/<name>`, at the filesystem root.
+    #[tokio::test]
+    async fn resolve_or_create_dir_refuses_an_empty_resolved_directory() {
+        let client = Arc::new(FakeClient::default());
+        let dyn_client: Arc<dyn AcpClient> = client.clone();
+        client.queue_terminal_stdout("SKILLS_DIR\t\n");
+        let err = resolve_or_create_dir(&dyn_client).await.unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    /// `Vec<&str>` -> `Vec<String>`, for comparing against
+    /// `FakeClient.creates`' recorded argument vectors.
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Pins the full command lines `skill_install` constructs — not
+    /// just that some `Err`/`Ok` came back. A refactor that dropped the
+    /// clone's `--` separator, or the `env` prefix that carries
+    /// `GIT_TERMINAL_PROMPT=0`/`GIT_ALLOW_PROTOCOL=https`, would leave
+    /// every other test in this file green; this is the one that would
+    /// catch it.
+    #[tokio::test]
+    async fn install_pins_the_exact_argument_vectors() {
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout(RESOLVED_DIR_STDOUT);
+        client.queue_terminal_stdout("ABSENT\n");
+        client.queue_terminal_stdout("Cloning into 'superpowers'...\ndone.");
+        let tool = SkillInstallTool::new(Arc::new(SkillTool::new()));
+        scope_acp_client(Arc::clone(&client) as Arc<dyn AcpClient>, async {
+            tool.execute(&json!({"url": "https://github.com/obra/superpowers"}))
+                .await
+        })
+        .await
+        .unwrap();
+
+        let creates = client.creates.lock().unwrap();
+        assert_eq!(creates.len(), 3, "{creates:?}");
+        assert_eq!(creates[0].0, "sh", "resolving the directory");
+        assert_eq!(creates[1].0, "sh", "the existence probe");
+        assert_eq!(
+            creates[2].0, "env",
+            "the clone, run through env for GIT_TERMINAL_PROMPT"
+        );
+        assert_eq!(
+            creates[2].1,
+            strs(&[
+                "GIT_TERMINAL_PROMPT=0",
+                "GIT_ALLOW_PROTOCOL=https",
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--",
+                "https://github.com/obra/superpowers",
+                "/home/user/.local/share/sapphire-agent/skills/superpowers",
+            ])
+        );
+    }
+
+    /// Same property as `install_pins_the_exact_argument_vectors`, for
+    /// `skill_update`'s two `git` calls.
+    #[tokio::test]
+    async fn update_pins_the_exact_argument_vectors() {
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout(RESOLVED_DIR_STDOUT);
+        client.queue_terminal_stdout("https://github.com/obra/superpowers\n");
+        client.queue_terminal_stdout("Already up to date.");
+        let tool = SkillUpdateTool::new(Arc::new(SkillTool::new()));
+        scope_acp_client(Arc::clone(&client) as Arc<dyn AcpClient>, async {
+            tool.execute(&json!({"name": "superpowers"})).await
+        })
+        .await
+        .unwrap();
+
+        let creates = client.creates.lock().unwrap();
+        assert_eq!(creates.len(), 3, "{creates:?}");
+        assert_eq!(
+            creates[1].1,
+            strs(&[
+                "GIT_TERMINAL_PROMPT=0",
+                "GIT_ALLOW_PROTOCOL=https",
+                "git",
+                "-C",
+                "/home/user/.local/share/sapphire-agent/skills/superpowers",
+                "remote",
+                "get-url",
+                "origin",
+            ]),
+            "the remote check"
+        );
+        assert_eq!(
+            creates[2].1,
+            strs(&[
+                "GIT_TERMINAL_PROMPT=0",
+                "GIT_ALLOW_PROTOCOL=https",
+                "git",
+                "-C",
+                "/home/user/.local/share/sapphire-agent/skills/superpowers",
+                "pull",
+                "--ff-only",
+            ]),
+            "the pull"
+        );
+    }
+
+    /// Same property again, for `skill_uninstall`'s probe, status check
+    /// and `rm -rf --`.
+    #[tokio::test]
+    async fn uninstall_pins_the_exact_argument_vectors() {
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout(RESOLVED_DIR_STDOUT);
+        client.queue_terminal_stdout("GITREPO\n");
+        client.queue_terminal_stdout("");
+        client.queue_terminal_stdout("");
+        let tool = SkillUninstallTool::new(Arc::new(SkillTool::new()));
+        scope_acp_client(Arc::clone(&client) as Arc<dyn AcpClient>, async {
+            tool.execute(&json!({"name": "superpowers"})).await
+        })
+        .await
+        .unwrap();
+
+        let creates = client.creates.lock().unwrap();
+        assert_eq!(creates.len(), 4, "{creates:?}");
+        assert_eq!(
+            creates[2].1,
+            strs(&[
+                "GIT_TERMINAL_PROMPT=0",
+                "GIT_ALLOW_PROTOCOL=https",
+                "git",
+                "-C",
+                "/home/user/.local/share/sapphire-agent/skills/superpowers",
+                "status",
+                "--porcelain",
+            ]),
+            "the dirty check"
+        );
+        assert_eq!(creates[3].0, "rm");
+        assert_eq!(
+            creates[3].1,
+            strs(&[
+                "-rf",
+                "--",
+                "/home/user/.local/share/sapphire-agent/skills/superpowers",
+            ]),
+            "the removal"
+        );
+    }
+
+    /// A hand-written entry (`<dir>/<name>/SKILL.md`, no `.git`) is not
+    /// a git checkout at all, so there is no "local changes" question
+    /// to ask — `git status` is never even invoked for it, and removal
+    /// proceeds straight from the probe.
+    #[tokio::test]
+    async fn uninstall_removes_a_non_git_entry_without_a_status_check() {
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout(RESOLVED_DIR_STDOUT);
+        client.queue_terminal_stdout("PLAIN\n");
+        client.queue_terminal_stdout("");
+        let tool = SkillUninstallTool::new(Arc::new(SkillTool::new()));
+        scope_acp_client(Arc::clone(&client) as Arc<dyn AcpClient>, async {
+            tool.execute(&json!({"name": "hand-written"})).await
+        })
+        .await
+        .unwrap();
+
+        let creates = client.creates.lock().unwrap();
+        assert_eq!(creates.len(), 3, "{creates:?}");
+        assert_eq!(
+            creates[2].0, "rm",
+            "removal follows straight from the probe"
+        );
+    }
+
+    /// An entry that does not exist at all gets a clear "not installed"
+    /// refusal, not whatever `git status` on a nonexistent directory
+    /// happens to print.
+    #[tokio::test]
+    async fn uninstall_reports_a_missing_entry_by_name() {
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout(RESOLVED_DIR_STDOUT);
+        client.queue_terminal_stdout("ABSENT\n");
+        let tool = SkillUninstallTool::new(Arc::new(SkillTool::new()));
+        let err = scope_acp_client(Arc::clone(&client) as Arc<dyn AcpClient>, async {
+            tool.execute(&json!({"name": "nope"})).await
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not installed"), "got: {err}");
+        assert_eq!(client.terminal_count(), 2, "must not attempt rm -rf");
     }
 
     /// A `Provider` that is never actually called — it only exists to
