@@ -64,7 +64,7 @@ is the contract superpowers' own non-Claude manifests ask for. Updating becomes
 |---|---|
 | Where does the checkout live? | **Client side.** The SDD scripts (`review-package`, `task-brief`, `sdd-workspace`) run `git` against the repository under review, and `find-polluter.sh` runs its test suite. They must execute where the repository is, which is the editor's machine. |
 | How does the agent find it? | **A convention resolved on the client**, with a client-side environment override. The server stores no path: it serves clients on several machines and operating systems, so a path in its config is right for at most one of them. |
-| How does anything get into it? | **`skill_install` / `skill_uninstall`.** A `data_dir` is managed by applications, not by hand, so the agent populates it on request. Sources are restricted to `https://` and every install is a permissioned action. |
+| How does anything get into it? | **`skill_install` / `skill_update` / `skill_uninstall`.** A `data_dir` is managed by applications, not by hand, so the agent populates it on request. Sources are restricted to `https://` and every install or update is a permissioned action. |
 | Who may see skills? | **Per memory namespace.** A development namespace opts in; the everyday one does not. This avoids writing "development means ACP" into the code — an overstatement made once already in the subagents spec and corrected during review. |
 | Scope of this spec | **Skills, plus subagent resume.** SDD's fix rounds 1-3 resume a specific implementer; without that the loop silently degrades to a fresh implementer every round. |
 | Where do resumed children live? | **A cache**, alongside `digest_cache` and `tool_result_cache`. |
@@ -316,7 +316,9 @@ by asserting on Rust that never evaluates it.
 Install and uninstall are mostly guard code, and the guards are what get tested
 directly: every rejected URL form from the table above; a derived destination
 name for ordinary and awkward URLs (trailing slash, `.git` suffix, a repo named
-`con`); a name containing a separator or `..` refused before any join; uninstall
+`con`); a name containing a separator or `..` refused before any join; install
+refusing a URL that is already present; update rejecting a non-`https` stored
+remote, and continuing past one failed entry when no name was given; uninstall
 refused on a dirty checkout and permitted under `force`; and the index finding
 skills through both accepted layouts, including one of each side by side.
 
