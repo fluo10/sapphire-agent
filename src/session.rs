@@ -437,20 +437,30 @@ impl SessionStore {
     }
 
     /// Walk every session file under `sessions_dir` and return the latest
-    /// `IntradayDigestLine` per session whose `digest_at` falls inside the
-    /// local-time `date` window (under `boundary_hour`), paired with the
-    /// session's metadata. Used to assemble the cross-session "today
-    /// digest" injected into the system prompt of newly opened rooms.
+    /// intra-day digest per session whose `digest_at` falls inside the
+    /// local-time `date` window, paired with the session's metadata.
+    ///
+    /// The digest text comes from `cache` — `<cache_dir>/digests/`, one
+    /// entry per session, overwritten in place. It used to be appended
+    /// to the session's own JSONL, which put a dozen near-identical
+    /// restatements of the same afternoon inside a file the retrieve
+    /// indexer walks (#190).
+    ///
+    /// A digest line still present in the file is read as a fallback, so
+    /// the upgrade does not blank out the day it lands on. Nothing
+    /// writes those lines any more.
     pub fn intraday_digests_for_day(
         &self,
         date: NaiveDate,
         boundary_hour: u8,
+        cache: Option<&crate::digest_cache::DigestCache>,
     ) -> Vec<(SessionMeta, IntradayDigestLine)> {
         let (day_start, day_end) = day_window(date, boundary_hour);
         let mut out = Vec::new();
         for path in collect_session_files(&self.base_dir, self.kind) {
-            // mtime pre-filter: a file last touched before day_start can't
-            // possibly carry a digest in this window.
+            // mtime pre-filter: a file last touched before day_start
+            // belongs to a session that said nothing today, and a
+            // session that said nothing today has no digest for today.
             if let Ok(meta_fs) = path.metadata()
                 && let Ok(mtime) = meta_fs.modified()
             {
@@ -459,9 +469,10 @@ impl SessionStore {
                     continue;
                 }
             }
-            let Some((meta, digest)) = load_meta_and_latest_intraday_digest(&path) else {
+            let Some((meta, file_digest)) = load_meta_and_latest_intraday_digest(&path) else {
                 continue;
             };
+            let digest = cache.and_then(|c| c.get(&meta.session_id)).or(file_digest);
             let Some(d) = digest else { continue };
             if d.digest_at >= day_start && d.digest_at < day_end {
                 out.push((meta, d));
@@ -1459,5 +1470,83 @@ mod tests {
             stale_id, fresh,
             "yesterday's session must not be picked up; daily rotation depends on it"
         );
+    }
+
+    // ── intra-day digest がキャッシュから引かれる (#190) ──────────────────
+
+    fn store_with_one_session() -> (tempfile::TempDir, SessionStore, String) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf(), "channel");
+        let key = ("!room:example.org".to_string(), None);
+        let sid = store.create_session(&key, "matrix", "default").unwrap();
+        (tmp, store, sid)
+    }
+
+    /// digest はセッションファイルではなくキャッシュに置かれる。ファイル側に
+    /// 何も書かれていなくても、today ブロックには現れなければならない。
+    #[test]
+    fn a_cached_digest_is_returned_without_any_line_in_the_file() {
+        let (_tmp, store, sid) = store_with_one_session();
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = crate::digest_cache::DigestCache::open(cache_dir.path().to_path_buf()).unwrap();
+        cache.put(&sid, "we fixed the parser", None).unwrap();
+
+        let today = local_date_for_timestamp(Local::now(), 4);
+        let got = store.intraday_digests_for_day(today, 4, Some(&cache));
+
+        assert_eq!(got.len(), 1, "the cached digest must be found; got {got:?}");
+        assert_eq!(got[0].1.digest, "we fixed the parser");
+        assert_eq!(got[0].0.session_id, sid);
+    }
+
+    /// アップグレード直後、キャッシュはまだ空でファイルには前バージョンが書いた
+    /// digest 行が残っている。その日の today ブロックが空になってはいけない。
+    #[test]
+    fn a_file_digest_is_the_fallback_when_the_cache_has_nothing() {
+        let (_tmp, store, sid) = store_with_one_session();
+        let path = store.absolute_path_for(&sid).unwrap();
+        let line = serde_json::to_string(&IntradayDigestLine {
+            digest_at: Utc::now(),
+            digest: "written by the previous version".to_string(),
+            since: None,
+        })
+        .unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{line}").unwrap();
+        drop(f);
+
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = crate::digest_cache::DigestCache::open(cache_dir.path().to_path_buf()).unwrap();
+
+        let today = local_date_for_timestamp(Local::now(), 4);
+        let got = store.intraday_digests_for_day(today, 4, Some(&cache));
+
+        assert_eq!(got.len(), 1, "the file's own line must still be read");
+        assert_eq!(got[0].1.digest, "written by the previous version");
+    }
+
+    /// キャッシュとファイルの両方にある場合、キャッシュが勝つ — そちらが
+    /// 現在の書き込み先で、常に新しい。
+    #[test]
+    fn the_cache_wins_over_a_stale_file_line() {
+        let (_tmp, store, sid) = store_with_one_session();
+        let path = store.absolute_path_for(&sid).unwrap();
+        let line = serde_json::to_string(&IntradayDigestLine {
+            digest_at: Utc::now(),
+            digest: "stale".to_string(),
+            since: None,
+        })
+        .unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{line}").unwrap();
+        drop(f);
+
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = crate::digest_cache::DigestCache::open(cache_dir.path().to_path_buf()).unwrap();
+        cache.put(&sid, "fresh", None).unwrap();
+
+        let today = local_date_for_timestamp(Local::now(), 4);
+        let got = store.intraday_digests_for_day(today, 4, Some(&cache));
+        assert_eq!(got[0].1.digest, "fresh");
     }
 }

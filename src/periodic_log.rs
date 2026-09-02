@@ -1233,12 +1233,12 @@ where
     F: Fn(&str) -> String,
 {
     let mut entries: Vec<(SessionMeta, crate::session::IntradayDigestLine)> = Vec::new();
-    entries.extend(channel_store.intraday_digests_for_day(today, boundary_hour));
+    entries.extend(channel_store.intraday_digests_for_day(today, boundary_hour, digest_cache));
     if let Some(s) = cross_device_store {
-        entries.extend(s.intraday_digests_for_day(today, boundary_hour));
+        entries.extend(s.intraday_digests_for_day(today, boundary_hour, digest_cache));
     }
     if let Some(s) = device_default_store {
-        entries.extend(s.intraday_digests_for_day(today, boundary_hour));
+        entries.extend(s.intraday_digests_for_day(today, boundary_hour, digest_cache));
     }
     if let (Some(s), Some(c)) = (acp_store, digest_cache) {
         entries.extend(s.intraday_digests_for_day(today, boundary_hour, c));
