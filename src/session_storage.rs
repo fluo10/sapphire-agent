@@ -69,7 +69,9 @@ pub fn elide_oversized_input(input: &Value) -> Value {
 pub fn repair_tool_pairing(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     // Pass 1 — drop every `tool_result` whose `tool_use` is not in the
     // message immediately before it. If that empties a message, drop the
-    // message too: an empty message is its own API error.
+    // message too: an empty message is its own API error. A message that
+    // arrived empty is left exactly as it was — this pass only undoes
+    // damage it caused, never damage that was already on disk.
     let mut kept: Vec<ChatMessage> = Vec::with_capacity(messages.len());
     for (idx, message) in messages.iter().enumerate() {
         let prev_uses: HashSet<&str> = idx
@@ -109,7 +111,12 @@ pub fn repair_tool_pairing(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
             continue;
         }
         let next = kept.get(i + 1);
-        let answered: HashSet<&str> = next.map(tool_result_ids).unwrap_or_default();
+        let answered: HashSet<String> = next
+            .map(tool_result_ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         let missing: Vec<ContentPart> = uses
             .iter()
             .filter(|id| !answered.contains(id.as_str()))
@@ -118,6 +125,7 @@ pub fn repair_tool_pairing(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
                 content: MISSING_RESULT.to_string(),
             })
             .collect();
+        let has_answer = !answered.is_empty();
         out.push(message);
         if missing.is_empty() {
             i += 1;
@@ -129,22 +137,30 @@ pub fn repair_tool_pairing(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
         // keeps the real results adjacent to their `tool_use`; splicing
         // a message in front would displace them by one and be rejected
         // for the very reason this function exists.
-        match next {
-            Some(next) if !answered.is_empty() => {
-                let mut merged = next.clone();
-                merged.parts.extend(missing);
-                out.push(merged);
-                i += 2;
-            }
-            _ => {
-                out.push(ChatMessage {
-                    role: Role::User,
-                    parts: missing,
-                    input_kind: None,
-                    user_id: None,
-                });
-                i += 1;
-            }
+        //
+        // That merge target really is `kept[i]`'s original successor,
+        // not a message pass 1 shifted into place: pass 1 only ever
+        // removes `ToolResult` parts, so a message carrying a `ToolUse`
+        // part is never emptied and never dropped by it. So whenever
+        // `answered` is non-empty here, `kept[i + 1]` is still adjacent
+        // to `kept[i]` exactly as it was on disk.
+        if has_answer {
+            // Extend in place and advance by one, not two — the merged
+            // message becomes `kept[i]` on the next iteration, so its
+            // own `ToolUse` parts (it can carry calls of its own) still
+            // get scanned and answered. Splicing it straight into `out`
+            // would skip that scan and could hand back API-invalid
+            // output for a call the merge happened to carry.
+            kept[i + 1].parts.extend(missing);
+            i += 1;
+        } else {
+            out.push(ChatMessage {
+                role: Role::User,
+                parts: missing,
+                input_kind: None,
+                user_id: None,
+            });
+            i += 1;
         }
     }
     out
@@ -320,5 +336,40 @@ mod tests {
             user(vec![tool_result("c1", "ok")]),
         ];
         assert_eq!(repair_tool_pairing(input.clone()), input);
+    }
+
+    /// The merge must not swallow whatever follows it.
+    #[test]
+    fn a_merge_does_not_swallow_the_message_after_it() {
+        let repaired = repair_tool_pairing(vec![
+            assistant(vec![tool_use("c1"), tool_use("c2")]),
+            user(vec![tool_result("c1", "real")]),
+            user(vec![ContentPart::Text("next".to_string())]),
+        ]);
+        assert_eq!(repaired.len(), 3, "{repaired:?}");
+        assert!(matches!(&repaired[2].parts[0], ContentPart::Text(t) if t == "next"));
+    }
+
+    /// A message can be both an answer to the one before it and a caller in
+    /// its own right. Merging a placeholder into it must not exempt it from
+    /// the scan that would answer its own call.
+    #[test]
+    fn a_merged_message_still_gets_its_own_calls_answered() {
+        let repaired = repair_tool_pairing(vec![
+            assistant(vec![tool_use("c1"), tool_use("c2")]),
+            user(vec![tool_result("c1", "real"), tool_use("c3")]),
+        ]);
+        let answered: std::collections::HashSet<&str> = repaired
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            answered.contains("c3"),
+            "c3 was never answered: {repaired:?}"
+        );
     }
 }
