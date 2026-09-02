@@ -238,16 +238,29 @@ pub struct SessionStore {
     /// `resolve_path` (filesystem scan) and eagerly by `create_session` /
     /// `ensure_session`. Avoids re-scanning per `append` call.
     path_cache: Mutex<HashMap<String, PathBuf>>,
+    /// Workspace-external, content-addressed store for tool results.
+    ///
+    /// `None` when the platform cache directory could not be opened at
+    /// startup. Degrades rather than failing: a result written without a
+    /// cache is recorded as a `ToolResultRef` with no hash, which reads
+    /// back as `MISSING_RESULT`. Losing the content is survivable;
+    /// losing the pairing is not.
+    tool_results: Option<Arc<crate::tool_result_cache::ToolResultCache>>,
 }
 
 impl SessionStore {
     #[allow(dead_code)]
-    pub fn new(base_dir: PathBuf, kind: &'static str) -> Self {
+    pub fn new(
+        base_dir: PathBuf,
+        kind: &'static str,
+        tool_results: Option<Arc<crate::tool_result_cache::ToolResultCache>>,
+    ) -> Self {
         Self {
             base_dir,
             kind,
             ws_state: None,
             path_cache: Mutex::new(HashMap::new()),
+            tool_results,
         }
     }
 
@@ -255,12 +268,14 @@ impl SessionStore {
         base_dir: PathBuf,
         kind: &'static str,
         ws_state: Arc<Mutex<WorkspaceState>>,
+        tool_results: Option<Arc<crate::tool_result_cache::ToolResultCache>>,
     ) -> Self {
         Self {
             base_dir,
             kind,
             ws_state: Some(ws_state),
             path_cache: Mutex::new(HashMap::new()),
+            tool_results,
         }
     }
 
@@ -402,7 +417,7 @@ impl SessionStore {
 
     /// Append a `ChatMessage` (with current timestamp) to an existing session.
     pub fn append(&self, session_id: &str, msg: &ChatMessage) -> anyhow::Result<()> {
-        let scrubbed = scrub_images_for_storage(msg);
+        let scrubbed = self.scrub_for_storage(msg);
         let to_store = scrubbed.as_ref().unwrap_or(msg);
         let stored = StoredMessage::from_chat(to_store);
         let line = serde_json::to_string(&stored)?;
@@ -598,12 +613,13 @@ impl SessionStore {
     pub fn load_session(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
         let path = self.resolve_path(session_id)?;
         let (_, messages, _, _) = load_session_file(&path)?;
-        Some(
-            messages
-                .into_iter()
-                .map(|m| m.into_chat_message())
-                .collect(),
-        )
+        let chat: Vec<ChatMessage> = messages
+            .into_iter()
+            .map(|m| m.into_chat_message())
+            .collect();
+        Some(crate::session_storage::repair_tool_pairing(
+            self.hydrate(chat),
+        ))
     }
 
     /// Load a session preserving wall-clock timestamps and
@@ -619,7 +635,20 @@ impl SessionStore {
     ) -> Option<(Vec<StoredMessage>, Option<SummaryLine>)> {
         let path = self.resolve_path(session_id)?;
         let (_, messages, _, summary) = load_session_file(&path)?;
-        Some((messages, summary))
+        let hydrated = messages
+            .into_iter()
+            .map(|mut m| {
+                let one = self.hydrate(vec![ChatMessage {
+                    role: m.role.clone(),
+                    parts: std::mem::take(&mut m.parts),
+                    input_kind: None,
+                    user_id: None,
+                }]);
+                m.parts = one.into_iter().next().map(|c| c.parts).unwrap_or_default();
+                m
+            })
+            .collect();
+        Some((hydrated, summary))
     }
 
     /// Create a new MCP-driven session for a logical `project`. Unlike
@@ -950,56 +979,116 @@ impl SessionStore {
         sorted.sort();
         sorted
     }
-}
 
-// ---------------------------------------------------------------------------
-// Image scrubbing for persistence
-// ---------------------------------------------------------------------------
-
-/// Replace every `ContentPart::Image` in `msg` with a text marker that
-/// preserves the MIME type and a SHA-256 of the raw bytes, returning the
-/// rewritten message. Returns `None` when `msg` has no image parts (so
-/// callers can skip the allocation).
-///
-/// Format: `[image: <media_type> sha256=<hex>]` — the hash gives future
-/// out-of-band caches a stable key (planned follow-up: ImageRef +
-/// workspace-external cache) without dragging multi-MB base64 blobs into
-/// JSONL session files or the in-memory history on reload.
-///
-/// An undecodable `data_base64` is recorded as `sha256=invalid-base64`
-/// rather than failing the append — a corrupt image shouldn't lose the
-/// surrounding turn from persistence.
-pub(crate) fn scrub_images_for_storage(msg: &ChatMessage) -> Option<ChatMessage> {
-    if !msg
-        .parts
-        .iter()
-        .any(|p| matches!(p, ContentPart::Image { .. }))
-    {
-        return None;
-    }
-    let parts = msg
-        .parts
-        .iter()
-        .map(|p| match p {
-            ContentPart::Image {
-                media_type,
-                data_base64,
-            } => {
-                let hash = match BASE64_STANDARD.decode(data_base64) {
-                    Ok(bytes) => sha256_hex(&bytes),
-                    Err(_) => "invalid-base64".to_string(),
-                };
-                ContentPart::Text(format!("[image: {media_type} sha256={hash}]"))
-            }
-            other => other.clone(),
+    /// What a message looks like on disk.
+    ///
+    /// Three transformations, all storage-path-only — the in-memory
+    /// history keeps the full values for the provider call:
+    ///
+    /// - a tool result's content goes to the cache and the line keeps a
+    ///   hash, because `<workspace>/sessions` is inside the retrieve
+    ///   index and a day of file reads would both bloat the workspace
+    ///   and skew every search that touches it
+    /// - an oversized tool *input* is elided, for the same reason and
+    ///   with no cache to escape into
+    /// - an image becomes a text marker carrying its hash
+    ///
+    /// Returns `None` when nothing needs rewriting, so the common
+    /// text-only append skips the allocation.
+    fn scrub_for_storage(&self, msg: &ChatMessage) -> Option<ChatMessage> {
+        let needs_work = msg.parts.iter().any(|p| {
+            matches!(
+                p,
+                ContentPart::Image { .. }
+                    | ContentPart::ToolResult { .. }
+                    | ContentPart::ToolUse { .. }
+            )
+        });
+        if !needs_work {
+            return None;
+        }
+        let parts = msg
+            .parts
+            .iter()
+            .map(|p| match p {
+                ContentPart::Image {
+                    media_type,
+                    data_base64,
+                } => {
+                    let hash = match BASE64_STANDARD.decode(data_base64) {
+                        Ok(bytes) => sha256_hex(&bytes),
+                        Err(_) => "invalid-base64".to_string(),
+                    };
+                    ContentPart::Text(format!("[image: {media_type} sha256={hash}]"))
+                }
+                ContentPart::ToolUse { id, name, input } => ContentPart::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: crate::session_storage::elide_oversized_input(input),
+                },
+                ContentPart::ToolResult {
+                    tool_use_id,
+                    content,
+                } => {
+                    // A missing cache must not degrade any further than
+                    // a lost hash does. Dropping the part would leave a
+                    // `tool_use` with no matching `tool_result`, which
+                    // the API rejects outright — the session would fail
+                    // to load rather than load thinner.
+                    let sha256 = match &self.tool_results {
+                        Some(cache) => match cache.put(content) {
+                            Ok(sha) => Some(sha),
+                            Err(e) => {
+                                warn!("Failed to cache tool result '{tool_use_id}': {e}");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    ContentPart::ToolResultRef {
+                        tool_use_id: tool_use_id.clone(),
+                        sha256,
+                    }
+                }
+                other => other.clone(),
+            })
+            .collect();
+        Some(ChatMessage {
+            role: msg.role.clone(),
+            parts,
+            input_kind: msg.input_kind.clone(),
+            user_id: msg.user_id.clone(),
         })
-        .collect();
-    Some(ChatMessage {
-        role: msg.role.clone(),
-        parts,
-        input_kind: msg.input_kind.clone(),
-        user_id: msg.user_id.clone(),
-    })
+    }
+
+    /// Turn every `ToolResultRef` back into the result the model needs
+    /// to see. A miss is a placeholder, not an error.
+    pub(crate) fn hydrate(&self, msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        msgs.into_iter()
+            .map(|m| ChatMessage {
+                parts: m
+                    .parts
+                    .iter()
+                    .map(|p| match p {
+                        ContentPart::ToolResultRef {
+                            tool_use_id,
+                            sha256,
+                        } => ContentPart::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: sha256
+                                .as_ref()
+                                .and_then(|s| self.tool_results.as_ref()?.get(s))
+                                .unwrap_or_else(|| {
+                                    crate::session_storage::MISSING_RESULT.to_string()
+                                }),
+                        },
+                        other => other.clone(),
+                    })
+                    .collect(),
+                ..m
+            })
+            .collect()
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1224,17 +1313,21 @@ mod tests {
 
     #[test]
     fn scrub_returns_none_when_no_images() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
         let msg = ChatMessage::user("plain text");
-        assert!(scrub_images_for_storage(&msg).is_none());
+        assert!(store.scrub_for_storage(&msg).is_none());
     }
 
     #[test]
     fn scrub_replaces_image_with_hash_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
         let bytes = b"\xff\xd8\xff\xe0fake-jpeg".to_vec();
         let b64 = BASE64_STANDARD.encode(&bytes);
         let msg =
             ChatMessage::user_with_images("look", std::iter::once(("image/jpeg".to_string(), b64)));
-        let scrubbed = scrub_images_for_storage(&msg).expect("scrub should rewrite");
+        let scrubbed = store.scrub_for_storage(&msg).expect("scrub should rewrite");
 
         // No Image parts remain on the persisted shape.
         assert!(
@@ -1260,6 +1353,8 @@ mod tests {
 
     #[test]
     fn scrub_invalid_base64_records_marker_without_panic() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
         let msg = ChatMessage {
             role: Role::User,
             parts: vec![ContentPart::Image {
@@ -1269,7 +1364,7 @@ mod tests {
             input_kind: Some(UserInputKind::Text),
             user_id: None,
         };
-        let scrubbed = scrub_images_for_storage(&msg).expect("scrub should rewrite");
+        let scrubbed = store.scrub_for_storage(&msg).expect("scrub should rewrite");
         let has_marker = scrubbed
             .parts
             .iter()
@@ -1279,6 +1374,8 @@ mod tests {
 
     #[test]
     fn scrub_passes_imageref_through_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
         let msg = ChatMessage {
             role: Role::User,
             parts: vec![ContentPart::ImageRef {
@@ -1291,7 +1388,7 @@ mod tests {
         // ImageRef carries no raw bytes — nothing to scrub, so the
         // helper returns None and append serializes the variant as-is.
         assert!(
-            scrub_images_for_storage(&msg).is_none(),
+            store.scrub_for_storage(&msg).is_none(),
             "scrub should leave ImageRef-only messages untouched"
         );
     }
@@ -1393,7 +1490,7 @@ mod tests {
 
     fn new_device_default_store() -> (tempfile::TempDir, SessionStore) {
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = SessionStore::new(tmp.path().to_path_buf(), "device-default");
+        let store = SessionStore::new(tmp.path().to_path_buf(), "device-default", None);
         (tmp, store)
     }
 
@@ -1518,7 +1615,7 @@ mod tests {
 
     fn store_with_one_session() -> (tempfile::TempDir, SessionStore, String) {
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = SessionStore::new(tmp.path().to_path_buf(), "channel");
+        let store = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
         let key = ("!room:example.org".to_string(), None);
         let sid = store.create_session(&key, "matrix", "default").unwrap();
         (tmp, store, sid)
@@ -1619,6 +1716,197 @@ mod tests {
             got.len(),
             1,
             "an old file must not hide a fresh cached digest: {got:?}"
+        );
+    }
+
+    // ── ツール結果の永続化 (#194) ────────────────────────────────────
+
+    fn cached_store() -> (tempfile::TempDir, tempfile::TempDir, SessionStore, String) {
+        let sessions = tempfile::TempDir::new().unwrap();
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = crate::tool_result_cache::ToolResultCache::open(cache_dir.path().to_path_buf())
+            .unwrap();
+        let store = SessionStore::new(sessions.path().to_path_buf(), "channel", Some(cache));
+        let key = ("!room:example.org".to_string(), None);
+        let sid = store.create_session(&key, "matrix", "default").unwrap();
+        (sessions, cache_dir, store, sid)
+    }
+
+    fn tool_use_msg(id: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            parts: vec![ContentPart::ToolUse {
+                id: id.to_string(),
+                name: "file_read".to_string(),
+                input: serde_json::json!({ "path": "a.rs" }),
+            }],
+            input_kind: None,
+            user_id: None,
+        }
+    }
+
+    fn tool_result_msg(id: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::User,
+            parts: vec![ContentPart::ToolResult {
+                tool_use_id: id.to_string(),
+                content: content.to_string(),
+            }],
+            input_kind: None,
+            user_id: None,
+        }
+    }
+
+    /// The whole point: what the agent did survives a reload.
+    #[test]
+    fn a_tool_result_round_trips_through_the_cache() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store
+            .append(&sid, &tool_result_msg("c1", "fn main() {}"))
+            .unwrap();
+
+        let loaded = store.load_session(&sid).expect("the session loads");
+        let content = loaded.iter().flat_map(|m| &m.parts).find_map(|p| match p {
+            ContentPart::ToolResult {
+                tool_use_id,
+                content,
+            } if tool_use_id == "c1" => Some(content.clone()),
+            _ => None,
+        });
+        assert_eq!(content.as_deref(), Some("fn main() {}"));
+    }
+
+    /// The content must not be in the JSONL — that file is inside the
+    /// retrieve index, which is the whole reason for the cache.
+    #[test]
+    fn the_result_content_never_reaches_the_session_file() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store
+            .append(&sid, &tool_result_msg("c1", "SECRET-CANARY-VALUE"))
+            .unwrap();
+
+        let raw = fs::read_to_string(store.absolute_path_for(&sid).unwrap()).unwrap();
+        assert!(
+            !raw.contains("SECRET-CANARY-VALUE"),
+            "tool result content leaked into the indexed file:\n{raw}"
+        );
+        assert!(
+            raw.contains("ToolResultRef"),
+            "expected a reference:\n{raw}"
+        );
+    }
+
+    /// An evicted result degrades to a placeholder. The pairing is what
+    /// the API validates, so this must load rather than fail.
+    #[test]
+    fn an_evicted_result_becomes_a_placeholder() {
+        let (_s, cache_dir, store, sid) = cached_store();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store
+            .append(&sid, &tool_result_msg("c1", "gone soon"))
+            .unwrap();
+
+        for entry in fs::read_dir(cache_dir.path()).unwrap().flatten() {
+            fs::remove_file(entry.path()).unwrap();
+        }
+
+        let loaded = store.load_session(&sid).expect("the session still loads");
+        let has_placeholder = loaded.iter().flat_map(|m| &m.parts).any(
+            |p| matches!(p, ContentPart::ToolResult { tool_use_id, content } if tool_use_id == "c1" && content == crate::session_storage::MISSING_RESULT),
+        );
+        assert!(has_placeholder, "expected a placeholder: {loaded:?}");
+    }
+
+    /// No cache at write time records the pairing with no hash. Writing
+    /// nothing would leave a tool_use the API rejects.
+    #[test]
+    fn no_cache_at_write_time_still_keeps_the_pairing() {
+        let sessions = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(sessions.path().to_path_buf(), "channel", None);
+        let key = ("!room:example.org".to_string(), None);
+        let sid = store.create_session(&key, "matrix", "default").unwrap();
+
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store.append(&sid, &tool_result_msg("c1", "lost")).unwrap();
+
+        let loaded = store.load_session(&sid).expect("the session loads");
+        let answered = loaded.iter().flat_map(|m| &m.parts).any(
+            |p| matches!(p, ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == "c1"),
+        );
+        assert!(answered, "the tool_use must still be answered: {loaded:?}");
+    }
+
+    /// An oversized tool input is elided rather than written whole — the
+    /// session file is indexed and there is no cache indirection for it.
+    #[test]
+    fn an_oversized_tool_input_is_elided_on_disk() {
+        let (_s, _c, store, sid) = cached_store();
+        let huge = "x".repeat(crate::tools::OUTPUT_CAP_BYTES + 1);
+        store
+            .append(
+                &sid,
+                &ChatMessage {
+                    role: Role::Assistant,
+                    parts: vec![ContentPart::ToolUse {
+                        id: "c1".to_string(),
+                        name: "file_write".to_string(),
+                        input: serde_json::json!({ "content": huge }),
+                    }],
+                    input_kind: None,
+                    user_id: None,
+                },
+            )
+            .unwrap();
+
+        let raw = fs::read_to_string(store.absolute_path_for(&sid).unwrap()).unwrap();
+        assert!(
+            raw.contains("_elided"),
+            "expected elision:\n{}",
+            &raw[..raw.len().min(400)]
+        );
+        assert!(
+            raw.len() < 4000,
+            "the line was written whole ({} bytes)",
+            raw.len()
+        );
+    }
+
+    /// The daily log is a permanent, searchable record. A placeholder
+    /// sentence from an evicted result has no business in it.
+    #[test]
+    fn the_daily_log_projection_carries_no_tool_traffic() {
+        let (_s, _c, store, sid) = cached_store();
+        store
+            .append(&sid, &ChatMessage::user("what is in a.rs"))
+            .unwrap();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store
+            .append(&sid, &tool_result_msg("c1", "fn main() {}"))
+            .unwrap();
+
+        let today = local_date_for_timestamp(Local::now(), 4);
+        let days = store.sessions_for_day(today, 4);
+        let parts: Vec<&ContentPart> = days
+            .iter()
+            .flat_map(|(_, ms)| ms)
+            .flat_map(|m| &m.parts)
+            .collect();
+        assert!(
+            parts.iter().all(|p| matches!(
+                p,
+                ContentPart::Text(_)
+                    | ContentPart::ToolUse { .. }
+                    | ContentPart::ToolResultRef { .. }
+            )),
+            "no hydrated tool result may appear: {parts:?}"
+        );
+        assert!(
+            !parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ToolResult { .. })),
+            "sessions_for_day must not hydrate: {parts:?}"
         );
     }
 }

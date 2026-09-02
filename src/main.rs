@@ -467,6 +467,7 @@ async fn main() -> Result<()> {
                 sessions_base.clone(),
                 "cross-device",
                 Arc::clone(&ws_state),
+                None,
             ));
 
             // ── Device-default session store (sessions/<ns>/device-default/) ─
@@ -477,6 +478,7 @@ async fn main() -> Result<()> {
                 sessions_base.clone(),
                 "device-default",
                 Arc::clone(&ws_state),
+                None,
             ));
 
             // ── MCP session store (sessions/<namespace>/mcp/) ──────────────
@@ -488,6 +490,7 @@ async fn main() -> Result<()> {
                 sessions_base.clone(),
                 "mcp",
                 Arc::clone(&ws_state),
+                None,
             ));
 
             // ── Voice providers + ServeState (built early) ──────────────────
@@ -730,6 +733,7 @@ async fn main() -> Result<()> {
                     sessions_base.clone(),
                     "channel",
                     Arc::clone(&ws_state),
+                    None,
                 ));
 
                 let mut channel_list: Vec<(String, Arc<dyn channel::Channel>)> = Vec::new();

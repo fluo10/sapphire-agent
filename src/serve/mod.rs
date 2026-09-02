@@ -3554,12 +3554,17 @@ rooms    = []
             permissions: Arc::new(acp_permissions::PermissionStore::open(
                 base.join("acp-permissions.json"),
             )),
-            cross_device_session_store: Arc::new(SessionStore::new(base.join("sessions"), "rpc")),
+            cross_device_session_store: Arc::new(SessionStore::new(
+                base.join("sessions"),
+                "rpc",
+                None,
+            )),
             device_default_session_store: Arc::new(SessionStore::new(
                 base.join("device-default"),
                 "device-default",
+                None,
             )),
-            mcp_session_store: Arc::new(SessionStore::new(base.join("mcp"), "mcp")),
+            mcp_session_store: Arc::new(SessionStore::new(base.join("mcp"), "mcp", None)),
             mcp_project_index: Default::default(),
             sessions: Default::default(),
             pending_sessions: Default::default(),
