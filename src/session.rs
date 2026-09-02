@@ -412,30 +412,6 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Append a same-day digest line. Used by the idle-flush task and the
-    /// graceful-shutdown path to publish "what this session has covered
-    /// today" for cross-session injection into other rooms.
-    pub fn append_intraday_digest(
-        &self,
-        session_id: &str,
-        digest: &str,
-        since: Option<DateTime<Utc>>,
-    ) -> anyhow::Result<()> {
-        let line = serde_json::to_string(&IntradayDigestLine {
-            digest_at: Utc::now(),
-            digest: digest.to_string(),
-            since,
-        })?;
-        let path = self
-            .resolve_path(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(file, "{line}")?;
-        drop(file);
-        self.notify_updated(&path);
-        Ok(())
-    }
-
     /// Walk every session file under `sessions_dir` and return the latest
     /// intra-day digest per session whose `digest_at` falls inside the
     /// local-time `date` window, paired with the session's metadata.

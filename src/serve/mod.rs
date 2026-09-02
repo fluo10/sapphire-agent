@@ -482,46 +482,42 @@ pub async fn run(
 /// `/rpc` and device-default stores is read by nobody today (`load_all`
 /// reads the channel store; `load_session_full` reads the mcp store).
 ///
-/// ACP sessions are included, but routed differently: they write
-/// through `state.digest_cache` rather than
-/// `SessionStore::append_intraday_digest`, which the ACP store does not
-/// have.
+/// Every session type — ACP, `/rpc`, and device-default alike — writes
+/// here through `state.digest_cache`, not into its own store's JSONL
+/// (#190); `build_today_digest_for_namespace` reads all three kinds
+/// back out of that same cache. There is no longer a distinction to
+/// make between ACP and non-ACP sessions at this point: neither
+/// `SessionStore` nor `AcpSessionStore` has a digest-writing method any
+/// more.
 async fn digest_all_sessions(state: &Arc<ServeState>) {
-    let (snapshot, is_acp): (Vec<(String, Vec<ChatMessage>)>, HashSet<String>) = {
+    let snapshot: Vec<(String, Vec<ChatMessage>)> = {
         let sessions = state.sessions.lock().await;
-        let acp = state.acp_sessions.lock().await;
-        let snapshot = sessions
+        sessions
             .iter()
             .filter(|(_, msgs)| msgs.len() >= 2)
             .map(|(sid, msgs)| (sid.clone(), msgs.clone()))
-            .collect();
-        (snapshot, acp.clone())
+            .collect()
     };
     if snapshot.is_empty() {
         return;
     }
+    // Resolved before any model call, not after: with nowhere to put the
+    // result, generating summaries for every session would burn a
+    // provider call each for nothing.
+    let Some(cache) = state.digest_cache.as_ref() else {
+        warn!(
+            "Digest cache unavailable; dropping {} shutdown digest(s)",
+            snapshot.len()
+        );
+        return;
+    };
     info!("Graceful shutdown: digesting {} session(s)", snapshot.len());
     for (session_id, messages) in snapshot {
         let provider = state.provider_for_session(&session_id).await;
         match generate_summary(&*provider, &messages).await {
             Ok(summary) if !summary.trim().is_empty() => {
-                if is_acp.contains(&session_id) {
-                    match &state.digest_cache {
-                        Some(cache) => {
-                            if let Err(e) = cache.put(&session_id, &summary, None) {
-                                warn!("Failed to cache shutdown digest for {session_id}: {e}");
-                            }
-                        }
-                        None => warn!(
-                            "Digest cache unavailable; dropping shutdown digest for {session_id}"
-                        ),
-                    }
-                } else if let Err(e) = state.store_for_session(&session_id).append_intraday_digest(
-                    &session_id,
-                    &summary,
-                    None,
-                ) {
-                    warn!("Failed to persist shutdown intra-day digest for {session_id}: {e}");
+                if let Err(e) = cache.put(&session_id, &summary, None) {
+                    warn!("Failed to cache shutdown digest for {session_id}: {e}");
                 }
             }
             Ok(_) => warn!("Shutdown digest for {session_id} was empty; skipping"),

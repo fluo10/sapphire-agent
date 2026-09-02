@@ -48,6 +48,11 @@ pub struct Agent {
     /// Workspace-external image cache. `None` disables in-memory image
     /// scrubbing entirely (PR1 hash-marker on disk still applies).
     image_cache: Option<Arc<ImageCache>>,
+    /// Workspace-external intra-day digest cache. `None` disables the
+    /// cross-session "today" block for this agent's rooms — the digest
+    /// has nowhere to go, and writing it back into the session JSONL is
+    /// what #190 exists to stop.
+    digest_cache: Option<Arc<crate::digest_cache::DigestCache>>,
     /// In-memory conversation history, keyed by (room_id, thread_id).
     /// Starts empty on process startup; raw history from disk is never reloaded
     /// (see `restart_summaries` for how prior context is carried across restarts).
@@ -83,6 +88,7 @@ pub struct Agent {
 }
 
 impl Agent {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         channels: Arc<Channels>,
@@ -91,6 +97,7 @@ impl Agent {
         tools: Option<Arc<ToolSet>>,
         session_store: Arc<SessionStore>,
         image_cache: Option<Arc<ImageCache>>,
+        digest_cache: Option<Arc<crate::digest_cache::DigestCache>>,
     ) -> Self {
         let (active_sessions, summaries, fallback) = session_store.load_all();
         info!(
@@ -107,6 +114,7 @@ impl Agent {
             tools,
             session_store,
             image_cache,
+            digest_cache,
             history: Mutex::new(HashMap::new()),
             active_sessions: Mutex::new(active_sessions),
             snapshots: Mutex::new(HashMap::new()),
@@ -257,14 +265,17 @@ impl Agent {
                     if let Err(e) = self.session_store.append_summary(&session_id, &summary) {
                         warn!("Failed to persist shutdown summary for {session_id}: {e}");
                     }
-                    // Also publish an intra-day digest line so the
-                    // cross-session today_digest picks up what this
-                    // session covered before we went down.
-                    if let Err(e) =
-                        self.session_store
-                            .append_intraday_digest(&session_id, &summary, None)
+                    // Also publish an intra-day digest so the
+                    // cross-session today block picks up what this
+                    // session covered before we went down. It goes to
+                    // the workspace-external cache, not the session's
+                    // own JSONL (#190).
+                    if let Some(cache) = self.digest_cache.as_ref()
+                        && let Err(e) = cache.put(&session_id, &summary, None)
                     {
-                        warn!("Failed to persist shutdown intra-day digest for {session_id}: {e}");
+                        warn!(
+                            "Failed to cache the shutdown intra-day digest for {session_id}: {e}"
+                        );
                     }
                 }
                 Ok(_) => warn!("Shutdown summary for {session_id} was empty; skipping"),
@@ -406,7 +417,7 @@ impl Agent {
     }
 
     /// Generate an intra-day digest of the current in-memory history for
-    /// `key` and append it to the session JSONL. Recorded with `since` =
+    /// `key` and write it into the digest cache. Recorded with `since` =
     /// the timestamp this Agent first observed activity for the key after
     /// its last flush (or session start), so consumers can sanity-check
     /// the window. Idempotent: marks `last_flushed_at` to the activity
@@ -431,6 +442,13 @@ impl Agent {
                 _ => return,
             }
         };
+        // Resolved before the model call, not after: with nowhere to put
+        // the result, generating it would burn a provider call for
+        // nothing.
+        let Some(cache) = self.digest_cache.clone() else {
+            debug!("No digest cache; skipping the intra-day digest for {session_id}");
+            return;
+        };
         let activity_ts = match self.last_activity_at.lock().await.get(key) {
             Some(ts) => *ts,
             None => return,
@@ -454,11 +472,8 @@ impl Agent {
             }
         };
 
-        if let Err(e) = self
-            .session_store
-            .append_intraday_digest(&session_id, &summary, None)
-        {
-            warn!("Failed to persist intra-day digest for {session_id}: {e}");
+        if let Err(e) = cache.put(&session_id, &summary, None) {
+            warn!("Failed to cache the intra-day digest for {session_id}: {e}");
             return;
         }
         self.last_flushed_at

@@ -691,6 +691,11 @@ async fn main() -> Result<()> {
                     }
                 };
 
+            // Cloned before `ServeState` takes ownership: the channel
+            // agent writes its own rooms' digests here too, now that
+            // they no longer go into the session JSONL (#190).
+            let digest_cache_for_agent = digest_cache.clone();
+
             let serve_state = Arc::new(serve::ServeState::new(
                 config.clone(),
                 Arc::clone(&registry),
@@ -820,6 +825,7 @@ async fn main() -> Result<()> {
                     Some(Arc::clone(&tool_set)),
                     Arc::clone(&channel_session_store),
                     image_cache.clone(),
+                    digest_cache_for_agent.clone(),
                 ));
                 agent.bootstrap().await;
                 // Wire the agent into the timer manager so chat-origin
