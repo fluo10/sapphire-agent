@@ -980,13 +980,15 @@ Nothing writes the variant yet."
         assert!(stored.id.is_some(), "from_chat must stamp an id");
     }
 
-    /// Ids are time-ordered so a file's message ids sort the way the
-    /// file does — the property a future `parent` migration relies on.
+    /// Distinct messages get distinct ids. The checkpoint looks its
+    /// cursor up by position, so what it needs is uniqueness, not order —
+    /// file order is what orders a session, here and in the future
+    /// `parent` migration (decision 3.1).
     #[test]
-    fn ids_are_time_ordered() {
+    fn each_message_gets_its_own_id() {
         let a = StoredMessage::from_chat(&ChatMessage::user("first"));
         let b = StoredMessage::from_chat(&ChatMessage::user("second"));
-        assert!(a.id.unwrap() < b.id.unwrap());
+        assert_ne!(a.id.unwrap(), b.id.unwrap());
     }
 
     /// Legacy JSONL predates the field and must still load.
@@ -1017,7 +1019,9 @@ Expected: コンパイルエラー — `StoredMessage` に `id` フィールド�
     /// either of which silently drops messages from a replay.
     ///
     /// `None` on lines written before this field existed; readers fall
-    /// back to file order there.
+    /// back to file order there. File order is what orders a session —
+    /// this is an identity, not a sort key, and no reader compares two
+    /// of them.
     ///
     /// Deliberately no `parent`. Unlike the ACP store, this format keeps
     /// one file per session, so file order survives as a reconstruction
