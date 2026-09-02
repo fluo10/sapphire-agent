@@ -2253,9 +2253,11 @@ impl TurnPersistence {
     /// history is rebuilt from events on reload, so a stored summary
     /// would be a second, staler answer to a question the events
     /// already answer.
-    fn append_summary(&self, summary: &str) {
+    fn append_summary(&self, summary: &str, keep_recent: usize) {
         if !self.is_acp
-            && let Err(e) = self.store.append_summary(&self.session_id, summary)
+            && let Err(e) = self
+                .store
+                .append_summary(&self.session_id, summary, keep_recent)
         {
             warn!("Failed to persist compaction summary: {e}");
         }
@@ -2385,7 +2387,7 @@ impl TurnLoop<'_> {
                     // staler answer to a question the events already
                     // answer. Compression stays an in-memory optimisation.
                     if let Some(p) = self.persistence {
-                        p.append_summary(&result.summary);
+                        p.append_summary(&result.summary, result.keep_recent);
                     }
                 }
                 Ok(None) => {}

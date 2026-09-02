@@ -193,6 +193,18 @@ pub struct SummaryLine {
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub up_to_timestamp: Option<DateTime<Utc>>,
+    /// The last message this summary absorbed. A restore replays the
+    /// messages *after* it, prefixed with the summary as a stub — which
+    /// reproduces the in-memory state at the moment of compaction rather
+    /// than replaying a whole session and paying for the compaction all
+    /// over again on the first turn back.
+    ///
+    /// `None` on lines written before this field existed. Those are read
+    /// as "this summary stands in for everything before it in file
+    /// order", which is what a shutdown summary — almost certainly what
+    /// such a line is — actually meant.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub covers_through: Option<Uuid>,
 }
 
 /// A short summary describing what happened in a single session during the
@@ -431,16 +443,30 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Append a compaction summary to the session file.
-    pub fn append_summary(&self, session_id: &str, summary: &str) -> anyhow::Result<()> {
+    /// Append a compaction summary, recording how far it reaches.
+    ///
+    /// `keep_recent` is how many trailing messages the caller kept
+    /// verbatim (0 for a day-boundary compaction, which replaces the
+    /// whole history). The cursor is computed here rather than passed
+    /// in: the caller holds an index into its in-memory history, and
+    /// only the store can map that onto its own file, whose message
+    /// count is at least as large — earlier compactions trimmed memory,
+    /// not the log.
+    pub fn append_summary(
+        &self,
+        session_id: &str,
+        summary: &str,
+        keep_recent: usize,
+    ) -> anyhow::Result<()> {
+        let path = self
+            .resolve_path(session_id)
+            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
         let line = serde_json::to_string(&SummaryLine {
             summary_at: Utc::now(),
             summary: summary.to_string(),
             up_to_timestamp: None,
+            covers_through: checkpoint_id(&path, keep_recent),
         })?;
-        let path = self
-            .resolve_path(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;
         drop(file);
@@ -552,16 +578,23 @@ impl SessionStore {
                 Some(s) => s.to_string(),
                 None => continue,
             };
-            if let Some((meta, messages, is_closed, summary)) = load_session_file(&path) {
-                let key: ConversationKey = (meta.room_id.clone(), meta.thread_id.clone());
-                if !is_closed {
+            if let Some(loaded) = load_session_file(&path) {
+                let key: ConversationKey =
+                    (loaded.meta.room_id.clone(), loaded.meta.thread_id.clone());
+                if !loaded.is_closed {
                     // Seed the path cache for active sessions so the first
                     // `append` after bootstrap doesn't pay a scan.
                     if let Ok(mut cache) = self.path_cache.lock() {
                         cache.insert(stem.clone(), path.clone());
                     }
                 }
-                entries.push((stem, key, messages, is_closed, summary.map(|s| s.summary)));
+                entries.push((
+                    stem,
+                    key,
+                    loaded.messages,
+                    loaded.is_closed,
+                    loaded.latest_summary.map(|s| s.summary),
+                ));
             }
         }
 
@@ -602,23 +635,25 @@ impl SessionStore {
     pub fn list_sessions(&self) -> Vec<SessionMeta> {
         let mut metas: Vec<SessionMeta> = collect_session_files(&self.base_dir, self.kind)
             .into_iter()
-            .filter_map(|p| load_session_file(&p).map(|(meta, _, _, _)| meta))
+            .filter_map(|p| load_session_file(&p).map(|loaded| loaded.meta))
             .collect();
         metas.sort_by_key(|m| m.created_at);
         metas
     }
 
-    /// Load a single session's conversation history by ID.
-    /// Returns None if the file doesn't exist or is malformed.
+    /// One session as the model should see it: the latest compaction
+    /// summary rendered as a stub, then the messages it did not absorb,
+    /// with tool results hydrated and any broken pairing repaired.
     pub fn load_session(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
         let path = self.resolve_path(session_id)?;
-        let (_, messages, _, _) = load_session_file(&path)?;
-        let chat: Vec<ChatMessage> = messages
-            .into_iter()
-            .map(|m| m.into_chat_message())
-            .collect();
+        let loaded = load_session_file(&path)?;
+        let (summary, tail) = model_history(&loaded);
+        let mut out = summary
+            .map(crate::context_compression::compaction_stub)
+            .unwrap_or_default();
+        out.extend(tail.iter().cloned().map(|m| m.into_chat_message()));
         Some(crate::session_storage::repair_tool_pairing(
-            self.hydrate(chat),
+            self.hydrate(out),
         ))
     }
 
@@ -634,8 +669,10 @@ impl SessionStore {
         session_id: &str,
     ) -> Option<(Vec<StoredMessage>, Option<SummaryLine>)> {
         let path = self.resolve_path(session_id)?;
-        let (_, messages, _, summary) = load_session_file(&path)?;
-        let hydrated = messages
+        let loaded = load_session_file(&path)?;
+        let summary = loaded.latest_summary;
+        let hydrated = loaded
+            .messages
             .into_iter()
             .map(|mut m| {
                 let one = self.hydrate(vec![ChatMessage {
@@ -734,7 +771,7 @@ impl SessionStore {
     ) -> anyhow::Result<Option<String>> {
         if let Some(existing) = self.resolve_path(session_id) {
             // Return existing public_id if the file already existed
-            let pub_id = load_session_file(&existing).and_then(|(meta, _, _, _)| meta.public_id);
+            let pub_id = load_session_file(&existing).and_then(|loaded| loaded.meta.public_id);
             return Ok(pub_id);
         }
         let path = self.path_for_new(session_id, namespace);
@@ -791,10 +828,11 @@ impl SessionStore {
 
         let mut best: Option<(DateTime<Utc>, String)> = None;
         for path in collect_session_files(&self.base_dir, self.kind) {
-            let Some((meta, _, is_closed, _)) = load_session_file(&path) else {
+            let Some(loaded) = load_session_file(&path) else {
                 continue;
             };
-            if is_closed {
+            let meta = loaded.meta;
+            if loaded.is_closed {
                 continue;
             }
             if meta.namespace.as_deref() != Some(namespace) {
@@ -865,10 +903,10 @@ impl SessionStore {
     /// Returns the internal UUID `session_id` if found.
     pub fn find_by_public_id(&self, public_id: &str) -> Option<String> {
         for path in collect_session_files(&self.base_dir, self.kind) {
-            if let Some((meta, _, _, _)) = load_session_file(&path)
-                && meta.public_id.as_deref() == Some(public_id)
+            if let Some(loaded) = load_session_file(&path)
+                && loaded.meta.public_id.as_deref() == Some(public_id)
             {
-                return Some(meta.session_id);
+                return Some(loaded.meta.session_id);
             }
         }
         None
@@ -897,14 +935,15 @@ impl SessionStore {
                 }
             }
 
-            if let Some((meta, messages, _, _)) = load_session_file(&path) {
-                let day_messages: Vec<StoredMessage> = messages
+            if let Some(loaded) = load_session_file(&path) {
+                let day_messages: Vec<StoredMessage> = loaded
+                    .messages
                     .into_iter()
                     .filter(|m| m.timestamp >= day_start && m.timestamp < day_end)
                     .collect();
 
                 if !day_messages.is_empty() {
-                    results.push((meta, day_messages));
+                    results.push((loaded.meta, day_messages));
                 }
             }
         }
@@ -942,11 +981,11 @@ impl SessionStore {
         let mut dates = std::collections::HashSet::new();
 
         for path in collect_session_files(&self.base_dir, self.kind) {
-            if let Some((meta, messages, _, _)) = load_session_file(&path) {
-                if !predicate(&meta) {
+            if let Some(loaded) = load_session_file(&path) {
+                if !predicate(&loaded.meta) {
                     continue;
                 }
-                for msg in messages {
+                for msg in loaded.messages {
                     let local_ts = msg.timestamp.with_timezone(&Local);
                     let date = local_date_for_timestamp(local_ts, boundary_hour);
                     dates.insert(date);
@@ -966,8 +1005,8 @@ impl SessionStore {
         let mut dates = std::collections::HashSet::new();
 
         for path in collect_session_files(&self.base_dir, self.kind) {
-            if let Some((_, messages, _, _)) = load_session_file(&path) {
-                for msg in messages {
+            if let Some(loaded) = load_session_file(&path) {
+                for msg in loaded.messages {
                     let local_ts = msg.timestamp.with_timezone(&Local);
                     let date = local_date_for_timestamp(local_ts, boundary_hour);
                     dates.insert(date);
@@ -1180,13 +1219,21 @@ pub fn local_date_for_timestamp(local_ts: DateTime<Local>, boundary_hour: u8) ->
 // File parsing helpers
 // ---------------------------------------------------------------------------
 
+/// One parsed session file.
+struct LoadedSession {
+    meta: SessionMeta,
+    messages: Vec<StoredMessage>,
+    is_closed: bool,
+    latest_summary: Option<SummaryLine>,
+    /// `messages.len()` at the moment the latest summary line was read.
+    /// The file-order fallback for a summary with no `covers_through`.
+    messages_before_summary: usize,
+}
+
 /// Parse a single session `.jsonl` file.
 ///
-/// Returns `(meta, messages, is_closed, latest_summary)` or `None` if the
-/// file is unreadable or has a malformed first line.
-fn load_session_file(
-    path: &Path,
-) -> Option<(SessionMeta, Vec<StoredMessage>, bool, Option<SummaryLine>)> {
+/// Returns `None` if the file is unreadable or has a malformed first line.
+fn load_session_file(path: &Path) -> Option<LoadedSession> {
     let file = fs::File::open(path).ok()?;
     let mut lines = BufReader::new(file).lines();
 
@@ -1197,6 +1244,7 @@ fn load_session_file(
     let mut messages = Vec::new();
     let mut is_closed = false;
     let mut latest_summary: Option<SummaryLine> = None;
+    let mut messages_before_summary = 0;
 
     for raw in lines.map_while(Result::ok) {
         let raw = raw.trim().to_string();
@@ -1218,7 +1266,10 @@ fn load_session_file(
             meta.title = Some(title.to_string());
         } else if value.get("summary_at").is_some() {
             match serde_json::from_value::<SummaryLine>(value) {
-                Ok(s) => latest_summary = Some(s),
+                Ok(s) => {
+                    latest_summary = Some(s);
+                    messages_before_summary = messages.len();
+                }
                 Err(e) => {
                     warn!("Skipping malformed summary in {}: {e}", path.display());
                 }
@@ -1237,7 +1288,40 @@ fn load_session_file(
         }
     }
 
-    Some((meta, messages, is_closed, latest_summary))
+    Some(LoadedSession {
+        meta,
+        messages,
+        is_closed,
+        latest_summary,
+        messages_before_summary,
+    })
+}
+
+/// The messages a restore should replay, and the summary to prefix them
+/// with.
+///
+/// Everything before the checkpoint is what the summary already says;
+/// replaying it too would re-send a conversation the running process had
+/// already compacted away, and pay for compacting it again on the first
+/// turn back.
+fn model_history(loaded: &LoadedSession) -> (Option<&str>, &[StoredMessage]) {
+    let Some(summary) = &loaded.latest_summary else {
+        return (None, &loaded.messages);
+    };
+    let start = match summary.covers_through {
+        Some(id) => match loaded.messages.iter().position(|m| m.id == Some(id)) {
+            Some(pos) => pos + 1,
+            None => {
+                warn!("session checkpoint {id} is not in the file; replaying the whole session");
+                0
+            }
+        },
+        None => loaded.messages_before_summary,
+    };
+    (
+        Some(summary.summary.as_str()),
+        loaded.messages.get(start..).unwrap_or(&[]),
+    )
 }
 
 /// Read just the first line of a session file: its `SessionMeta`. Cheap
@@ -1277,6 +1361,55 @@ fn load_latest_intraday_digest(path: &Path) -> Option<IntradayDigestLine> {
         }
     }
     latest
+}
+
+/// The id of the last message a summary keeping `keep_recent` trailing
+/// messages absorbs.
+///
+/// `None` when the file has no messages, or when the message at that
+/// position predates `StoredMessage::id`. The second case costs one
+/// checkpoint's worth of tail on a session that spans the upgrade —
+/// bounded to a day under the default `Reset` policy, which rotates the
+/// file — and the reader's file-order fallback handles it.
+fn checkpoint_id(path: &Path, keep_recent: usize) -> Option<Uuid> {
+    let ids = message_ids_in_order(path);
+    if ids.is_empty() {
+        return None;
+    }
+    // A summary that covers nothing is not reachable from
+    // `maybe_compress` (it fires only with at least one message to
+    // summarise, and the file holds at least as many as memory did), but
+    // clamping costs nothing and keeps the index in range.
+    let covered = ids.len().saturating_sub(keep_recent).max(1);
+    ids[covered - 1]
+}
+
+/// Every message line's id, in file order. Non-message lines are skipped
+/// so the positions line up with what a reader replays.
+fn message_ids_in_order(path: &Path) -> Vec<Option<Uuid>> {
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for raw in BufReader::new(file).lines().map_while(Result::ok) {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            continue;
+        };
+        if value.get("timestamp").is_none() {
+            continue;
+        }
+        out.push(
+            value
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok()),
+        );
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1504,15 +1637,15 @@ mod tests {
             .expect("find_or_create");
         // Resolve from disk and verify the meta the store wrote.
         let path = store.absolute_path_for(&sid).expect("path cached");
-        let (meta, _msgs, is_closed, _summary) =
-            load_session_file(&path).expect("meta line present");
+        let loaded = load_session_file(&path).expect("meta line present");
+        let meta = loaded.meta;
         assert_eq!(meta.session_id, sid);
         assert_eq!(meta.channel, "device-default");
         assert_eq!(meta.device_id.as_deref(), Some("device-a"));
         assert_eq!(meta.room_profile.as_deref(), Some("default"));
         assert_eq!(meta.namespace.as_deref(), Some("default"));
         assert!(meta.public_id.is_none(), "device-default has no grain-id");
-        assert!(!is_closed);
+        assert!(!loaded.is_closed);
     }
 
     /// Second call within the same local day returns the same session_id.
@@ -1908,5 +2041,173 @@ mod tests {
                 .any(|p| matches!(p, ContentPart::ToolResult { .. })),
             "sessions_for_day must not hydrate: {parts:?}"
         );
+    }
+
+    // ── compaction チェックポイント ──────────────────────────────────
+
+    /// The checkpoint covers everything but the trailing `keep_recent`
+    /// messages, so a restore reproduces the state the process had when
+    /// it went down rather than replaying the whole file.
+    #[test]
+    fn a_restore_replays_the_summary_and_the_kept_tail() {
+        let (_s, _c, store, sid) = cached_store();
+        for i in 0..5 {
+            store
+                .append(&sid, &ChatMessage::user(&format!("m{i}")))
+                .unwrap();
+        }
+        store.append_summary(&sid, "the first three", 2).unwrap();
+
+        let loaded = store.load_session(&sid).expect("the session loads");
+        let texts: Vec<String> = loaded
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            texts[0].contains("the first three"),
+            "stub first: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "m3"),
+            "kept tail missing: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "m4"),
+            "kept tail missing: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "m0"),
+            "covered message replayed: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "m2"),
+            "covered message replayed: {texts:?}"
+        );
+    }
+
+    /// A file with no summary replays whole — there is no checkpoint to
+    /// start from.
+    #[test]
+    fn a_file_without_a_summary_replays_everything() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &ChatMessage::user("only one")).unwrap();
+        let loaded = store.load_session(&sid).unwrap();
+        assert_eq!(loaded.len(), 1);
+    }
+
+    /// A SummaryLine written before covers_through existed means "this
+    /// summary stands in for everything before it in the file" — which
+    /// is what the shutdown summary it almost certainly is did mean.
+    #[test]
+    fn a_legacy_summary_line_replays_only_what_follows_it() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &ChatMessage::user("before")).unwrap();
+
+        let path = store.absolute_path_for(&sid).unwrap();
+        let legacy = r#"{"summary_at":"2026-04-06T11:00:00Z","summary":"what happened"}"#;
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{legacy}").unwrap();
+        drop(f);
+
+        store.append(&sid, &ChatMessage::user("after")).unwrap();
+
+        let loaded = store.load_session(&sid).unwrap();
+        let texts: Vec<String> = loaded
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts[0].contains("what happened"), "stub first: {texts:?}");
+        assert!(texts.iter().any(|t| t == "after"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "before"), "{texts:?}");
+    }
+
+    /// keep_recent = 0 is the day-boundary compaction: it replaced the
+    /// whole in-memory history with a stub, so a restore should too.
+    #[test]
+    fn a_boundary_compaction_leaves_only_the_stub() {
+        let (_s, _c, store, sid) = cached_store();
+        for i in 0..3 {
+            store
+                .append(&sid, &ChatMessage::user(&format!("m{i}")))
+                .unwrap();
+        }
+        store.append_summary(&sid, "yesterday", 0).unwrap();
+
+        let loaded = store.load_session(&sid).unwrap();
+        assert_eq!(loaded.len(), 2, "stub only: {loaded:?}");
+    }
+
+    /// A session spanning the upgrade has messages with no id. The
+    /// cursor cannot point at one, so the checkpoint degrades to the
+    /// file-order rule rather than pointing at nothing — bounded to a
+    /// day under the default Reset policy, which rotates the file.
+    #[test]
+    fn a_checkpoint_over_id_less_messages_degrades_to_file_order() {
+        let (_s, _c, store, sid) = cached_store();
+        let path = store.absolute_path_for(&sid).unwrap();
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            for i in 0..3 {
+                writeln!(
+                    f,
+                    r#"{{"timestamp":"2026-04-06T10:0{i}:00Z","role":"user","parts":[{{"Text":"old{i}"}}]}}"#
+                )
+                .unwrap();
+            }
+        }
+
+        store.append_summary(&sid, "the old ones", 1).unwrap();
+        store.append(&sid, &ChatMessage::user("new")).unwrap();
+
+        let loaded = store.load_session(&sid).expect("the session still loads");
+        let texts: Vec<String> = loaded
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts[0].contains("the old ones"), "stub first: {texts:?}");
+        assert!(texts.iter().any(|t| t == "new"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t == "old0"),
+            "file-order fallback must skip everything before the line: {texts:?}"
+        );
+    }
+
+    /// The checkpoint must not land between a tool_use and its result.
+    /// find_safe_split_point guarantees it on the write side; this pins
+    /// that the read side stays loadable if it ever does not.
+    #[test]
+    fn a_checkpoint_cutting_a_pair_still_loads_paired() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store.append(&sid, &tool_result_msg("c1", "ok")).unwrap();
+        // Cover the tool_use, keep only the result — the gap the repair
+        // exists for.
+        store.append_summary(&sid, "did a thing", 1).unwrap();
+
+        let loaded = store.load_session(&sid).unwrap();
+        let stray = loaded.iter().enumerate().any(|(i, m)| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ToolResult { .. }))
+                && !loaded.get(i.wrapping_sub(1)).is_some_and(|prev| {
+                    prev.parts
+                        .iter()
+                        .any(|p| matches!(p, ContentPart::ToolUse { .. }))
+                })
+        });
+        assert!(!stray, "an unpaired tool_result survived: {loaded:?}");
     }
 }

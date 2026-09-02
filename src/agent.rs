@@ -216,7 +216,7 @@ impl Agent {
             let provider = self.provider_for(&key.0);
             match generate_summary(&*provider, &messages).await {
                 Ok(summary) if !summary.trim().is_empty() => {
-                    if let Err(e) = self.session_store.append_summary(&session_id, &summary) {
+                    if let Err(e) = self.session_store.append_summary(&session_id, &summary, 0) {
                         warn!("Failed to persist fallback summary for {session_id}: {e}");
                     }
                     self.restart_summaries.lock().await.insert(key, summary);
@@ -262,7 +262,7 @@ impl Agent {
             let provider = self.provider_for(&key.0);
             match generate_summary(&*provider, &messages).await {
                 Ok(summary) if !summary.trim().is_empty() => {
-                    if let Err(e) = self.session_store.append_summary(&session_id, &summary) {
+                    if let Err(e) = self.session_store.append_summary(&session_id, &summary, 0) {
                         warn!("Failed to persist shutdown summary for {session_id}: {e}");
                     }
                     // Also publish an intra-day digest so the
@@ -654,7 +654,7 @@ impl Agent {
             }
         };
 
-        if let Err(e) = self.session_store.append_summary(session_id, &summary) {
+        if let Err(e) = self.session_store.append_summary(session_id, &summary, 0) {
             warn!("Failed to persist boundary summary for {session_id}: {e}");
         }
 
@@ -863,10 +863,11 @@ impl Agent {
                     // Replace in-memory history with compressed version
                     *self.history.lock().await.entry(key.clone()).or_default() =
                         result.compressed.clone();
-                    if let Err(e) = self
-                        .session_store
-                        .append_summary(&session_id, &result.summary)
-                    {
+                    if let Err(e) = self.session_store.append_summary(
+                        &session_id,
+                        &result.summary,
+                        result.keep_recent,
+                    ) {
                         warn!("Failed to persist compaction summary: {e}");
                     }
                     result.compressed

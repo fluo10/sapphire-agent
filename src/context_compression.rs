@@ -95,9 +95,6 @@ pub struct CompressionResult {
     /// this into a checkpoint cursor by counting back from its file's
     /// tip — the caller has no way to map an in-memory index onto a line
     /// number, and should not have to.
-    ///
-    /// Not read yet; wired into `append_summary` by a later task.
-    #[allow(dead_code)]
     pub keep_recent: usize,
 }
 
