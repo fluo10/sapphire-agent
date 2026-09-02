@@ -84,6 +84,26 @@ pub struct SessionMeta {
 /// A single stored message: `ChatMessage` + wall-clock timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
+    /// Stable identity for this line, generated at write time.
+    ///
+    /// The compaction checkpoint (`SummaryLine::covers_through`) points
+    /// at one of these. A timestamp would be the obvious cursor and is a
+    /// worse one: coarse system clocks repeat a value across two rapid
+    /// appends, and an NTP step backwards makes timestamps non-monotonic,
+    /// either of which silently drops messages from a replay.
+    ///
+    /// `None` on lines written before this field existed; readers fall
+    /// back to file order there. File order is what orders a session —
+    /// this is an identity, not a sort key, and no reader compares two
+    /// of them.
+    ///
+    /// Deliberately no `parent`. Unlike the ACP store, this format keeps
+    /// one file per session, so file order survives as a reconstruction
+    /// hint — a file written before `parent` existed cannot contain a
+    /// fork, because a fork needs two writers that both record one. See
+    /// decision 3.1 of the design doc.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub id: Option<Uuid>,
     pub timestamp: DateTime<Utc>,
     pub role: Role,
     pub parts: Vec<ContentPart>,
@@ -126,6 +146,7 @@ pub struct ReportMeta {
 impl StoredMessage {
     pub fn from_chat(msg: &ChatMessage) -> Self {
         Self {
+            id: Some(Uuid::now_v7()),
             timestamp: Utc::now(),
             role: msg.role.clone(),
             parts: msg.parts.clone(),
@@ -162,16 +183,32 @@ struct TitleLine {
     session_title: String,
 }
 
-/// Compacted recap of a session, appended whenever an in-memory compression
-/// fires and on graceful shutdown. Restart uses the latest `SummaryLine` to
-/// inject context into the system prompt without replaying the raw (and
-/// potentially tool-unpaired) message history.
+/// Compacted recap of a session, appended whenever a compaction fires.
+/// `covers_through` makes the latest `SummaryLine` the restore cursor: a
+/// reload replays this summary as a stub, followed only by the messages it
+/// did not absorb, rather than the whole raw history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryLine {
     pub summary_at: DateTime<Utc>,
     pub summary: String,
+    /// Unused: always written as `None` and read nowhere. `covers_through`
+    /// took over its stated job as the restore cursor. Kept (rather than
+    /// removed) because removing a field is a format change; don't
+    /// implement against this one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub up_to_timestamp: Option<DateTime<Utc>>,
+    /// The last message this summary absorbed. A restore replays the
+    /// messages *after* it, prefixed with the summary as a stub — which
+    /// reproduces the in-memory state at the moment of compaction rather
+    /// than replaying a whole session and paying for the compaction all
+    /// over again on the first turn back.
+    ///
+    /// `None` on lines written before this field existed. Those are read
+    /// as "this summary stands in for everything before it in file
+    /// order", which is what a shutdown summary — almost certainly what
+    /// such a line is — actually meant.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub covers_through: Option<Uuid>,
 }
 
 /// A short summary describing what happened in a single session during the
@@ -217,16 +254,29 @@ pub struct SessionStore {
     /// `resolve_path` (filesystem scan) and eagerly by `create_session` /
     /// `ensure_session`. Avoids re-scanning per `append` call.
     path_cache: Mutex<HashMap<String, PathBuf>>,
+    /// Workspace-external, content-addressed store for tool results.
+    ///
+    /// `None` when the platform cache directory could not be opened at
+    /// startup. Degrades rather than failing: a result written without a
+    /// cache is recorded as a `ToolResultRef` with no hash, which reads
+    /// back as `MISSING_RESULT`. Losing the content is survivable;
+    /// losing the pairing is not.
+    tool_results: Option<Arc<crate::tool_result_cache::ToolResultCache>>,
 }
 
 impl SessionStore {
     #[allow(dead_code)]
-    pub fn new(base_dir: PathBuf, kind: &'static str) -> Self {
+    pub fn new(
+        base_dir: PathBuf,
+        kind: &'static str,
+        tool_results: Option<Arc<crate::tool_result_cache::ToolResultCache>>,
+    ) -> Self {
         Self {
             base_dir,
             kind,
             ws_state: None,
             path_cache: Mutex::new(HashMap::new()),
+            tool_results,
         }
     }
 
@@ -234,12 +284,14 @@ impl SessionStore {
         base_dir: PathBuf,
         kind: &'static str,
         ws_state: Arc<Mutex<WorkspaceState>>,
+        tool_results: Option<Arc<crate::tool_result_cache::ToolResultCache>>,
     ) -> Self {
         Self {
             base_dir,
             kind,
             ws_state: Some(ws_state),
             path_cache: Mutex::new(HashMap::new()),
+            tool_results,
         }
     }
 
@@ -381,7 +433,7 @@ impl SessionStore {
 
     /// Append a `ChatMessage` (with current timestamp) to an existing session.
     pub fn append(&self, session_id: &str, msg: &ChatMessage) -> anyhow::Result<()> {
-        let scrubbed = scrub_images_for_storage(msg);
+        let scrubbed = self.scrub_for_storage(msg);
         let to_store = scrubbed.as_ref().unwrap_or(msg);
         let stored = StoredMessage::from_chat(to_store);
         let line = serde_json::to_string(&stored)?;
@@ -395,40 +447,30 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Append a compaction summary to the session file.
-    pub fn append_summary(&self, session_id: &str, summary: &str) -> anyhow::Result<()> {
+    /// Append a compaction summary, recording how far it reaches.
+    ///
+    /// `keep_recent` is how many trailing messages the caller kept
+    /// verbatim (0 for a day-boundary compaction, which replaces the
+    /// whole history). The cursor is computed here rather than passed
+    /// in: the caller holds an index into its in-memory history, and
+    /// only the store can map that onto its own file, whose message
+    /// count is at least as large — earlier compactions trimmed memory,
+    /// not the log.
+    pub fn append_summary(
+        &self,
+        session_id: &str,
+        summary: &str,
+        keep_recent: usize,
+    ) -> anyhow::Result<()> {
+        let path = self
+            .resolve_path(session_id)
+            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
         let line = serde_json::to_string(&SummaryLine {
             summary_at: Utc::now(),
             summary: summary.to_string(),
             up_to_timestamp: None,
+            covers_through: checkpoint_id(&path, keep_recent),
         })?;
-        let path = self
-            .resolve_path(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(file, "{line}")?;
-        drop(file);
-        self.notify_updated(&path);
-        Ok(())
-    }
-
-    /// Append a same-day digest line. Used by the idle-flush task and the
-    /// graceful-shutdown path to publish "what this session has covered
-    /// today" for cross-session injection into other rooms.
-    pub fn append_intraday_digest(
-        &self,
-        session_id: &str,
-        digest: &str,
-        since: Option<DateTime<Utc>>,
-    ) -> anyhow::Result<()> {
-        let line = serde_json::to_string(&IntradayDigestLine {
-            digest_at: Utc::now(),
-            digest: digest.to_string(),
-            since,
-        })?;
-        let path = self
-            .resolve_path(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{line}")?;
         drop(file);
@@ -437,30 +479,46 @@ impl SessionStore {
     }
 
     /// Walk every session file under `sessions_dir` and return the latest
-    /// `IntradayDigestLine` per session whose `digest_at` falls inside the
-    /// local-time `date` window (under `boundary_hour`), paired with the
-    /// session's metadata. Used to assemble the cross-session "today
-    /// digest" injected into the system prompt of newly opened rooms.
+    /// intra-day digest per session whose `digest_at` falls inside the
+    /// local-time `date` window, paired with the session's metadata.
+    ///
+    /// The digest text comes from `cache` — `<cache_dir>/digests/`, one
+    /// entry per session, overwritten in place. It used to be appended
+    /// to the session's own JSONL, which put a dozen near-identical
+    /// restatements of the same afternoon inside a file the retrieve
+    /// indexer walks (#190). This read path no longer treats the file as
+    /// canonical: a cache hit is used as-is. Moving the write side off
+    /// the file too is a separate change.
+    ///
+    /// A digest line still present in the file is read as a fallback for
+    /// a session the cache has nothing for yet, so the upgrade does not
+    /// blank out the day it lands on.
+    ///
+    /// There is deliberately no mtime pre-filter here. One used to skip
+    /// files last touched before `day_start`, on the reasoning that a
+    /// quiet session has no digest today — but that only held while
+    /// writing a digest meant appending to the file, which refreshed its
+    /// mtime. A digest written to the cache leaves the file, and its
+    /// mtime, untouched, so the filter would silently drop a session
+    /// that fell quiet just before the day boundary and got its digest
+    /// just after it. The performance the filter bought is recovered
+    /// instead by reading only the meta line before touching the cache,
+    /// and scanning the rest of the file only on a cache miss.
     pub fn intraday_digests_for_day(
         &self,
         date: NaiveDate,
         boundary_hour: u8,
+        cache: Option<&crate::digest_cache::DigestCache>,
     ) -> Vec<(SessionMeta, IntradayDigestLine)> {
         let (day_start, day_end) = day_window(date, boundary_hour);
         let mut out = Vec::new();
         for path in collect_session_files(&self.base_dir, self.kind) {
-            // mtime pre-filter: a file last touched before day_start can't
-            // possibly carry a digest in this window.
-            if let Ok(meta_fs) = path.metadata()
-                && let Ok(mtime) = meta_fs.modified()
-            {
-                let mtime_utc: DateTime<Utc> = mtime.into();
-                if mtime_utc < day_start {
-                    continue;
-                }
-            }
-            let Some((meta, digest)) = load_meta_and_latest_intraday_digest(&path) else {
+            let Some(meta) = load_session_meta(&path) else {
                 continue;
+            };
+            let digest = match cache.and_then(|c| c.get(&meta.session_id)) {
+                Some(d) => Some(d),
+                None => load_latest_intraday_digest(&path),
             };
             let Some(d) = digest else { continue };
             if d.digest_at >= day_start && d.digest_at < day_end {
@@ -487,126 +545,128 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Load all sessions from disk on startup.
+    /// Load every active session from disk on startup.
     ///
-    /// For each `ConversationKey`, picks the latest ULID-ordered session that
-    /// does **not** have a `closed_at` marker (i.e. is still active).
-    ///
-    /// Raw message history is intentionally NOT reconstructed into in-memory
-    /// history: Anthropic's API requires paired tool_use/tool_result, and we
-    /// skip persisting tool messages to disk, so reloading would break that
-    /// invariant. Instead, callers get:
+    /// For each `ConversationKey`, picks the latest session that has no
+    /// `closed_at` marker. Returns:
     ///
     /// - `active`: which session file is current per conversation
-    /// - `summaries`: the latest `SummaryLine` per conversation (when present)
-    /// - `fallback_messages`: raw `ChatMessage` list for active sessions that
-    ///   have NO summary yet — Agent bootstrap uses these to synthesize a
-    ///   summary on startup (e.g. after a crash that skipped graceful shutdown)
-    #[allow(clippy::type_complexity)]
+    /// - `histories`: that session's conversation as the model should
+    ///   see it — the latest compaction summary as a stub, the messages
+    ///   it did not absorb, tool results hydrated, pairing repaired
+    ///
+    /// Raw history used to be withheld on the grounds that Anthropic
+    /// requires paired tool traffic and none was persisted. Both halves
+    /// of that changed (#194), so the restart summary this replaced is
+    /// gone: a summary costs a model call, throws the turn structure
+    /// away, and answers a question the log now answers directly.
     pub fn load_all(
         &self,
     ) -> (
         HashMap<ConversationKey, String>,
-        HashMap<ConversationKey, String>,
         HashMap<ConversationKey, Vec<ChatMessage>>,
     ) {
-        type SessionEntry = (
-            String,
-            ConversationKey,
-            Vec<StoredMessage>,
-            bool,
-            Option<String>,
-        );
-        let mut entries: Vec<SessionEntry> = Vec::new();
+        let mut entries: Vec<(String, ConversationKey)> = Vec::new();
 
         for path in collect_session_files(&self.base_dir, self.kind) {
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) => s.to_string(),
-                None => continue,
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
             };
-            if let Some((meta, messages, is_closed, summary)) = load_session_file(&path) {
-                let key: ConversationKey = (meta.room_id.clone(), meta.thread_id.clone());
-                if !is_closed {
-                    // Seed the path cache for active sessions so the first
-                    // `append` after bootstrap doesn't pay a scan.
-                    if let Ok(mut cache) = self.path_cache.lock() {
-                        cache.insert(stem.clone(), path.clone());
-                    }
-                }
-                entries.push((stem, key, messages, is_closed, summary.map(|s| s.summary)));
+            let Some(loaded) = load_session_file(&path) else {
+                continue;
+            };
+            if loaded.is_closed {
+                continue;
             }
+            // Seed the path cache so the first append after bootstrap
+            // doesn't pay a scan.
+            if let Ok(mut cache) = self.path_cache.lock() {
+                cache.insert(stem.to_string(), path.clone());
+            }
+            entries.push((
+                stem.to_string(),
+                (loaded.meta.room_id.clone(), loaded.meta.thread_id.clone()),
+            ));
         }
 
+        // Session ids are UUIDv7, so the newest file for a key sorts last.
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut active: HashMap<ConversationKey, String> = HashMap::new();
-        let mut summaries: HashMap<ConversationKey, String> = HashMap::new();
-        let mut fallback: HashMap<ConversationKey, Vec<ChatMessage>> = HashMap::new();
-
-        for (session_id, key, messages, is_closed, summary) in entries {
-            if !is_closed {
-                active.insert(key.clone(), session_id);
-                match summary {
-                    Some(s) => {
-                        summaries.insert(key.clone(), s);
-                        fallback.remove(&key);
-                    }
-                    None => {
-                        summaries.remove(&key);
-                        if !messages.is_empty() {
-                            let chat_messages: Vec<ChatMessage> = messages
-                                .into_iter()
-                                .map(|m| m.into_chat_message())
-                                .collect();
-                            fallback.insert(key, chat_messages);
-                        } else {
-                            fallback.remove(&key);
-                        }
-                    }
+        let mut histories: HashMap<ConversationKey, Vec<ChatMessage>> = HashMap::new();
+        for (session_id, key) in entries {
+            match self.load_session(&session_id) {
+                Some(history) if !history.is_empty() => {
+                    histories.insert(key.clone(), history);
+                }
+                _ => {
+                    histories.remove(&key);
                 }
             }
+            active.insert(key, session_id);
         }
 
-        (active, summaries, fallback)
+        (active, histories)
     }
 
     /// List metadata for all sessions in this store (used by API for session listing).
     pub fn list_sessions(&self) -> Vec<SessionMeta> {
         let mut metas: Vec<SessionMeta> = collect_session_files(&self.base_dir, self.kind)
             .into_iter()
-            .filter_map(|p| load_session_file(&p).map(|(meta, _, _, _)| meta))
+            .filter_map(|p| load_session_file(&p).map(|loaded| loaded.meta))
             .collect();
         metas.sort_by_key(|m| m.created_at);
         metas
     }
 
-    /// Load a single session's conversation history by ID.
-    /// Returns None if the file doesn't exist or is malformed.
+    /// One session as the model should see it: the latest compaction
+    /// summary rendered as a stub, then the messages it did not absorb,
+    /// with tool results hydrated and any broken pairing repaired.
+    ///
+    /// This is the model's view, not the record as written — a checkpoint
+    /// silently drops every covered message and adds a summary stub the
+    /// caller never sent. A reader that wants the record as written (e.g.
+    /// a client-facing endpoint handing a session back to the party that
+    /// wrote it) should use `load_session_full` instead, which does not
+    /// trim.
     pub fn load_session(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
         let path = self.resolve_path(session_id)?;
-        let (_, messages, _, _) = load_session_file(&path)?;
-        Some(
-            messages
-                .into_iter()
-                .map(|m| m.into_chat_message())
-                .collect(),
-        )
+        let loaded = load_session_file(&path)?;
+        let (summary, tail) = model_history(&loaded);
+        let mut out = summary
+            .map(crate::context_compression::compaction_stub)
+            .unwrap_or_default();
+        out.extend(tail.iter().cloned().map(|m| m.into_chat_message()));
+        Some(crate::session_storage::repair_tool_pairing(
+            self.hydrate(out),
+        ))
     }
 
-    /// Load a session preserving wall-clock timestamps and
-    /// `report_meta` provenance, alongside the latest `SummaryLine`
-    /// if one has been written. Used by `recall_memory`: the summary
-    /// becomes `project_summary` (older content compacted) and the
-    /// messages provide the recent verbatim reports. Plain
-    /// `load_session` is unsuitable because the `ChatMessage`
-    /// conversion drops both fields.
+    /// Load a session's messages exactly as written, preserving wall-clock
+    /// timestamps and `report_meta` provenance, alongside the latest
+    /// `SummaryLine` if one has been written. Two callers:
+    ///
+    /// - `recall_memory` (`serve/mcp.rs`), which filters to messages with
+    ///   `report_meta.is_some()` — only `append_report` sets that field,
+    ///   as a single `ContentPart::Text`, so `ContentPart::ToolResultRef`
+    ///   never reaches it either way.
+    /// - `handle_get_session` (`serve/mod.rs`), the client-facing "show me
+    ///   this session" RPC, which hands the record back to the party that
+    ///   wrote it and surfaces `ToolResultRef`'s cache key rather than
+    ///   pulling potentially-large content out of the cache into a
+    ///   response body.
+    ///
+    /// Unlike `load_session`, this does not hydrate `ToolResultRef` back
+    /// into `ToolResult`, does not trim to a compaction checkpoint, and
+    /// does not run `repair_tool_pairing` — it isn't assembling a history
+    /// for a provider, so there's nothing to hydrate or repair for.
     pub fn load_session_full(
         &self,
         session_id: &str,
     ) -> Option<(Vec<StoredMessage>, Option<SummaryLine>)> {
         let path = self.resolve_path(session_id)?;
-        let (_, messages, _, summary) = load_session_file(&path)?;
-        Some((messages, summary))
+        let loaded = load_session_file(&path)?;
+        Some((loaded.messages, loaded.latest_summary))
     }
 
     /// Create a new MCP-driven session for a logical `project`. Unlike
@@ -656,6 +716,7 @@ impl SessionStore {
         meta: ReportMeta,
     ) -> anyhow::Result<()> {
         let stored = StoredMessage {
+            id: Some(Uuid::now_v7()),
             timestamp: Utc::now(),
             role: Role::User,
             parts: vec![ContentPart::Text(rendered_text.to_string())],
@@ -691,7 +752,7 @@ impl SessionStore {
     ) -> anyhow::Result<Option<String>> {
         if let Some(existing) = self.resolve_path(session_id) {
             // Return existing public_id if the file already existed
-            let pub_id = load_session_file(&existing).and_then(|(meta, _, _, _)| meta.public_id);
+            let pub_id = load_session_file(&existing).and_then(|loaded| loaded.meta.public_id);
             return Ok(pub_id);
         }
         let path = self.path_for_new(session_id, namespace);
@@ -748,10 +809,11 @@ impl SessionStore {
 
         let mut best: Option<(DateTime<Utc>, String)> = None;
         for path in collect_session_files(&self.base_dir, self.kind) {
-            let Some((meta, _, is_closed, _)) = load_session_file(&path) else {
+            let Some(loaded) = load_session_file(&path) else {
                 continue;
             };
-            if is_closed {
+            let meta = loaded.meta;
+            if loaded.is_closed {
                 continue;
             }
             if meta.namespace.as_deref() != Some(namespace) {
@@ -822,10 +884,10 @@ impl SessionStore {
     /// Returns the internal UUID `session_id` if found.
     pub fn find_by_public_id(&self, public_id: &str) -> Option<String> {
         for path in collect_session_files(&self.base_dir, self.kind) {
-            if let Some((meta, _, _, _)) = load_session_file(&path)
-                && meta.public_id.as_deref() == Some(public_id)
+            if let Some(loaded) = load_session_file(&path)
+                && loaded.meta.public_id.as_deref() == Some(public_id)
             {
-                return Some(meta.session_id);
+                return Some(loaded.meta.session_id);
             }
         }
         None
@@ -854,14 +916,15 @@ impl SessionStore {
                 }
             }
 
-            if let Some((meta, messages, _, _)) = load_session_file(&path) {
-                let day_messages: Vec<StoredMessage> = messages
+            if let Some(loaded) = load_session_file(&path) {
+                let day_messages: Vec<StoredMessage> = loaded
+                    .messages
                     .into_iter()
                     .filter(|m| m.timestamp >= day_start && m.timestamp < day_end)
                     .collect();
 
                 if !day_messages.is_empty() {
-                    results.push((meta, day_messages));
+                    results.push((loaded.meta, day_messages));
                 }
             }
         }
@@ -899,11 +962,11 @@ impl SessionStore {
         let mut dates = std::collections::HashSet::new();
 
         for path in collect_session_files(&self.base_dir, self.kind) {
-            if let Some((meta, messages, _, _)) = load_session_file(&path) {
-                if !predicate(&meta) {
+            if let Some(loaded) = load_session_file(&path) {
+                if !predicate(&loaded.meta) {
                     continue;
                 }
-                for msg in messages {
+                for msg in loaded.messages {
                     let local_ts = msg.timestamp.with_timezone(&Local);
                     let date = local_date_for_timestamp(local_ts, boundary_hour);
                     dates.insert(date);
@@ -923,8 +986,8 @@ impl SessionStore {
         let mut dates = std::collections::HashSet::new();
 
         for path in collect_session_files(&self.base_dir, self.kind) {
-            if let Some((_, messages, _, _)) = load_session_file(&path) {
-                for msg in messages {
+            if let Some(loaded) = load_session_file(&path) {
+                for msg in loaded.messages {
                     let local_ts = msg.timestamp.with_timezone(&Local);
                     let date = local_date_for_timestamp(local_ts, boundary_hour);
                     dates.insert(date);
@@ -936,56 +999,116 @@ impl SessionStore {
         sorted.sort();
         sorted
     }
-}
 
-// ---------------------------------------------------------------------------
-// Image scrubbing for persistence
-// ---------------------------------------------------------------------------
-
-/// Replace every `ContentPart::Image` in `msg` with a text marker that
-/// preserves the MIME type and a SHA-256 of the raw bytes, returning the
-/// rewritten message. Returns `None` when `msg` has no image parts (so
-/// callers can skip the allocation).
-///
-/// Format: `[image: <media_type> sha256=<hex>]` — the hash gives future
-/// out-of-band caches a stable key (planned follow-up: ImageRef +
-/// workspace-external cache) without dragging multi-MB base64 blobs into
-/// JSONL session files or the in-memory history on reload.
-///
-/// An undecodable `data_base64` is recorded as `sha256=invalid-base64`
-/// rather than failing the append — a corrupt image shouldn't lose the
-/// surrounding turn from persistence.
-pub(crate) fn scrub_images_for_storage(msg: &ChatMessage) -> Option<ChatMessage> {
-    if !msg
-        .parts
-        .iter()
-        .any(|p| matches!(p, ContentPart::Image { .. }))
-    {
-        return None;
-    }
-    let parts = msg
-        .parts
-        .iter()
-        .map(|p| match p {
-            ContentPart::Image {
-                media_type,
-                data_base64,
-            } => {
-                let hash = match BASE64_STANDARD.decode(data_base64) {
-                    Ok(bytes) => sha256_hex(&bytes),
-                    Err(_) => "invalid-base64".to_string(),
-                };
-                ContentPart::Text(format!("[image: {media_type} sha256={hash}]"))
-            }
-            other => other.clone(),
+    /// What a message looks like on disk.
+    ///
+    /// Three transformations, all storage-path-only — the in-memory
+    /// history keeps the full values for the provider call:
+    ///
+    /// - a tool result's content goes to the cache and the line keeps a
+    ///   hash, because `<workspace>/sessions` is inside the retrieve
+    ///   index and a day of file reads would both bloat the workspace
+    ///   and skew every search that touches it
+    /// - an oversized tool *input* is elided, for the same reason and
+    ///   with no cache to escape into
+    /// - an image becomes a text marker carrying its hash
+    ///
+    /// Returns `None` when nothing needs rewriting, so the common
+    /// text-only append skips the allocation.
+    fn scrub_for_storage(&self, msg: &ChatMessage) -> Option<ChatMessage> {
+        let needs_work = msg.parts.iter().any(|p| {
+            matches!(
+                p,
+                ContentPart::Image { .. }
+                    | ContentPart::ToolResult { .. }
+                    | ContentPart::ToolUse { .. }
+            )
+        });
+        if !needs_work {
+            return None;
+        }
+        let parts = msg
+            .parts
+            .iter()
+            .map(|p| match p {
+                ContentPart::Image {
+                    media_type,
+                    data_base64,
+                } => {
+                    let hash = match BASE64_STANDARD.decode(data_base64) {
+                        Ok(bytes) => sha256_hex(&bytes),
+                        Err(_) => "invalid-base64".to_string(),
+                    };
+                    ContentPart::Text(format!("[image: {media_type} sha256={hash}]"))
+                }
+                ContentPart::ToolUse { id, name, input } => ContentPart::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: crate::session_storage::elide_oversized_input(input),
+                },
+                ContentPart::ToolResult {
+                    tool_use_id,
+                    content,
+                } => {
+                    // A missing cache must not degrade any further than
+                    // a lost hash does. Dropping the part would leave a
+                    // `tool_use` with no matching `tool_result`, which
+                    // the API rejects outright — the session would fail
+                    // to load rather than load thinner.
+                    let sha256 = match &self.tool_results {
+                        Some(cache) => match cache.put(content) {
+                            Ok(sha) => Some(sha),
+                            Err(e) => {
+                                warn!("Failed to cache tool result '{tool_use_id}': {e}");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    ContentPart::ToolResultRef {
+                        tool_use_id: tool_use_id.clone(),
+                        sha256,
+                    }
+                }
+                other => other.clone(),
+            })
+            .collect();
+        Some(ChatMessage {
+            role: msg.role.clone(),
+            parts,
+            input_kind: msg.input_kind.clone(),
+            user_id: msg.user_id.clone(),
         })
-        .collect();
-    Some(ChatMessage {
-        role: msg.role.clone(),
-        parts,
-        input_kind: msg.input_kind.clone(),
-        user_id: msg.user_id.clone(),
-    })
+    }
+
+    /// Turn every `ToolResultRef` back into the result the model needs
+    /// to see. A miss is a placeholder, not an error.
+    pub(crate) fn hydrate(&self, msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        msgs.into_iter()
+            .map(|m| ChatMessage {
+                parts: m
+                    .parts
+                    .iter()
+                    .map(|p| match p {
+                        ContentPart::ToolResultRef {
+                            tool_use_id,
+                            sha256,
+                        } => ContentPart::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: sha256
+                                .as_ref()
+                                .and_then(|s| self.tool_results.as_ref()?.get(s))
+                                .unwrap_or_else(|| {
+                                    crate::session_storage::MISSING_RESULT.to_string()
+                                }),
+                        },
+                        other => other.clone(),
+                    })
+                    .collect(),
+                ..m
+            })
+            .collect()
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1077,13 +1200,21 @@ pub fn local_date_for_timestamp(local_ts: DateTime<Local>, boundary_hour: u8) ->
 // File parsing helpers
 // ---------------------------------------------------------------------------
 
+/// One parsed session file.
+struct LoadedSession {
+    meta: SessionMeta,
+    messages: Vec<StoredMessage>,
+    is_closed: bool,
+    latest_summary: Option<SummaryLine>,
+    /// `messages.len()` at the moment the latest summary line was read.
+    /// The file-order fallback for a summary with no `covers_through`.
+    messages_before_summary: usize,
+}
+
 /// Parse a single session `.jsonl` file.
 ///
-/// Returns `(meta, messages, is_closed, latest_summary)` or `None` if the
-/// file is unreadable or has a malformed first line.
-fn load_session_file(
-    path: &Path,
-) -> Option<(SessionMeta, Vec<StoredMessage>, bool, Option<SummaryLine>)> {
+/// Returns `None` if the file is unreadable or has a malformed first line.
+fn load_session_file(path: &Path) -> Option<LoadedSession> {
     let file = fs::File::open(path).ok()?;
     let mut lines = BufReader::new(file).lines();
 
@@ -1094,6 +1225,7 @@ fn load_session_file(
     let mut messages = Vec::new();
     let mut is_closed = false;
     let mut latest_summary: Option<SummaryLine> = None;
+    let mut messages_before_summary = 0;
 
     for raw in lines.map_while(Result::ok) {
         let raw = raw.trim().to_string();
@@ -1115,7 +1247,10 @@ fn load_session_file(
             meta.title = Some(title.to_string());
         } else if value.get("summary_at").is_some() {
             match serde_json::from_value::<SummaryLine>(value) {
-                Ok(s) => latest_summary = Some(s),
+                Ok(s) => {
+                    latest_summary = Some(s);
+                    messages_before_summary = messages.len();
+                }
                 Err(e) => {
                     warn!("Skipping malformed summary in {}: {e}", path.display());
                 }
@@ -1134,20 +1269,61 @@ fn load_session_file(
         }
     }
 
-    Some((meta, messages, is_closed, latest_summary))
+    Some(LoadedSession {
+        meta,
+        messages,
+        is_closed,
+        latest_summary,
+        messages_before_summary,
+    })
 }
 
-/// Minimal-cost variant of `load_session_file`: returns just the metadata
-/// and the latest `IntradayDigestLine`, skipping message accumulation.
-fn load_meta_and_latest_intraday_digest(
-    path: &Path,
-) -> Option<(SessionMeta, Option<IntradayDigestLine>)> {
+/// The messages a restore should replay, and the summary to prefix them
+/// with.
+///
+/// Everything before the checkpoint is what the summary already says;
+/// replaying it too would re-send a conversation the running process had
+/// already compacted away, and pay for compacting it again on the first
+/// turn back.
+fn model_history(loaded: &LoadedSession) -> (Option<&str>, &[StoredMessage]) {
+    let Some(summary) = &loaded.latest_summary else {
+        return (None, &loaded.messages);
+    };
+    let start = match summary.covers_through {
+        Some(id) => match loaded.messages.iter().position(|m| m.id == Some(id)) {
+            Some(pos) => pos + 1,
+            None => {
+                warn!("session checkpoint {id} is not in the file; replaying the whole session");
+                0
+            }
+        },
+        None => loaded.messages_before_summary,
+    };
+    (
+        Some(summary.summary.as_str()),
+        loaded.messages.get(start..).unwrap_or(&[]),
+    )
+}
+
+/// Read just the first line of a session file: its `SessionMeta`. Cheap
+/// enough to call for every session before deciding whether a full scan
+/// for a fallback digest is even needed (see `intraday_digests_for_day`).
+fn load_session_meta(path: &Path) -> Option<SessionMeta> {
     let file = fs::File::open(path).ok()?;
     let mut lines = BufReader::new(file).lines();
-
     let first = lines.next()?.ok()?;
     let meta_line: MetaLine = serde_json::from_str(first.trim()).ok()?;
-    let meta = meta_line.meta;
+    Some(meta_line.meta)
+}
+
+/// Scan a session file for its latest `IntradayDigestLine`, skipping
+/// message accumulation. Only worth calling when the digest cache has no
+/// entry for the session — the transition-era fallback in
+/// `intraday_digests_for_day` (#190).
+fn load_latest_intraday_digest(path: &Path) -> Option<IntradayDigestLine> {
+    let file = fs::File::open(path).ok()?;
+    let mut lines = BufReader::new(file).lines();
+    let _ = lines.next()?; // meta line, already consumed by `load_session_meta`
 
     let mut latest: Option<IntradayDigestLine> = None;
     for raw in lines.map_while(Result::ok) {
@@ -1165,26 +1341,110 @@ fn load_meta_and_latest_intraday_digest(
             latest = Some(d);
         }
     }
-    Some((meta, latest))
+    latest
+}
+
+/// The id of the last message a summary keeping `keep_recent` trailing
+/// messages absorbs.
+///
+/// `None` when the file has no messages, or when the message at that
+/// position predates `StoredMessage::id`. The second case costs one
+/// checkpoint's worth of tail on a session that spans the upgrade —
+/// bounded to a day under the default `Reset` policy, which rotates the
+/// file — and the reader's file-order fallback handles it.
+fn checkpoint_id(path: &Path, keep_recent: usize) -> Option<Uuid> {
+    let ids = message_ids_in_order(path);
+    if ids.is_empty() {
+        return None;
+    }
+    // A summary that covers nothing is not reachable from
+    // `maybe_compress` (it fires only with at least one message to
+    // summarise, and the file holds at least as many as memory did), but
+    // clamping costs nothing and keeps the index in range.
+    let covered = ids.len().saturating_sub(keep_recent).max(1);
+    ids[covered - 1]
+}
+
+/// Every message line's id, in file order. Non-message lines are skipped
+/// so the positions line up with what a reader replays.
+fn message_ids_in_order(path: &Path) -> Vec<Option<Uuid>> {
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for raw in BufReader::new(file).lines().map_while(Result::ok) {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            continue;
+        };
+        if value.get("timestamp").is_none() {
+            continue;
+        }
+        // Must agree with `load_session_file` on what counts as a
+        // message: a timestamped line that fails to deserialize as a
+        // `StoredMessage` is skipped there too (with a warning), so a
+        // cursor must never be computed against one here — the reader
+        // would not find it and would fall back to replaying everything.
+        let Ok(stored) = serde_json::from_value::<StoredMessage>(value) else {
+            continue;
+        };
+        out.push(stored.id);
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Every newly written message carries an id. The compaction
+    /// checkpoint points at one, so a message without one cannot be a
+    /// cursor.
+    #[test]
+    fn a_new_stored_message_gets_an_id() {
+        let stored = StoredMessage::from_chat(&ChatMessage::user("hi"));
+        assert!(stored.id.is_some(), "from_chat must stamp an id");
+    }
+
+    /// Distinct messages get distinct ids. The checkpoint looks its
+    /// cursor up by position, so what it needs is uniqueness, not order —
+    /// file order is what orders a session, here and in the future
+    /// `parent` migration (decision 3.1).
+    #[test]
+    fn each_message_gets_its_own_id() {
+        let a = StoredMessage::from_chat(&ChatMessage::user("first"));
+        let b = StoredMessage::from_chat(&ChatMessage::user("second"));
+        assert_ne!(a.id.unwrap(), b.id.unwrap());
+    }
+
+    /// Legacy JSONL predates the field and must still load.
+    #[test]
+    fn a_stored_message_without_an_id_deserializes_as_none() {
+        let legacy = r#"{"timestamp":"2026-04-08T11:30:22.372570890Z","role":"user","parts":[{"Text":"hello"}]}"#;
+        let msg: StoredMessage = serde_json::from_str(legacy).expect("legacy JSONL parses");
+        assert!(msg.id.is_none());
+    }
+
     #[test]
     fn scrub_returns_none_when_no_images() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
         let msg = ChatMessage::user("plain text");
-        assert!(scrub_images_for_storage(&msg).is_none());
+        assert!(store.scrub_for_storage(&msg).is_none());
     }
 
     #[test]
     fn scrub_replaces_image_with_hash_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
         let bytes = b"\xff\xd8\xff\xe0fake-jpeg".to_vec();
         let b64 = BASE64_STANDARD.encode(&bytes);
         let msg =
             ChatMessage::user_with_images("look", std::iter::once(("image/jpeg".to_string(), b64)));
-        let scrubbed = scrub_images_for_storage(&msg).expect("scrub should rewrite");
+        let scrubbed = store.scrub_for_storage(&msg).expect("scrub should rewrite");
 
         // No Image parts remain on the persisted shape.
         assert!(
@@ -1210,6 +1470,8 @@ mod tests {
 
     #[test]
     fn scrub_invalid_base64_records_marker_without_panic() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
         let msg = ChatMessage {
             role: Role::User,
             parts: vec![ContentPart::Image {
@@ -1219,7 +1481,7 @@ mod tests {
             input_kind: Some(UserInputKind::Text),
             user_id: None,
         };
-        let scrubbed = scrub_images_for_storage(&msg).expect("scrub should rewrite");
+        let scrubbed = store.scrub_for_storage(&msg).expect("scrub should rewrite");
         let has_marker = scrubbed
             .parts
             .iter()
@@ -1229,6 +1491,8 @@ mod tests {
 
     #[test]
     fn scrub_passes_imageref_through_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
         let msg = ChatMessage {
             role: Role::User,
             parts: vec![ContentPart::ImageRef {
@@ -1241,7 +1505,7 @@ mod tests {
         // ImageRef carries no raw bytes — nothing to scrub, so the
         // helper returns None and append serializes the variant as-is.
         assert!(
-            scrub_images_for_storage(&msg).is_none(),
+            store.scrub_for_storage(&msg).is_none(),
             "scrub should leave ImageRef-only messages untouched"
         );
     }
@@ -1261,6 +1525,7 @@ mod tests {
     #[test]
     fn stored_message_omits_none_fields_on_serialize() {
         let msg = StoredMessage {
+            id: None,
             timestamp: Utc::now(),
             role: Role::Assistant,
             parts: vec![ContentPart::Text("hi".to_string())],
@@ -1286,6 +1551,7 @@ mod tests {
     #[test]
     fn stored_message_text_input_kind_round_trip() {
         let original = StoredMessage {
+            id: None,
             timestamp: Utc::now(),
             role: Role::User,
             parts: vec![ContentPart::Text("hi".to_string())],
@@ -1304,6 +1570,7 @@ mod tests {
     #[test]
     fn stored_message_voice_input_kind_round_trip() {
         let original = StoredMessage {
+            id: None,
             timestamp: Utc::now(),
             role: Role::User,
             parts: vec![ContentPart::Text("hello there".to_string())],
@@ -1340,7 +1607,7 @@ mod tests {
 
     fn new_device_default_store() -> (tempfile::TempDir, SessionStore) {
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = SessionStore::new(tmp.path().to_path_buf(), "device-default");
+        let store = SessionStore::new(tmp.path().to_path_buf(), "device-default", None);
         (tmp, store)
     }
 
@@ -1354,15 +1621,15 @@ mod tests {
             .expect("find_or_create");
         // Resolve from disk and verify the meta the store wrote.
         let path = store.absolute_path_for(&sid).expect("path cached");
-        let (meta, _msgs, is_closed, _summary) =
-            load_session_file(&path).expect("meta line present");
+        let loaded = load_session_file(&path).expect("meta line present");
+        let meta = loaded.meta;
         assert_eq!(meta.session_id, sid);
         assert_eq!(meta.channel, "device-default");
         assert_eq!(meta.device_id.as_deref(), Some("device-a"));
         assert_eq!(meta.room_profile.as_deref(), Some("default"));
         assert_eq!(meta.namespace.as_deref(), Some("default"));
         assert!(meta.public_id.is_none(), "device-default has no grain-id");
-        assert!(!is_closed);
+        assert!(!loaded.is_closed);
     }
 
     /// Second call within the same local day returns the same session_id.
@@ -1458,6 +1725,631 @@ mod tests {
         assert_ne!(
             stale_id, fresh,
             "yesterday's session must not be picked up; daily rotation depends on it"
+        );
+    }
+
+    // ── intra-day digest がキャッシュから引かれる (#190) ──────────────────
+
+    fn store_with_one_session() -> (tempfile::TempDir, SessionStore, String) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
+        let key = ("!room:example.org".to_string(), None);
+        let sid = store.create_session(&key, "matrix", "default").unwrap();
+        (tmp, store, sid)
+    }
+
+    /// digest はセッションファイルではなくキャッシュに置かれる。ファイル側に
+    /// 何も書かれていなくても、today ブロックには現れなければならない。
+    #[test]
+    fn a_cached_digest_is_returned_without_any_line_in_the_file() {
+        let (_tmp, store, sid) = store_with_one_session();
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = crate::digest_cache::DigestCache::open(cache_dir.path().to_path_buf()).unwrap();
+        cache.put(&sid, "we fixed the parser", None).unwrap();
+
+        let today = local_date_for_timestamp(Local::now(), 4);
+        let got = store.intraday_digests_for_day(today, 4, Some(&cache));
+
+        assert_eq!(got.len(), 1, "the cached digest must be found; got {got:?}");
+        assert_eq!(got[0].1.digest, "we fixed the parser");
+        assert_eq!(got[0].0.session_id, sid);
+    }
+
+    /// アップグレード直後、キャッシュはまだ空でファイルには前バージョンが書いた
+    /// digest 行が残っている。その日の today ブロックが空になってはいけない。
+    #[test]
+    fn a_file_digest_is_the_fallback_when_the_cache_has_nothing() {
+        let (_tmp, store, sid) = store_with_one_session();
+        let path = store.absolute_path_for(&sid).unwrap();
+        let line = serde_json::to_string(&IntradayDigestLine {
+            digest_at: Utc::now(),
+            digest: "written by the previous version".to_string(),
+            since: None,
+        })
+        .unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{line}").unwrap();
+        drop(f);
+
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = crate::digest_cache::DigestCache::open(cache_dir.path().to_path_buf()).unwrap();
+
+        let today = local_date_for_timestamp(Local::now(), 4);
+        let got = store.intraday_digests_for_day(today, 4, Some(&cache));
+
+        assert_eq!(got.len(), 1, "the file's own line must still be read");
+        assert_eq!(got[0].1.digest, "written by the previous version");
+    }
+
+    /// キャッシュとファイルの両方にある場合、キャッシュが勝つ — そちらが
+    /// 現在の書き込み先で、常に新しい。
+    #[test]
+    fn the_cache_wins_over_a_stale_file_line() {
+        let (_tmp, store, sid) = store_with_one_session();
+        let path = store.absolute_path_for(&sid).unwrap();
+        let line = serde_json::to_string(&IntradayDigestLine {
+            digest_at: Utc::now(),
+            digest: "stale".to_string(),
+            since: None,
+        })
+        .unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{line}").unwrap();
+        drop(f);
+
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = crate::digest_cache::DigestCache::open(cache_dir.path().to_path_buf()).unwrap();
+        cache.put(&sid, "fresh", None).unwrap();
+
+        let today = local_date_for_timestamp(Local::now(), 4);
+        let got = store.intraday_digests_for_day(today, 4, Some(&cache));
+        assert_eq!(got[0].1.digest, "fresh");
+    }
+
+    /// A digest lives in the cache now, so the session file is not touched
+    /// when one is written. A room that fell quiet just before the day
+    /// boundary and got its digest just after it has an old file and a
+    /// fresh digest — and must still appear in today's block.
+    #[test]
+    fn a_fresh_cached_digest_survives_an_old_file_mtime() {
+        let (_tmp, store, sid) = store_with_one_session();
+        let path = store.absolute_path_for(&sid).unwrap();
+        let two_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 3600);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = crate::digest_cache::DigestCache::open(cache_dir.path().to_path_buf()).unwrap();
+        cache.put(&sid, "quiet room, late digest", None).unwrap();
+
+        let today = local_date_for_timestamp(Local::now(), 4);
+        let got = store.intraday_digests_for_day(today, 4, Some(&cache));
+        assert_eq!(
+            got.len(),
+            1,
+            "an old file must not hide a fresh cached digest: {got:?}"
+        );
+    }
+
+    // ── ツール結果の永続化 (#194) ────────────────────────────────────
+
+    fn cached_store() -> (tempfile::TempDir, tempfile::TempDir, SessionStore, String) {
+        let sessions = tempfile::TempDir::new().unwrap();
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = crate::tool_result_cache::ToolResultCache::open(cache_dir.path().to_path_buf())
+            .unwrap();
+        let store = SessionStore::new(sessions.path().to_path_buf(), "channel", Some(cache));
+        let key = ("!room:example.org".to_string(), None);
+        let sid = store.create_session(&key, "matrix", "default").unwrap();
+        (sessions, cache_dir, store, sid)
+    }
+
+    fn tool_use_msg(id: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            parts: vec![ContentPart::ToolUse {
+                id: id.to_string(),
+                name: "file_read".to_string(),
+                input: serde_json::json!({ "path": "a.rs" }),
+            }],
+            input_kind: None,
+            user_id: None,
+        }
+    }
+
+    fn tool_result_msg(id: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::User,
+            parts: vec![ContentPart::ToolResult {
+                tool_use_id: id.to_string(),
+                content: content.to_string(),
+            }],
+            input_kind: None,
+            user_id: None,
+        }
+    }
+
+    /// The whole point: what the agent did survives a reload.
+    #[test]
+    fn a_tool_result_round_trips_through_the_cache() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store
+            .append(&sid, &tool_result_msg("c1", "fn main() {}"))
+            .unwrap();
+
+        let loaded = store.load_session(&sid).expect("the session loads");
+        let content = loaded.iter().flat_map(|m| &m.parts).find_map(|p| match p {
+            ContentPart::ToolResult {
+                tool_use_id,
+                content,
+            } if tool_use_id == "c1" => Some(content.clone()),
+            _ => None,
+        });
+        assert_eq!(content.as_deref(), Some("fn main() {}"));
+    }
+
+    /// The content must not be in the JSONL — that file is inside the
+    /// retrieve index, which is the whole reason for the cache.
+    #[test]
+    fn the_result_content_never_reaches_the_session_file() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store
+            .append(&sid, &tool_result_msg("c1", "SECRET-CANARY-VALUE"))
+            .unwrap();
+
+        let raw = fs::read_to_string(store.absolute_path_for(&sid).unwrap()).unwrap();
+        assert!(
+            !raw.contains("SECRET-CANARY-VALUE"),
+            "tool result content leaked into the indexed file:\n{raw}"
+        );
+        assert!(
+            raw.contains("ToolResultRef"),
+            "expected a reference:\n{raw}"
+        );
+    }
+
+    /// An evicted result degrades to a placeholder. The pairing is what
+    /// the API validates, so this must load rather than fail.
+    #[test]
+    fn an_evicted_result_becomes_a_placeholder() {
+        let (_s, cache_dir, store, sid) = cached_store();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store
+            .append(&sid, &tool_result_msg("c1", "gone soon"))
+            .unwrap();
+
+        for entry in fs::read_dir(cache_dir.path()).unwrap().flatten() {
+            fs::remove_file(entry.path()).unwrap();
+        }
+
+        let loaded = store.load_session(&sid).expect("the session still loads");
+        let has_placeholder = loaded.iter().flat_map(|m| &m.parts).any(
+            |p| matches!(p, ContentPart::ToolResult { tool_use_id, content } if tool_use_id == "c1" && content == crate::session_storage::MISSING_RESULT),
+        );
+        assert!(has_placeholder, "expected a placeholder: {loaded:?}");
+    }
+
+    /// No cache at write time records the pairing with no hash. Writing
+    /// nothing would leave a tool_use the API rejects.
+    #[test]
+    fn no_cache_at_write_time_still_keeps_the_pairing() {
+        let sessions = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(sessions.path().to_path_buf(), "channel", None);
+        let key = ("!room:example.org".to_string(), None);
+        let sid = store.create_session(&key, "matrix", "default").unwrap();
+
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store.append(&sid, &tool_result_msg("c1", "lost")).unwrap();
+
+        let loaded = store.load_session(&sid).expect("the session loads");
+        let answered = loaded.iter().flat_map(|m| &m.parts).any(
+            |p| matches!(p, ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == "c1"),
+        );
+        assert!(answered, "the tool_use must still be answered: {loaded:?}");
+    }
+
+    /// An oversized tool input is elided rather than written whole — the
+    /// session file is indexed and there is no cache indirection for it.
+    #[test]
+    fn an_oversized_tool_input_is_elided_on_disk() {
+        let (_s, _c, store, sid) = cached_store();
+        let huge = "x".repeat(crate::tools::OUTPUT_CAP_BYTES + 1);
+        store
+            .append(
+                &sid,
+                &ChatMessage {
+                    role: Role::Assistant,
+                    parts: vec![ContentPart::ToolUse {
+                        id: "c1".to_string(),
+                        name: "file_write".to_string(),
+                        input: serde_json::json!({ "content": huge }),
+                    }],
+                    input_kind: None,
+                    user_id: None,
+                },
+            )
+            .unwrap();
+
+        let raw = fs::read_to_string(store.absolute_path_for(&sid).unwrap()).unwrap();
+        assert!(
+            raw.contains("_elided"),
+            "expected elision:\n{}",
+            &raw[..raw.len().min(400)]
+        );
+        assert!(
+            raw.len() < 4000,
+            "the line was written whole ({} bytes)",
+            raw.len()
+        );
+    }
+
+    /// The daily log is a permanent, searchable record. A placeholder
+    /// sentence from an evicted result has no business in it.
+    #[test]
+    fn the_daily_log_projection_carries_no_tool_traffic() {
+        let (_s, _c, store, sid) = cached_store();
+        store
+            .append(&sid, &ChatMessage::user("what is in a.rs"))
+            .unwrap();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store
+            .append(&sid, &tool_result_msg("c1", "fn main() {}"))
+            .unwrap();
+
+        let today = local_date_for_timestamp(Local::now(), 4);
+        let days = store.sessions_for_day(today, 4);
+        let parts: Vec<&ContentPart> = days
+            .iter()
+            .flat_map(|(_, ms)| ms)
+            .flat_map(|m| &m.parts)
+            .collect();
+        assert!(
+            parts.iter().all(|p| matches!(
+                p,
+                ContentPart::Text(_)
+                    | ContentPart::ToolUse { .. }
+                    | ContentPart::ToolResultRef { .. }
+            )),
+            "no hydrated tool result may appear: {parts:?}"
+        );
+        assert!(
+            !parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ToolResult { .. })),
+            "sessions_for_day must not hydrate: {parts:?}"
+        );
+    }
+
+    // ── compaction チェックポイント ──────────────────────────────────
+
+    /// The checkpoint covers everything but the trailing `keep_recent`
+    /// messages, so a restore reproduces the state the process had when
+    /// it went down rather than replaying the whole file.
+    #[test]
+    fn a_restore_replays_the_summary_and_the_kept_tail() {
+        let (_s, _c, store, sid) = cached_store();
+        for i in 0..5 {
+            store
+                .append(&sid, &ChatMessage::user(&format!("m{i}")))
+                .unwrap();
+        }
+        store.append_summary(&sid, "the first three", 2).unwrap();
+
+        let loaded = store.load_session(&sid).expect("the session loads");
+        let texts: Vec<String> = loaded
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            texts[0].contains("the first three"),
+            "stub first: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "m3"),
+            "kept tail missing: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "m4"),
+            "kept tail missing: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "m0"),
+            "covered message replayed: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "m2"),
+            "covered message replayed: {texts:?}"
+        );
+    }
+
+    /// A file with no summary replays whole — there is no checkpoint to
+    /// start from.
+    #[test]
+    fn a_file_without_a_summary_replays_everything() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &ChatMessage::user("only one")).unwrap();
+        let loaded = store.load_session(&sid).unwrap();
+        assert_eq!(loaded.len(), 1);
+    }
+
+    /// A SummaryLine written before covers_through existed means "this
+    /// summary stands in for everything before it in the file" — which
+    /// is what the shutdown summary it almost certainly is did mean.
+    #[test]
+    fn a_legacy_summary_line_replays_only_what_follows_it() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &ChatMessage::user("before")).unwrap();
+
+        let path = store.absolute_path_for(&sid).unwrap();
+        let legacy = r#"{"summary_at":"2026-04-06T11:00:00Z","summary":"what happened"}"#;
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{legacy}").unwrap();
+        drop(f);
+
+        store.append(&sid, &ChatMessage::user("after")).unwrap();
+
+        let loaded = store.load_session(&sid).unwrap();
+        let texts: Vec<String> = loaded
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts[0].contains("what happened"), "stub first: {texts:?}");
+        assert!(texts.iter().any(|t| t == "after"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "before"), "{texts:?}");
+    }
+
+    /// A file with two legacy summary lines must use the count at the
+    /// *latest* one, not the first — a bug that captured the count only
+    /// once (at the first summary) would still pass a test with a single
+    /// legacy line, but would silently replay messages the newer summary
+    /// already covers.
+    #[test]
+    fn a_second_legacy_summary_uses_its_own_count_not_the_first() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &ChatMessage::user("m0")).unwrap();
+
+        let path = store.absolute_path_for(&sid).unwrap();
+        let first = r#"{"summary_at":"2026-04-06T11:00:00Z","summary":"first summary"}"#;
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{first}").unwrap();
+        drop(f);
+
+        store.append(&sid, &ChatMessage::user("m1")).unwrap();
+
+        let second = r#"{"summary_at":"2026-04-06T12:00:00Z","summary":"second summary"}"#;
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{second}").unwrap();
+        drop(f);
+
+        store.append(&sid, &ChatMessage::user("m2")).unwrap();
+
+        let loaded = store.load_session(&sid).unwrap();
+        let texts: Vec<String> = loaded
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts[0].contains("second summary"),
+            "stub must be the latest summary: {texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "m2"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t == "m1"),
+            "must not replay what the second summary already covers: {texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t == "m0"), "{texts:?}");
+    }
+
+    /// A checkpoint id that is not in the file (corruption, or a partial
+    /// sync) must not silently return nothing — the whole file replays
+    /// behind the stub instead, same as a file with no checkpoint at all.
+    /// This is the failure mode `model_history`'s fallback branch exists
+    /// to prevent.
+    #[test]
+    fn a_checkpoint_not_found_in_the_file_replays_everything() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &ChatMessage::user("m0")).unwrap();
+        store.append(&sid, &ChatMessage::user("m1")).unwrap();
+
+        let path = store.absolute_path_for(&sid).unwrap();
+        let missing = Uuid::now_v7();
+        let line = serde_json::to_string(&SummaryLine {
+            summary_at: Utc::now(),
+            summary: "stale checkpoint".to_string(),
+            up_to_timestamp: None,
+            covers_through: Some(missing),
+        })
+        .unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{line}").unwrap();
+        drop(f);
+
+        let loaded = store.load_session(&sid).expect("the session still loads");
+        let texts: Vec<String> = loaded
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts[0].contains("stale checkpoint"),
+            "stub first: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "m0"),
+            "checkpoint miss must fall back to replaying everything: {texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "m1"), "{texts:?}");
+    }
+
+    /// keep_recent = 0 is the day-boundary compaction: it replaced the
+    /// whole in-memory history with a stub, so a restore should too.
+    #[test]
+    fn a_boundary_compaction_leaves_only_the_stub() {
+        let (_s, _c, store, sid) = cached_store();
+        for i in 0..3 {
+            store
+                .append(&sid, &ChatMessage::user(&format!("m{i}")))
+                .unwrap();
+        }
+        store.append_summary(&sid, "yesterday", 0).unwrap();
+
+        let loaded = store.load_session(&sid).unwrap();
+        assert_eq!(loaded.len(), 2, "stub only: {loaded:?}");
+    }
+
+    /// A session spanning the upgrade has messages with no id. The
+    /// cursor cannot point at one, so the checkpoint degrades to the
+    /// file-order rule rather than pointing at nothing — bounded to a
+    /// day under the default Reset policy, which rotates the file.
+    #[test]
+    fn a_checkpoint_over_id_less_messages_degrades_to_file_order() {
+        let (_s, _c, store, sid) = cached_store();
+        let path = store.absolute_path_for(&sid).unwrap();
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            for i in 0..3 {
+                writeln!(
+                    f,
+                    r#"{{"timestamp":"2026-04-06T10:0{i}:00Z","role":"user","parts":[{{"Text":"old{i}"}}]}}"#
+                )
+                .unwrap();
+            }
+        }
+
+        store.append_summary(&sid, "the old ones", 1).unwrap();
+        store.append(&sid, &ChatMessage::user("new")).unwrap();
+
+        let loaded = store.load_session(&sid).expect("the session still loads");
+        let texts: Vec<String> = loaded
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts[0].contains("the old ones"), "stub first: {texts:?}");
+        assert!(texts.iter().any(|t| t == "new"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t == "old0"),
+            "file-order fallback must skip everything before the line: {texts:?}"
+        );
+    }
+
+    /// The checkpoint must not land between a tool_use and its result.
+    /// find_safe_split_point guarantees it on the write side; this pins
+    /// that the read side stays loadable if it ever does not.
+    #[test]
+    fn a_checkpoint_cutting_a_pair_still_loads_paired() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store.append(&sid, &tool_result_msg("c1", "ok")).unwrap();
+        // Cover the tool_use, keep only the result — the gap the repair
+        // exists for.
+        store.append_summary(&sid, "did a thing", 1).unwrap();
+
+        let loaded = store.load_session(&sid).unwrap();
+        let stray = loaded.iter().enumerate().any(|(i, m)| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ToolResult { .. }))
+                && !loaded.get(i.wrapping_sub(1)).is_some_and(|prev| {
+                    prev.parts
+                        .iter()
+                        .any(|p| matches!(p, ContentPart::ToolUse { .. }))
+                })
+        });
+        assert!(!stray, "an unpaired tool_result survived: {loaded:?}");
+    }
+
+    /// The point of the whole change: a restarted room remembers what it
+    /// did, not just what was said.
+    #[test]
+    fn load_all_restores_tool_traffic_for_an_active_session() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &ChatMessage::user("read a.rs")).unwrap();
+        store.append(&sid, &tool_use_msg("c1")).unwrap();
+        store
+            .append(&sid, &tool_result_msg("c1", "fn main() {}"))
+            .unwrap();
+
+        let (active, histories) = store.load_all();
+        let key = ("!room:example.org".to_string(), None);
+        assert_eq!(active.get(&key).map(String::as_str), Some(sid.as_str()));
+
+        let history = histories.get(&key).expect("history restored");
+        assert!(
+            history.iter().flat_map(|m| &m.parts).any(|p| matches!(p, ContentPart::ToolResult { tool_use_id, content } if tool_use_id == "c1" && content == "fn main() {}")),
+            "the tool result did not come back: {history:?}"
+        );
+    }
+
+    /// A closed session is not resumed — the day boundary rotated it on
+    /// purpose.
+    #[test]
+    fn load_all_skips_closed_sessions() {
+        let (_s, _c, store, sid) = cached_store();
+        store.append(&sid, &ChatMessage::user("hi")).unwrap();
+        store.close_session(&sid).unwrap();
+
+        let (active, histories) = store.load_all();
+        assert!(active.is_empty(), "{active:?}");
+        assert!(histories.is_empty(), "{histories:?}");
+    }
+
+    /// The subtlest property in `load_all`: when a key has more than one
+    /// active session file, the newest wins — both for `active` (which
+    /// file gets appended to next) and for `histories` (the older
+    /// session's history must not leak through just because it happened
+    /// to load first). A newer session that is itself empty must evict
+    /// whatever the older one contributed, not merely fail to overwrite
+    /// it.
+    #[test]
+    fn load_all_prefers_the_newest_session_and_drops_history_when_it_is_empty() {
+        let (_s, _c, store, old_sid) = cached_store();
+        store.append(&old_sid, &ChatMessage::user("old")).unwrap();
+
+        let key = ("!room:example.org".to_string(), None);
+        let new_sid = store.create_session(&key, "matrix", "default").unwrap();
+        assert!(
+            new_sid > old_sid,
+            "UUIDv7 ids must sort newer-last for this test to mean anything: \
+             {old_sid} vs {new_sid}"
+        );
+
+        let (active, histories) = store.load_all();
+        assert_eq!(
+            active.get(&key),
+            Some(&new_sid),
+            "the newest session file must be the active one"
+        );
+        assert!(
+            !histories.contains_key(&key),
+            "the newer, empty session must evict the older session's \
+             history, not lose to it: {histories:?}"
         );
     }
 }

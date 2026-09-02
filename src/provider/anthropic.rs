@@ -321,6 +321,13 @@ fn chat_message_to_api(msg: &ChatMessage) -> ApiMessage {
                 tool_use_id: tool_use_id.clone(),
                 content: content.clone(),
             },
+            // Only reachable when a read path failed to hydrate. Keep
+            // the pairing — that is what the API validates — and let the
+            // model call the tool again if it needs the content.
+            ContentPart::ToolResultRef { tool_use_id, .. } => ApiPart::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: crate::session_storage::MISSING_RESULT.to_string(),
+            },
         })
         .collect();
 

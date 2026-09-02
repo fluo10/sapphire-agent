@@ -167,8 +167,7 @@ fn default_true() -> bool {
 /// Action taken at the day boundary for a given conversation.
 ///
 /// - `Reset`: close the session and clear in-memory caches (legacy behavior).
-///   The next message starts a fresh session; prior-run summary is injected via
-///   `restart_summaries`.
+///   The next message starts a fresh session.
 /// - `Compact`: keep the same session alive, but force-summarize the current
 ///   in-memory history and replace it with a summary stub. The SummaryLine is
 ///   appended to the session JSONL. Session continuity is preserved.

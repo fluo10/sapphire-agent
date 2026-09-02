@@ -281,6 +281,18 @@ fn convert_user_message(msg: &ChatMessage) -> Vec<ApiMessage> {
             ContentPart::ToolUse { .. } => {
                 // Should not appear on User messages — silently skip.
             }
+            // See the Anthropic provider's arm: hydration failed
+            // upstream, and the pairing matters more than the content.
+            ContentPart::ToolResultRef { tool_use_id, .. } => {
+                out.push(ApiMessage {
+                    role: "tool",
+                    content: Some(ApiContent::Text(
+                        crate::session_storage::MISSING_RESULT.to_string(),
+                    )),
+                    tool_calls: None,
+                    tool_call_id: Some(tool_use_id.clone()),
+                });
+            }
         }
     }
 
@@ -328,7 +340,8 @@ fn convert_assistant_message(msg: &ChatMessage) -> ApiMessage {
             // Assistant should not carry images or tool results.
             ContentPart::Image { .. }
             | ContentPart::ImageRef { .. }
-            | ContentPart::ToolResult { .. } => {}
+            | ContentPart::ToolResult { .. }
+            | ContentPart::ToolResultRef { .. } => {}
         }
     }
 

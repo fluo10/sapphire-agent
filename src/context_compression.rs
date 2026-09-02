@@ -10,6 +10,7 @@
 
 use crate::config::CompressionConfig;
 use crate::provider::{ChatMessage, ContentPart, Provider, Role};
+use crate::session_storage::MISSING_RESULT;
 use tracing::{info, warn};
 
 /// Rough token estimate for a string.
@@ -57,14 +58,44 @@ fn estimate_message_tokens(msg: &ChatMessage) -> usize {
                 estimate_tokens(name) + estimate_tokens(&input.to_string())
             }
             ContentPart::ToolResult { content, .. } => estimate_tokens(content),
+            // Hydration happens before this runs on any real path, so
+            // this is the un-hydrated form only — a placeholder's worth.
+            ContentPart::ToolResultRef { .. } => estimate_tokens(MISSING_RESULT),
         })
         .sum()
+}
+
+/// A compaction summary rendered back into the conversation.
+///
+/// One generator, three callers: `maybe_compress`, the day-boundary
+/// compaction in `Agent`, and every store's restore path. They used to
+/// have two wordings between them, and a restore has no way to know
+/// which one produced the summary it is reading — so there is one.
+///
+/// The wording is not load-bearing; being the same everywhere is.
+pub fn compaction_stub(summary: &str) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage {
+            role: Role::User,
+            parts: vec![ContentPart::Text(format!(
+                "[Context Summary — earlier messages were compressed]\n\n{summary}"
+            ))],
+            input_kind: None,
+            user_id: None,
+        },
+        ChatMessage::assistant("Understood. I have the context from our earlier conversation."),
+    ]
 }
 
 /// Outcome of a compression attempt.
 pub struct CompressionResult {
     pub compressed: Vec<ChatMessage>,
     pub summary: String,
+    /// How many trailing messages survived verbatim. The store turns
+    /// this into a checkpoint cursor by counting back from its file's
+    /// tip — the caller has no way to map an in-memory index onto a line
+    /// number, and should not have to.
+    pub keep_recent: usize,
 }
 
 /// Check whether compression is needed and, if so, compress the history.
@@ -113,23 +144,13 @@ pub async fn maybe_compress(
         estimate_tokens(&summary),
     );
 
-    let mut compressed = Vec::with_capacity(1 + to_keep.len());
-    compressed.push(ChatMessage {
-        role: Role::User,
-        parts: vec![ContentPart::Text(format!(
-            "[Context Summary — earlier messages were compressed]\n\n{summary}"
-        ))],
-        input_kind: None,
-        user_id: None,
-    });
-    compressed.push(ChatMessage::assistant(
-        "Understood. I have the context from our earlier conversation.",
-    ));
+    let mut compressed = compaction_stub(&summary);
     compressed.extend_from_slice(to_keep);
 
     Ok(Some(CompressionResult {
         compressed,
         summary,
+        keep_recent: to_keep.len(),
     }))
 }
 
@@ -228,6 +249,9 @@ pub async fn generate_summary(
                         content.clone()
                     };
                     transcript.push_str(&format!("{role_label}: [Tool result: {truncated}]\n\n"));
+                }
+                ContentPart::ToolResultRef { .. } => {
+                    transcript.push_str(&format!("{role_label}: [Tool result: unavailable]\n\n"));
                 }
             }
         }
@@ -387,5 +411,21 @@ mod tests {
         // all rather than unwinding inside the tokio task).
         let summary = generate_summary(&StubProvider, &messages).await.unwrap();
         assert_eq!(summary, "a summary");
+    }
+
+    /// The stub has one generator so the compaction path and the restore
+    /// path cannot drift into producing different shapes for the same
+    /// thing.
+    #[test]
+    fn the_stub_is_a_user_message_carrying_the_summary_and_an_assistant_ack() {
+        let stub = compaction_stub("we fixed the parser");
+        assert_eq!(stub.len(), 2);
+        assert_eq!(stub[0].role, Role::User);
+        assert_eq!(stub[1].role, Role::Assistant);
+        assert!(
+            matches!(&stub[0].parts[0], ContentPart::Text(t) if t.contains("we fixed the parser")),
+            "the summary must be in the user message: {:?}",
+            stub[0]
+        );
     }
 }
