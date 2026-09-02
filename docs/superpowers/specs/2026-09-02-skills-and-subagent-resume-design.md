@@ -63,6 +63,7 @@ is the contract superpowers' own non-Claude manifests ask for. Updating becomes
 | Question | Decision |
 |---|---|
 | Where does the checkout live? | **Client side.** The SDD scripts (`review-package`, `task-brief`, `sdd-workspace`) run `git` against the repository under review, and `find-polluter.sh` runs its test suite. They must execute where the repository is, which is the editor's machine. |
+| How does the agent find it? | **A convention resolved on the client**, with a client-side environment override. The server stores no path: it serves clients on several machines and operating systems, so a path in its config is right for at most one of them. |
 | Who may see skills? | **Per memory namespace.** A development namespace opts in; the everyday one does not. This avoids writing "development means ACP" into the code — an overstatement made once already in the subagents spec and corrected during review. |
 | Scope of this spec | **Skills, plus subagent resume.** SDD's fix rounds 1-3 resume a specific implementer; without that the loop silently degrades to a fresh implementer every round. |
 | Where do resumed children live? | **A cache**, alongside `digest_cache` and `tool_result_cache`. |
@@ -74,14 +75,12 @@ is the contract superpowers' own non-Claude manifests ask for. Updating becomes
 
 ### Configuration
 
-```toml
-[skills]
-# Absolute path ON THE EDITOR'S MACHINE to a checkout's skills directory.
-dir = "C:/Users/fluo10/src/superpowers/skills"
-# Optional. Overrides the built-in index command for a client whose shell
-# is not POSIX-like. The directory is appended as a positional argument.
-# index_command = ["bash", "-c", "<script>", "_"]
+**The server holds no client path.** It cannot: one agent serves clients on
+different machines and different operating systems, so any absolute path in its
+own config is right for at most one of them and silently wrong for the rest.
+Server-side configuration is a single switch:
 
+```toml
 [memory_namespace.dev]
 skills = true          # default false
 
@@ -91,14 +90,45 @@ max_history_bytes = 8_388_608   # 8 MiB
 retain_days = 7
 ```
 
-`dir` is a client-side path. `sapphire-agent` never resolves it against its own
-filesystem, and a path that happens to exist on the agent host is not consulted.
-
 Enablement hangs off `MemoryNamespaceConfig`, which `resolve_namespace_chain`
 already computes per turn. A namespace with `skills = true` offers the tool; the
 rest do not. `visible_tool_predicate` takes only booleans today, so it gains one
 more — resolved from the turn's namespace by the caller, in the same place the
 client capabilities are resolved.
+
+### Where the skills directory is, without the server knowing
+
+The location is a **convention resolved on the client**, mirroring the
+`directories::BaseDirs::data_dir()` semantics `init_app_ctx` already uses for
+this crate's own directories on the server:
+
+| Platform | Directory |
+|---|---|
+| Windows | `%APPDATA%\sapphire-agent\skills` |
+| macOS | `~/Library/Application Support/sapphire-agent/skills` |
+| Linux / BSD | `${XDG_DATA_HOME:-~/.local/share}/sapphire-agent/skills` |
+
+A checkout is data, not configuration, which is why this follows `data_dir`
+rather than `config_dir`.
+
+Candidates are tried **in order, first hit wins** — the idiom
+`Workspace::read_first_existing` already applies to `AGENTS.md` / `AGENT.md`:
+
+1. `$SAPPHIRE_AGENT_SKILLS_DIR`, if set
+2. `$APPDATA/sapphire-agent/skills`
+3. `$HOME/Library/Application Support/sapphire-agent/skills`
+4. `${XDG_DATA_HOME:-$HOME/.local/share}/sapphire-agent/skills`
+
+The environment variable is the escape hatch for a checkout that already lives
+somewhere else. It is set on the client, by the person whose machine it is, in
+whatever form that OS uses — which is the only place that question can be
+answered correctly.
+
+The resolution happens in the same client-side invocation that builds the index,
+so the agent learns the path by being told it, never by assuming it. The
+resolved directory is cached for the session and reused for every subsequent
+`skill(name)`. A `skill(name)` that arrives before any index call resolves
+first.
 
 ### The `skill` tool
 
@@ -128,20 +158,26 @@ works in the case we expect to hit.
 
 The index is different, because **ACP has no directory listing** — no list, glob
 or stat exists in the agent→client surface. So the index comes from one terminal
-invocation of a small shell loop over `<dir>/*/SKILL.md`.
+invocation of a fixed shell script that walks the candidate list above, prints
+the directory it settled on, and then prints each `SKILL.md`'s `name` and
+`description`.
 
-The directory is passed to that script as a positional argument. It is never
-interpolated into the script text. Building a shell command by string
-concatenation is how the workspace path guard was defeated four times; this
-design does not start there.
+**That script is a compile-time constant with nothing interpolated into it.**
+The candidates are environment expansions the client's own shell performs; the
+agent contributes no string to the command line at all. Building shell commands
+by concatenation is how the workspace path guard was defeated four times, so
+this design removes the possibility rather than guarding it.
 
 **This makes `skill` depend on the client's terminal capability.** That is not a
 new dependency being introduced — superpowers' six scripts all run under bash,
 so a client without a shell cannot run SDD at all. The design states an existing
 requirement rather than adding one.
 
-The exact index command is configurable, so a client whose shell is not
-POSIX-like can be accommodated without a code change.
+There is deliberately **no configurable index command**. A shell snippet in
+server-side config would be both a fresh injection surface and a second way to
+put a client-shaped value on the server, which is the mistake this section
+exists to undo. A client that cannot run the fixed script cannot run superpowers
+either.
 
 ### Where the discipline goes
 
@@ -164,8 +200,9 @@ required for it.
 
 | Condition | Behaviour |
 |---|---|
-| `[skills]` unset, or the namespace has not opted in | The tool is not offered. Same path as the gate. |
-| Index command fails, or the directory is empty | Recoverable error naming the configured path. The model can still reach the files through `client_shell`. |
+| The namespace has not opted in | The tool is not offered. Same path as the gate. |
+| No candidate directory exists on the client | Recoverable error listing every candidate that was tried, and naming `$SAPPHIRE_AGENT_SKILLS_DIR` as the override. The model can relay that to the user, who is the only one who can fix it. |
+| The directory resolves but is empty | Recoverable error naming the resolved path. |
 | `fs/read_text_file` refuses the path | Retry through the terminal; only then report. |
 | Unknown skill name | Recoverable error listing the known names — the convention `subagent` already follows. |
 | No client (a non-ACP transport in an enabled namespace) | Not offered. Skills are client-side by construction. |
@@ -173,9 +210,14 @@ required for it.
 ### Testing
 
 `AcpClient` has a `FakeClient` in `src/tools/acp_client.rs::tests`, so the whole
-surface closes in unit tests: index parsing, the absolute-directory header, the
-`fs`-to-terminal fallback, unknown names, an unset `dir`, and the gate on and
-off.
+surface closes in unit tests: parsing the resolver's output into a directory
+plus an index, the absolute-directory header, the `fs`-to-terminal fallback,
+unknown skill names, a client where no candidate directory exists, reuse of the
+resolved directory across calls in one session, and the gate on and off.
+
+The candidate list itself is shell running on someone else's machine, so it is
+covered by an executable test of the script against a fixture tree rather than
+by asserting on Rust that never evaluates it.
 
 ---
 
@@ -302,8 +344,15 @@ not written.
 ## What could be wrong
 
 - **The editor's terminal may not run bash the way this assumes**, especially on
-  Windows. This is why the index command is configurable rather than compiled
-  in.
+  Windows, where it depends on a Git Bash or WSL `bash` being on `PATH`. There
+  is no configuration escape from this by design; the honest fallback is that
+  the model reads the skills through `client_shell` itself.
+- **The candidate list is a reimplementation of `directories`' rules in shell**,
+  and it can drift from that crate's behaviour — most plausibly on a Linux
+  desktop with an unusual `XDG_DATA_HOME`, or on Windows where a roaming
+  profile makes `%APPDATA%` not what the user expected.
+  `$SAPPHIRE_AGENT_SKILLS_DIR` exists so that drift is always recoverable
+  without a release.
 - **`fs/read_text_file` may be project-scoped**, which is anticipated by the
   terminal fallback but has not been confirmed against Zed.
 - **Upstream may reorganise.** The contract implemented here —
