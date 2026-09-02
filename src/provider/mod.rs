@@ -89,7 +89,7 @@ pub enum UserInputKind {
 }
 
 /// A message in the conversation history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     pub parts: Vec<ContentPart>,
