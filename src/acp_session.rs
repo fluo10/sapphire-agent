@@ -295,6 +295,10 @@ impl AcpSessionStore {
     /// messages because earlier compactions trimmed memory and not the
     /// file.
     ///
+    /// Resolved against the chain, not file order: `history_for_model`
+    /// walks the chain to find `covers_through` again, and file order
+    /// only agrees with the chain for a session one process wrote — the
+    /// same reason `chain`'s own doc gives for not trusting file order.
     /// A session with no messages gets no checkpoint; there is nothing
     /// for one to point at.
     pub fn append_summary(
@@ -303,9 +307,9 @@ impl AcpSessionStore {
         summary: &str,
         keep_recent: usize,
     ) -> Result<()> {
+        let events = self.events(session_id).unwrap_or_default();
         let message_ids: Vec<Uuid> = self
-            .events(session_id)
-            .unwrap_or_default()
+            .chain(session_id, &events)
             .into_iter()
             .filter(|e| matches!(e.body, EventBody::Message { .. }))
             .map(|e| e.id)
@@ -1391,13 +1395,14 @@ mod tests {
             texts[0].contains("the first three"),
             "stub first: {texts:?}"
         );
-        assert!(
-            texts.iter().any(|t| t == "m4"),
-            "kept tail missing: {texts:?}"
-        );
-        assert!(
-            !texts.iter().any(|t| t == "m0"),
-            "covered message replayed: {texts:?}"
+        // `compaction_stub` contributes two messages (indices 0 and 1);
+        // the checkpoint kept 2 trailing messages, so the tail must be
+        // exactly m3, m4 — not m2..m4 (start = pos instead of pos + 1)
+        // and not m4 alone.
+        assert_eq!(
+            &texts[2..],
+            &["m3", "m4"],
+            "the checkpoint boundary is off: {texts:?}"
         );
     }
 
@@ -1415,31 +1420,49 @@ mod tests {
         );
     }
 
-    /// A Summary event is not a message; the daily-log projection and
-    /// the digest sweep must not see it as one.
+    /// A Summary event must never register as message activity: not in
+    /// the daily log's shape, and not in the digest-due sweep's "has
+    /// something new since the last digest" check.
+    ///
+    /// The daily-log assertion is structural — `EventBody::Summary`
+    /// carries no `role`/`parts`, so it cannot literally decode into a
+    /// logged message — but the digest-due assertion is a live
+    /// regression check: the cache is refreshed *after* the message but
+    /// *before* the summary, so if `sessions_needing_digest` ever
+    /// dropped its `matches!(e.body, EventBody::Message { .. })` filter
+    /// and read the summary's timestamp as "last activity" instead, the
+    /// session would look due again even though nothing new was said —
+    /// burning a model call every sweep, forever.
     #[test]
-    fn a_summary_event_is_not_a_message() {
-        let (_d, store) = store();
+    fn a_summary_event_is_not_mistaken_for_recent_activity() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
         store.create("s1", "default", "/tmp").unwrap();
         store
             .append_message("s1", &ChatMessage::user("hello"))
             .unwrap();
+
+        // Cached digest lands strictly between the message and the
+        // summary that follows it.
+        let between = Utc::now();
+        cache.put_at("s1", "covered", None, between).unwrap();
         store.append_summary("s1", "a recap", 0).unwrap();
 
         let today = today(4);
+
         let days = store.sessions_for_day(today, 4);
-        let texts: Vec<String> = days
-            .iter()
-            .flat_map(|(_, ms)| ms)
-            .flat_map(|m| &m.parts)
-            .filter_map(|p| match p {
-                ContentPart::Text(t) => Some(t.clone()),
-                _ => None,
-            })
-            .collect();
+        assert_eq!(days.len(), 1);
+        let (_, messages) = &days[0];
+        assert_eq!(
+            messages.len(),
+            1,
+            "the summary must not add a second entry to the daily log: {messages:?}"
+        );
+
         assert!(
-            !texts.iter().any(|t| t.contains("a recap")),
-            "the summary leaked into the daily log: {texts:?}"
+            store.sessions_needing_digest(&cache, today, 4).is_empty(),
+            "a digest that already covers the last message must not be \
+             invalidated by a Summary event appended after it"
         );
     }
 
