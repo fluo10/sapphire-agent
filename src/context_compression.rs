@@ -10,6 +10,7 @@
 
 use crate::config::CompressionConfig;
 use crate::provider::{ChatMessage, ContentPart, Provider, Role};
+use crate::session_storage::MISSING_RESULT;
 use tracing::{info, warn};
 
 /// Rough token estimate for a string.
@@ -57,6 +58,9 @@ fn estimate_message_tokens(msg: &ChatMessage) -> usize {
                 estimate_tokens(name) + estimate_tokens(&input.to_string())
             }
             ContentPart::ToolResult { content, .. } => estimate_tokens(content),
+            // Hydration happens before this runs on any real path, so
+            // this is the un-hydrated form only — a placeholder's worth.
+            ContentPart::ToolResultRef { .. } => estimate_tokens(MISSING_RESULT),
         })
         .sum()
 }
@@ -228,6 +232,9 @@ pub async fn generate_summary(
                         content.clone()
                     };
                     transcript.push_str(&format!("{role_label}: [Tool result: {truncated}]\n\n"));
+                }
+                ContentPart::ToolResultRef { .. } => {
+                    transcript.push_str(&format!("{role_label}: [Tool result: unavailable]\n\n"));
                 }
             }
         }

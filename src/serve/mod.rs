@@ -1075,6 +1075,12 @@ async fn handle_get_session(
                     ContentPart::ToolResult { tool_use_id, content } => {
                         json!({ "type": "tool_result", "tool_use_id": tool_use_id, "content": content })
                     }
+                    ContentPart::ToolResultRef { tool_use_id, sha256 } => {
+                        // Same shape as tool_result, with the cache key
+                        // surfaced instead of content a caller cannot be
+                        // handed from a listing anyway.
+                        json!({ "type": "tool_result", "tool_use_id": tool_use_id, "sha256": sha256 })
+                    }
                 })
                 .collect();
             json!({ "role": role, "parts": parts })
