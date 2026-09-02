@@ -58,9 +58,23 @@ pub struct Event {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum EventBody {
-    Message { role: Role, parts: Vec<StoredPart> },
-    Title { title: String },
+    Message {
+        role: Role,
+        parts: Vec<StoredPart>,
+    },
+    Title {
+        title: String,
+    },
     Closed,
+    /// A compaction summary and the message it absorbed up to.
+    ///
+    /// Not a message: `history()` and the daily-log projection skip it,
+    /// because the editor's transcript and the permanent record are both
+    /// about what was said. Only `history_for_model` reads it.
+    Summary {
+        summary: String,
+        covers_through: Uuid,
+    },
 }
 
 /// A message part as it appears on disk.
@@ -123,6 +137,13 @@ enum Line {
         id: Uuid,
         parent: Option<Uuid>,
         at: DateTime<Utc>,
+    },
+    Summary {
+        id: Uuid,
+        parent: Option<Uuid>,
+        at: DateTime<Utc>,
+        summary: String,
+        covers_through: Uuid,
     },
 }
 
@@ -265,6 +286,46 @@ impl AcpSessionStore {
         })
     }
 
+    /// Record a compaction summary and how far it reaches.
+    ///
+    /// `keep_recent` is how many trailing messages the caller kept
+    /// verbatim. The cursor is resolved here, against this store's own
+    /// events — the caller holds an index into its in-memory history and
+    /// cannot map it onto the log, which holds at least as many
+    /// messages because earlier compactions trimmed memory and not the
+    /// file.
+    ///
+    /// A session with no messages gets no checkpoint; there is nothing
+    /// for one to point at.
+    pub fn append_summary(
+        &self,
+        session_id: &str,
+        summary: &str,
+        keep_recent: usize,
+    ) -> Result<()> {
+        let message_ids: Vec<Uuid> = self
+            .events(session_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| matches!(e.body, EventBody::Message { .. }))
+            .map(|e| e.id)
+            .collect();
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let covered = message_ids.len().saturating_sub(keep_recent).max(1);
+        let covers_through = message_ids[covered - 1];
+        let id = Uuid::now_v7();
+        let summary = summary.to_string();
+        self.append_line(session_id, id, move |parent| Line::Summary {
+            id,
+            parent,
+            at: Utc::now(),
+            summary,
+            covers_through,
+        })
+    }
+
     /// ACP exposes no close-or-delete operation yet, so nothing in
     /// production ever writes a `Closed` event — the read path's refusal
     /// of a closed session (`adopt_session` in `src/serve/acp.rs`) is
@@ -396,6 +457,21 @@ impl AcpSessionStore {
                         at,
                         body: EventBody::Closed,
                     }),
+                    Line::Summary {
+                        id,
+                        parent,
+                        at,
+                        summary,
+                        covers_through,
+                    } => Some(Event {
+                        id,
+                        parent,
+                        at,
+                        body: EventBody::Summary {
+                            summary,
+                            covers_through,
+                        },
+                    }),
                 })
                 .collect(),
         )
@@ -443,6 +519,7 @@ impl AcpSessionStore {
                 // Last title wins: a session can be retitled.
                 Line::Title { title: t, .. } => title = Some(t),
                 Line::Closed { .. } => is_closed = true,
+                Line::Summary { .. } => {}
             }
         }
         Some(SessionSummary {
@@ -453,24 +530,19 @@ impl AcpSessionStore {
         })
     }
 
-    /// The conversation as the model should see it.
+    /// The events on the chain, in order, starting from the root.
     ///
-    /// Walks the parent chain rather than trusting file order, because
-    /// file order is only accidentally right: it agrees with the chain
+    /// File order is only accidentally right — it agrees with the chain
     /// for a session one process wrote, and says nothing useful for one
     /// that was synced or merged.
-    pub fn history(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
-        let events = self.events(session_id)?;
-
+    fn chain<'a>(&self, session_id: &str, events: &'a [Event]) -> Vec<&'a Event> {
         // parent -> children, so the walk is a lookup rather than a scan.
         let mut children: HashMap<Option<Uuid>, Vec<&Event>> = HashMap::new();
-        for event in &events {
+        for event in events {
             children.entry(event.parent).or_default().push(event);
         }
-
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(events.len());
         let mut cursor = None;
-        let mut seen = 0usize;
         loop {
             let Some(next) = children.get(&cursor) else {
                 break;
@@ -482,31 +554,91 @@ impl AcpSessionStore {
                 );
             }
             let event = next[0];
-            if let EventBody::Message { role, parts } = &event.body {
-                out.push(ChatMessage {
-                    role: role.clone(),
-                    parts: parts.iter().map(|p| self.load_part(p)).collect(),
-                    input_kind: None,
-                    user_id: None,
-                });
-            }
+            out.push(event);
             cursor = Some(event.id);
-
             // A hand-edited or partially-synced file could contain a
             // cycle. The chain cannot be longer than the file.
-            seen += 1;
-            if seen > events.len() {
+            if out.len() > events.len() {
                 warn!("ACP session {session_id}: the parent chain cycles; stopping");
                 break;
             }
         }
+        out
+    }
 
-        // The chain can hold a `tool_use` whose `tool_result` never made
-        // it to disk — the second append failed, the process died
-        // between the two, a sync landed only half the pair. The repair
-        // is shared with the four `SessionStore` kinds, which have the
-        // same gap for the same reasons.
+    /// The whole conversation, for the editor's `session/load` replay.
+    ///
+    /// Whole on purpose: the editor keeps no transcript of its own, so a
+    /// trimmed replay would render a thread with a hole in it. What the
+    /// *model* sees is `history_for_model`, which starts from the latest
+    /// compaction checkpoint.
+    pub fn history(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+        let events = self.events(session_id)?;
+        let out = self.messages_from(&self.chain(session_id, &events));
         Some(crate::session_storage::repair_tool_pairing(out))
+    }
+
+    /// The conversation as the model should see it: the latest
+    /// compaction summary rendered as a stub, then the messages it did
+    /// not absorb.
+    ///
+    /// Compression runs on ACP turns like every other transport, and
+    /// used to throw its summary away on the grounds that the events
+    /// answer the same question. They do — but they answer it with the
+    /// *whole* session, so every reload replayed everything and paid for
+    /// the same compaction again on the first turn back.
+    pub fn history_for_model(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+        let events = self.events(session_id)?;
+        let chain = self.chain(session_id, &events);
+
+        let checkpoint = chain.iter().rev().find_map(|e| match &e.body {
+            EventBody::Summary {
+                summary,
+                covers_through,
+            } => Some((summary.clone(), *covers_through)),
+            _ => None,
+        });
+
+        let Some((summary, covers_through)) = checkpoint else {
+            let out = self.messages_from(&chain);
+            return Some(crate::session_storage::repair_tool_pairing(out));
+        };
+
+        let messages: Vec<&Event> = chain
+            .iter()
+            .copied()
+            .filter(|e| matches!(e.body, EventBody::Message { .. }))
+            .collect();
+        let start = match messages.iter().position(|e| e.id == covers_through) {
+            Some(pos) => pos + 1,
+            None => {
+                warn!(
+                    "ACP session {session_id}: checkpoint {covers_through} is not on the chain; replaying everything"
+                );
+                0
+            }
+        };
+
+        let mut out = crate::context_compression::compaction_stub(&summary);
+        out.extend(self.messages_from(&messages[start..]));
+        Some(crate::session_storage::repair_tool_pairing(out))
+    }
+
+    /// Project the message events among `events` into `ChatMessage`s,
+    /// hydrating each part.
+    fn messages_from(&self, events: &[&Event]) -> Vec<ChatMessage> {
+        events
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::Message { role, parts } => Some(ChatMessage {
+                    role: role.clone(),
+                    parts: parts.iter().map(|p| self.load_part(p)).collect(),
+                    input_kind: None,
+                    user_id: None,
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     fn load_part(&self, part: &StoredPart) -> ContentPart {
@@ -1228,6 +1360,87 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["one", "two", "three"]);
+    }
+
+    /// `session/load` replays for the editor, which keeps no transcript
+    /// of its own — that one stays whole. The LLM's copy does not.
+    #[test]
+    fn a_checkpoint_trims_the_model_history_but_not_the_editor_replay() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/tmp").unwrap();
+        for i in 0..5 {
+            store
+                .append_message("s1", &ChatMessage::user(&format!("m{i}")))
+                .unwrap();
+        }
+        store.append_summary("s1", "the first three", 2).unwrap();
+
+        let full = store.history("s1").expect("the editor replay");
+        assert_eq!(full.len(), 5, "session/load must still see everything");
+
+        let model = store.history_for_model("s1").expect("the model history");
+        let texts: Vec<String> = model
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts[0].contains("the first three"),
+            "stub first: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "m4"),
+            "kept tail missing: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "m0"),
+            "covered message replayed: {texts:?}"
+        );
+    }
+
+    /// No summary yet: the two reads agree.
+    #[test]
+    fn without_a_checkpoint_the_model_sees_the_whole_session() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/tmp").unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("only"))
+            .unwrap();
+        assert_eq!(
+            store.history_for_model("s1").unwrap(),
+            store.history("s1").unwrap()
+        );
+    }
+
+    /// A Summary event is not a message; the daily-log projection and
+    /// the digest sweep must not see it as one.
+    #[test]
+    fn a_summary_event_is_not_a_message() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/tmp").unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("hello"))
+            .unwrap();
+        store.append_summary("s1", "a recap", 0).unwrap();
+
+        let today = today(4);
+        let days = store.sessions_for_day(today, 4);
+        let texts: Vec<String> = days
+            .iter()
+            .flat_map(|(_, ms)| ms)
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !texts.iter().any(|t| t.contains("a recap")),
+            "the summary leaked into the daily log: {texts:?}"
+        );
     }
 
     /// A tool result survives a round trip through the cache.

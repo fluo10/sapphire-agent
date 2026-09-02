@@ -2254,16 +2254,21 @@ impl TurnPersistence {
         }
     }
 
-    /// Append a compaction summary. ACP sessions keep none — their
-    /// history is rebuilt from events on reload, so a stored summary
-    /// would be a second, staler answer to a question the events
-    /// already answer.
+    /// Append a compaction summary and the checkpoint it establishes.
+    ///
+    /// Unconditional now. ACP used to skip this on the grounds that its
+    /// events already answer the question — they do, but with the whole
+    /// session, so every reload replayed everything and re-paid for the
+    /// same compaction on the first turn back.
     fn append_summary(&self, summary: &str, keep_recent: usize) {
-        if !self.is_acp
-            && let Err(e) = self
-                .store
+        let result = if self.is_acp {
+            self.acp_store
                 .append_summary(&self.session_id, summary, keep_recent)
-        {
+        } else {
+            self.store
+                .append_summary(&self.session_id, summary, keep_recent)
+        };
+        if let Err(e) = result {
             warn!("Failed to persist compaction summary: {e}");
         }
     }
@@ -2386,11 +2391,9 @@ impl TurnLoop<'_> {
             match maybe_compress(provider, system, history, compression_config).await {
                 Ok(Some(result)) => {
                     *history = result.compressed;
-                    // ACP sessions do not persist a compaction summary: the
-                    // full event history is re-read from the store on
-                    // reload, so a stored summary would only be a second,
-                    // staler answer to a question the events already
-                    // answer. Compression stays an in-memory optimisation.
+                    // Persist the checkpoint so a reload starts the model's
+                    // history from here instead of replaying the whole
+                    // session and re-paying for this compaction.
                     if let Some(p) = self.persistence {
                         p.append_summary(&result.summary, result.keep_recent);
                     }
@@ -2747,7 +2750,7 @@ pub(crate) async fn run_llm_turn(
                 if is_acp {
                     state
                         .acp_session_store
-                        .history(&session_id)
+                        .history_for_model(&session_id)
                         .unwrap_or_default()
                 } else {
                     store.load_session(&session_id).unwrap_or_default()
