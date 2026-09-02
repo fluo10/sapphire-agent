@@ -491,46 +491,42 @@ pub async fn run(
 /// `/rpc` and device-default stores is read by nobody today (`load_all`
 /// reads the channel store; `load_session_full` reads the mcp store).
 ///
-/// ACP sessions are included, but routed differently: they write
-/// through `state.digest_cache` rather than
-/// `SessionStore::append_intraday_digest`, which the ACP store does not
-/// have.
+/// Every session type — ACP, `/rpc`, and device-default alike — writes
+/// here through `state.digest_cache`, not into its own store's JSONL
+/// (#190); `build_today_digest_for_namespace` reads all three kinds
+/// back out of that same cache. There is no longer a distinction to
+/// make between ACP and non-ACP sessions at this point: neither
+/// `SessionStore` nor `AcpSessionStore` has a digest-writing method any
+/// more.
 async fn digest_all_sessions(state: &Arc<ServeState>) {
-    let (snapshot, is_acp): (Vec<(String, Vec<ChatMessage>)>, HashSet<String>) = {
+    let snapshot: Vec<(String, Vec<ChatMessage>)> = {
         let sessions = state.sessions.lock().await;
-        let acp = state.acp_sessions.lock().await;
-        let snapshot = sessions
+        sessions
             .iter()
             .filter(|(_, msgs)| msgs.len() >= 2)
             .map(|(sid, msgs)| (sid.clone(), msgs.clone()))
-            .collect();
-        (snapshot, acp.clone())
+            .collect()
     };
     if snapshot.is_empty() {
         return;
     }
+    // Resolved before any model call, not after: with nowhere to put the
+    // result, generating summaries for every session would burn a
+    // provider call each for nothing.
+    let Some(cache) = state.digest_cache.as_ref() else {
+        warn!(
+            "Digest cache unavailable; dropping {} shutdown digest(s)",
+            snapshot.len()
+        );
+        return;
+    };
     info!("Graceful shutdown: digesting {} session(s)", snapshot.len());
     for (session_id, messages) in snapshot {
         let provider = state.provider_for_session(&session_id).await;
         match generate_summary(&*provider, &messages).await {
             Ok(summary) if !summary.trim().is_empty() => {
-                if is_acp.contains(&session_id) {
-                    match &state.digest_cache {
-                        Some(cache) => {
-                            if let Err(e) = cache.put(&session_id, &summary, None) {
-                                warn!("Failed to cache shutdown digest for {session_id}: {e}");
-                            }
-                        }
-                        None => warn!(
-                            "Digest cache unavailable; dropping shutdown digest for {session_id}"
-                        ),
-                    }
-                } else if let Err(e) = state.store_for_session(&session_id).append_intraday_digest(
-                    &session_id,
-                    &summary,
-                    None,
-                ) {
-                    warn!("Failed to persist shutdown intra-day digest for {session_id}: {e}");
+                if let Err(e) = cache.put(&session_id, &summary, None) {
+                    warn!("Failed to cache shutdown digest for {session_id}: {e}");
                 }
             }
             Ok(_) => warn!("Shutdown digest for {session_id} was empty; skipping"),
@@ -851,7 +847,17 @@ async fn handle_initialize(
 
     let (session_id, is_new) = match resolved {
         Some(id) => {
-            let exists = state.cross_device_session_store.load_session(&id).is_some();
+            // Existence only — `load_session` would parse the file,
+            // prepend the compaction stub, hydrate every tool result out
+            // of the cache, and run `repair_tool_pairing`'s two passes,
+            // none of which this needs. `load_session` returns `Some` for
+            // any file whose meta line parses, which is exactly what
+            // `absolute_path_for` (a `resolve_path` lookup) already
+            // answers.
+            let exists = state
+                .cross_device_session_store
+                .absolute_path_for(&id)
+                .is_some();
             (id, !exists)
         }
         None => (uuid::Uuid::now_v7().to_string(), true),
@@ -1056,9 +1062,14 @@ async fn handle_get_session(
         }
     };
 
+    // `load_session` is the model's view — a compaction checkpoint trims
+    // covered messages and prefixes a synthetic summary stub the client
+    // never sent. This endpoint hands the record back to the client that
+    // wrote it, so it must read the untrimmed, unsummarised record instead.
     let messages = state
         .store_for_session(&session_id)
-        .load_session(&session_id)
+        .load_session_full(&session_id)
+        .map(|(messages, _summary)| messages)
         .unwrap_or_default();
 
     let items: Vec<Value> = messages
@@ -1085,8 +1096,20 @@ async fn handle_get_session(
                     ContentPart::ToolUse { id, name, input } => {
                         json!({ "type": "tool_use", "id": id, "name": name, "input": input })
                     }
+                    ContentPart::ToolUseRef { id, name, sha256 } => {
+                        // Same shape as tool_use, with the cache key
+                        // surfaced instead of arguments a caller cannot
+                        // be handed from a listing anyway.
+                        json!({ "type": "tool_use", "id": id, "name": name, "sha256": sha256 })
+                    }
                     ContentPart::ToolResult { tool_use_id, content } => {
                         json!({ "type": "tool_result", "tool_use_id": tool_use_id, "content": content })
+                    }
+                    ContentPart::ToolResultRef { tool_use_id, sha256 } => {
+                        // Same shape as tool_result, with the cache key
+                        // surfaced instead of content a caller cannot be
+                        // handed from a listing anyway.
+                        json!({ "type": "tool_result", "tool_use_id": tool_use_id, "sha256": sha256 })
                     }
                 })
                 .collect();
@@ -2228,7 +2251,7 @@ pub(crate) struct TurnPersistence {
 impl TurnPersistence {
     /// Append one message. There is nothing here for a caller to gate a
     /// paired append on — that bookkeeping belongs to
-    /// `append_acp_only`, whose doc explains it; this method's own
+    /// `append_message_paired`, whose doc explains it; this method's own
     /// caller (the final assistant message, which pairs with nothing)
     /// discards any return value, so there is none.
     fn append_message(&self, msg: &ChatMessage) {
@@ -2245,22 +2268,18 @@ impl TurnPersistence {
     /// caller may go on to persist a message that must be paired with
     /// this one.
     ///
-    /// ACP sessions persist tool traffic; the other stores do not (see
-    /// #194). Their line format has no reference form for a result, so
-    /// writing one raw would put the content into the workspace and the
-    /// retrieve index — which is exactly what the ACP store's external
-    /// cache exists to avoid. Unlike [`Self::append_message`], the
-    /// non-ACP branch writes nothing at all rather than falling back to
-    /// `store.append` — hence the separate method.
-    ///
-    /// `true` when nothing was written at all: there is no pairing to
-    /// break, so a `tool_result` must not be skipped just because its
-    /// `tool_use` was never a candidate for the store.
-    fn append_acp_only(&self, msg: &ChatMessage) -> bool {
-        if !self.is_acp {
-            return true;
-        }
-        match self.acp_store.append_message(&self.session_id, msg) {
+    /// `false` only when the append was attempted and failed. Every
+    /// store persists tool traffic now (#194), so there is no longer a
+    /// transport that skips this — what used to be the `is_acp` branch
+    /// here always returned `true` for the four `SessionStore` kinds
+    /// precisely because they wrote nothing at all.
+    fn append_message_paired(&self, msg: &ChatMessage) -> bool {
+        let result = if self.is_acp {
+            self.acp_store.append_message(&self.session_id, msg)
+        } else {
+            self.store.append(&self.session_id, msg)
+        };
+        match result {
             Ok(()) => true,
             Err(e) => {
                 warn!("Failed to persist a message: {e}");
@@ -2269,14 +2288,21 @@ impl TurnPersistence {
         }
     }
 
-    /// Append a compaction summary. ACP sessions keep none — their
-    /// history is rebuilt from events on reload, so a stored summary
-    /// would be a second, staler answer to a question the events
-    /// already answer.
-    fn append_summary(&self, summary: &str) {
-        if !self.is_acp
-            && let Err(e) = self.store.append_summary(&self.session_id, summary)
-        {
+    /// Append a compaction summary and the checkpoint it establishes.
+    ///
+    /// Unconditional now. ACP used to skip this on the grounds that its
+    /// events already answer the question — they do, but with the whole
+    /// session, so every reload replayed everything and re-paid for the
+    /// same compaction on the first turn back.
+    fn append_summary(&self, summary: &str, keep_recent: usize) {
+        let result = if self.is_acp {
+            self.acp_store
+                .append_summary(&self.session_id, summary, keep_recent)
+        } else {
+            self.store
+                .append_summary(&self.session_id, summary, keep_recent)
+        };
+        if let Err(e) = result {
             warn!("Failed to persist compaction summary: {e}");
         }
     }
@@ -2379,16 +2405,14 @@ impl TurnLoop<'_> {
         // deep clone of every `ToolSpec` — schemas included — on every
         // round of every turn.
         let visible_specs: Arc<[ToolSpec]> = Arc::from(tool_specs);
+        // Rounds this turn, not tool calls in `history`. `history` can
+        // arrive already seeded with a restored session's prior tool
+        // traffic, so counting the whole thing would spend a session's
+        // entire budget on what it did before this turn started — and the
+        // check runs before compaction, so nothing could ever trim it
+        // back.
+        let mut round = 0usize;
         let (final_text, stop) = loop {
-            let round = history
-                .iter()
-                .filter(|m| {
-                    m.parts
-                        .iter()
-                        .any(|p| matches!(p, ContentPart::ToolUse { .. }))
-                })
-                .count();
-
             if round >= MAX_TOOL_ROUNDS {
                 warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS})");
                 // `None` for the text, as before — callers that predate ACP
@@ -2407,13 +2431,11 @@ impl TurnLoop<'_> {
             match maybe_compress(provider, system, history, compression_config).await {
                 Ok(Some(result)) => {
                     *history = result.compressed;
-                    // ACP sessions do not persist a compaction summary: the
-                    // full event history is re-read from the store on
-                    // reload, so a stored summary would only be a second,
-                    // staler answer to a question the events already
-                    // answer. Compression stays an in-memory optimisation.
+                    // Persist the checkpoint so a reload starts the model's
+                    // history from here instead of replaying the whole
+                    // session and re-paying for this compaction.
                     if let Some(p) = self.persistence {
-                        p.append_summary(&result.summary);
+                        p.append_summary(&result.summary, result.keep_recent);
                     }
                 }
                 Ok(None) => {}
@@ -2459,6 +2481,7 @@ impl TurnLoop<'_> {
                     break (Some(accumulated_text.join("\n\n")), TurnStop::Replied);
                 }
                 Ok(resp) => {
+                    round += 1;
                     let tool_calls = resp.tool_calls.clone();
                     if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
                         accumulated_text.push(t.clone());
@@ -2466,19 +2489,13 @@ impl TurnLoop<'_> {
                     let msg =
                         ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
                     history.push(msg.clone());
-                    // ACP sessions persist tool traffic; the other stores do
-                    // not (see #194). Their line format has no reference
-                    // form for a result, so writing one raw would put the
-                    // content into the workspace and the retrieve index —
-                    // which is exactly what the ACP store's external cache
-                    // exists to avoid.
-                    //
-                    // Whether this append actually landed is captured and
-                    // carried down to the `tool_result` append below: the
-                    // two must not be skipped independently of each other
+                    // Whether this append landed is captured and carried
+                    // down to the `tool_result` append below: the two
+                    // must not be skipped independently of each other
                     // (see the comment there for why).
-                    let tool_use_persisted =
-                        self.persistence.is_none_or(|p| p.append_acp_only(&msg));
+                    let tool_use_persisted = self
+                        .persistence
+                        .is_none_or(|p| p.append_message_paired(&msg));
 
                     // Notify client of each tool starting
                     for call in &tool_calls {
@@ -2695,7 +2712,7 @@ impl TurnLoop<'_> {
                     // than neither, so skip this append too rather than
                     // leaving only the result on disk.
                     if tool_use_persisted && let Some(p) = self.persistence {
-                        p.append_acp_only(&result_msg);
+                        p.append_message_paired(&result_msg);
                     }
                 }
             }
@@ -2775,7 +2792,7 @@ pub(crate) async fn run_llm_turn(
                 if is_acp {
                     state
                         .acp_session_store
-                        .history(&session_id)
+                        .history_for_model(&session_id)
                         .unwrap_or_default()
                 } else {
                     store.load_session(&session_id).unwrap_or_default()
@@ -3586,11 +3603,11 @@ rooms    = []
         // Same base directory as the cross-device store above: the ACP
         // store puts itself in an `acp/` subtree per namespace, so
         // sharing `base.join("sessions")` doesn't collide with `rpc/`.
-        let tool_result_cache =
-            crate::tool_result_cache::ToolResultCache::open(base.join("tool-results")).unwrap();
+        let tool_payload_cache =
+            crate::tool_payload_cache::ToolPayloadCache::open(base.join("tool-payloads")).unwrap();
         let acp_session_store = Arc::new(AcpSessionStore::new(
             base.join("sessions"),
-            Some(tool_result_cache),
+            Some(tool_payload_cache),
         ));
         let digest_cache = Some(DigestCache::open(base.join("digests")).unwrap());
         let subagent_cache = Some(
@@ -3609,12 +3626,17 @@ rooms    = []
             permissions: Arc::new(acp_permissions::PermissionStore::open(
                 base.join("acp-permissions.json"),
             )),
-            cross_device_session_store: Arc::new(SessionStore::new(base.join("sessions"), "rpc")),
+            cross_device_session_store: Arc::new(SessionStore::new(
+                base.join("sessions"),
+                "rpc",
+                None,
+            )),
             device_default_session_store: Arc::new(SessionStore::new(
                 base.join("device-default"),
                 "device-default",
+                None,
             )),
-            mcp_session_store: Arc::new(SessionStore::new(base.join("mcp"), "mcp")),
+            mcp_session_store: Arc::new(SessionStore::new(base.join("mcp"), "mcp", None)),
             mcp_project_index: Default::default(),
             sessions: Default::default(),
             pending_sessions: Default::default(),
@@ -5067,7 +5089,7 @@ mod tests {
         let has_use = events.iter().any(|e| match &e.body {
             EventBody::Message { parts, .. } => parts
                 .iter()
-                .any(|p| matches!(p, StoredPart::ToolUse { id, .. } if id == "call-1")),
+                .any(|p| matches!(p, StoredPart::ToolUseRef { id, .. } if id == "call-1")),
             _ => false,
         });
         let has_result = events.iter().any(|e| match &e.body {
@@ -5086,12 +5108,13 @@ mod tests {
         );
     }
 
-    /// `/rpc` and the other transports keep today's behaviour: their
-    /// stores have no reference form for a tool result, so writing one
-    /// raw would put the content in the workspace and the retrieve
-    /// index. Tracked as #194.
+    /// `/rpc` used to skip tool traffic entirely (its store had no
+    /// reference form for a tool result, so writing one raw would put
+    /// the content in the workspace and the retrieve index). The four
+    /// `SessionStore` kinds now have the same workspace-external cache
+    /// ACP does, so `/rpc` persists both halves too. Tracked as #194.
     #[tokio::test]
-    async fn an_rpc_turn_still_does_not_persist_tool_calls() {
+    async fn an_rpc_turn_now_persists_its_tool_calls_too() {
         let state = ServeState::for_test_scripted(
             true,
             vec![
@@ -5125,16 +5148,83 @@ mod tests {
         )
         .await;
 
-        let stored = state
+        // Read the raw JSONL rather than `load_session`: `load_session`
+        // runs `repair_tool_pairing`, which synthesises a MISSING_RESULT
+        // stand-in for an orphaned `tool_use` on the way out. That would
+        // make this test pass even if the `tool_result` append were
+        // silently dropped — it would prove only "the tool_use reached
+        // disk and something answers it after loading", not "both
+        // halves reached disk". Reading raw is the same technique
+        // `a_failed_tool_use_append_suppresses_the_tool_result_append_too`
+        // uses against the ACP store, and for the same reason (see its
+        // own comment).
+        let path = state
             .cross_device_session_store
-            .load_session(&sid)
-            .unwrap_or_default();
+            .absolute_path_for(&sid)
+            .expect("the session file exists");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let use_at = raw
+            .find("ToolUse")
+            .expect("the tool_use never reached disk");
+        let result_at = raw.find("ToolResultRef").expect(
+            "the tool_result never reached disk — repair_tool_pairing \
+             would hide this on a load",
+        );
         assert!(
-            !stored.iter().flat_map(|m| m.parts.iter()).any(|p| matches!(
-                p,
-                ContentPart::ToolUse { .. } | ContentPart::ToolResult { .. }
-            )),
-            "the /rpc store must still hold no tool traffic"
+            use_at < result_at,
+            "the pair is out of order on disk:\n{raw}"
+        );
+    }
+
+    /// The four SessionStore kinds persist tool traffic now, so a /rpc
+    /// session's tool_use and tool_result both reach disk (#194).
+    #[test]
+    fn a_non_acp_session_persists_both_halves_of_a_tool_call() {
+        let base = tempfile::TempDir::new().unwrap();
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache =
+            crate::tool_payload_cache::ToolPayloadCache::open(cache_dir.path().to_path_buf())
+                .unwrap();
+        let store = SessionStore::new(base.path().join("sessions"), "rpc", Some(cache));
+        let key = ("s1".to_string(), None);
+        store
+            .ensure_session("s1", &key, "rpc", None, "default")
+            .unwrap();
+
+        store
+            .append(
+                "s1",
+                &ChatMessage::assistant_with_tools(
+                    None,
+                    vec![crate::provider::ToolCall {
+                        id: "c1".to_string(),
+                        name: "file_read".to_string(),
+                        input: serde_json::json!({}),
+                    }],
+                ),
+            )
+            .unwrap();
+        store
+            .append(
+                "s1",
+                &ChatMessage::tool_results_with_images(
+                    vec![("c1".to_string(), "contents".to_string())],
+                    Vec::new(),
+                ),
+            )
+            .unwrap();
+
+        let loaded = store.load_session("s1").expect("the session loads");
+        assert!(
+            loaded
+                .iter()
+                .flat_map(|m| &m.parts)
+                .any(|p| matches!(p, ContentPart::ToolUse { id, .. } if id == "c1")),
+            "tool_use missing: {loaded:?}"
+        );
+        assert!(
+            loaded.iter().flat_map(|m| &m.parts).any(|p| matches!(p, ContentPart::ToolResult { tool_use_id, content } if tool_use_id == "c1" && content == "contents")),
+            "tool_result missing: {loaded:?}"
         );
     }
 
@@ -5358,5 +5448,128 @@ mod tests {
         }
         let no_term = visible_tool_predicate(false, true, true, true, false);
         assert!(!no_term("skill"), "skill offered without a terminal");
+    }
+
+    /// The bug this pins: `round` used to be counted over the whole
+    /// history, which restoring a session now seeds with everything it
+    /// did before this turn started. A session that arrives with more
+    /// than `MAX_TOOL_ROUNDS` tool_use messages already in it — exactly
+    /// what a restored, long-lived room looks like — tripped the budget
+    /// check on the very first iteration, before the provider was ever
+    /// called, and broke silently (`text: None`, nothing sent). It must
+    /// still get an ordinary reply: the budget is rounds *this turn*.
+    #[tokio::test]
+    async fn a_session_restored_with_more_than_the_round_budget_still_replies() {
+        let state = ServeState::for_test(true);
+
+        // More than MAX_TOOL_ROUNDS assistant messages carrying a
+        // ToolUse part, paired with their tool_results, as a restored
+        // session's history would arrive already hydrated.
+        let mut history = Vec::new();
+        for i in 0..(MAX_TOOL_ROUNDS + 1) {
+            let id = format!("old-{i}");
+            history.push(ChatMessage::assistant_with_tools(
+                None,
+                vec![crate::provider::ToolCall {
+                    id: id.clone(),
+                    name: "file_read".to_string(),
+                    input: json!({}),
+                }],
+            ));
+            history.push(ChatMessage::tool_results_with_images(
+                vec![(id, "contents".to_string())],
+                Vec::new(),
+            ));
+        }
+        state
+            .sessions
+            .lock()
+            .await
+            .insert("s-restored".to_string(), history);
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-restored".to_string(),
+            ChatMessage::user("still there?"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome.stop, TurnStop::Replied),
+            "a fresh turn on a restored session must reach the provider \
+             and reply normally, not exhaust its budget on history from \
+             before this turn"
+        );
+        assert_eq!(outcome.text.as_deref(), Some("ok"));
+    }
+
+    /// `handle_get_session` must hand back the record exactly as written —
+    /// not `load_session`'s model view, which trims everything a
+    /// checkpoint covers and prefixes a synthetic summary stub the client
+    /// never sent. This was already gotten wrong once during this
+    /// branch's development (see 789c5f0) and nothing else pins it:
+    /// swapping `load_session_full` for `load_session` here still
+    /// compiles and still passes the rest of the suite.
+    #[tokio::test]
+    async fn get_session_returns_the_full_record_even_past_a_checkpoint() {
+        let state = ServeState::for_test(true);
+        let sid = "get-session-full".to_string();
+        let key: ConversationKey = (sid.clone(), None);
+        state
+            .cross_device_session_store
+            .ensure_session(&sid, &key, "rpc", None, "default")
+            .unwrap();
+
+        state
+            .cross_device_session_store
+            .append(&sid, &ChatMessage::user("first"))
+            .unwrap();
+        state
+            .cross_device_session_store
+            .append(&sid, &ChatMessage::assistant("second"))
+            .unwrap();
+
+        // A checkpoint with keep_recent = 0 covers everything appended so
+        // far, the same shape a day-boundary compaction writes.
+        state
+            .cross_device_session_store
+            .append_summary(&sid, "earlier stuff happened", 0)
+            .unwrap();
+
+        state
+            .cross_device_session_store
+            .append(&sid, &ChatMessage::user("third"))
+            .unwrap();
+
+        let response = handle_get_session(Arc::clone(&state), json!(1), Some(sid.clone())).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let messages = v["result"]["messages"].as_array().expect("messages array");
+
+        assert_eq!(
+            messages.len(),
+            3,
+            "the endpoint must return every message as written, not the \
+             model's post-checkpoint view: {v}"
+        );
+        let has_stub = messages.iter().any(|m| {
+            m["parts"].as_array().is_some_and(|parts| {
+                parts.iter().any(|p| {
+                    p["type"] == "text"
+                        && p["text"]
+                            .as_str()
+                            .is_some_and(|t| t.starts_with("[Context Summary"))
+                })
+            })
+        });
+        assert!(
+            !has_stub,
+            "the synthetic compaction stub must never appear in a \
+             client-facing get_session response: {v}"
+        );
     }
 }

@@ -9,6 +9,7 @@ mod agents;
 mod ambient;
 mod channel;
 mod cli_device;
+mod cli_init;
 mod config;
 mod config_layer;
 mod context_compression;
@@ -24,10 +25,11 @@ mod periodic_log;
 mod provider;
 mod serve;
 mod session;
+mod session_storage;
 mod skills;
 mod subagent_cache;
 mod timer;
-mod tool_result_cache;
+mod tool_payload_cache;
 mod tools;
 mod voice;
 mod workspace;
@@ -92,6 +94,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Seed a workspace with the files the agent reads.
+    Init {
+        /// Directory to seed. Created if missing; defaults to the current one.
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
     /// Validate the config file and exit
     Verify,
     /// Manage the devices that authenticate to this agent.
@@ -165,6 +173,13 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Before the config load below: `init` is what an operator runs when there
+    // is no host config yet, so requiring one to reach it would make the
+    // command unusable exactly when it is needed.
+    if let Some(Command::Init { path }) = &cli.command {
+        return cli_init::run(path.clone());
+    }
+
     let config_path = cli.config.unwrap_or_else(Config::default_path);
     let LoadedConfig {
         config,
@@ -214,6 +229,8 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
+        // Returned above, before the config was loaded.
+        Some(Command::Init { .. }) => unreachable!("`init` is dispatched ahead of the config load"),
         Some(Command::Verify) => {
             let workspace_dir = config.resolved_workspace_dir(&config_path);
             let profile_errors = config.validate_profiles();
@@ -482,6 +499,53 @@ async fn main() -> Result<()> {
             // ── Session store base directory ────────────────────────────────
             let sessions_base = config.resolved_sessions_dir(&workspace_dir);
 
+            // ── Tool-payload cache (workspace-external, content-addressed) ──
+            // Every session store below — cross-device, device-default,
+            // mcp, channel — and the ACP store further down keep tool
+            // both halves of a tool call out of the JSONL itself,
+            // content-addressed by hash,
+            // for the same reason images are. Built here, before any of
+            // them, so the same `Option<Arc<...>>` can be handed to all
+            // four SessionStore kinds plus AcpSessionStore.
+            //
+            // Resolves once at startup, degrading to `None` on a missing
+            // platform cache dir or an open failure (e.g. read-only
+            // `~/.cache` / `%LOCALAPPDATA%`) rather than aborting startup
+            // — mirrors `image_cache` below. A daemon whose whole design
+            // premise is that losing a cache is survivable must not make
+            // its boot path the one place where it isn't: this cache
+            // being unavailable would otherwise stop `/rpc`, Matrix,
+            // Discord and voice too, in every deployment, even ones that
+            // never use ACP.
+            //
+            // Every session store persists tool traffic now, so this
+            // cache is on the request path of every transport — not just
+            // ACP. `None` still degrades rather than aborting startup: a
+            // payload written without it keeps its call and its pairing
+            // and reads back as a stand-in, which is a thinner session
+            // rather than an unloadable one.
+            let tool_payload_cache: Option<Arc<tool_payload_cache::ToolPayloadCache>> =
+                match tool_payload_cache::ToolPayloadCache::default_dir() {
+                    Some(dir) => match tool_payload_cache::ToolPayloadCache::open(dir.clone()) {
+                        Ok(cache) => {
+                            tracing::info!("Tool-payload cache opened at {dir:?}");
+                            Some(cache)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Tool-payload cache open failed ({e:?}); tool payloads will not be cached"
+                            );
+                            None
+                        }
+                    },
+                    None => {
+                        tracing::warn!(
+                            "No platform cache dir resolvable; tool-payload cache disabled"
+                        );
+                        None
+                    }
+                };
+
             // ── Provider registry ────────────────────────────────────────────
             // Builds the Anthropic provider plus any `[providers.<name>]`
             // entries, then validates every profile/room reference. Failure
@@ -501,6 +565,7 @@ async fn main() -> Result<()> {
                 sessions_base.clone(),
                 "cross-device",
                 Arc::clone(&ws_state),
+                tool_payload_cache.clone(),
             ));
 
             // ── Device-default session store (sessions/<ns>/device-default/) ─
@@ -511,6 +576,7 @@ async fn main() -> Result<()> {
                 sessions_base.clone(),
                 "device-default",
                 Arc::clone(&ws_state),
+                tool_payload_cache.clone(),
             ));
 
             // ── MCP session store (sessions/<namespace>/mcp/) ──────────────
@@ -522,6 +588,7 @@ async fn main() -> Result<()> {
                 sessions_base.clone(),
                 "mcp",
                 Arc::clone(&ws_state),
+                tool_payload_cache.clone(),
             ));
 
             // ── Voice providers + ServeState (built early) ──────────────────
@@ -654,49 +721,13 @@ async fn main() -> Result<()> {
             // list should not be showing Matrix conversations. Tool
             // results are kept in a workspace-external, content-addressed
             // cache rather than inline, for the same reason images are.
-            //
-            // Resolves once at startup, degrading to `None` on a missing
-            // platform cache dir or an open failure (e.g. read-only
-            // `~/.cache` / `%LOCALAPPDATA%`) rather than aborting startup
-            // — mirrors `image_cache` above. A daemon whose whole design
-            // premise is that losing a cache is survivable must not make
-            // its boot path the one place where it isn't: this cache
-            // being unavailable would otherwise stop `/rpc`, Matrix,
-            // Discord and voice too, in every deployment, even ones that
-            // never use ACP. `None` costs less than it looks here: the
-            // request path does not persist `tool_use`/`tool_result`
-            // messages at all yet (#191), so nothing in production
-            // reaches this cache regardless; `AcpSessionStore::store_part`
-            // degrades a tool result it is asked to cache to an
-            // unrecoverable marker instead of failing the append.
-            let tool_result_cache: Option<Arc<tool_result_cache::ToolResultCache>> =
-                match tool_result_cache::ToolResultCache::default_dir() {
-                    Some(dir) => match tool_result_cache::ToolResultCache::open(dir.clone()) {
-                        Ok(cache) => {
-                            tracing::info!("Tool-result cache opened at {dir:?}");
-                            Some(cache)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Tool-result cache open failed ({e:?}); tool results will not be cached"
-                            );
-                            None
-                        }
-                    },
-                    None => {
-                        tracing::warn!(
-                            "No platform cache dir resolvable; tool-result cache disabled"
-                        );
-                        None
-                    }
-                };
             let acp_session_store = Arc::new(acp_session::AcpSessionStore::new(
                 sessions_base.clone(),
-                tool_result_cache,
+                tool_payload_cache.clone(),
             ));
 
             // ── Intra-day digest cache (workspace-external, store-agnostic) ─
-            // Same directory family as the tool-result cache above, and
+            // Same directory family as the tool-payload cache above, and
             // the same degrade-not-abort treatment — a session must
             // still load and every transport must still serve even
             // without a place to cache "today's digest." `None` costs
@@ -754,6 +785,11 @@ async fn main() -> Result<()> {
                     }
                 };
 
+            // Cloned before `ServeState` takes ownership: the channel
+            // agent writes its own rooms' digests here too, now that
+            // they no longer go into the session JSONL (#190).
+            let digest_cache_for_agent = digest_cache.clone();
+
             let serve_state = Arc::new(serve::ServeState::new(
                 config.clone(),
                 Arc::clone(&registry),
@@ -774,7 +810,7 @@ async fn main() -> Result<()> {
             timer_manager.set_serve_state(Arc::downgrade(&serve_state));
 
             // Captured below so main can await the agent's graceful shutdown
-            // (summarize_on_shutdown) before returning. Without this, the
+            // (flush_digests_on_shutdown) before returning. Without this, the
             // tokio runtime drops the spawned task the moment serve::run
             // returns, cancelling any in-flight LLM call (#48).
             let mut agent_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -788,6 +824,7 @@ async fn main() -> Result<()> {
                     sessions_base.clone(),
                     "channel",
                     Arc::clone(&ws_state),
+                    tool_payload_cache.clone(),
                 ));
 
                 let mut channel_list: Vec<(String, Arc<dyn channel::Channel>)> = Vec::new();
@@ -884,8 +921,8 @@ async fn main() -> Result<()> {
                     Some(Arc::clone(&tool_set)),
                     Arc::clone(&channel_session_store),
                     image_cache.clone(),
+                    digest_cache_for_agent.clone(),
                 ));
-                agent.bootstrap().await;
                 // Wire the agent into the timer manager so chat-origin
                 // timers fire through `Agent::trigger`.
                 timer_manager.set_agent(Arc::downgrade(&agent));
@@ -1008,7 +1045,7 @@ async fn main() -> Result<()> {
             serve::run(addr, Arc::clone(&serve_state), ambient_routes).await?;
 
             // Wait for the agent task's graceful shutdown to finish so its
-            // summarize_on_shutdown LLM call isn't aborted by runtime drop.
+            // flush_digests_on_shutdown LLM call isn't aborted by runtime drop.
             if let Some(handle) = agent_handle
                 && let Err(e) = handle.await
             {

@@ -278,8 +278,20 @@ fn convert_user_message(msg: &ChatMessage) -> Vec<ApiMessage> {
                     tool_call_id: Some(tool_use_id.clone()),
                 });
             }
-            ContentPart::ToolUse { .. } => {
+            ContentPart::ToolUse { .. } | ContentPart::ToolUseRef { .. } => {
                 // Should not appear on User messages — silently skip.
+            }
+            // See the Anthropic provider's arm: hydration failed
+            // upstream, and the pairing matters more than the content.
+            ContentPart::ToolResultRef { tool_use_id, .. } => {
+                out.push(ApiMessage {
+                    role: "tool",
+                    content: Some(ApiContent::Text(
+                        crate::session_storage::MISSING_RESULT.to_string(),
+                    )),
+                    tool_calls: None,
+                    tool_call_id: Some(tool_use_id.clone()),
+                });
             }
         }
     }
@@ -325,10 +337,24 @@ fn convert_assistant_message(msg: &ChatMessage) -> ApiMessage {
                     },
                 });
             }
+            // See the Anthropic provider's arm: hydration failed
+            // upstream, and the call matters more than its arguments.
+            ContentPart::ToolUseRef { id, name, .. } => {
+                tool_calls.push(ApiAssistantToolCall {
+                    id: id.clone(),
+                    kind: "function",
+                    function: ApiAssistantToolFunction {
+                        name: name.clone(),
+                        arguments: serde_json::to_string(&crate::session_storage::missing_input())
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    },
+                });
+            }
             // Assistant should not carry images or tool results.
             ContentPart::Image { .. }
             | ContentPart::ImageRef { .. }
-            | ContentPart::ToolResult { .. } => {}
+            | ContentPart::ToolResult { .. }
+            | ContentPart::ToolResultRef { .. } => {}
         }
     }
 

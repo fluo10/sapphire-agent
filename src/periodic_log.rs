@@ -1233,12 +1233,12 @@ where
     F: Fn(&str) -> String,
 {
     let mut entries: Vec<(SessionMeta, crate::session::IntradayDigestLine)> = Vec::new();
-    entries.extend(channel_store.intraday_digests_for_day(today, boundary_hour));
+    entries.extend(channel_store.intraday_digests_for_day(today, boundary_hour, digest_cache));
     if let Some(s) = cross_device_store {
-        entries.extend(s.intraday_digests_for_day(today, boundary_hour));
+        entries.extend(s.intraday_digests_for_day(today, boundary_hour, digest_cache));
     }
     if let Some(s) = device_default_store {
-        entries.extend(s.intraday_digests_for_day(today, boundary_hour));
+        entries.extend(s.intraday_digests_for_day(today, boundary_hour, digest_cache));
     }
     if let (Some(s), Some(c)) = (acp_store, digest_cache) {
         entries.extend(s.intraday_digests_for_day(today, boundary_hour, c));
@@ -1728,12 +1728,12 @@ mod tests {
     fn an_acp_digest_lands_in_its_own_namespace() {
         let td = make_tempdir();
         let sessions_base = td.path().join("sessions");
-        let channel_store = SessionStore::new(sessions_base.join("channel"), "channel");
+        let channel_store = SessionStore::new(sessions_base.join("channel"), "channel", None);
 
-        let tool_result_cache =
-            crate::tool_result_cache::ToolResultCache::open(td.path().join("tool-results"))
+        let tool_payload_cache =
+            crate::tool_payload_cache::ToolPayloadCache::open(td.path().join("tool-payloads"))
                 .unwrap();
-        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), Some(tool_result_cache));
+        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), Some(tool_payload_cache));
         let digest_cache = DigestCache::open(td.path().join("digests")).unwrap();
 
         acp_store.create("s1", "work", "/p").unwrap();
@@ -1791,11 +1791,11 @@ mod tests {
     /// them out.
     fn merge_test_stores(td: &tempfile::TempDir) -> (SessionStore, AcpSessionStore) {
         let sessions_base = td.path().join("sessions");
-        let channel_store = SessionStore::new(sessions_base.join("channel"), "channel");
-        let tool_result_cache =
-            crate::tool_result_cache::ToolResultCache::open(td.path().join("tool-results"))
+        let channel_store = SessionStore::new(sessions_base.join("channel"), "channel", None);
+        let tool_payload_cache =
+            crate::tool_payload_cache::ToolPayloadCache::open(td.path().join("tool-payloads"))
                 .unwrap();
-        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), Some(tool_result_cache));
+        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), Some(tool_payload_cache));
         (channel_store, acp_store)
     }
 

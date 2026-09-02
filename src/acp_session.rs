@@ -19,7 +19,8 @@
 
 use crate::provider::{ChatMessage, ContentPart, Role};
 use crate::session::{IntradayDigestLine, SessionMeta, StoredMessage};
-use crate::tool_result_cache::ToolResultCache;
+use crate::session_storage::{MISSING_RESULT, missing_input};
+use crate::tool_payload_cache::ToolPayloadCache;
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -32,16 +33,6 @@ use uuid::Uuid;
 
 /// The directory name under `<sessions>/<namespace>/`.
 const KIND: &str = "acp";
-
-/// What the model is told when a tool result is no longer in the cache.
-///
-/// The pairing between `tool_use` and `tool_result` is what the API
-/// validates, not the content — so a placeholder keeps the history
-/// valid and the conversation's shape intact. This is why the store
-/// needs no resume summary: a summary would cost a model call and throw
-/// the turn structure away to solve a problem a sentence solves.
-pub const MISSING_RESULT: &str =
-    "[this tool result is no longer stored; call the tool again if you need it]";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionHeader {
@@ -67,9 +58,23 @@ pub struct Event {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum EventBody {
-    Message { role: Role, parts: Vec<StoredPart> },
-    Title { title: String },
+    Message {
+        role: Role,
+        parts: Vec<StoredPart>,
+    },
+    Title {
+        title: String,
+    },
     Closed,
+    /// A compaction summary and the message it absorbed up to.
+    ///
+    /// Not a message: `history()` and the daily-log projection skip it,
+    /// because the editor's transcript and the permanent record are both
+    /// about what was said. Only `history_for_model` reads it.
+    Summary {
+        summary: String,
+        covers_through: Uuid,
+    },
 }
 
 /// A message part as it appears on disk.
@@ -84,10 +89,30 @@ pub enum EventBody {
 #[serde(rename_all = "snake_case")]
 pub enum StoredPart {
     Text(String),
+    /// **Legacy, read-only.** What this store wrote before inputs were
+    /// cached (#212). Nothing produces it any more; it stays so that a
+    /// session file written by an earlier build still loads its calls
+    /// instead of silently dropping them — and dropping a `tool_use`
+    /// while keeping its `tool_result` is exactly the orphan the repair
+    /// pass then has to clean up.
+    ///
+    /// Delete it once no reachable session predates the change.
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
+    },
+    ToolUseRef {
+        id: String,
+        /// Stays inline. It is short, and it is what `generate_summary`
+        /// renders as `[Called tool: {name}]` — behind the hash, a
+        /// summary of an evicted session would say nothing at all about
+        /// what the agent did.
+        name: String,
+        /// `None` means the input had nowhere to be stored, exactly as
+        /// for a result below.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
     },
     ToolResultRef {
         tool_use_id: String,
@@ -133,18 +158,27 @@ enum Line {
         parent: Option<Uuid>,
         at: DateTime<Utc>,
     },
+    Summary {
+        id: Uuid,
+        parent: Option<Uuid>,
+        at: DateTime<Utc>,
+        summary: String,
+        covers_through: Uuid,
+    },
 }
 
 pub struct AcpSessionStore {
     base_dir: PathBuf,
-    /// `None` when the tool-result cache directory could not be opened
+    /// `None` when the tool-payload cache directory could not be opened
     /// at startup (read-only or missing `~/.cache` / `%LOCALAPPDATA%`).
     /// Degrades rather than making the whole store unusable: a session
-    /// must still load. See `store_part`'s `None` arm for what this
-    /// costs — currently nothing reachable in production, since
-    /// `run_llm_turn` does not persist `tool_use`/`tool_result` at all
-    /// yet (issue #191).
-    cache: Option<Arc<ToolResultCache>>,
+    /// must still load. ACP has persisted tool traffic since #191, and
+    /// #194 put every transport on this cache, so `None` is live here in
+    /// production: `store_part`'s `ToolResult` arm writes a
+    /// `ToolResultRef` with no hash instead of the content, and a reload
+    /// reads that back as `MISSING_RESULT` — the pairing survives, only
+    /// the result body is lost.
+    cache: Option<Arc<ToolPayloadCache>>,
     /// `session_id` → the id of the last event written.
     ///
     /// An append needs its parent, and re-reading the whole file to
@@ -154,7 +188,7 @@ pub struct AcpSessionStore {
 }
 
 impl AcpSessionStore {
-    pub fn new(base_dir: PathBuf, cache: Option<Arc<ToolResultCache>>) -> Self {
+    pub fn new(base_dir: PathBuf, cache: Option<Arc<ToolPayloadCache>>) -> Self {
         Self {
             base_dir,
             cache,
@@ -274,6 +308,50 @@ impl AcpSessionStore {
         })
     }
 
+    /// Record a compaction summary and how far it reaches.
+    ///
+    /// `keep_recent` is how many trailing messages the caller kept
+    /// verbatim. The cursor is resolved here, against this store's own
+    /// events — the caller holds an index into its in-memory history and
+    /// cannot map it onto the log, which holds at least as many
+    /// messages because earlier compactions trimmed memory and not the
+    /// file.
+    ///
+    /// Resolved against the chain, not file order: `history_for_model`
+    /// walks the chain to find `covers_through` again, and file order
+    /// only agrees with the chain for a session one process wrote — the
+    /// same reason `chain`'s own doc gives for not trusting file order.
+    /// A session with no messages gets no checkpoint; there is nothing
+    /// for one to point at.
+    pub fn append_summary(
+        &self,
+        session_id: &str,
+        summary: &str,
+        keep_recent: usize,
+    ) -> Result<()> {
+        let events = self.events(session_id).unwrap_or_default();
+        let message_ids: Vec<Uuid> = self
+            .chain(session_id, &events)
+            .into_iter()
+            .filter(|e| matches!(e.body, EventBody::Message { .. }))
+            .map(|e| e.id)
+            .collect();
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let covered = message_ids.len().saturating_sub(keep_recent).max(1);
+        let covers_through = message_ids[covered - 1];
+        let id = Uuid::now_v7();
+        let summary = summary.to_string();
+        self.append_line(session_id, id, move |parent| Line::Summary {
+            id,
+            parent,
+            at: Utc::now(),
+            summary,
+            covers_through,
+        })
+    }
+
     /// ACP exposes no close-or-delete operation yet, so nothing in
     /// production ever writes a `Closed` event — the read path's refusal
     /// of a closed session (`adopt_session` in `src/serve/acp.rs`) is
@@ -293,27 +371,34 @@ impl AcpSessionStore {
         })
     }
 
-    /// A tool result's content goes to the cache; the log keeps a hash.
+    /// Both halves of a tool call go to the cache; the log keeps hashes.
     fn store_part(&self, part: &ContentPart) -> Result<StoredPart> {
         Ok(match part {
             ContentPart::Text(t) => StoredPart::Text(t.clone()),
-            ContentPart::ToolUse { id, name, input } => StoredPart::ToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                // Unlike a result, an input has nowhere to go but the
-                // JSONL itself — there is no cache/hash indirection for
-                // it. That file lives under `workspace_dir/sessions`,
-                // which the retrieve indexer walks, so an unbounded
-                // input (e.g. a multi-megabyte `file_write`) would put
-                // its whole content into the index — exactly what the
-                // ACP store's external cache exists to keep out for
-                // results (see the `ToolResult` arm below), and what an
-                // uncapped `input` would silently reintroduce. Elide
-                // rather than truncate: truncated JSON does not parse,
-                // and a reload needs `input` to still be valid JSON of
-                // the same shape.
-                input: self.elide_oversized_input(input),
-            },
+            ContentPart::ToolUse { id, name, input } => {
+                // An input is cached for the same reason a result is: a
+                // `file_write` call carries the file's contents, this
+                // file lives under `workspace_dir/sessions`, and the
+                // retrieve indexer walks it line by line. It used to be
+                // written inline and merely elided above a size
+                // threshold, which bounded the worst case without
+                // addressing what the requirement actually was (#212).
+                let sha256 = match &self.cache {
+                    Some(cache) => Some(cache.put_input(input)?),
+                    None => {
+                        warn!(
+                            "Tool-payload cache unavailable; recording the input of \
+                             '{id}' with no content"
+                        );
+                        None
+                    }
+                };
+                StoredPart::ToolUseRef {
+                    id: id.clone(),
+                    name: name.clone(),
+                    sha256,
+                }
+            }
             ContentPart::ToolResult {
                 tool_use_id,
                 content,
@@ -328,7 +413,7 @@ impl AcpSessionStore {
                     Some(cache) => Some(cache.put(content)?),
                     None => {
                         warn!(
-                            "Tool-result cache unavailable; recording '{tool_use_id}' \
+                            "Tool-payload cache unavailable; recording '{tool_use_id}' \
                              with no content"
                         );
                         None
@@ -343,26 +428,6 @@ impl AcpSessionStore {
             // marker rather than dropped, so a message that was only an
             // image does not read back as an empty one.
             _ => StoredPart::Other,
-        })
-    }
-
-    /// Storage-path-only transformation: never touches the in-memory
-    /// value, only what gets written to the JSONL — the same shape as
-    /// the result hashing right above it. An oversized input becomes a
-    /// small marker object instead of being written verbatim, so a
-    /// single large tool call cannot dump its whole payload into the
-    /// (indexed) session file. Still valid JSON, so the `input` field's
-    /// type is unchanged and a reload still produces a well-formed
-    /// `ToolUse`.
-    fn elide_oversized_input(&self, input: &serde_json::Value) -> serde_json::Value {
-        let size = serde_json::to_string(input).map(|s| s.len()).unwrap_or(0);
-        if size <= crate::tools::OUTPUT_CAP_BYTES {
-            return input.clone();
-        }
-        serde_json::json!({
-            "_elided": format!(
-                "{size} bytes of tool input, too large to store"
-            )
         })
     }
 }
@@ -425,6 +490,21 @@ impl AcpSessionStore {
                         at,
                         body: EventBody::Closed,
                     }),
+                    Line::Summary {
+                        id,
+                        parent,
+                        at,
+                        summary,
+                        covers_through,
+                    } => Some(Event {
+                        id,
+                        parent,
+                        at,
+                        body: EventBody::Summary {
+                            summary,
+                            covers_through,
+                        },
+                    }),
                 })
                 .collect(),
         )
@@ -472,6 +552,7 @@ impl AcpSessionStore {
                 // Last title wins: a session can be retitled.
                 Line::Title { title: t, .. } => title = Some(t),
                 Line::Closed { .. } => is_closed = true,
+                Line::Summary { .. } => {}
             }
         }
         Some(SessionSummary {
@@ -482,24 +563,19 @@ impl AcpSessionStore {
         })
     }
 
-    /// The conversation as the model should see it.
+    /// The events on the chain, in order, starting from the root.
     ///
-    /// Walks the parent chain rather than trusting file order, because
-    /// file order is only accidentally right: it agrees with the chain
+    /// File order is only accidentally right — it agrees with the chain
     /// for a session one process wrote, and says nothing useful for one
     /// that was synced or merged.
-    pub fn history(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
-        let events = self.events(session_id)?;
-
+    fn chain<'a>(&self, session_id: &str, events: &'a [Event]) -> Vec<&'a Event> {
         // parent -> children, so the walk is a lookup rather than a scan.
         let mut children: HashMap<Option<Uuid>, Vec<&Event>> = HashMap::new();
-        for event in &events {
+        for event in events {
             children.entry(event.parent).or_default().push(event);
         }
-
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(events.len());
         let mut cursor = None;
-        let mut seen = 0usize;
         loop {
             let Some(next) = children.get(&cursor) else {
                 break;
@@ -511,158 +587,113 @@ impl AcpSessionStore {
                 );
             }
             let event = next[0];
-            if let EventBody::Message { role, parts } = &event.body {
-                out.push(ChatMessage {
-                    role: role.clone(),
-                    parts: parts.iter().map(|p| self.load_part(p)).collect(),
-                    input_kind: None,
-                    user_id: None,
-                });
-            }
+            out.push(event);
             cursor = Some(event.id);
-
             // A hand-edited or partially-synced file could contain a
             // cycle. The chain cannot be longer than the file.
-            seen += 1;
-            if seen > events.len() {
+            if out.len() > events.len() {
                 warn!("ACP session {session_id}: the parent chain cycles; stopping");
                 break;
             }
         }
+        out
+    }
 
-        // A `tool_use` can end up on disk without its `tool_result` —
-        // the second `append_message` failed (the cache write erred),
-        // the process died between the two appends, a sync landed only
-        // half the pair. The write side already warns and moves on
-        // rather than losing the turn; left uncorrected here, the gap
-        // it leaves is worse than a lost message, because the API
-        // requires a `tool_result` to sit in the message *immediately
-        // following* its `tool_use` — not merely present somewhere
-        // later in the transcript. That is why the repair is spliced in
-        // right after the message that carries the orphan, rather than
-        // gathered into one message at the end: a trailing message is
-        // only correct while the orphan happens to be the last thing on
-        // record. Once a fresh turn chains a real message onto a
-        // not-yet-repaired orphan (the in-memory repair from a prior
-        // read is never written back), a later read would otherwise
-        // place the trailing repair after that unrelated message
-        // instead of between the two, and the session goes right back
-        // to unloadable. Synthesise rather than drop the `tool_use`:
-        // dropping would erase the fact that the agent attempted the
-        // call, and `MISSING_RESULT` is exactly the shape a cache miss
-        // already produces, so the model sees nothing it doesn't
-        // already know how to handle.
-        //
-        // The check below is positional — "does the immediately
-        // adjacent message carry the matching part" — rather than "does
-        // a matching part exist anywhere in the transcript". A set-based
-        // check silently accepts pairings the API rejects: two messages
-        // that both carry `tool_use` id `c1` where only one is actually
-        // answered (the set contains `c1` either way, so neither gets
-        // repaired); an id answered many messages earlier than the
-        // `tool_use` that (re)issued it, reachable through a fork the
-        // walk resolves differently or a partial sync; and a
-        // `tool_result` that answers nothing adjacent at all. The
-        // positional check is symmetric — a `tool_use` needs its
-        // `tool_result` in the very next message, and a `tool_result`
-        // needs its `tool_use` in the very previous one — so both
-        // directions are handled by looking at the same two neighbours.
-        let mut repaired = Vec::with_capacity(out.len());
-        for (idx, message) in out.iter().enumerate() {
-            // A `tool_result` whose id has no matching `tool_use` in the
-            // immediately preceding message is not a valid pairing,
-            // wherever else in the transcript its id might appear —
-            // drop it. If that empties the message, drop the message
-            // too: an empty message is its own API error.
-            let prev_tool_use_ids: std::collections::HashSet<&str> = idx
-                .checked_sub(1)
-                .and_then(|p| out.get(p))
-                .map(|prev| {
-                    prev.parts
-                        .iter()
-                        .filter_map(|p| match p {
-                            ContentPart::ToolUse { id, .. } => Some(id.as_str()),
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let kept_parts: Vec<ContentPart> = message
-                .parts
-                .iter()
-                .filter(|p| match p {
-                    ContentPart::ToolResult { tool_use_id, .. } => {
-                        prev_tool_use_ids.contains(tool_use_id.as_str())
-                    }
-                    _ => true,
-                })
-                .cloned()
-                .collect();
-            if kept_parts.is_empty() && !message.parts.is_empty() {
-                continue;
+    /// The whole conversation, for the editor's `session/load` replay.
+    ///
+    /// Whole on purpose: the editor keeps no transcript of its own, so a
+    /// trimmed replay would render a thread with a hole in it. What the
+    /// *model* sees is `history_for_model`, which starts from the latest
+    /// compaction checkpoint.
+    pub fn history(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+        let events = self.events(session_id)?;
+        let out = self.messages_from(&self.chain(session_id, &events));
+        Some(crate::session_storage::repair_tool_pairing(out))
+    }
+
+    /// The conversation as the model should see it: the latest
+    /// compaction summary rendered as a stub, then the messages it did
+    /// not absorb.
+    ///
+    /// Compression runs on ACP turns like every other transport, and
+    /// used to throw its summary away on the grounds that the events
+    /// answer the same question. They do — but they answer it with the
+    /// *whole* session, so every reload replayed everything and paid for
+    /// the same compaction again on the first turn back.
+    pub fn history_for_model(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+        let events = self.events(session_id)?;
+        let chain = self.chain(session_id, &events);
+
+        let checkpoint = chain.iter().rev().find_map(|e| match &e.body {
+            EventBody::Summary {
+                summary,
+                covers_through,
+            } => Some((summary.clone(), *covers_through)),
+            _ => None,
+        });
+
+        let Some((summary, covers_through)) = checkpoint else {
+            let out = self.messages_from(&chain);
+            return Some(crate::session_storage::repair_tool_pairing(out));
+        };
+
+        let messages: Vec<&Event> = chain
+            .iter()
+            .copied()
+            .filter(|e| matches!(e.body, EventBody::Message { .. }))
+            .collect();
+        let start = match messages.iter().position(|e| e.id == covers_through) {
+            Some(pos) => pos + 1,
+            None => {
+                warn!(
+                    "ACP session {session_id}: checkpoint {covers_through} is not on the chain; replaying everything"
+                );
+                0
             }
+        };
 
-            // A `tool_use` in this message is answered only if the
-            // immediately following message carries a `tool_result` for
-            // its id. Ids are deduplicated so two `tool_use` parts that
-            // (wrongly) share one id do not produce two `tool_result`s
-            // for it in the repair.
-            let next_tool_result_ids: std::collections::HashSet<&str> = out
-                .get(idx + 1)
-                .map(|next| {
-                    next.parts
-                        .iter()
-                        .filter_map(|p| match p {
-                            ContentPart::ToolResult { tool_use_id, .. } => {
-                                Some(tool_use_id.as_str())
-                            }
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut repaired_ids = std::collections::HashSet::new();
-            let orphan_results: Vec<ContentPart> = message
-                .parts
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::ToolUse { id, .. }
-                        if !next_tool_result_ids.contains(id.as_str())
-                            && repaired_ids.insert(id.clone()) =>
-                    {
-                        Some(ContentPart::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: MISSING_RESULT.to_string(),
-                        })
-                    }
-                    _ => None,
-                })
-                .collect();
+        let mut out = crate::context_compression::compaction_stub(&summary);
+        out.extend(self.messages_from(&messages[start..]));
+        Some(crate::session_storage::repair_tool_pairing(out))
+    }
 
-            repaired.push(ChatMessage {
-                parts: kept_parts,
-                ..message.clone()
-            });
-            if !orphan_results.is_empty() {
-                repaired.push(ChatMessage {
-                    role: Role::User,
-                    parts: orphan_results,
+    /// Project the message events among `events` into `ChatMessage`s,
+    /// hydrating each part.
+    fn messages_from(&self, events: &[&Event]) -> Vec<ChatMessage> {
+        events
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::Message { role, parts } => Some(ChatMessage {
+                    role: role.clone(),
+                    parts: parts.iter().map(|p| self.load_part(p)).collect(),
                     input_kind: None,
                     user_id: None,
-                });
-            }
-        }
-
-        Some(repaired)
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     fn load_part(&self, part: &StoredPart) -> ContentPart {
         match part {
             StoredPart::Text(t) => ContentPart::Text(t.clone()),
+            // Legacy: the input is inline, so there is nothing to fetch.
             StoredPart::ToolUse { id, name, input } => ContentPart::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
                 input: input.clone(),
+            },
+            StoredPart::ToolUseRef { id, name, sha256 } => ContentPart::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                // Absent either way — no hash was ever written, or the
+                // hash's entry is gone. The call itself survives, which
+                // is what the pairing needs; `name` keeps the record of
+                // what was attempted from being nothing at all.
+                input: sha256
+                    .as_ref()
+                    .and_then(|sha| self.cache.as_ref()?.get_input(sha))
+                    .unwrap_or_else(missing_input),
             },
             StoredPart::ToolResultRef {
                 tool_use_id,
@@ -846,6 +877,7 @@ impl AcpSessionStore {
                             return None;
                         }
                         Some(StoredMessage {
+                            id: None,
                             timestamp: e.at,
                             role: role.clone(),
                             parts: text,
@@ -950,7 +982,7 @@ mod tests {
     fn store() -> (tempfile::TempDir, AcpSessionStore) {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
-        let cache = crate::tool_result_cache::ToolResultCache::open(cache_dir).unwrap();
+        let cache = crate::tool_payload_cache::ToolPayloadCache::open(cache_dir).unwrap();
         let store = AcpSessionStore::new(dir.path().join("sessions"), Some(cache));
         (dir, store)
     }
@@ -1148,15 +1180,13 @@ mod tests {
         assert_eq!(evicted[1].parts, never[1].parts);
     }
 
-    /// Fix 4/#194: a tool *input* has no cache/hash indirection the way a
-    /// result does, so an unbounded input (e.g. a multi-megabyte
-    /// `file_write`) would otherwise go straight into the JSONL — which
-    /// lives under `workspace_dir/sessions` and is walked by the
-    /// retrieve indexer. It must be elided on the way to disk, and the
-    /// elided form must still be valid, well-shaped JSON so a reload
-    /// still produces a `ToolUse`.
+    /// #212: a tool *input* is cached exactly the way a result is, at
+    /// any size. A `file_write` call carries the file's contents, and
+    /// the JSONL lives under `workspace_dir/sessions`, which the
+    /// retrieve indexer walks line by line. It must not reach disk, and
+    /// it must come back whole.
     #[test]
-    fn an_oversized_tool_input_is_elided_on_the_way_to_disk() {
+    fn a_tool_input_is_cached_rather_than_written_to_the_jsonl() {
         let (_d, store) = store();
         store.create("s1", "default", "/p").unwrap();
 
@@ -1183,24 +1213,81 @@ mod tests {
             "the oversized input must not reach the (indexed) JSONL verbatim"
         );
 
+        assert!(
+            raw.contains("file_write"),
+            "the tool name must stay inline so a summary can still name it"
+        );
+
         let history = store.history("s1").expect("the session loads");
         match &history[0].parts[0] {
             ContentPart::ToolUse { id, name, input } => {
                 assert_eq!(id, "c1");
                 assert_eq!(name, "file_write");
-                assert!(
-                    input.get("_elided").is_some(),
-                    "the reloaded input must carry the elision marker: {input:?}"
+                assert_eq!(
+                    input,
+                    &serde_json::json!({ "content": huge }),
+                    "the input must round-trip byte-for-byte"
                 );
             }
             other => panic!("expected a ToolUse, got {other:?}"),
         }
     }
 
-    /// The elision in the test above must not fire on an ordinary,
-    /// well-under-the-cap input — the common case is untouched.
+    /// A file written before inputs were cached holds `{"tool_use": …}`
+    /// with the arguments inline. It must still load its call: dropping
+    /// the part would leave the `tool_result` answering it orphaned, and
+    /// the repair pass would then delete that too — turning a readable
+    /// old session into a conversation with a hole where the work was.
     #[test]
-    fn an_ordinary_tool_input_is_stored_unchanged() {
+    fn a_legacy_inline_tool_use_still_loads() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/p").unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("do it"))
+            .unwrap();
+
+        let parent = store.events("s1").unwrap().last().unwrap().id;
+        let legacy = serde_json::json!({
+            "kind": "message",
+            "id": Uuid::now_v7(),
+            "parent": parent,
+            "at": Utc::now(),
+            "role": "assistant",
+            "parts": [{"tool_use": {
+                "id": "c1",
+                "name": "file_read",
+                "input": {"path": "a.rs"},
+            }}],
+        });
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.path_for_test("s1"))
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{legacy}").unwrap();
+        drop(f);
+
+        let history = store.history("s1").expect("the session loads");
+        let call = history.iter().flat_map(|m| &m.parts).find_map(|p| match p {
+            ContentPart::ToolUse { id, name, input } if id == "c1" => {
+                Some((name.clone(), input.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            call,
+            Some((
+                "file_read".to_string(),
+                serde_json::json!({ "path": "a.rs" })
+            )),
+            "the legacy call must load with its inline input: {history:?}"
+        );
+    }
+
+    /// An ordinary input takes the same path — there is no size
+    /// threshold any more, so the common case must round-trip too.
+    #[test]
+    fn an_ordinary_tool_input_round_trips() {
         let (_d, store) = store();
         store.create("s1", "default", "/p").unwrap();
 
@@ -1374,6 +1461,106 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["one", "two", "three"]);
+    }
+
+    /// `session/load` replays for the editor, which keeps no transcript
+    /// of its own — that one stays whole. The LLM's copy does not.
+    #[test]
+    fn a_checkpoint_trims_the_model_history_but_not_the_editor_replay() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/tmp").unwrap();
+        for i in 0..5 {
+            store
+                .append_message("s1", &ChatMessage::user(&format!("m{i}")))
+                .unwrap();
+        }
+        store.append_summary("s1", "the first three", 2).unwrap();
+
+        let full = store.history("s1").expect("the editor replay");
+        assert_eq!(full.len(), 5, "session/load must still see everything");
+
+        let model = store.history_for_model("s1").expect("the model history");
+        let texts: Vec<String> = model
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts[0].contains("the first three"),
+            "stub first: {texts:?}"
+        );
+        // `compaction_stub` contributes two messages (indices 0 and 1);
+        // the checkpoint kept 2 trailing messages, so the tail must be
+        // exactly m3, m4 — not m2..m4 (start = pos instead of pos + 1)
+        // and not m4 alone.
+        assert_eq!(
+            &texts[2..],
+            &["m3", "m4"],
+            "the checkpoint boundary is off: {texts:?}"
+        );
+    }
+
+    /// No summary yet: the two reads agree.
+    #[test]
+    fn without_a_checkpoint_the_model_sees_the_whole_session() {
+        let (_d, store) = store();
+        store.create("s1", "default", "/tmp").unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("only"))
+            .unwrap();
+        assert_eq!(
+            store.history_for_model("s1").unwrap(),
+            store.history("s1").unwrap()
+        );
+    }
+
+    /// A Summary event must never register as message activity: not in
+    /// the daily log's shape, and not in the digest-due sweep's "has
+    /// something new since the last digest" check.
+    ///
+    /// The daily-log assertion is structural — `EventBody::Summary`
+    /// carries no `role`/`parts`, so it cannot literally decode into a
+    /// logged message — but the digest-due assertion is a live
+    /// regression check: the cache is refreshed *after* the message but
+    /// *before* the summary, so if `sessions_needing_digest` ever
+    /// dropped its `matches!(e.body, EventBody::Message { .. })` filter
+    /// and read the summary's timestamp as "last activity" instead, the
+    /// session would look due again even though nothing new was said —
+    /// burning a model call every sweep, forever.
+    #[test]
+    fn a_summary_event_is_not_mistaken_for_recent_activity() {
+        let (dir, store) = store();
+        let cache = digest_cache(&dir);
+        store.create("s1", "default", "/tmp").unwrap();
+        store
+            .append_message("s1", &ChatMessage::user("hello"))
+            .unwrap();
+
+        // Cached digest lands strictly between the message and the
+        // summary that follows it.
+        let between = Utc::now();
+        cache.put_at("s1", "covered", None, between).unwrap();
+        store.append_summary("s1", "a recap", 0).unwrap();
+
+        let today = today(4);
+
+        let days = store.sessions_for_day(today, 4);
+        assert_eq!(days.len(), 1);
+        let (_, messages) = &days[0];
+        assert_eq!(
+            messages.len(),
+            1,
+            "the summary must not add a second entry to the daily log: {messages:?}"
+        );
+
+        assert!(
+            store.sessions_needing_digest(&cache, today, 4).is_empty(),
+            "a digest that already covers the last message must not be \
+             invalidated by a Summary event appended after it"
+        );
     }
 
     /// A tool result survives a round trip through the cache.

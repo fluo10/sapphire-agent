@@ -1,0 +1,57 @@
+# Workspace-level configuration for sapphire-agent.
+#
+# This file travels with the workspace. It may only set what describes the
+# agent — its model, behaviour, routing and namespaces. Credentials, bind
+# addresses, MCP servers and machine paths are host-local: if this file
+# sets one it is dropped and named in a warning at startup. Run
+# `sapphire-agent verify` to see where each effective value came from.
+#
+# Every commented setting below is one this layer is allowed to set.
+
+# Heartbeat cron tasks are off in a fresh workspace, so a test rig sharing
+# a machine with a live agent cannot fire duplicate scheduled tasks. Turn
+# it on once the workspace is doing real work.
+heartbeat_enabled = false
+
+# Hour the agent's "day" rolls over, for daily logs and session policy.
+# day_boundary_hour = 4
+
+# What happens to a session at the day boundary:
+#   "reset"   close it; the next message starts a new one
+#   "compact" keep it, summarising the prior day into a stub
+#   "none"    do nothing
+# session_policy = "compact"
+
+# Write a daily log at each day boundary.
+# daily_log_enabled = true
+
+# Periodically compact MEMORY.md.
+# memory_compaction_enabled = true
+
+# Close an idle session after this many minutes.
+# intraday_idle_minutes = 180
+
+# Re-index the workspace this often, in minutes.
+# sync_interval_minutes = 15
+
+# The agent's model and framing. The API key itself is host-local.
+# [anthropic]
+# model = "claude-sonnet-5"
+# light_model = "claude-haiku-4-5-20251001"
+# max_tokens = 8192
+# system_prompt = "..."
+
+# How many digest items each log level contributes to the system prompt.
+# [digest]
+# daily_items = 3
+# weekly_items = 3
+# monthly_items = 5
+# yearly_items = 5
+# weekly_enabled = true
+# monthly_enabled = true
+# yearly_enabled = true
+
+# Which rooms and devices run under which profile, and which memory
+# namespace they read. `default` catches everything not listed elsewhere.
+# [room_profile.default]
+# memory_namespace = "default"

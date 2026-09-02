@@ -36,7 +36,7 @@ impl DigestCache {
     }
 
     /// `~/.cache/sapphire-agent/digests`, beside the image and
-    /// tool-result caches.
+    /// tool-payload caches.
     pub fn default_dir() -> Option<PathBuf> {
         dirs::cache_dir().map(|d| d.join("sapphire-agent").join("digests"))
     }
