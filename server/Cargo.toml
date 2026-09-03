@@ -15,11 +15,28 @@ name = "sapphire-agent"
 path = "src/main.rs"
 
 [features]
-default = ["redb-store", "fastembed-embed", "voice-sherpa"]
+default = ["redb-store", "voice-sherpa"]
 # Pure-Rust cache backend (redb + tantivy) for the FTS/record store, and the
 # brute-force vector index alongside it. Without it the workspace falls back to
 # an ephemeral in-memory store.
 redb-store = ["sapphire-framework/redb-store"]
+# In-process local embeddings. MUTUALLY EXCLUSIVE WITH `voice-sherpa`, and off
+# by default for that reason — see #225.
+#
+# fastembed pulls `ort`, which vendors its own ONNX Runtime; sherpa-onnx-sys
+# vendors another. Both statically link a copy of re2, so linking them into one
+# binary gives duplicate symbols (`re2::Regexp::Concat` and friends) on Linux,
+# and LNK2038 on Windows where the CRTs also disagree. Whether it actually
+# fails depends on which objects the linker happens to pull: the agent's
+# release binary linked, its *test* binary did not.
+#
+# Dropping it costs nothing operationally — the framework's `openai` and
+# `ollama` embedders cover the same ground over HTTP, and llama.cpp's server
+# speaks the OpenAI-compatible `/v1/embeddings` shape. What it buys back is
+# single-file distribution: with sherpa linked shared to dodge the conflict,
+# the published binary could not start at all (#182).
+#
+# Usable on its own: `--no-default-features --features redb-store,fastembed-embed`.
 fastembed-embed = ["sapphire-framework/fastembed-embed"]
 # Compile in the local sherpa-onnx STT + TTS providers. Enabled by
 # default, but note that sherpa-onnx-sys pulls in a large C++ build
@@ -151,7 +168,7 @@ serenity = { version = "0.12", default-features = false, features = [
 # Statically links sherpa-onnx + ONNX runtime — no system install needed.
 # Optional, gated behind the `voice-sherpa` feature; the build is slow
 # (sherpa-onnx-sys compiles C++ via CMake).
-sherpa-onnx = { version = "1.13", optional = true, default-features = false, features = ["shared"] }
+sherpa-onnx = { version = "1.13", optional = true }
 
 # Model bundle extraction. sherpa-onnx ships pre-trained models as
 # tar.bz2 archives on GitHub releases; both crates are gated alongside

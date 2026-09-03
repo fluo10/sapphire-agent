@@ -33,6 +33,27 @@ The repo root is a **virtual workspace manifest** (`[workspace]` only, no `[pack
 
 A package rename (`sapphire-agent` → `-server`, `sapphire-call-cli` → `sapphire-agent-cli`, …) is a possible future step; it is deliberately decoupled from this move, so directory and package names are temporarily out of sync. A future ESP32-S3 client firmware would live in a separate nested workspace (its own `Cargo.lock` / `rust-toolchain.toml` / `.cargo/config.toml`), added to `[workspace] exclude`, not as a member.
 
+### Two ONNX Runtimes cannot share a binary — keep `ort` out of the default build
+
+`sherpa-onnx-sys` vendors an ONNX Runtime; `ort` vendors another. Both statically link their own copy of **re2**, so putting them in one binary gives duplicate symbols (`re2::Regexp::Concat` and friends) under `rust-lld` on Linux, and LNK2038 on Windows where the CRTs disagree as well. Whether a given link fails depends on which objects the linker happens to pull: the agent's release binary linked fine while its *test* binary did not.
+
+This is not a Windows quirk, and it is the reason `sherpa-onnx` was briefly linked **shared** (66f1c10) — which in turn shipped a binary that could not start anywhere (#182), because the libraries stay in `target/` and nothing writes an RPATH.
+
+The resolution is to keep `ort` out of the default graph, which restores static linking and single-file distribution everywhere:
+
+- **`server/`** — `fastembed-embed` is off by default (#225). The framework's `openai` and `ollama` embedders cover the same ground over HTTP, and llama.cpp's server speaks the OpenAI-compatible `/v1/embeddings` shape.
+- **`cli/`** — the openWakeWord detector is gone; detection moves server-side in #183.
+- **`desktop/`** — never pulled `ort`; it only followed the workspace's link mode.
+
+So `cargo build --workspace` works on Linux and macOS. It still does **not** link on Windows for `server/`, which is fine — the agent is a headless server app with no Windows build (#182). Build the clients by name there:
+
+```sh
+cargo build --package sapphire-call-cli
+cargo build --package sapphire-call-desktop
+```
+
+If you enable `fastembed-embed`, drop `voice-sherpa`: `--no-default-features --features redb-store,fastembed-embed`.
+
 ### Historical note: agent false-positive release PRs (now fixed)
 
 `sapphire-agent` used to live *at* the workspace root, so **release-plz attributed any workspace-root file change to it** — including `Cargo.lock`, which almost every sibling-crate commit touches. That produced spurious `sapphire-agent` release PRs (investigated in closed [#143](https://github.com/fluo10/sapphire-agent/pull/143), [#144](https://github.com/fluo10/sapphire-agent/pull/144)). release-plz's release-trigger logic is purely path-based and no config (regex filter, git-cliff `skip = true`, etc.) suppressed it. Moving the package into `server/` — leaving no package at the root — is the structural fix: root `Cargo.lock` churn is no longer inside any package's directory.
