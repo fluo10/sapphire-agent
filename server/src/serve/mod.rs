@@ -41,8 +41,6 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
 
-const MAX_TOOL_ROUNDS: usize = 10;
-
 // ---------------------------------------------------------------------------
 // Shared server state
 // ---------------------------------------------------------------------------
@@ -2210,18 +2208,20 @@ pub(crate) enum TurnStop {
     /// that path the cause reaches only the log line right before this
     /// is returned, not any `TurnHost`.
     ProviderError,
-    /// [`MAX_TOOL_ROUNDS`] was reached with the model still calling tools.
-    /// `text` is `None` — deliberately, because every caller that predates
-    /// ACP treats this as a failed turn and must keep doing so — but the
-    /// prose the model emitted alongside its tool calls is real work, and
-    /// is carried here rather than discarded. It may be empty.
+    /// The turn's `[tools.tool_rounds]` budget was reached with the model
+    /// still calling tools. `text` is `None` — deliberately, because every
+    /// caller that predates ACP treats this as a failed turn and must
+    /// keep doing so — but the prose the model emitted alongside its tool
+    /// calls is real work, and is carried here rather than discarded. It
+    /// may be empty.
     BudgetExhausted { partial_text: String },
 }
 
 /// Outcome of [`run_llm_turn`].
 pub(crate) struct LlmTurnOutcome {
     /// Final assistant text, when the turn completed successfully. `None`
-    /// on provider error or when MAX_TOOL_ROUNDS was hit without resolving.
+    /// on provider error or when the `[tools.tool_rounds]` budget was hit
+    /// without resolving.
     text: Option<String>,
     /// True iff the session had no prior turns before this one. Used by
     /// callers to decide whether to spawn a title-generation task.
@@ -5528,20 +5528,24 @@ mod tests {
     /// The bug this pins: `round` used to be counted over the whole
     /// history, which restoring a session now seeds with everything it
     /// did before this turn started. A session that arrives with more
-    /// than `MAX_TOOL_ROUNDS` tool_use messages already in it — exactly
+    /// tool_use messages already in it than the budget allows — exactly
     /// what a restored, long-lived room looks like — tripped the budget
     /// check on the very first iteration, before the provider was ever
     /// called, and broke silently (`text: None`, nothing sent). It must
     /// still get an ordinary reply: the budget is rounds *this turn*.
+    /// The count below (11) is one past the ten rounds this budget used
+    /// to be fixed at, back when this test was written; it stays well
+    /// under today's shipped default, so it still pins the counting bug
+    /// without depending on where the default happens to sit.
     #[tokio::test]
     async fn a_session_restored_with_more_than_the_round_budget_still_replies() {
         let state = ServeState::for_test(true);
 
-        // More than MAX_TOOL_ROUNDS assistant messages carrying a
-        // ToolUse part, paired with their tool_results, as a restored
-        // session's history would arrive already hydrated.
+        // More than the round budget's worth of assistant messages
+        // carrying a ToolUse part, paired with their tool_results, as a
+        // restored session's history would arrive already hydrated.
         let mut history = Vec::new();
-        for i in 0..(MAX_TOOL_ROUNDS + 1) {
+        for i in 0..11 {
             let id = format!("old-{i}");
             history.push(ChatMessage::assistant_with_tools(
                 None,

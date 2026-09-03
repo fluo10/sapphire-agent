@@ -56,8 +56,10 @@
 //! used to be a real hazard: `ToolSet::execute` held its read guard
 //! across the whole call to `Tool::execute_full`, so for `subagent` the
 //! guard was held across an entire nested conversation — up to
-//! `MAX_TOOL_ROUNDS` provider calls plus however long a human takes to
-//! answer an `AcpProgress::approve` prompt. `tokio::sync::RwLock` is
+//! `[tools.tool_rounds]`'s `unattended` provider calls (a subagent is
+//! always judged by that half of the budget, never `interactive`) plus
+//! however long a human takes to answer an `AcpProgress::approve`
+//! prompt. `tokio::sync::RwLock` is
 //! task-fair: a reader blocks as soon as a writer is queued, so a
 //! concurrent write (an MCP server's `tools/list_changed` refresh via
 //! `ToolSet::refresh_if_needed`, or `mcp_reconnect`) queued behind that

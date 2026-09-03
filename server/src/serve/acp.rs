@@ -2447,19 +2447,19 @@ mod tests {
         assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
     }
 
-    /// Running out of tool rounds is an ordinary ending, not a broken agent.
-    /// The budget is ten, which "search, read four files, edit two" reaches
-    /// on its own, so this is the routine case — and ACP has a stop reason
-    /// for exactly it. Answering a JSON-RPC error instead would put an
-    /// internal-error dialog in front of the user *and* throw away the prose
-    /// the model produced on the way, so both halves are pinned here.
+    /// Running out of tool rounds is an ordinary ending, not a broken
+    /// agent, and ACP has a stop reason for exactly it. The default no
+    /// longer reaches it — `interactive = 0` is unbounded — so this pins
+    /// the configured case: an operator who sets a cap gets
+    /// `max_turn_requests`, not an internal-error dialog.
+    ///
+    /// The prose is pinned too, in its new shape: one chunk per round, as
+    /// each round produced it, rather than one joined chunk at the end.
     #[tokio::test]
-    async fn exhausting_the_tool_budget_ends_the_turn_with_max_turn_requests() {
-        // One scripted response per permitted round, each calling the
-        // fixture's `echo` tool and saying something first. The count is
-        // exact: an eleventh provider call would find the script empty and
-        // fail the turn as a provider error, which this test would see.
-        let script: Vec<crate::provider::ChatResponse> = (0..super::super::MAX_TOOL_ROUNDS)
+    async fn a_configured_budget_ends_the_turn_with_max_turn_requests() {
+        const ROUNDS: usize = 4;
+
+        let script: Vec<crate::provider::ChatResponse> = (0..ROUNDS)
             .map(|i| crate::provider::ChatResponse {
                 text: Some(format!("step {i}")),
                 tool_calls: vec![crate::provider::ToolCall {
@@ -2470,7 +2470,15 @@ mod tests {
                 stop_reason: None,
             })
             .collect();
-        let addr = spawn(ServeState::for_test_scripted(true, script)).await;
+        let state = ServeState::for_test_scripted_with_rounds(
+            true,
+            script,
+            crate::config::ToolRounds {
+                interactive: ROUNDS,
+                unattended: ROUNDS,
+            },
+        );
+        let addr = spawn(state).await;
         let (_session_id, updates, reply) = drive(&addr, text_prompt("do a big refactor")).await;
 
         assert!(
@@ -2482,17 +2490,14 @@ mod tests {
             "got {reply}"
         );
 
-        // The work done before the budget ran out reaches the editor.
-        let expected: String = (0..super::super::MAX_TOOL_ROUNDS)
-            .map(|i| format!("step {i}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        // Every round's prose reached the editor, in its own chunk.
+        let expected: Vec<String> = (0..ROUNDS).map(|i| format!("step {i}")).collect();
         let chunks: Vec<&str> = updates
             .iter()
             .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
             .map(|u| u["content"]["text"].as_str().unwrap())
             .collect();
-        assert_eq!(chunks, vec![expected.as_str()], "got {chunks:?}");
+        assert_eq!(chunks, expected, "got {chunks:?}");
     }
 
     /// A session id this connection never minted is answered — not queued
