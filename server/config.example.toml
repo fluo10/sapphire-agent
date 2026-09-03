@@ -438,6 +438,14 @@ system_prompt = "You are a helpful personal assistant."
 # # https://github.com/dscripka/openWakeWord, drop the .onnx on the
 # # server, point `wake_word_model` at it, restart. Every connected
 # # satellite fetches the bytes via voice/config and caches by SHA-256.
+# #
+# # NOTE: no client can act on this today. The satellite's openWakeWord
+# # runtime was removed because it forced the whole workspace onto shared
+# # sherpa linking, which left every published binary unable to start
+# # (#182). A satellite that receives a model warns and runs VAD-only.
+# # #183 moves detection to the server, which restores the feature and
+# # is also what the ESP32 satellites need. The setting is kept so the
+# # model keeps its home in config until then.
 # [voice]
 # wake_word_model = "/srv/sapphire/wake-models/saphina-v1.onnx"
 

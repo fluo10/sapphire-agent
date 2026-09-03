@@ -15,7 +15,7 @@ A personal AI assistant agent that lives in a [`sapphire-framework`](https://git
 - **Client-side tools**: `client_file_read`, `client_file_write`, `client_shell`, `client_shell_start`, `client_shell_output`, `client_shell_kill` — touch the *editor's* machine instead, over `/acp`'s `fs/*` and `terminal/*` requests. Only offered inside an ACP session, and only for the capabilities the connected editor actually declared at `initialize`. See [Client-side tools: whose machine](#client-side-tools-whose-machine) below.
 - **Sessions**: human-readable [`grain-id`](https://crates.io/crates/grain-id) aliases, auto-generated titles, history dump on resume.
 - **Background**: heartbeat cron tasks, periodic memory compaction, periodic workspace re-index, daily / weekly / monthly / yearly logs with catch-up.
-- **Voice**: optional `sapphire-call voice` satellite with local STT/TTS (via `sherpa-onnx`), Silero VAD, and an openWakeWord wake detector. See [crates/sapphire-call](crates/sapphire-call/).
+- **Voice**: optional `sapphire-call voice` satellite with local STT/TTS (via `sherpa-onnx`) and Silero VAD. See [cli/](cli/). Wake-word gating is temporarily unavailable while detection moves to the server ([#183](https://github.com/fluo10/sapphire-agent/issues/183)); the satellite runs VAD-only.
 - **Ambient audio ingest**: optional always-on capture from a wearable/pendant device — `POST /audio/ingest` takes raw audio (metadata in query params, no JSON/base64 framing) from a bearer-authenticated device, re-gates it, transcribes it, attributes it to a speaker against reference audio curated in the workspace, and stores the transcript outside the workspace. Records without answering: nothing in this path starts an LLM turn. `transcript_read`, `speaker_candidates` and `speaker_promote` expose the result as agent tools. Disabled by default — enable via `[ambient].enabled = true`; see `config.example.toml`.
 - **Agent-to-agent**: `/a2a` endpoint speaks the v1 A2A protocol (JSON-RPC `SendMessage`, AgentCard) with per-device bearer-token auth — enable via `[a2a].enabled = true`.
 - **External AI integration**: `/mcp` endpoint publishes `write_report` and `recall_memory` tools so Claude Code (and other MCP clients) can share project context with the agent — see [docs/mcp-integration.md](docs/mcp-integration.md).
@@ -28,7 +28,7 @@ A personal AI assistant agent that lives in a [`sapphire-framework`](https://git
   - `sapphire-agent verify` — validate config and report loaded workspace files, including the device -> room_profile bindings
   - `sapphire-agent device add|list|rotate|retire` — register a device, mint or replace its bearer token, or stop it; `device add` prints the token to stdout and the `[room_profile.<n>].devices` line to paste to stderr
   - `sapphire-agent user add|list` — register the person or agent a device belongs to
-  - `sapphire-call` — interactive REPL / voice satellite client (separate crate; see [crates/sapphire-call](crates/sapphire-call/))
+  - `sapphire-call` — interactive REPL / voice satellite client (separate crate; see [cli/](cli/))
 
 ## Install
 
@@ -43,6 +43,10 @@ git clone https://github.com/fluo10/sapphire-agent
 cd sapphire-agent
 cargo build --release
 ```
+
+Release binaries are published for **Linux** (x86_64, aarch64) and **macOS** (aarch64). Each is a single self-contained file — `sherpa-onnx` and its ONNX Runtime are linked statically, so there is nothing to install alongside it.
+
+The agent is a headless server application and is not built for Windows; the client binaries (`sapphire-call`, `sapphire-call-desktop`) still are. See [#182](https://github.com/fluo10/sapphire-agent/issues/182).
 
 ## Configure
 

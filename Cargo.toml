@@ -1,11 +1,21 @@
 [workspace]
+# Explicit because this is a virtual manifest: a virtual workspace defaults to
+# resolver "1" regardless of edition. The old root package was edition 2024
+# (→ resolver "3"), so pin "3" to preserve the prior feature-resolution behavior.
+resolver = "3"
 members = [
-    ".",
+    "server",
+    "cli",
+    "desktop",
     "crates/sapphire-agent-rpc",
     "crates/sapphire-call-core",
-    "crates/sapphire-call-cli",
-    "crates/sapphire-call-desktop",
 ]
+# Keep the bare `cargo build` / `cargo test` at the repo root scoped to the
+# agent binary, as it was when `sapphire-agent` was the root package. Without
+# this a virtual workspace defaults to all members, dragging in the desktop
+# (bevy) and cli (sherpa) builds. CI targets the full set explicitly via
+# `--workspace` / `--package`, so it is unaffected.
+default-members = ["server"]
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -31,193 +41,3 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fluo10/sapphire-agent"
-
-[package]
-name = "sapphire-agent"
-version = "0.7.2"
-edition.workspace = true
-description = "A personal AI assistant agent with Matrix/Discord channels, Anthropic backend, and a sapphire-framework memory layer"
-license.workspace = true
-repository.workspace = true
-homepage = "https://github.com/fluo10/sapphire-agent"
-keywords = ["ai", "agent", "anthropic", "matrix", "discord"]
-categories = ["command-line-utilities"]
-readme = "README.md"
-exclude = ["/.github", "/.gitignore", "/.claude", "/.vscode", "/rust-toolchain.toml", "/config.example.toml"]
-
-[[bin]]
-name = "sapphire-agent"
-path = "src/main.rs"
-
-[features]
-default = ["redb-store", "fastembed-embed", "voice-sherpa"]
-# Pure-Rust cache backend (redb + tantivy) for the FTS/record store, and the
-# brute-force vector index alongside it. Without it the workspace falls back to
-# an ephemeral in-memory store.
-redb-store = ["sapphire-framework/redb-store"]
-fastembed-embed = ["sapphire-framework/fastembed-embed"]
-# Compile in the local sherpa-onnx STT + TTS providers. Enabled by
-# default, but note that sherpa-onnx-sys pulls in a large C++ build
-# (sherpa-onnx + ONNX runtime, ~5–10 minutes on a cold cache). Users
-# who only run the Gradio TTS path or who don't need voice at all can
-# opt out with `--no-default-features` plus the other defaults.
-voice-sherpa = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2"]
-
-[dependencies]
-# Async runtime
-tokio = { workspace = true, features = [
-    "time",
-    "sync",
-    "fs",
-    "signal",
-    "net",
-] }
-
-# HTTP client (Anthropic API + tool HTTP calls)
-reqwest = { workspace = true, features = ["blocking"] }
-
-# Matrix client + E2EE
-matrix-sdk = { version = "0.16", default-features = false, features = [
-    "e2e-encryption",
-    "rustls-tls",
-    "sqlite",
-    "bundled-sqlite",
-    "markdown",
-] }
-
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json.workspace = true
-
-# Config (TOML)
-toml = "1.0"
-
-# YAML (heartbeat task frontmatter)
-serde_yaml = "0.9"
-
-# Cron expression parsing (heartbeat schedules)
-cron = "0.16"
-
-# Error handling
-anyhow.workspace = true
-
-# Async traits
-async-trait = "0.1"
-
-# Futures utilities (SSE streaming)
-futures-util.workspace = true
-
-# Logging
-tracing = "0.1"
-tracing-subscriber.workspace = true
-
-# CLI
-clap.workspace = true
-
-# XDG directories for config/data paths
-directories = "6.0"
-
-# Shell path expansion (~/)
-shellexpand = "3.1"
-
-# Identity comparison for the tool path guard: "is this the same file",
-# answered by device+inode / volume+file-index rather than by spelling.
-# The stdlib exposes the Windows half only behind an unstable feature.
-# Already in the tree via walkdir; naming it directly makes the reason
-# it is here visible.
-same-file = "1.0"
-
-# Date/time with serde support (human-readable ISO 8601 timestamps)
-chrono = { version = "0.4", features = ["serde"] }
-
-# Time-ordered unique IDs for session files
-uuid = { version = "1", features = ["v7", "serde"] }
-
-# Local-first workspace framework: file indexing, FTS, vector search.
-# The facade crate (bevy-style) fronts the internal sapphire-framework-*
-# crates; each feature re-exports one as a module. `default-features = false`
-# plus an explicit `workspace` keeps the facade's own default (workspace +
-# redb-store) from bypassing the feature flags below.
-# `remote-server` is enabled for one type: `remote_server::KeyStore`, which
-# authenticates ambient capture devices. It drags in the whole JSON-RPC sync
-# server (axum, redb, blob, retrieve, track) for that one struct; splitting it
-# out is fluo10/sapphire-framework#103, after which this becomes `keys`.
-sapphire-framework = { version = "0.1", git = "https://github.com/fluo10/sapphire-framework", branch = "main", default-features = false, features = ["workspace", "remote-server", "registry"] }
-
-# Human-readable ids: session ids, and the device/user ids in the workspace
-# registry. Must match the version sapphire-framework uses — `KeyEntry.device_id`
-# is a `GrainId`, and two semver-incompatible grain-id versions in one graph are
-# two different types.
-grain-id = { version = "0.16", features = ["serde"] }
-
-# HTTP server (control API + Matrix/Discord channels)
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
-
-# Stream utilities (axum SSE)
-tokio-stream = { version = "0.1", features = ["sync"] }
-
-# Cancellation tokens for in-flight ACP prompt turns. The parent/child
-# hierarchy is the whole reason for the dependency: one token per ACP
-# connection and a child per turn, so `session/cancel` stops one turn while a
-# client that goes away stops every turn it left running, with one call and
-# without a registry to keep in step.
-tokio-util = "0.7"
-
-# CORS middleware
-tower-http = { version = "0.6", default-features = false, features = ["cors"] }
-
-# Base64 encoding (image attachments → Anthropic API)
-base64 = "0.22"
-
-# SHA-256 for content-addressing voice/config payloads (so satellites
-# can cache the openWakeWord model by hash instead of re-downloading).
-sha2 = "0.11"
-
-# Discord bot (gateway + HTTP, rustls TLS)
-# Requires MESSAGE_CONTENT privileged intent enabled in Discord Developer Portal
-serenity = { version = "0.12", default-features = false, features = [
-    "client",
-    "gateway",
-    "model",
-    "rustls_backend",
-] }
-
-# Local STT + TTS via the official sherpa-onnx Rust crate (k2-fsa).
-# Statically links sherpa-onnx + ONNX runtime — no system install needed.
-# Optional, gated behind the `voice-sherpa` feature; the build is slow
-# (sherpa-onnx-sys compiles C++ via CMake).
-sherpa-onnx = { version = "1.13", optional = true, default-features = false, features = ["shared"] }
-
-# Model bundle extraction. sherpa-onnx ships pre-trained models as
-# tar.bz2 archives on GitHub releases; both crates are gated alongside
-# sherpa-onnx itself.
-tar = { version = "0.4", optional = true }
-bzip2 = { version = "0.6", optional = true }
-
-# WAV decoding for TTS providers that return audio files (e.g. Gradio Web UI).
-hound = "3.5"
-
-# A2A protocol v1 types (Message, Task, Part, AgentCard, JSON-RPC).
-# Official Linux Foundation SDK; we use the types crate only and roll our
-# own JSON-RPC dispatch on the existing axum app in src/serve.
-a2a = { package = "a2a-lf", version = "0.3" }
-
-# OS-standard cache / data / config directory resolution. Used by the
-# image cache to default to `$XDG_CACHE_HOME/sapphire-agent/images/`
-# (or the platform equivalent) when no explicit dir is configured.
-dirs = "6"
-
-# Agent Client Protocol SDK (Zed's official Rust SDK). Backs `GET /acp`: the
-# JSON-RPC dispatch loop, the v1 schema types, and the `Lines` transport the
-# WebSocket is wrapped in. Default features only — `unstable_protocol_v2`
-# stays off, which is what pins this build to ACP v1.
-agent-client-protocol = "2.0.0"
-
-[dev-dependencies]
-tempfile = "3"
-filetime = "0.2"
-tokio-tungstenite = "0.30.0"
-
-# `ServiceExt::oneshot` to drive an axum `Router` directly in tests,
-# without binding a real listener.
-tower = { version = "0.5", default-features = false, features = ["util"] }

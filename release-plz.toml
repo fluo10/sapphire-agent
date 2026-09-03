@@ -20,7 +20,7 @@ changelog_config = "./cliff.toml"
 
 [[package]]
 name = "sapphire-agent"
-changelog_path = "./CHANGELOG.md"
+changelog_path = "./server/CHANGELOG.md"
 
 [[package]]
 name = "sapphire-agent-rpc"
@@ -32,7 +32,7 @@ changelog_path = "./crates/sapphire-call-core/CHANGELOG.md"
 
 [[package]]
 name = "sapphire-call-cli"
-changelog_path = "./crates/sapphire-call-cli/CHANGELOG.md"
+changelog_path = "./cli/CHANGELOG.md"
 
 # sapphire-call-desktop ships as a GitHub-release-only binary (bevy +
 # bundled font + ICE-licensed Lucide SVGs — not intended for crates.io,
@@ -47,6 +47,6 @@ changelog_path = "./crates/sapphire-call-cli/CHANGELOG.md"
 # excludes the package from its scan and never tags new versions.
 [[package]]
 name = "sapphire-call-desktop"
-changelog_path = "./crates/sapphire-call-desktop/CHANGELOG.md"
+changelog_path = "./desktop/CHANGELOG.md"
 publish = false
 release = true
