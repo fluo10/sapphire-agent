@@ -9,9 +9,10 @@
 //!    the caller's own `progress` unchanged (see [`TurnContext`] in
 //!    `src/serve/mod.rs`). If delegation ran under its own host or its
 //!    own origin, "ask a subagent" would become a way to get done by
-//!    proxy what the model was refused directly. (One exception, scoped
-//!    narrowly: `turn_error` is *not* forwarded unchanged — see
-//!    `SubagentTool::execute`'s host wrapper, `ParentHostSansTurnError`,
+//!    proxy what the model was refused directly. (Three exceptions,
+//!    each scoped narrowly: `turn_error`, `message_chunk`, and
+//!    `round_budget` are *not* forwarded unchanged — see
+//!    `SubagentTool::execute`'s host wrapper, `SubagentHost`,
 //!    below.)
 //! 2. **The system prompt is the definition and nothing else.** See
 //!    [`subagent_system_prompt`].
@@ -224,8 +225,13 @@ fn build_spec(agents: &[AgentDef]) -> ToolSpec {
     }
 }
 
-/// Forwards every `TurnHost` method to the parent's host except
-/// `turn_error`, which it swallows.
+/// Forwards every `TurnHost` method to the parent's host except three:
+/// `turn_error`, `message_chunk`, and `round_budget`, each special-cased
+/// for its own reason (see that method's doc below).
+///
+/// The name says what the type *is* — the host a subagent's nested turn
+/// runs under, mostly the parent's own — rather than naming any one of
+/// its exceptions, now that there are three of them.
 ///
 /// A subagent's nested `TurnLoop` runs with `progress: &ctx.progress` —
 /// the parent's own host, by design (see the module doc's first
@@ -258,12 +264,12 @@ fn build_spec(agents: &[AgentDef]) -> ToolSpec {
 /// `approve()`, `acp_client()`, `client_fs_caps()`,
 /// `client_terminal_cap()`, `tool_start`/`tool_end`/`tool_allowed` all
 /// still resolve to the parent's own host, because those are what keep
-/// delegation inside the same permission gate — only `turn_error` is
-/// special-cased.
-struct ParentHostSansTurnError(std::sync::Arc<dyn crate::serve::TurnHost>);
+/// delegation inside the same permission gate — `turn_error`,
+/// `message_chunk`, and `round_budget` are the three special-cased.
+struct SubagentHost(std::sync::Arc<dyn crate::serve::TurnHost>);
 
 #[async_trait]
-impl crate::serve::TurnHost for ParentHostSansTurnError {
+impl crate::serve::TurnHost for SubagentHost {
     async fn tool_start(&self, id: &str, name: &str) {
         self.0.tool_start(id, name).await;
     }
@@ -617,11 +623,11 @@ impl SubagentTool {
         // subagent must reach the same person, judged by the same
         // origin. A different host here would make delegation a way
         // around the gate. `turn_error` is the one method NOT forwarded
-        // unchanged — see `ParentHostSansTurnError`'s doc for why a
+        // unchanged — see `SubagentHost`'s doc for why a
         // subagent's own provider failure must not report itself as
         // *this request's* terminal outcome.
         let progress: std::sync::Arc<dyn crate::serve::TurnHost> = std::sync::Arc::new(
-            ParentHostSansTurnError(std::sync::Arc::clone(&ctx.progress)),
+            SubagentHost(std::sync::Arc::clone(&ctx.progress)),
         );
 
         let (text, stop) = crate::serve::TurnLoop {
@@ -964,7 +970,7 @@ mod tests {
     }
 
     /// A minimal `TurnHost` that records every call it receives, so a
-    /// test can tell `ParentHostSansTurnError` actually forwards to the
+    /// test can tell `SubagentHost` actually forwards to the
     /// wrapped host rather than silently no-op'ing everything.
     #[derive(Default)]
     struct RecordingHost {
@@ -993,7 +999,7 @@ mod tests {
     #[tokio::test]
     async fn turn_error_is_swallowed_not_forwarded() {
         let inner = std::sync::Arc::new(RecordingHost::default());
-        let wrapped = ParentHostSansTurnError(inner.clone());
+        let wrapped = SubagentHost(inner.clone());
 
         crate::serve::TurnHost::turn_error(&wrapped, "the subagent's provider broke").await;
 
@@ -1023,7 +1029,7 @@ mod tests {
         }
 
         let parent = std::sync::Arc::new(ChunkRecorder::default());
-        let wrapped = ParentHostSansTurnError(
+        let wrapped = SubagentHost(
             std::sync::Arc::clone(&parent) as std::sync::Arc<dyn crate::serve::TurnHost>,
         );
 
@@ -1048,7 +1054,7 @@ mod tests {
             }
         }
 
-        let wrapped = ParentHostSansTurnError(
+        let wrapped = SubagentHost(
             std::sync::Arc::new(InteractiveParent) as std::sync::Arc<dyn crate::serve::TurnHost>,
         );
 
@@ -1063,7 +1069,7 @@ mod tests {
     #[tokio::test]
     async fn every_other_method_forwards_to_the_parent_host() {
         let inner = std::sync::Arc::new(RecordingHost::default());
-        let wrapped = ParentHostSansTurnError(inner.clone());
+        let wrapped = SubagentHost(inner.clone());
 
         assert_eq!(
             crate::serve::TurnHost::origin(&wrapped),

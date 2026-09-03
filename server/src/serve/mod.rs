@@ -2015,7 +2015,7 @@ pub(crate) trait TurnHost: Send + Sync {
     /// Called for every non-empty text a round produces, including the
     /// final tool-less one, so a host that implements this sees the
     /// turn's prose in order and needs nothing from `outcome.text`.
-    /// `ParentHostSansTurnError` deliberately does *not* forward it — see
+    /// `SubagentHost` deliberately does *not* forward it — see
     /// its doc.
     async fn message_chunk(&self, _text: &str) {}
 
@@ -2203,7 +2203,7 @@ pub(crate) enum TurnStop {
     /// has already been handed the message, so the cause is available to
     /// whoever is reporting — on every path except a subagent's nested
     /// turn, where `SubagentTool::execute` runs it under
-    /// `ParentHostSansTurnError`, which deliberately swallows
+    /// `SubagentHost`, which deliberately swallows
     /// `turn_error` (see that type's doc, `src/tools/subagent.rs`). On
     /// that path the cause reaches only the log line right before this
     /// is returned, not any `TurnHost`.
