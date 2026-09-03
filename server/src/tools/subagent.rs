@@ -278,6 +278,31 @@ impl crate::serve::TurnHost for ParentHostSansTurnError {
     /// type doc — it does not reach the parent model either.
     async fn turn_error(&self, _message: &str) {}
 
+    /// Swallowed, like `turn_error` and for a related reason: a
+    /// subagent's prose is not the parent agent's speech. Forwarding it
+    /// would put the delegate's narration into the editor under the
+    /// parent's name, which misattributes it — and the parent has no way
+    /// to correct the record, because by the time it sees the subagent's
+    /// answer the chunks are already on screen.
+    ///
+    /// Nothing is lost: what the subagent concluded comes back as the
+    /// `subagent` tool's result, which is where the parent reads it and
+    /// where the user sees it attributed correctly.
+    ///
+    /// `tool_start`/`tool_end` still forward, deliberately — see the
+    /// module doc. Those are what make a permission prompt for a
+    /// subagent's call legible as coming from *this* session.
+    async fn message_chunk(&self, _text: &str) {}
+
+    /// Not delegated, and this one must not be: a nested turn under an
+    /// unbounded parent would itself be unbounded, so a parent that
+    /// delegates in a loop would have no cap anywhere. A subagent is
+    /// always judged `unattended` — nobody can cancel it directly, only
+    /// the whole parent turn — whatever route the parent came in on.
+    fn round_budget(&self) -> crate::serve::RoundBudget {
+        crate::serve::RoundBudget::Unattended
+    }
+
     fn origin(&self) -> crate::tools::policy::Origin {
         self.0.origin()
     }
@@ -975,6 +1000,61 @@ mod tests {
         assert!(
             inner.turn_errors.lock().unwrap().is_empty(),
             "turn_error must not reach the parent's host"
+        );
+    }
+
+    /// サブエージェントの散文は親のストリームに漏れない。漏れると、
+    /// 委任先が言ったことが親エージェント自身の発言として編集画面に出る
+    /// —— 誤帰属であり、報告はツール結果として戻ってくる。
+    #[tokio::test]
+    async fn a_subagents_prose_does_not_reach_the_parents_stream() {
+        #[derive(Default)]
+        struct ChunkRecorder {
+            chunks: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl crate::serve::TurnHost for ChunkRecorder {
+            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_end(&self, _id: &str, _name: &str) {}
+            async fn turn_error(&self, _message: &str) {}
+            async fn message_chunk(&self, text: &str) {
+                self.chunks.lock().unwrap().push(text.to_string());
+            }
+        }
+
+        let parent = std::sync::Arc::new(ChunkRecorder::default());
+        let wrapped = ParentHostSansTurnError(
+            std::sync::Arc::clone(&parent) as std::sync::Arc<dyn crate::serve::TurnHost>,
+        );
+
+        crate::serve::TurnHost::message_chunk(&wrapped, "the subagent's own words").await;
+
+        let seen = parent.chunks.lock().unwrap().clone();
+        assert!(seen.is_empty(), "親には届かない: {seen:?}");
+    }
+
+    /// 親が無制限でも、サブエージェントは有限で回る。委譲していたら
+    /// 入れ子が無制限になり、上限が二乗で消える。
+    #[test]
+    fn a_subagent_is_unattended_even_under_an_interactive_parent() {
+        struct InteractiveParent;
+        #[async_trait]
+        impl crate::serve::TurnHost for InteractiveParent {
+            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_end(&self, _id: &str, _name: &str) {}
+            async fn turn_error(&self, _message: &str) {}
+            fn round_budget(&self) -> crate::serve::RoundBudget {
+                crate::serve::RoundBudget::Interactive
+            }
+        }
+
+        let wrapped = ParentHostSansTurnError(
+            std::sync::Arc::new(InteractiveParent) as std::sync::Arc<dyn crate::serve::TurnHost>,
+        );
+
+        assert_eq!(
+            crate::serve::TurnHost::round_budget(&wrapped),
+            crate::serve::RoundBudget::Unattended
         );
     }
 
