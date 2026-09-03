@@ -1549,10 +1549,21 @@ this machine knows."
 Run: `cargo test -p sapphire-agent`
 Expected: PASS
 
-- [ ] **Step 2: clippy を通す**
+- [ ] **Step 2: clippy に新しい警告を足していないことを確認する**
 
-Run: `cargo clippy -p sapphire-agent --all-targets -- -D warnings`
-Expected: 警告なし。`accumulated_text` の削除で未使用の変数や束縛が残っていればここで出る
+Run: `cargo clippy -p sapphire-agent --all-targets 2>&1 | grep -c '^warning: '`
+
+**`-D warnings` で「警告ゼロ」を期待してはいけない。** `origin/main`（a6cacdc）の時点で
+既に6件の警告がある — `acp_session.rs:1474`、`serve/mod.rs:3379`（`ChatLog`）、
+`session.rs:2146`、`session.rs:2320`、`skills.rs:460`、`tools/subagent.rs:1064`。
+いずれも本ブランチが触っていない箇所で、直すのはこの変更の範囲外である。
+
+Expected: 警告は**この6件のみ**。特に次の2つが消えていること:
+- `constant MAX_TOOL_ROUNDS is never used` — Task 4 で const を削除して解消
+- `variant RoundBudget::Interactive is never constructed` — Task 3 で構築され解消
+
+`accumulated_text` の削除で未使用の変数や束縛が残っていれば、新しい警告として現れる。
+7件目以降が出たらそれが本ブランチの負債である。
 
 - [ ] **Step 3: 整形を確認する**
 
