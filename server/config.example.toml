@@ -296,6 +296,16 @@ system_prompt = "You are a helpful personal assistant."
 #     filesystem" actually reaches.
 #   - `tavily_api_key` — enables the `web_search` tool. Omit to leave
 #     the tool unregistered.
+#   - `[tools.tool_rounds]` — how many tool rounds one turn may spend,
+#     split by whether the route can cancel a turn in flight. `interactive`
+#     covers ACP, which has `session/cancel` (the editor's Escape), and
+#     defaults to `0` — unbounded — so a long piece of delegated work runs
+#     to its end instead of stopping every ten rounds. `unattended` covers
+#     Matrix, Discord, `/rpc`, `/a2a` and the heartbeat, none of which can
+#     be interrupted, and defaults to 25. `0` means unbounded on either
+#     side; subagents are always judged `unattended`, whatever their
+#     parent is. These bound spend, not context — `[compression]` is what
+#     keeps the history in the window.
 #   - `[[tools.mcp_servers]]` — outbound MCP client. Connects to
 #     external MCP servers and exposes their tools to the agent as
 #     `mcp__<name>__<tool_name>`. Distinct from the inbound MCP
@@ -345,6 +355,10 @@ system_prompt = "You are a helpful personal assistant."
 #
 # [tools.host_access]
 # enabled = false
+#
+# [tools.tool_rounds]
+# interactive = 0                           # ACP; 0 = unbounded
+# unattended  = 25                          # everything else
 #
 # # Example: HTTP transport to a remote MCP server.
 # [[tools.mcp_servers]]

@@ -761,6 +761,9 @@ pub struct ToolsConfig {
     /// Whether the agent may touch its own filesystem and shell.
     #[serde(default)]
     pub host_access: HostAccess,
+    /// How many tool rounds one turn may spend. See [`ToolRounds`].
+    #[serde(default)]
+    pub tool_rounds: ToolRounds,
 }
 
 /// Whether the agent may touch the machine it runs on.
@@ -773,6 +776,50 @@ pub struct ToolsConfig {
 pub struct HostAccess {
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// How many tool rounds a single turn may spend, per route.
+///
+/// Split in two because the routes are not alike in the one way that
+/// matters: whether a human can stop a turn that has gone wrong. ACP has
+/// `session/cancel` — the editor's Escape — so a turn there can run as
+/// long as it is useful and be cut off the moment it is not. Matrix,
+/// Discord, `/rpc`, A2A and the heartbeat have no such control, and the
+/// heartbeat in particular runs with nobody watching, so a runaway loop
+/// there spends money until the process is restarted. A single number
+/// would have to be chosen for the worst of those, which is what the
+/// hard-coded ten effectively did.
+///
+/// Context growth is not what these bound: `maybe_compress` runs every
+/// round and trims the history on its own. What they bound is spend.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ToolRounds {
+    /// Routes with a way to cancel a turn in flight. ACP only.
+    #[serde(default = "ToolRounds::default_interactive")]
+    pub interactive: usize,
+    /// Everything else: Matrix, Discord, `/rpc` (desktop chat and voice),
+    /// A2A, heartbeat, and every subagent regardless of its parent.
+    #[serde(default = "ToolRounds::default_unattended")]
+    pub unattended: usize,
+}
+
+impl ToolRounds {
+    /// `0` means unbounded, on either side.
+    fn default_interactive() -> usize {
+        0
+    }
+    fn default_unattended() -> usize {
+        25
+    }
+}
+
+impl Default for ToolRounds {
+    fn default() -> Self {
+        Self {
+            interactive: Self::default_interactive(),
+            unattended: Self::default_unattended(),
+        }
+    }
 }
 
 /// Configuration for a single external MCP server.
@@ -2778,5 +2825,32 @@ embedding_num_threads = 4
         assert_eq!(cfg.vad_model_dir.as_deref(), Some("/models/silero"));
         assert_eq!(cfg.vad_threshold, 0.6);
         assert_eq!(cfg.embedding_num_threads, 4);
+    }
+
+    /// 既定値は「中断できる経路は無制限、できない経路は有限」。`0` が
+    /// 無制限を意味することと、省略時にその既定が入ることを両方留める。
+    #[test]
+    fn tool_rounds_default_to_unbounded_interactive_and_a_bounded_rest() {
+        let rounds = crate::config::ToolRounds::default();
+        assert_eq!(rounds.interactive, 0, "ACP は既定で無制限");
+        assert_eq!(rounds.unattended, 25);
+    }
+
+    /// `[tools]` を書きつつ `tool_rounds` を省いた設定が、既定値で埋まる。
+    /// `#[serde(default)]` が無いとここで落ちる。
+    #[test]
+    fn tools_config_without_tool_rounds_falls_back_to_the_default() {
+        let tools: crate::config::ToolsConfig =
+            toml::from_str("tavily_api_key = \"tvly-x\"").unwrap();
+        assert_eq!(tools.tool_rounds, crate::config::ToolRounds::default());
+    }
+
+    /// 書かれた値がそのまま読める。
+    #[test]
+    fn tool_rounds_round_trip_from_toml() {
+        let tools: crate::config::ToolsConfig =
+            toml::from_str("[tool_rounds]\ninteractive = 40\nunattended = 3").unwrap();
+        assert_eq!(tools.tool_rounds.interactive, 40);
+        assert_eq!(tools.tool_rounds.unattended, 3);
     }
 }
