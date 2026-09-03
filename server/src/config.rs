@@ -811,6 +811,21 @@ impl ToolRounds {
     fn default_unattended() -> usize {
         25
     }
+
+    /// The cap for `budget`, or `None` when it is unbounded.
+    ///
+    /// `0` is the spelling for unbounded because a config file has to
+    /// say it somehow, and `0` is the one value that is never a
+    /// meaningful cap — a turn that may spend no tool rounds at all
+    /// cannot call a tool, which is not a thing anyone wants to
+    /// configure.
+    pub fn limit(&self, budget: crate::serve::RoundBudget) -> Option<usize> {
+        let n = match budget {
+            crate::serve::RoundBudget::Interactive => self.interactive,
+            crate::serve::RoundBudget::Unattended => self.unattended,
+        };
+        (n != 0).then_some(n)
+    }
 }
 
 impl Default for ToolRounds {

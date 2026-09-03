@@ -2005,6 +2005,30 @@ pub(crate) trait TurnHost: Send + Sync {
     async fn tool_end(&self, id: &str, name: &str);
     async fn turn_error(&self, message: &str);
 
+    /// One piece of the model's prose, as soon as the round that produced
+    /// it is done.
+    ///
+    /// Default no-op, and that default is load-bearing: `/rpc`, `/a2a` and
+    /// the voice pipeline read the turn's whole reply from
+    /// `LlmTurnOutcome::text` and are correct as they are. TTS in
+    /// particular must not be handed a turn in pieces — it would speak the
+    /// narration between tool calls as if it were the answer.
+    ///
+    /// Called for every non-empty text a round produces, including the
+    /// final tool-less one, so a host that implements this sees the
+    /// turn's prose in order and needs nothing from `outcome.text`.
+    /// `ParentHostSansTurnError` deliberately does *not* forward it — see
+    /// its doc.
+    async fn message_chunk(&self, _text: &str) {}
+
+    /// Which round budget this turn is judged by. See [`RoundBudget`].
+    ///
+    /// `Unattended` by default, which is the safe direction: a host that
+    /// forgets to answer gets the bounded budget, not the unbounded one.
+    fn round_budget(&self) -> RoundBudget {
+        RoundBudget::Unattended
+    }
+
     /// Which row of the permission table this turn is judged by.
     ///
     /// `Trusted` by default: `/rpc`, `/a2a` and the voice pipeline were
@@ -2140,6 +2164,26 @@ impl TurnHost for NullProgress {
     async fn tool_start(&self, _id: &str, _name: &str) {}
     async fn tool_end(&self, _id: &str, _name: &str) {}
     async fn turn_error(&self, _message: &str) {}
+}
+
+/// Which round budget a turn is judged by.
+///
+/// A property of the *route*, not of the request: what separates the two
+/// is whether a human can stop a turn that has gone wrong. Only ACP can
+/// (`session/cancel`), so only `AcpProgress` returns `Interactive`.
+///
+/// Deliberately not a number. A host knows which kind of route it is; it
+/// does not know what the operator configured, and threading the config
+/// through every implementor to let each read the same field would put
+/// the same decision in four places. `TurnLoop::run` resolves this
+/// against `[tools.tool_rounds]` in one place instead — the same shape
+/// `TurnHost::origin` uses for the permission table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoundBudget {
+    /// The turn can be cancelled in flight. ACP only.
+    Interactive,
+    /// It cannot. Everything else, and every subagent.
+    Unattended,
 }
 
 /// Why a turn stopped.
@@ -2411,10 +2455,19 @@ impl TurnLoop<'_> {
         // entire budget on what it did before this turn started — and the
         // check runs before compaction, so nothing could ever trim it
         // back.
+        // Resolved once per turn, not per round: the config cannot change
+        // mid-turn, and reading it here keeps `RoundBudget` a routing
+        // question rather than a numeric one. `None` is unbounded — the
+        // check below simply never fires.
+        let round_limit = state
+            .config
+            .tools
+            .tool_rounds
+            .limit(progress.round_budget());
         let mut round = 0usize;
         let (final_text, stop) = loop {
-            if round >= MAX_TOOL_ROUNDS {
-                warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS})");
+            if round_limit.is_some_and(|max| round >= max) {
+                warn!("Reached max tool rounds ({round})");
                 // `None` for the text, as before — callers that predate ACP
                 // report this as a failed turn and must keep doing so — but the
                 // prose accumulated so far rides along on the stop reason for
@@ -2476,6 +2529,7 @@ impl TurnLoop<'_> {
                         p.append_message(&msg);
                     }
                     if !text.is_empty() {
+                        progress.message_chunk(&text).await;
                         accumulated_text.push(text);
                     }
                     break (Some(accumulated_text.join("\n\n")), TurnStop::Replied);
@@ -2484,6 +2538,7 @@ impl TurnLoop<'_> {
                     round += 1;
                     let tool_calls = resp.tool_calls.clone();
                     if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
+                        progress.message_chunk(t).await;
                         accumulated_text.push(t.clone());
                     }
                     let msg =
@@ -3518,6 +3573,17 @@ impl ServeState {
         Self::build_for_test(acp_enabled, StubProvider::new(responses))
     }
 
+    /// Same as [`Self::for_test_scripted`], with an explicit round budget
+    /// so a test can pin the cap instead of depending on the shipped
+    /// default. Tests that do not care keep calling `for_test_scripted`.
+    pub(crate) fn for_test_scripted_with_rounds(
+        acp_enabled: bool,
+        responses: Vec<crate::provider::ChatResponse>,
+        rounds: crate::config::ToolRounds,
+    ) -> Arc<Self> {
+        Self::build_for_test_with(acp_enabled, StubProvider::new(responses), rounds)
+    }
+
     /// Same as [`Self::for_test_scripted`], plus a [`ChatLog`] handle so
     /// a test can assert on what each `chat()` call actually received —
     /// not just the scripted outcome, but the `system`/`tools` a
@@ -3541,6 +3607,14 @@ impl ServeState {
     }
 
     fn build_for_test(acp_enabled: bool, provider: StubProvider) -> Arc<Self> {
+        Self::build_for_test_with(acp_enabled, provider, crate::config::ToolRounds::default())
+    }
+
+    fn build_for_test_with(
+        acp_enabled: bool,
+        provider: StubProvider,
+        rounds: crate::config::ToolRounds,
+    ) -> Arc<Self> {
         // Leak the TempDir guard on purpose: this is a test binary and the
         // OS reclaims the directory when it exits.
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
@@ -3585,6 +3659,7 @@ rooms    = []
         config.acp = Some(crate::config::AcpConfig {
             enabled: acp_enabled,
         });
+        config.tools.tool_rounds = rounds;
         config.keys.file = Some(keys_file.clone());
         config.room_profiles.get_mut("developer").unwrap().devices = vec![device.id.to_string()];
 
@@ -5571,5 +5646,218 @@ mod tests {
             "the synthetic compaction stub must never appear in a \
              client-facing get_session response: {v}"
         );
+    }
+
+    /// `0` は無制限、それ以外はその数。二段階の写像を一箇所に留める。
+    #[test]
+    fn a_zero_budget_means_unbounded() {
+        use crate::config::ToolRounds;
+        let rounds = ToolRounds {
+            interactive: 0,
+            unattended: 25,
+        };
+        assert_eq!(rounds.limit(RoundBudget::Interactive), None);
+        assert_eq!(rounds.limit(RoundBudget::Unattended), Some(25));
+    }
+
+    /// 中間テキストは溜められるのではなく、そのラウンドで渡される。ここが
+    /// この変更の全部である。ツールを呼ばない最後の応答のテキストも同じ口を
+    /// 通るので、ホストから見たテキストの並びは会話そのものになる。
+    #[tokio::test]
+    async fn text_reaches_the_host_round_by_round() {
+        #[derive(Default)]
+        struct ChunkRecorder {
+            chunks: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl TurnHost for ChunkRecorder {
+            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_end(&self, _id: &str, _name: &str) {}
+            async fn turn_error(&self, _message: &str) {}
+            async fn message_chunk(&self, text: &str) {
+                self.chunks.lock().unwrap().push(text.to_string());
+            }
+        }
+
+        let state = ServeState::for_test_scripted(
+            false,
+            vec![
+                crate::provider::ChatResponse {
+                    text: Some("looking now".to_string()),
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo".to_string(),
+                        input: json!({ "text": "ping" }),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    text: Some("found it".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        let host = Arc::new(ChunkRecorder::default());
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-chunks".to_string(),
+            ChatMessage::user("go"),
+            Arc::clone(&host) as Arc<dyn TurnHost>,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            *host.chunks.lock().unwrap(),
+            vec!["looking now".to_string(), "found it".to_string()]
+        );
+        // `outcome.text` は据え置き。これを読む `/rpc`・A2A・音声が壊れない
+        // ことが、この変更が既定 no-op で足りる理由である。
+        assert_eq!(outcome.text.as_deref(), Some("looking now\n\nfound it"));
+    }
+
+    /// 空のテキストは渡さない。ツールだけ呼ぶラウンドで空メッセージが
+    /// 流れると、チャンネル経路では空の吹き出しになる。
+    #[tokio::test]
+    async fn an_empty_text_is_not_handed_to_the_host() {
+        #[derive(Default)]
+        struct ChunkRecorder {
+            chunks: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl TurnHost for ChunkRecorder {
+            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_end(&self, _id: &str, _name: &str) {}
+            async fn turn_error(&self, _message: &str) {}
+            async fn message_chunk(&self, text: &str) {
+                self.chunks.lock().unwrap().push(text.to_string());
+            }
+        }
+
+        let state = ServeState::for_test_scripted(
+            false,
+            vec![
+                crate::provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo".to_string(),
+                        input: json!({ "text": "ping" }),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        let host = Arc::new(ChunkRecorder::default());
+        let _ = run_llm_turn(
+            Arc::clone(&state),
+            "s-empty".to_string(),
+            ChatMessage::user("go"),
+            Arc::clone(&host) as Arc<dyn TurnHost>,
+            None,
+        )
+        .await;
+
+        assert_eq!(*host.chunks.lock().unwrap(), vec!["done".to_string()]);
+    }
+
+    /// 既定 `Unattended` のホストは、設定した数で打ち切られる。上限が
+    /// ハードコードではなく config から来ていることを、10 以外の数で示す。
+    #[tokio::test]
+    async fn an_unattended_host_stops_at_the_configured_budget() {
+        use crate::config::ToolRounds;
+
+        let script: Vec<crate::provider::ChatResponse> = (0..3)
+            .map(|i| crate::provider::ChatResponse {
+                text: Some(format!("step {i}")),
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: format!("call-{i}"),
+                    name: "echo".to_string(),
+                    input: json!({ "text": "ping" }),
+                }],
+                stop_reason: None,
+            })
+            .collect();
+        let state = ServeState::for_test_scripted_with_rounds(
+            false,
+            script,
+            ToolRounds {
+                interactive: 0,
+                unattended: 3,
+            },
+        );
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-budget".to_string(),
+            ChatMessage::user("go"),
+            Arc::new(NullProgress) as Arc<dyn TurnHost>,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome.stop, TurnStop::BudgetExhausted { .. }),
+            "3 ラウンド使い切ったら打ち切られる"
+        );
+    }
+
+    /// `interactive = 0` のホストは、既定の10ラウンドを超えても回り続ける。
+    /// スクリプトは12本 — 11本目に到達する時点で、旧来の上限は破れている。
+    #[tokio::test]
+    async fn an_interactive_host_runs_past_the_old_hard_coded_ten() {
+        use crate::config::ToolRounds;
+
+        struct InteractiveHost;
+        #[async_trait::async_trait]
+        impl TurnHost for InteractiveHost {
+            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_end(&self, _id: &str, _name: &str) {}
+            async fn turn_error(&self, _message: &str) {}
+            fn round_budget(&self) -> RoundBudget {
+                RoundBudget::Interactive
+            }
+        }
+
+        let mut script: Vec<crate::provider::ChatResponse> = (0..12)
+            .map(|i| crate::provider::ChatResponse {
+                text: None,
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: format!("call-{i}"),
+                    name: "echo".to_string(),
+                    input: json!({ "text": "ping" }),
+                }],
+                stop_reason: None,
+            })
+            .collect();
+        script.push(crate::provider::ChatResponse {
+            text: Some("finished".to_string()),
+            tool_calls: Vec::new(),
+            stop_reason: None,
+        });
+
+        let state = ServeState::for_test_scripted_with_rounds(
+            false,
+            script,
+            ToolRounds {
+                interactive: 0,
+                unattended: 25,
+            },
+        );
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-unbounded".to_string(),
+            ChatMessage::user("go"),
+            Arc::new(InteractiveHost) as Arc<dyn TurnHost>,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("finished"));
     }
 }
