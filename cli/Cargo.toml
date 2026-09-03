@@ -11,8 +11,8 @@ name = "sapphire-call"
 path = "src/main.rs"
 
 [dependencies]
-sapphire-agent-rpc = { path = "../sapphire-agent-rpc", version = "0.7.0" }
-sapphire-call-core = { path = "../sapphire-call-core", version = "0.7.0" }
+sapphire-agent-rpc = { path = "../crates/sapphire-agent-rpc", version = "0.7.0" }
+sapphire-call-core = { path = "../crates/sapphire-call-core", version = "0.7.0" }
 
 # Async runtime — voice subcommand needs sync, time, and rt features.
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "signal"] }

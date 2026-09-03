@@ -8,22 +8,34 @@ This workspace ships five crates and uses **conventional-commit scopes** to rout
 
 | Scope | Targets |
 |---|---|
-| `(desktop)` | `crates/sapphire-call-desktop/` (bevy GUI client) |
-| `(cli)` or `(call)` | `crates/sapphire-call-cli/` (voice satellite binary) |
+| `(desktop)` | `desktop/` (bevy GUI client) |
+| `(cli)` or `(call)` | `cli/` (voice satellite binary) |
 | `(rpc)` | `crates/sapphire-agent-rpc/` (RPC client library) |
 | `(core)` | `crates/sapphire-call-core/` (shared config + device_id) |
-| unscoped, or `(agent)` / `(messages)` / `(voice)` / `(serve)` / `(channel)` / `(matrix)` / `(discord)` / `(sessions)` / `(chat)` / `(timer)` / `(heartbeat)` / `(memory)` / `(image-cache)` / `(api)` / `(tools)` / `(search)` / `(fts)` / `(mcp)` / `(features)` / `(workspace)` / `(deps)` | the agent binary itself (top-level crate) |
+| unscoped, or `(agent)` / `(messages)` / `(voice)` / `(serve)` / `(channel)` / `(matrix)` / `(discord)` / `(sessions)` / `(chat)` / `(timer)` / `(heartbeat)` / `(memory)` / `(image-cache)` / `(api)` / `(tools)` / `(search)` / `(fts)` / `(mcp)` / `(features)` / `(workspace)` / `(deps)` | the agent binary (`server/`) |
 | `(release)`, `(release-plz)`, `(fmt)`, `(ci)`, `(test)` | infrastructure — workspace-wide, no semver impact intended |
 
 Use the scope that names the crate or sub-area you're changing. The release-plz changelog filter (`cliff.toml`) keys off this.
 
-## Misattribution: agent gets false-positive release PRs
+## Workspace layout: directory ↔ package
 
-`sapphire-agent`'s package manifest lives at the workspace root (`./Cargo.toml`), so **release-plz attributes any workspace-root file change to it** — including `Cargo.lock`, `release-plz.toml`, `README.md`. Any sibling-crate commit that touches `Cargo.lock` (which is almost all of them, since deps update) therefore proposes a `sapphire-agent` bump too.
+The repo root is a **virtual workspace manifest** (`[workspace]` only, no `[package]`). Binaries live in role-named top-level directories; libraries stay in `crates/`. Directory names are shorter than the package names for readability — release-plz keys off the package `name` in each `Cargo.toml`, not the directory, so the two need not match.
 
-This was investigated and confirmed empirically (see closed [#143](https://github.com/fluo10/sapphire-agent/pull/143), [#144](https://github.com/fluo10/sapphire-agent/pull/144)). release-plz's release-trigger logic is purely path-based; no config (regex filter, git-cliff `skip = true`, etc.) suppresses it. The only structural fix is moving `sapphire-agent` to `crates/sapphire-agent/`, which we explicitly chose not to do — the main agent crate stays at the workspace root.
+| Directory | Package | Kind |
+|---|---|---|
+| `server/` | `sapphire-agent` | bin (`sapphire-agent`) |
+| `cli/` | `sapphire-call-cli` | bin (`sapphire-call`) |
+| `desktop/` | `sapphire-call-desktop` | bin (`sapphire-call-desktop`) |
+| `crates/sapphire-agent-rpc/` | `sapphire-agent-rpc` | lib |
+| `crates/sapphire-call-core/` | `sapphire-call-core` | lib |
 
-**Operational rule**: when release-plz proposes a `sapphire-agent` bump whose changelog body is empty or only contains entries unrelated to agent code, treat it as misattribution and close the PR. The `cliff.toml` filter makes this obvious: legitimate agent releases produce a non-empty, agent-focused changelog; misattribution releases produce a blank or noise-only one.
+`server/` still carries the agent's own `templates/`, `config.example.toml`, and `CHANGELOG.md` (the binary embeds the templates via `include_str!` and reads `config.example.toml` via `CARGO_MANIFEST_DIR`). `default-members = ["server"]` keeps a bare `cargo build` / `cargo test` at the root scoped to the agent, as it was when `sapphire-agent` was the root package.
+
+A package rename (`sapphire-agent` → `-server`, `sapphire-call-cli` → `sapphire-agent-cli`, …) is a possible future step; it is deliberately decoupled from this move, so directory and package names are temporarily out of sync. A future ESP32-S3 client firmware would live in a separate nested workspace (its own `Cargo.lock` / `rust-toolchain.toml` / `.cargo/config.toml`), added to `[workspace] exclude`, not as a member.
+
+### Historical note: agent false-positive release PRs (now fixed)
+
+`sapphire-agent` used to live *at* the workspace root, so **release-plz attributed any workspace-root file change to it** — including `Cargo.lock`, which almost every sibling-crate commit touches. That produced spurious `sapphire-agent` release PRs (investigated in closed [#143](https://github.com/fluo10/sapphire-agent/pull/143), [#144](https://github.com/fluo10/sapphire-agent/pull/144)). release-plz's release-trigger logic is purely path-based and no config (regex filter, git-cliff `skip = true`, etc.) suppressed it. Moving the package into `server/` — leaving no package at the root — is the structural fix: root `Cargo.lock` churn is no longer inside any package's directory.
 
 ## Extending the changelog filter
 
