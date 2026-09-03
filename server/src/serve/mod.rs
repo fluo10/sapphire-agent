@@ -5533,15 +5533,39 @@ mod tests {
     /// check on the very first iteration, before the provider was ever
     /// called, and broke silently (`text: None`, nothing sent). It must
     /// still get an ordinary reply: the budget is rounds *this turn*.
-    /// The count below (11) is one past the ten rounds this budget used
-    /// to be fixed at, back when this test was written; it stays well
-    /// under today's shipped default, so it still pins the counting bug
-    /// without depending on where the default happens to sit.
+    ///
+    /// The cap is pinned here (three, via `for_test_scripted_with_rounds`)
+    /// rather than inherited from `ToolRounds::default()`. A test that
+    /// borrows the shipped default only discriminates for as long as that
+    /// default happens to stay below the seeded history's length — it
+    /// silently stops catching the regression the moment the default
+    /// moves past it, which is exactly what happened when the unattended
+    /// default became 25 (`for_test`'s cap) while this test still seeded
+    /// only 11: the reintroduced bug would start `round` at 11, still
+    /// under 25, and the turn would reply normally either way, so the
+    /// test would pass with or without the bug. Seeding 11 pairs against
+    /// an explicit cap of 3 keeps the history well past the budget no
+    /// matter what the shipped default is: if `round` is ever seeded from
+    /// history again, it starts at 11, the very first check trips
+    /// (`11 >= 3`), and the turn comes back `BudgetExhausted` instead of
+    /// `Replied` — this test would then fail, which is the signal it
+    /// exists to give.
     #[tokio::test]
     async fn a_session_restored_with_more_than_the_round_budget_still_replies() {
-        let state = ServeState::for_test(true);
+        let state = ServeState::for_test_scripted_with_rounds(
+            true,
+            vec![crate::provider::ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+            crate::config::ToolRounds {
+                interactive: 3,
+                unattended: 3,
+            },
+        );
 
-        // More than the round budget's worth of assistant messages
+        // More than the pinned round budget's worth of assistant messages
         // carrying a ToolUse part, paired with their tool_results, as a
         // restored session's history would arrive already hydrated.
         let mut history = Vec::new();
