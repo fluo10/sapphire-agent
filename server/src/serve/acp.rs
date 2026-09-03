@@ -344,6 +344,33 @@ impl super::TurnHost for AcpProgress {
         *self.error.lock().unwrap() = Some(message.to_string());
     }
 
+    /// Sent the moment the round that produced it is done, rather than
+    /// held until the turn ends.
+    ///
+    /// One chunk per round, not per token: `Provider::chat` returns a
+    /// whole response, so a round is the finest boundary that actually
+    /// exists. Splitting further would invent boundaries the model never
+    /// produced.
+    ///
+    /// This is the *only* way text reaches an ACP client now. The turn's
+    /// `outcome.text` is deliberately ignored on this path — see the
+    /// `session/prompt` handler — because everything in it has already
+    /// come through here, and sending it again would duplicate the whole
+    /// reply.
+    async fn message_chunk(&self, text: &str) {
+        self.notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(text.to_string())),
+        )));
+    }
+
+    /// ACP is the one route that can stop a turn in flight:
+    /// `session/cancel` is implemented, and the editor's Escape sends it.
+    /// That is what makes an unbounded budget safe to offer here and
+    /// nowhere else.
+    fn round_budget(&self) -> super::RoundBudget {
+        super::RoundBudget::Interactive
+    }
+
     fn origin(&self) -> crate::tools::policy::Origin {
         crate::tools::policy::Origin::Acp(self.mode)
     }
@@ -1498,7 +1525,7 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                                 );
                             };
 
-                            let Some(reply) = outcome.text else {
+                            let Some(_reply) = outcome.text else {
                                 if turn_cancel.is_cancelled() {
                                     // The turn failed *because* it was being
                                     // cancelled, or was cancelled in the
@@ -1516,27 +1543,17 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                                 // failure, and ACP has the exact word for
                                 // it: `MaxTurnRequests`, "the agent reached
                                 // the maximum number of allowed agent
-                                // requests between user turns". The budget
-                                // is `MAX_TOOL_ROUNDS` — ten — which an
-                                // editor reaches on an ordinary "search,
-                                // read a few files, edit two" prompt, so
-                                // this is a routine ending, not an
-                                // exceptional one, and showing the user an
-                                // error dialog for it is wrong twice over:
-                                // the agent is fine, and the work it did do
-                                // would go on the floor. The prose it
-                                // emitted alongside its tool calls is
-                                // delivered as the reply.
-                                if let super::TurnStop::BudgetExhausted { partial_text } =
-                                    &outcome.stop
+                                // requests between user turns". With
+                                // `[tools.tool_rounds] interactive = 0` —
+                                // the default — this never fires at all;
+                                // an operator who sets a cap gets a
+                                // routine ending rather than an error
+                                // dialog, and the work done on the way is
+                                // already in the client's hands because
+                                // every round's prose went out through
+                                // `message_chunk` as it happened.
+                                if matches!(&outcome.stop, super::TurnStop::BudgetExhausted { .. })
                                 {
-                                    if !partial_text.is_empty() {
-                                        progress.notify(SessionUpdate::AgentMessageChunk(
-                                            ContentChunk::new(ContentBlock::Text(
-                                                TextContent::new(partial_text.clone()),
-                                            )),
-                                        ));
-                                    }
                                     return answered(
                                         &session_id,
                                         responder.respond(PromptResponse::new(
@@ -1560,17 +1577,14 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                                 );
                             };
 
-                            // One chunk, not a stream: `Provider::chat`
-                            // returns the whole response at once, so there is
-                            // nothing to stream, and splitting it here would
-                            // invent chunk boundaries the model never
-                            // produced. An empty reply is no chunk at all
-                            // rather than an empty one.
-                            if !reply.is_empty() {
-                                progress.notify(SessionUpdate::AgentMessageChunk(
-                                    ContentChunk::new(ContentBlock::Text(TextContent::new(reply))),
-                                ));
-                            }
+                            // No chunk here: every non-empty text this turn
+                            // produced — the final one included — already
+                            // went out from `AcpProgress::message_chunk` in
+                            // the round that produced it. `outcome.text` is
+                            // the same prose joined back together, kept for
+                            // `/rpc`, `/a2a` and the voice pipeline, and
+                            // sending it here as well would deliver the
+                            // whole reply twice.
                             answered(
                                 &session_id,
                                 responder.respond(PromptResponse::new(StopReason::EndTurn)),
@@ -2152,6 +2166,94 @@ mod tests {
             .map(|u| u["content"]["text"].as_str().unwrap())
             .collect();
         assert_eq!(chunks, vec!["hello from the agent"], "got {updates:?}");
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
+    }
+
+    /// 中間の散文がラウンドごとに届く。まとめて1通ではなく、モデルが
+    /// 出した単位で並ぶ。これが「作業中に喋れる」の全部である。
+    #[tokio::test]
+    async fn prose_arrives_round_by_round_rather_than_all_at_the_end() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    text: Some("checking the config".to_string()),
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo".to_string(),
+                        input: serde_json::json!({ "text": "ping" }),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    text: Some("it was the timeout".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        let addr = spawn(state).await;
+        let (_session_id, updates, reply) = drive(&addr, text_prompt("why is it slow")).await;
+
+        let chunks: Vec<&str> = updates
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+            .map(|u| u["content"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            chunks,
+            vec!["checking the config", "it was the timeout"],
+            "got {chunks:?}"
+        );
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
+    }
+
+    /// 最終テキストが二重に届かない。`message_chunk` で流したものを
+    /// ターン終了時にもう一度送っていたら、ここで2通になる。
+    #[tokio::test]
+    async fn the_final_reply_is_not_sent_twice() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![crate::provider::ChatResponse {
+                text: Some("just this".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let addr = spawn(state).await;
+        let (_session_id, updates, _reply) = drive(&addr, text_prompt("hello")).await;
+
+        let chunks: Vec<&str> = updates
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+            .map(|u| u["content"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(chunks, vec!["just this"], "got {chunks:?}");
+    }
+
+    /// ACP は `interactive` 側で判定される。既定は 0 = 無制限なので、
+    /// 旧来の10ラウンドを超えても止まらない。
+    #[tokio::test]
+    async fn an_acp_turn_runs_past_ten_rounds_by_default() {
+        let mut script: Vec<crate::provider::ChatResponse> = (0..12)
+            .map(|i| crate::provider::ChatResponse {
+                text: None,
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: format!("call-{i}"),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({ "text": "ping" }),
+                }],
+                stop_reason: None,
+            })
+            .collect();
+        script.push(crate::provider::ChatResponse {
+            text: Some("finished".to_string()),
+            tool_calls: Vec::new(),
+            stop_reason: None,
+        });
+        let addr = spawn(ServeState::for_test_scripted(true, script)).await;
+        let (_session_id, _updates, reply) = drive(&addr, text_prompt("do a lot")).await;
+
         assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
     }
 
