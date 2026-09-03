@@ -69,6 +69,20 @@ allow = [
     "bzip2-1.0.6",
 ]
 confidence-threshold = 0.93
+# Font licences, scoped to the one crate that carries fonts rather than added
+# to `allow` above. OFL-1.1 and Ubuntu-font-1.0 govern the *typefaces* egui
+# embeds as its fallback UI font, not the code; blanket-allowing them would
+# also wave through a code dependency that happened to pick one. This crate
+# is `(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0` — the code half is
+# already allowed, and we ship an OFL font of our own in `desktop/assets/`.
+#
+# Only visible since the workspace root became a virtual manifest: cargo-deny
+# assumes `--workspace` for a virtual manifest, but takes a root *package* as
+# the sole graph root otherwise, so `sapphire-call-desktop`'s tree had never
+# been checked before.
+exceptions = [
+    { name = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+]
 
 [bans]
 # Duplicate-version warnings are too noisy in real Rust workspaces (every
