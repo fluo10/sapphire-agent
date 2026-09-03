@@ -1113,32 +1113,163 @@ rather than a red-green pair."
 
 ---
 
-### Task 6: Matrix/Discord をラウンドごとの送信にする
+---
 
-`agent.rs` のループは `TurnHost` を通らないので、送信をループ内に移す。
+### Task 6a: `agent.rs` のテスト土台を作る
+
+`server/src/agent.rs` の `mod tests`（1077 行〜）には、`Agent` を組み立てるヘルパが**一つも無い**。あるのはツールポリシー関門のテスト4件だけで、スクリプト済みプロバイダも、送信を記録するチャンネルスタブも無い。Task 6b の振る舞いテストはこれ無しには書けないので、土台だけを先に作り、それ自体を1つのテストで証明する。
+
+**このタスクは本番コードを変更しない。** `#[cfg(test)]` の中だけで完結する。
 
 **Files:**
-- Modify: `server/src/agent.rs`（const 17 行、ループ 761 行付近、上限判定 771 行付近、分岐 842 / 850 行付近、`stop_typing` 982 行、末尾送信 984〜996 行付近）
-- Test: `server/src/agent.rs`（同ファイル内の `mod tests`）
+- Modify: `server/src/agent.rs`（`mod tests` は 1077 行〜。既存の `test_workspace()` は 1086 行付近）
 
 **Interfaces:**
-- Consumes: `ToolRounds::limit`、`RoundBudget`（Task 2）
+- Consumes: なし
+- Produces（すべて `mod tests` の中）:
+  - `struct RecordingChannel { sent: Arc<Mutex<Vec<OutgoingMessage>>>, fail_first: bool, calls: Mutex<usize> }`
+    — `impl crate::channel::Channel for RecordingChannel`
+  - `fn agent_with_scripted_provider(responses: Vec<crate::provider::ChatResponse>) -> (Arc<Agent>, Arc<Mutex<Vec<OutgoingMessage>>>)`
+  - `fn agent_with_failing_first_send(responses: Vec<crate::provider::ChatResponse>) -> (Arc<Agent>, Arc<Mutex<Vec<OutgoingMessage>>>)`
+  - `fn incoming(text: &str) -> crate::channel::IncomingMessage`
+
+- [ ] **Step 1: 組み立てに必要なものを読む**
+
+先に読むこと。**既にあるものを使い、無いものだけ作る。**
+
+- `server/src/agent.rs:82` の `Agent::new` — 8引数（`Config`, `Arc<Channels>`, `Arc<ProviderRegistry>`, `Arc<Workspace>`, `Option<Arc<ToolSet>>`, `Arc<SessionStore>`, `Option<Arc<ImageCache>>`, `Option<Arc<DigestCache>>`）
+- `server/src/agent.rs:1086` の `test_workspace()` — 既存。`AppContext` のキャッシュディレクトリ設定と `Workspace::from_root` をすでに済ませてある。**これを再利用する**
+- `server/src/channel/mod.rs:117` の `trait Channel` — `send` / `start_typing` / `stop_typing` ほか。既定実装のあるメソッドは実装しない
+- `server/src/channel/mod.rs:153` の `Channels::new(Vec<(String, Arc<dyn Channel>)>, HashMap<String, String>)` — ここにスタブを差す
+- `server/src/serve/mod.rs` の `ServeState::build_for_test` — `Config::parse_for_test` とテンポラリディレクトリから組み立てる流儀。**同じ流儀に合わせる**
+- `server/src/serve/mod.rs` の `StubProvider` — スクリプト済み `ChatResponse` を順に返すテスト用プロバイダが既にある。`ProviderRegistry` に差せるならこれを使い、`#[cfg(test)]` の可視性が届かない場合のみ同等のものを `agent.rs` 側に作る
+- `server/src/session.rs` の `SessionStore` — テンポラリディレクトリから作れるか確認する
+
+- [ ] **Step 2: 土台が動くことを示すテストを1つ書く**
+
+```rust
+    /// 土台そのもののテスト。`Agent` が組み立てられ、`handle_message` が
+    /// 一周し、スタブチャンネルに返信が届くところまでを通す。Task 6b の
+    /// 振る舞いテストは全部これに乗るので、ここが通らないうちは先へ進めない。
+    #[tokio::test]
+    async fn the_test_harness_drives_a_turn_end_to_end() {
+        let (agent, sent) = agent_with_scripted_provider(vec![crate::provider::ChatResponse {
+            text: Some("ok".to_string()),
+            tool_calls: Vec::new(),
+            stop_reason: None,
+        }]);
+
+        agent.handle_message(incoming("hello")).await.unwrap();
+
+        let bodies: Vec<String> =
+            sent.lock().unwrap().iter().map(|m| m.content.clone()).collect();
+        assert_eq!(bodies, vec!["ok".to_string()]);
+    }
+```
+
+- [ ] **Step 3: 落ちることを確認する**
+
+Run: `cargo test -p sapphire-agent -- the_test_harness_drives_a_turn`
+Expected: FAIL — `agent_with_scripted_provider` / `incoming` が存在せずコンパイルエラー
+
+- [ ] **Step 4: スタブチャンネルを書く**
+
+`mod tests` の中に置く。`Channel` トレイトの必須メソッドだけを実装し、既定実装のあるものは触らない。
+
+```rust
+    /// Records what the agent sent, so a test can assert on the shape of a
+    /// turn's delivery rather than only its final text.
+    ///
+    /// `fail_first` exists for one test: a send that the channel refuses
+    /// must not take the rest of the turn down with it. Counting calls
+    /// rather than holding a queue of outcomes keeps the stub to the one
+    /// behaviour that is actually needed.
+    struct RecordingChannel {
+        sent: Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>,
+        fail_first: bool,
+        calls: Mutex<usize>,
+    }
+```
+
+`impl crate::channel::Channel for RecordingChannel` の `send` は、`fail_first` が立っていて呼び出しが1回目なら `Err` を返し、それ以外は `sent` に積んで `Ok(())` を返す。`start_typing` / `stop_typing` は既定実装があるなら実装しない。
+
+トレイトの他の必須メソッド（名前・受信ループなど）は、コンパイラが要求するものだけを最小限に埋める。**推測で埋めない** — `cargo build` のエラーが要求するものが正解である。
+
+- [ ] **Step 5: `Agent` 組み立てヘルパを書く**
+
+```rust
+    /// Build an `Agent` whose provider replays `responses` in order and
+    /// whose only channel records what it is asked to send.
+    ///
+    /// Mirrors `ServeState::build_for_test` (src/serve/mod.rs): leak the
+    /// `TempDir` on purpose — this is a test binary and the OS reclaims
+    /// the directory when it exits.
+    fn agent_with_scripted_provider(
+        responses: Vec<crate::provider::ChatResponse>,
+    ) -> (Arc<Agent>, Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>) {
+        build_test_agent(responses, false)
+    }
+
+    /// Same, but the channel refuses the first send.
+    fn agent_with_failing_first_send(
+        responses: Vec<crate::provider::ChatResponse>,
+    ) -> (Arc<Agent>, Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>) {
+        build_test_agent(responses, true)
+    }
+```
+
+`build_test_agent(responses, fail_first)` が実際の組み立てを行う。`test_workspace()` を再利用し、`Config::parse_for_test` で最小の設定を作り、`Channels::new(vec![("test".into(), Arc::new(channel))], HashMap::new())` を差す。`tools` は `None` でよい — Task 6b のテストが呼ぶツールは `echo` だが、ツールが解決できない場合の挙動を確かめるのが目的ではないので、`ToolSet` が要るなら `crate::tools::default_tool_set` を使う。**どちらが要るかは Task 6b のテストが決める**: ツールコールを含む応答を流すので、そのツール名が解決できる `ToolSet` が要る。`ServeState::build_for_test` が `EchoTool` を差しているので、同じ `echo` が使えるようにすること。
+
+`incoming` は最小の `IncomingMessage` を作る。`room_id` と `thread_id` はテスト間で固定でよい。
+
+```rust
+    fn incoming(text: &str) -> crate::channel::IncomingMessage {
+        // フィールドは `crate::channel::IncomingMessage` の定義に合わせる
+    }
+```
+
+- [ ] **Step 6: テストが通ることを確認する**
+
+Run: `cargo test -p sapphire-agent -- the_test_harness_drives_a_turn`
+Expected: PASS
+
+- [ ] **Step 7: 既存テストが壊れていないことを確認する**
+
+Run: `cargo test -p sapphire-agent`
+Expected: PASS。ただし `acp.rs` の `exhausting_the_tool_budget_...` は Task 2〜4 の途中経過として落ちている場合がある。**それ以外**が通っていればよい
+
+- [ ] **Step 8: コミット**
+
+```bash
+git add server/src/agent.rs
+git commit -m "test(agent): give agent.rs a harness that can drive a whole turn
+
+The tests in this file could only reach the tool-policy gate; there was
+no way to build an Agent, script its provider, or see what it sent. The
+next commit changes how a turn is delivered to a channel, which is not
+observable without one.
+
+A recording channel, a scripted provider, and one test that drives a
+turn end to end through them. No production code moves here."
+```
+
+---
+
+### Task 6b: ラウンドごとに送る
+
+Task 6a の土台の上で、`agent.rs` のループを書き換える。
+
+**Files:**
+- Modify: `server/src/agent.rs`（const 17 行、`accumulated_text` 754 行付近、上限判定 771 行付近、分岐 842 / 850 行付近、`stop_typing` 982 行、末尾送信 984〜996 行付近）
+- Test: `server/src/agent.rs`（`mod tests`）
+
+**Interfaces:**
+- Consumes: `ToolRounds::limit`、`RoundBudget`（Task 2）、`agent_with_scripted_provider` / `agent_with_failing_first_send` / `incoming`（Task 6a）
 - Produces: `Agent::send_turn_message(&self, incoming: &IncomingMessage, text: &str)`（このタスク内でのみ使う）
 
-- [ ] **Step 1: 既存のテストの組み立て方を読む**
+- [ ] **Step 1: 失敗するテストを書く**
 
-実装に入る前に `server/src/agent.rs` の `mod tests` を読み、`Agent` をどう組み立てているか、送信を記録するスタブチャンネルが既にあるかを確認する。**あるものを使い、無いものだけ作る。** 新しい組み立て方を発明しない。
-
-既存に無い場合に必要なのは3つ:
-- スクリプト済みプロバイダを積んだ `Agent`
-- `ChannelManager` に差す、送った `OutgoingMessage` を `Arc<Mutex<Vec<_>>>` に積むスタブ
-- n 回目の `send` だけ `Err` を返せるスタブ（Step 4 の失敗テスト用）
-
-`ServeState::build_for_test` が `Config::parse_for_test` とテンポラリディレクトリから組み立てているのと同じ流儀に合わせる。
-
-- [ ] **Step 2: 失敗するテストを書く**
-
-以下の3件を `mod tests` に追加する。ヘルパ名は Step 1 で確認した既存のものに合わせること — 下の `agent_with_scripted_provider` / `agent_with_failing_first_send` / `incoming` は、既存に相当物が無かった場合に作る名前である。
+`server/src/agent.rs` の `mod tests` に3件追加する。ヘルパは Task 6a のものをそのまま使う。
 
 ```rust
     /// ツールを呼ぶターンは複数メッセージに分かれる。「○○するぞ」と
@@ -1219,12 +1350,12 @@ rather than a red-green pair."
     }
 ```
 
-- [ ] **Step 3: 落ちることを確認する**
+- [ ] **Step 2: 落ちることを確認する**
 
 Run: `cargo test -p sapphire-agent -- a_tool_using_turn_is_delivered an_ordinary_reply_is_still_one a_failed_send_does_not_end`
 Expected: FAIL — 1件目は `["調べます\n\n見つかりました"]` の1通になる
 
-- [ ] **Step 4: 送信ヘルパを足す**
+- [ ] **Step 3: 送信ヘルパを足す**
 
 `server/src/agent.rs` の `Agent` の `impl` に置く。
 
@@ -1254,9 +1385,9 @@ Expected: FAIL — 1件目は `["調べます\n\n見つかりました"]` の1�
     }
 ```
 
-- [ ] **Step 5: ループを書き換える**
+- [ ] **Step 4: ループを書き換える**
 
-上限判定（771 行付近）。`const MAX_TOOL_ROUNDS`（17 行）は削除し、`let mut round = 0usize;` の直前に置く。
+`const MAX_TOOL_ROUNDS`（17 行）を削除し、`let mut round = 0usize;` の直前に上限解決を置く。
 
 ```rust
         // Matrix and Discord have no way to cancel a turn in flight, so
@@ -1268,6 +1399,8 @@ Expected: FAIL — 1件目は `["調べます\n\n見つかりました"]` の1�
             .tool_rounds
             .limit(crate::serve::RoundBudget::Unattended);
 ```
+
+上限判定（771 行付近）。
 
 ```rust
             if round_limit.is_some_and(|max| round >= max) {
@@ -1295,7 +1428,7 @@ Expected: FAIL — 1件目は `["調べます\n\n見つかりました"]` の1�
 
 `accumulated_text` はこのファイルから不要になる。宣言（754 行付近）を削除し、`let final_text = loop {` は `loop {` に、`break Some(accumulated_text.join("\n\n"))` は `break` になる。
 
-- [ ] **Step 6: 末尾の一括送信を消す**
+- [ ] **Step 5: 末尾の一括送信を消す**
 
 984 行付近の `if let Some(text) = final_text { ... }` から送信ブロックを削除する。
 
@@ -1303,22 +1436,22 @@ Expected: FAIL — 1件目は `["調べます\n\n見つかりました"]` の1�
 
 `stop_typing`（982 行）はそのまま残す。ループ内の各送信後に `start_typing` を打ち直しているので、最後にここで止める必要がある。
 
-- [ ] **Step 7: テストが通ることを確認する**
+- [ ] **Step 6: テストが通ることを確認する**
 
-Run: `cargo test -p sapphire-agent -- a_tool_using_turn_is_delivered an_ordinary_reply_is_still_one a_failed_send_does_not_end`
-Expected: PASS（3 件）
+Run: `cargo test -p sapphire-agent -- a_tool_using_turn_is_delivered an_ordinary_reply_is_still_one a_failed_send_does_not_end the_test_harness_drives_a_turn`
+Expected: PASS（4 件。6a の土台テストも引き続き通る）
 
-- [ ] **Step 8: 参照が残っていないことを確認する**
+- [ ] **Step 7: 参照が残っていないことを確認する**
 
 Run: `rg 'MAX_TOOL_ROUNDS|accumulated_text' server/src/agent.rs`
 Expected: 一致なし
 
-- [ ] **Step 9: 全体が通ることを確認する**
+- [ ] **Step 8: 全体が通ることを確認する**
 
 Run: `cargo test -p sapphire-agent`
 Expected: PASS
 
-- [ ] **Step 10: コミット**
+- [ ] **Step 9: コミット**
 
 ```bash
 git add server/src/agent.rs
@@ -1451,19 +1584,19 @@ Expected: 差分なし
 |---|---|
 | §1 `TurnHost` にテキストフック | Task 2 |
 | §2 ACP を完全ストリーミング化 | Task 3（実装）、Task 4（既存テストの更新） |
-| §3 ラウンド上限を経路ごとの設定に | Task 1（設定）、Task 2（解決）、Task 4（`serve/` の const 削除）、Task 6（`agent.rs` 側） |
+| §3 ラウンド上限を経路ごとの設定に | Task 1（設定）、Task 2（解決）、Task 4（`serve/` の const 削除）、Task 6b（`agent.rs` 側） |
 | §4 サブエージェントの2つを非委譲 | Task 5 |
 | §4 上限到達がユーザーを煩わせないこと | 既存の `answer_text` がそのまま担う。変更不要 — Task 5 のコメントで言及 |
-| §5 Matrix/Discord のラウンドごと送信 | Task 6 |
+| §5 Matrix/Discord のラウンドごと送信 | Task 6a（テスト土台）、Task 6b（本体＋振る舞いテスト） |
 | §6 `AGENTS.md` の一節 | Task 7 |
 | やらないこと: 停止条件、進捗報告ツール、`/rpc` SSE、音声 | どのタスクでも触らない。Task 2 Step 4 のトレイト doc が、音声を触らない理由をコードに残す |
-| 既知の重複（2つのループ） | 直さない。Task 2 と Task 6 が同じ変更を両方に入れる形で現れる |
+| 既知の重複（2つのループ） | 直さない。Task 2 と Task 6b が同じ変更を両方に入れる形で現れる |
 
 仕様の全節に対応タスクがある。
 
 **2. Placeholder scan**
 
-Task 6 Step 1〜2 の「既存のヘルパがあればそれを使い、無ければ作る」が唯一の条件付き記述。これは曖昧さではなく `server/src/agent.rs` の `mod tests` の現状に依存する判断であり、どちらの場合に何が必要かを3点挙げて明示してある。他に TBD / TODO / 「適切に処理する」の類は無い。
+当初 Task 6 Step 1 が「既存のヘルパがあればそれを使い、無ければ作る」という条件付きだった。実行前の走査で `server/src/agent.rs` の `mod tests`（1077 行〜）を読んだ結果、`Agent` を組み立てるヘルパは**一つも無い**ことが判明したため、Task 6 を 6a（土台）と 6b（本体）に分割し、条件を除去した。6a Step 1 は「読むもの」を実ファイルの行番号で列挙してある。他に TBD / TODO / 「適切に処理する」の類は無い。
 
 **3. Type consistency**
 
@@ -1473,7 +1606,8 @@ Task 6 Step 1〜2 の「既存のヘルパがあればそれを使い、無け�
 - `TurnHost::message_chunk(&self, text: &str)` — Task 2 Step 4 で `async`・既定 no-op。Task 3 Step 3（`AcpProgress`）と Task 5 Step 1（`ParentHostSansTurnError`）が同じシグネチャで実装
 - `TurnHost::round_budget(&self) -> RoundBudget` — 非 `async`。Task 3 Step 3 と Task 5 Step 1 が同じシグネチャで実装
 - `ServeState::for_test_scripted_with_rounds(acp_enabled, responses, rounds)` — Task 2 Step 6 で定義、Task 2 Step 1 と Task 4 Step 2 で使用。引数順一貫
-- `Agent::send_turn_message(&self, &IncomingMessage, &str)` — Task 6 Step 4 で定義、Step 5 で使用
+- `Agent::send_turn_message(&self, &IncomingMessage, &str)` — Task 6b Step 3 で定義、Step 4 で使用
+- `agent_with_scripted_provider` / `agent_with_failing_first_send` / `incoming` — Task 6a で定義、Task 6b Step 1 のテストが使用
 
 **4. 順序の依存**
 
