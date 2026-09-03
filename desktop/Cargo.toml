@@ -84,4 +84,4 @@ cpal = "0.17"
 # detection logic instead of rolling a separate energy-based path.
 # sherpa-onnx statically links its C++ + ONNX runtime, so first
 # build of this crate is slow.
-sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"] }
+sherpa-onnx = "1.13"

@@ -5,16 +5,18 @@
 //! - **VAD-only (default):** hot mic for the process lifetime, Silero
 //!   VAD chunks the stream into utterances, each segment ships to the
 //!   agent. Good for quiet rooms / single-user desks.
-//! - **Wake-then-VAD:** sherpa-onnx KWS gates the VAD. While Idle the
-//!   satellite only feeds audio to the keyword spotter; on a wake
-//!   match it switches to VAD until an utterance completes, ships it,
-//!   plays the reply, and returns to wake-listening.
+//! - **Wake-then-VAD:** a wake detector gates the VAD. While Idle the
+//!   satellite only feeds audio to the detector; on a wake match it
+//!   switches to VAD until an utterance completes, ships it, plays the
+//!   reply, and returns to wake-listening. No client-side detector
+//!   exists at present, so this mode is unreachable until #183 moves
+//!   detection to the server — see [`wake`].
 //!
 //! In both modes the mic is gated off during reply playback so the
 //! satellite doesn't transcribe its own TTS.
 
 mod download;
-mod oww;
+mod wake;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -326,48 +328,21 @@ pub async fn run(
     .await
     .map_err(|e| anyhow!("VAD build task panicked: {e}"))??;
 
-    // ── Optional wake-word detector ─────────────────────────────────────
-    let wake_detector: Option<oww::OpenWakeWordDetector> = match server_wake.model {
-        Some(model) => {
-            let sapphire_agent_rpc::WakeWordModel {
-                filename,
-                sha256,
-                bytes,
-            } = model;
-            // Derive a display label from the filename stem (without
-            // version suffix or extension) so wake events print
-            // something recognisable like "[wake: saphina]".
-            let label = std::path::Path::new(&filename)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.split('-').next().unwrap_or(s).to_string())
-                .unwrap_or_else(|| "wake".to_string());
-            let wake_threshold = options.sensitivity.wake_threshold;
-            let wake_cooldown_chunks =
-                oww::cooldown_chunks_from_ms(options.sensitivity.wake_cooldown_ms);
-            let detector = tokio::task::spawn_blocking({
-                let label = label.clone();
-                move || {
-                    let (mel, embed) = download::ensure_oww_frontend()
-                        .context("failed to fetch openWakeWord frontend models")?;
-                    let wake_path = download::cache_inline_oww(&bytes, &sha256)
-                        .context("failed to cache openWakeWord classifier")?;
-                    oww::OpenWakeWordDetector::create(
-                        &mel,
-                        &embed,
-                        &wake_path,
-                        label,
-                        wake_threshold,
-                        wake_cooldown_chunks,
-                    )
-                }
-            })
-            .await
-            .map_err(|e| anyhow!("openWakeWord init task panicked: {e}"))??;
-            eprintln!("wake-word: {filename} (label: {label})");
-            Some(detector)
+    // ── Wake word: announced by the server, not runnable here ───────────
+    //
+    // The server hands a wake model to every satellite, but no client can run
+    // one until detection moves server-side (#183) — see `wake`. Warn and fall
+    // back to VAD-only rather than refusing to start: the model is global
+    // server config, not something this satellite asked for.
+    let wake_detector: Option<wake::Detector> = {
+        if let Some(model) = &server_wake.model {
+            eprintln!(
+                "warning: the server configures a wake word ({}), but this build cannot run \
+                 wake-word detection; running VAD-only",
+                model.filename
+            );
         }
-        None => None,
+        None
     };
 
     // ── Audio I/O ────────────────────────────────────────────────────────
@@ -561,7 +536,7 @@ struct ListenCtx {
     vad: VoiceActivityDetector,
     /// `Some` enables wake-word mode; the satellite gates VAD behind
     /// successful keyword spotting on this detector.
-    wake: Option<oww::OpenWakeWordDetector>,
+    wake: Option<wake::Detector>,
     /// In wake-word mode: true while we're waiting for the next wake
     /// trigger, false once it fires and we're capturing the utterance.
     /// Always false in VAD-only mode.

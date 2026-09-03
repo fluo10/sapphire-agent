@@ -41,13 +41,12 @@ jobs:
             binary: sapphire-agent
             asset_name: sapphire-agent-linux-aarch64
             continue-on-error: false
+          # No Windows entry: sapphire-agent is a headless server app, and
+          # Windows was never its intended environment — it was built only
+          # because the build happened to pass. See #182.
           - os: macos-latest
             binary: sapphire-agent
             asset_name: sapphire-agent-macos-aarch64
-            continue-on-error: true
-          - os: windows-latest
-            binary: sapphire-agent.exe
-            asset_name: sapphire-agent-windows-x86_64.zip
             continue-on-error: true
     runs-on: ${{ matrix.os }}
     permissions:
@@ -64,20 +63,30 @@ jobs:
       - uses: ./.github/actions/refresh-sherpa-onnx-libs
       - run: cargo build --release --package sapphire-agent
 
-      - name: Package binary
+      # sherpa-onnx links statically, so the asset is self-contained. Guard
+      # it: under shared linking the libraries stay in `target/` and nothing
+      # writes an RPATH, so the uploaded binary dies at every install site
+      # with "libsherpa-onnx-c-api.so: cannot open shared object file". That
+      # shipped once already (#182) because only Windows packaged the
+      # libraries beside the executable.
+      - name: Assert the binary is self-contained
         shell: bash
         run: |
-          # Windows links sherpa-onnx and ONNX Runtime as DLLs rather than
-          # statically: upstream only ships a /MT static archive for Windows,
-          # which cannot link beside ort's /MD runtime (LNK2038). The exe
-          # therefore does not start on its own — ship the DLLs beside it.
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a "${{ matrix.asset_name }}" \
-              "./target/release/${{ matrix.binary }}" \
-              ./target/release/*.dll
-          else
-            cp "target/release/${{ matrix.binary }}" "${{ matrix.asset_name }}"
+          bin="target/release/${{ matrix.binary }}"
+          case "$RUNNER_OS" in
+            Linux) deps=$(ldd "$bin") ;;
+            macOS) deps=$(otool -L "$bin") ;;
+            *) echo "::error::no dynamic-link check for $RUNNER_OS"; exit 1 ;;
+          esac
+          if grep -i sherpa <<<"$deps"; then
+            echo "::error::$bin links sherpa-onnx dynamically; this asset would not start"
+            exit 1
           fi
+          echo "$bin links no sherpa-onnx library — self-contained."
+
+      - name: Package binary
+        shell: bash
+        run: cp "target/release/${{ matrix.binary }}" "${{ matrix.asset_name }}"
       - name: Upload to release
         uses: softprops/action-gh-release@v3
         with:
