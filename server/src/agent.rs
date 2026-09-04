@@ -13,9 +13,6 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
 
-/// Maximum number of tool-call rounds per message to prevent infinite loops.
-const MAX_TOOL_ROUNDS: usize = 10;
-
 impl Agent {
     /// Resolve the provider that should serve `room_id`, honouring the
     /// room → profile → provider mapping defined in `Config`. Falls back to
@@ -674,6 +671,48 @@ impl Agent {
     // Message handling
     // -----------------------------------------------------------------------
 
+    /// Send one piece of the turn's prose, as the round that produced it
+    /// finishes.
+    ///
+    /// A failure is logged and swallowed rather than ending the turn. A
+    /// turn can now send up to `[tools.tool_rounds] unattended` messages,
+    /// which is enough to meet a channel's rate limit, and losing the
+    /// whole turn's remaining work to one refused send would be a much
+    /// worse outcome than a gap in the narration.
+    ///
+    /// Typing is restarted after a send only when `more_to_come` is
+    /// true: the indicator stops on its own when a message lands, and a
+    /// turn that goes quiet while it is still working is exactly what
+    /// this change exists to prevent — but that only holds while more
+    /// of the turn is still ahead. Callers pass `true` from the
+    /// tool-call branch (another round is coming) and `false` from the
+    /// tool-less branch that ends the turn. Restarting unconditionally,
+    /// including on that last send, is harmless on Matrix but not on
+    /// Discord: `stop_typing` there is a no-op (Discord's indicator
+    /// expires on its own and cannot be cancelled — see the comment at
+    /// `channel/discord.rs:217`), and `broadcast_typing` lasts about
+    /// ten seconds, so a restart on the final send strands the bot
+    /// looking like it's still typing for ten seconds after the turn is
+    /// actually done.
+    async fn send_turn_message(
+        &self,
+        incoming: &crate::channel::IncomingMessage,
+        text: &str,
+        more_to_come: bool,
+    ) {
+        let out = OutgoingMessage {
+            content: text.to_string(),
+            room_id: incoming.room_id.clone(),
+            thread_id: incoming.thread_id.clone(),
+        };
+        if let Err(e) = self.channels.send(&out).await {
+            warn!("Failed to send a turn message: {e:#}");
+        }
+        if more_to_come {
+            let _ = self.channels.start_typing(&incoming.room_id).await;
+        }
+    }
+
     async fn handle_message(
         self: Arc<Self>,
         incoming: crate::channel::IncomingMessage,
@@ -751,14 +790,21 @@ impl Agent {
         let compression_config = &self.config.compression;
 
         // Tool-calling loop
-        let mut accumulated_text: Vec<String> = Vec::new();
         // Rounds this turn, not tool calls in the history. History is
         // restored from disk now, so counting the whole thing would spend a
         // room's entire budget on what it did before the process started —
         // and the check runs before compaction, so nothing could ever trim
         // it back.
         let mut round = 0usize;
-        let final_text = loop {
+        // Matrix and Discord have no way to cancel a turn in flight, so
+        // they are judged `unattended` — the same budget every route
+        // without an interrupt gets. See `[tools.tool_rounds]`.
+        let round_limit = self
+            .config
+            .tools
+            .tool_rounds
+            .limit(crate::serve::RoundBudget::Unattended);
+        loop {
             let messages = {
                 self.history
                     .lock()
@@ -768,9 +814,9 @@ impl Agent {
                     .unwrap_or_default()
             };
 
-            if round >= MAX_TOOL_ROUNDS {
-                warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS}), stopping");
-                break Some(accumulated_text.join("\n\n"));
+            if round_limit.is_some_and(|max| round >= max) {
+                warn!("Reached max tool rounds ({round}), stopping");
+                break;
             }
 
             // Check if context compression is needed
@@ -839,15 +885,19 @@ impl Agent {
                         .push(msg.clone());
                     let _ = self.persist(&session_id, &msg);
                     if !text.is_empty() {
-                        accumulated_text.push(text);
+                        // Turn's last send: nothing follows, so don't
+                        // restart typing.
+                        self.send_turn_message(&incoming, &text, false).await;
                     }
-                    break Some(accumulated_text.join("\n\n"));
+                    break;
                 }
                 Ok(resp) => {
                     round += 1;
                     let tool_calls = resp.tool_calls.clone();
                     if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
-                        accumulated_text.push(t.clone());
+                        // Another round is still ahead: restart typing
+                        // so it doesn't lapse while that round runs.
+                        self.send_turn_message(&incoming, t, true).await;
                     }
                     let msg =
                         ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
@@ -964,7 +1014,7 @@ impl Agent {
                     }
                 }
             }
-        };
+        }
 
         // Scrub `Image` parts in the just-completed history into compact
         // `ImageRef` references backed by the workspace-external image
@@ -981,41 +1031,30 @@ impl Agent {
 
         let _ = self.channels.stop_typing(&incoming.room_id).await;
 
-        if let Some(text) = final_text {
-            if !text.is_empty() {
-                let out = OutgoingMessage {
-                    content: text,
-                    room_id: incoming.room_id.clone(),
-                    thread_id: incoming.thread_id.clone(),
-                };
-                self.channels
-                    .send(&out)
+        // Spawn background prefetch for next turn. This turn's prose was
+        // already sent round by round via `send_turn_message` above, so
+        // there is nothing left to send here — this is purely priming the
+        // cache the *next* turn will read from.
+        if let Some(tools) = &self.tools {
+            let tools = Arc::clone(tools);
+            let agent = Arc::clone(&self);
+            let key_clone = key.clone();
+            let query = incoming.content.clone();
+            tokio::spawn(async move {
+                let input = serde_json::json!({ "query": query, "limit": 5 });
+                let result = tools
+                    .execute(&ToolCall {
+                        id: "prefetch".to_string(),
+                        name: "workspace_search".to_string(),
+                        input,
+                    })
+                    .await;
+                agent
+                    .prefetch_cache
+                    .lock()
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to send response: {e:#}"))?;
-            }
-
-            // Spawn background prefetch for next turn
-            if let Some(tools) = &self.tools {
-                let tools = Arc::clone(tools);
-                let agent = Arc::clone(&self);
-                let key_clone = key.clone();
-                let query = incoming.content.clone();
-                tokio::spawn(async move {
-                    let input = serde_json::json!({ "query": query, "limit": 5 });
-                    let result = tools
-                        .execute(&ToolCall {
-                            id: "prefetch".to_string(),
-                            name: "workspace_search".to_string(),
-                            input,
-                        })
-                        .await;
-                    agent
-                        .prefetch_cache
-                        .lock()
-                        .await
-                        .insert(key_clone, result.text);
-                });
-            }
+                    .insert(key_clone, result.text);
+            });
         }
 
         Ok(())
@@ -1228,5 +1267,346 @@ mod tests {
         }
 
         assert_eq!(permitted.len() + refused.len(), calls.len());
+    }
+
+    // -------------------------------------------------------------------
+    // Turn-driving harness
+    //
+    // Everything below builds a real `Agent` — scripted provider, tool
+    // set, session store — so a test can drive `handle_message` end to
+    // end and observe what got sent, rather than only reaching the
+    // tool-policy gate as the tests above do. Nothing here is production
+    // code: it exists so Task 6b's delivery-shape tests have something
+    // to run against.
+    // -------------------------------------------------------------------
+
+    /// Records what the agent sent, so a test can assert on the shape of a
+    /// turn's delivery rather than only its final text.
+    ///
+    /// `fail_first` exists for one test: a send that the channel refuses
+    /// must not take the rest of the turn down with it. Counting calls
+    /// rather than holding a queue of outcomes keeps the stub to the one
+    /// behaviour that is actually needed.
+    ///
+    /// `typing_started_after` exists for FIX 2's test: it records, for
+    /// each `start_typing` call, how many messages `sent` already held
+    /// at that moment. That ties a typing restart to its position in
+    /// the turn rather than just counting restarts, so a test can
+    /// assert the indicator is restarted after a mid-turn send but not
+    /// after the turn's last one — the exact ordering `send_turn_message`
+    /// is responsible for.
+    struct RecordingChannel {
+        sent: Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>,
+        fail_first: bool,
+        calls: Mutex<usize>,
+        typing_started_after: Arc<Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::channel::Channel for RecordingChannel {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        async fn send(&self, message: &crate::channel::OutgoingMessage) -> anyhow::Result<()> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if self.fail_first && *calls == 1 {
+                return Err(anyhow::anyhow!("simulated send failure"));
+            }
+            self.sent.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+
+        async fn start_typing(&self, _room_id: &str) -> anyhow::Result<()> {
+            let sent_so_far = self.sent.lock().unwrap().len();
+            self.typing_started_after.lock().unwrap().push(sent_so_far);
+            Ok(())
+        }
+
+        // `Channels::listen_all` is never driven in these tests —
+        // `handle_message` is called directly — so this only needs to
+        // satisfy the trait, not do anything.
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<crate::channel::IncomingMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What a test gets back from `build_test_agent` and its wrappers: the
+    /// agent itself, what it sent, and — per FIX 2's
+    /// `typing_started_after` — how many sends preceded each typing
+    /// restart. Named so the three-`Arc` return type doesn't trip
+    /// clippy's `type_complexity` lint at every one of these functions.
+    type TestAgentHandles = (
+        Arc<super::Agent>,
+        Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>,
+        Arc<Mutex<Vec<usize>>>,
+    );
+
+    /// Build an `Agent` whose provider replays `responses` in order and
+    /// whose only channel records what it is asked to send.
+    ///
+    /// Mirrors `ServeState::build_for_test` (src/serve/mod.rs): leak the
+    /// `TempDir` on purpose — this is a test binary and the OS reclaims
+    /// the directory when it exits.
+    fn build_test_agent(
+        responses: Vec<crate::provider::ChatResponse>,
+        fail_first: bool,
+    ) -> TestAgentHandles {
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let base = dir.path().to_path_buf();
+
+        // Minimal config: no room_profile mapping for the test room, so
+        // `ProviderRegistry::for_room` falls through to the "anthropic"
+        // key — which `for_test` below points at the same stub.
+        let config = crate::config::Config::parse_for_test(
+            r#"
+[anthropic]
+api_key = "test"
+"#,
+        );
+
+        let provider = crate::serve::StubProvider::new(responses);
+        // Registered under both names, as `ServeState::build_for_test_with`
+        // does: the fallback path (no room_profile match) resolves the
+        // built-in "anthropic" key.
+        let registry = crate::provider::registry::ProviderRegistry::for_test(
+            &["anthropic", "stub"],
+            Arc::new(provider),
+        );
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let typing_started_after = Arc::new(Mutex::new(Vec::new()));
+        let channel = RecordingChannel {
+            sent: Arc::clone(&sent),
+            fail_first,
+            calls: Mutex::new(0),
+            typing_started_after: Arc::clone(&typing_started_after),
+        };
+        let channels = crate::channel::Channels::new(
+            vec![(
+                "test".to_string(),
+                Arc::new(channel) as Arc<dyn crate::channel::Channel>,
+            )],
+            std::collections::HashMap::new(),
+        );
+
+        let workspace = Arc::new(crate::workspace::Workspace::new(
+            base.join("workspace"),
+            crate::config::DigestConfig::default(),
+        ));
+
+        // Registers the same `echo` tool `ServeState::build_for_test`
+        // advertises, so Task 6b's scripted tool calls (which name
+        // `echo`) resolve without needing the full
+        // `crate::tools::default_tool_set` wiring.
+        let tools = Arc::new(crate::tools::ToolSet::new(
+            vec![Box::new(crate::serve::EchoTool::new())],
+            Vec::new(),
+        ));
+
+        let session_store = Arc::new(crate::session::SessionStore::new(
+            base.join("sessions"),
+            "test",
+            None,
+        ));
+
+        let agent = super::Agent::new(
+            config,
+            Arc::new(channels),
+            Arc::new(registry),
+            workspace,
+            Some(tools),
+            session_store,
+            None,
+            None,
+        );
+
+        (Arc::new(agent), sent, typing_started_after)
+    }
+
+    /// Convenience wrapper over `build_test_agent` with a channel that
+    /// accepts every send.
+    fn agent_with_scripted_provider(
+        responses: Vec<crate::provider::ChatResponse>,
+    ) -> TestAgentHandles {
+        build_test_agent(responses, false)
+    }
+
+    /// Same, but the channel refuses the first send.
+    ///
+    /// Exists for the delivery-shape tests that need to prove a refused
+    /// send doesn't take the rest of a turn down with it — see
+    /// `a_failed_send_does_not_end_the_turn`.
+    fn agent_with_failing_first_send(
+        responses: Vec<crate::provider::ChatResponse>,
+    ) -> TestAgentHandles {
+        build_test_agent(responses, true)
+    }
+
+    fn incoming(text: &str) -> crate::channel::IncomingMessage {
+        crate::channel::IncomingMessage {
+            id: "m1".to_string(),
+            sender: "@tester:example.com".to_string(),
+            content: text.to_string(),
+            room_id: "test-room".to_string(),
+            timestamp: 0,
+            thread_id: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// The test harness itself. `Agent` gets built, `handle_message` runs
+    /// one turn, and the reply lands on the stub channel. Task 6b's
+    /// behaviour tests all ride on this, so nothing further proceeds
+    /// until this passes.
+    #[tokio::test]
+    async fn the_test_harness_drives_a_turn_end_to_end() {
+        let (agent, sent, _typing) =
+            agent_with_scripted_provider(vec![crate::provider::ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }]);
+
+        agent.handle_message(incoming("hello")).await.unwrap();
+
+        let bodies: Vec<String> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(bodies, vec!["ok".to_string()]);
+    }
+
+    /// ツールを呼ぶターンは複数メッセージに分かれる。「○○するぞ」と
+    /// 「○○したぞ」が1通に潰れていたのが、この変更の直す対象である。
+    #[tokio::test]
+    async fn a_tool_using_turn_is_delivered_as_several_messages() {
+        let (agent, sent, _typing) = agent_with_scripted_provider(vec![
+            crate::provider::ChatResponse {
+                text: Some("調べます".to_string()),
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({ "text": "ping" }),
+                }],
+                stop_reason: None,
+            },
+            crate::provider::ChatResponse {
+                text: Some("見つかりました".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            },
+        ]);
+
+        agent.handle_message(incoming("なぜ遅い")).await.unwrap();
+
+        let bodies: Vec<String> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(
+            bodies,
+            vec!["調べます".to_string(), "見つかりました".to_string()]
+        );
+    }
+
+    /// ツールを呼ばない普通の会話は、今までどおり1通のまま。この変更で
+    /// 日常の会話が細切れになってはいけない。
+    #[tokio::test]
+    async fn an_ordinary_reply_is_still_one_message() {
+        let (agent, sent, _typing) =
+            agent_with_scripted_provider(vec![crate::provider::ChatResponse {
+                text: Some("こんにちは".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }]);
+
+        agent.handle_message(incoming("やあ")).await.unwrap();
+
+        let bodies: Vec<String> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(bodies, vec!["こんにちは".to_string()]);
+    }
+
+    /// 送信に失敗してもターンは落ちない。上限ぶんの連投がレート制限に
+    /// 触れうる以上、1通の失敗でターン全体を失うのは高すぎる。
+    #[tokio::test]
+    async fn a_failed_send_does_not_end_the_turn() {
+        let (agent, sent, _typing) = agent_with_failing_first_send(vec![
+            crate::provider::ChatResponse {
+                text: Some("最初".to_string()),
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({ "text": "ping" }),
+                }],
+                stop_reason: None,
+            },
+            crate::provider::ChatResponse {
+                text: Some("最後".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            },
+        ]);
+
+        let result = agent.handle_message(incoming("やって")).await;
+
+        assert!(result.is_ok(), "1通の失敗でターンを落とさない");
+        let bodies: Vec<String> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(bodies, vec!["最後".to_string()], "後続は届く");
+    }
+
+    /// FIX 2: typing restarts after a mid-turn send (more of the turn is
+    /// still coming) but must not restart after the turn's *last* send.
+    /// On Discord that restart would strand the ~10s indicator with
+    /// nothing left in the turn to clear it — see the doc on
+    /// `send_turn_message`.
+    ///
+    /// `typing_started_after` records, for every restart, how many
+    /// messages `sent` held at that moment: one entry for
+    /// `handle_message`'s own start-of-turn call (before anything is
+    /// sent, so `0`), one for the mid-turn send that follows the first,
+    /// tool-calling round (so `1`) — and, if the old unconditional
+    /// restart ever came back, a trailing `2` for the final send. The
+    /// exact sequence `[0, 1]` is the pin.
+    #[tokio::test]
+    async fn typing_is_not_restarted_after_the_turns_last_send() {
+        let (agent, _sent, typing) = agent_with_scripted_provider(vec![
+            crate::provider::ChatResponse {
+                text: Some("調べます".to_string()),
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({ "text": "ping" }),
+                }],
+                stop_reason: None,
+            },
+            crate::provider::ChatResponse {
+                text: Some("見つかりました".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            },
+        ]);
+
+        agent.handle_message(incoming("なぜ遅い")).await.unwrap();
+
+        assert_eq!(*typing.lock().unwrap(), vec![0, 1]);
     }
 }

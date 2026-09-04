@@ -9,9 +9,10 @@
 //!    the caller's own `progress` unchanged (see [`TurnContext`] in
 //!    `src/serve/mod.rs`). If delegation ran under its own host or its
 //!    own origin, "ask a subagent" would become a way to get done by
-//!    proxy what the model was refused directly. (One exception, scoped
-//!    narrowly: `turn_error` is *not* forwarded unchanged — see
-//!    `SubagentTool::execute`'s host wrapper, `ParentHostSansTurnError`,
+//!    proxy what the model was refused directly. (Three exceptions,
+//!    each scoped narrowly: `turn_error`, `message_chunk`, and
+//!    `round_budget` are *not* forwarded unchanged — see
+//!    `SubagentTool::execute`'s host wrapper, `SubagentHost`,
 //!    below.)
 //! 2. **The system prompt is the definition and nothing else.** See
 //!    [`subagent_system_prompt`].
@@ -56,8 +57,10 @@
 //! used to be a real hazard: `ToolSet::execute` held its read guard
 //! across the whole call to `Tool::execute_full`, so for `subagent` the
 //! guard was held across an entire nested conversation — up to
-//! `MAX_TOOL_ROUNDS` provider calls plus however long a human takes to
-//! answer an `AcpProgress::approve` prompt. `tokio::sync::RwLock` is
+//! `[tools.tool_rounds]`'s `unattended` provider calls (a subagent is
+//! always judged by that half of the budget, never `interactive`) plus
+//! however long a human takes to answer an `AcpProgress::approve`
+//! prompt. `tokio::sync::RwLock` is
 //! task-fair: a reader blocks as soon as a writer is queued, so a
 //! concurrent write (an MCP server's `tools/list_changed` refresh via
 //! `ToolSet::refresh_if_needed`, or `mcp_reconnect`) queued behind that
@@ -222,8 +225,13 @@ fn build_spec(agents: &[AgentDef]) -> ToolSpec {
     }
 }
 
-/// Forwards every `TurnHost` method to the parent's host except
-/// `turn_error`, which it swallows.
+/// Forwards every `TurnHost` method to the parent's host except three:
+/// `turn_error`, `message_chunk`, and `round_budget`, each special-cased
+/// for its own reason (see that method's doc below).
+///
+/// The name says what the type *is* — the host a subagent's nested turn
+/// runs under, mostly the parent's own — rather than naming any one of
+/// its exceptions, now that there are three of them.
 ///
 /// A subagent's nested `TurnLoop` runs with `progress: &ctx.progress` —
 /// the parent's own host, by design (see the module doc's first
@@ -256,12 +264,12 @@ fn build_spec(agents: &[AgentDef]) -> ToolSpec {
 /// `approve()`, `acp_client()`, `client_fs_caps()`,
 /// `client_terminal_cap()`, `tool_start`/`tool_end`/`tool_allowed` all
 /// still resolve to the parent's own host, because those are what keep
-/// delegation inside the same permission gate — only `turn_error` is
-/// special-cased.
-struct ParentHostSansTurnError(std::sync::Arc<dyn crate::serve::TurnHost>);
+/// delegation inside the same permission gate — `turn_error`,
+/// `message_chunk`, and `round_budget` are the three special-cased.
+struct SubagentHost(std::sync::Arc<dyn crate::serve::TurnHost>);
 
 #[async_trait]
-impl crate::serve::TurnHost for ParentHostSansTurnError {
+impl crate::serve::TurnHost for SubagentHost {
     async fn tool_start(&self, id: &str, name: &str) {
         self.0.tool_start(id, name).await;
     }
@@ -275,6 +283,31 @@ impl crate::serve::TurnHost for ParentHostSansTurnError {
     /// also masquerade as *this* turn's terminal outcome, and — per the
     /// type doc — it does not reach the parent model either.
     async fn turn_error(&self, _message: &str) {}
+
+    /// Swallowed, like `turn_error` and for a related reason: a
+    /// subagent's prose is not the parent agent's speech. Forwarding it
+    /// would put the delegate's narration into the editor under the
+    /// parent's name, which misattributes it — and the parent has no way
+    /// to correct the record, because by the time it sees the subagent's
+    /// answer the chunks are already on screen.
+    ///
+    /// Nothing is lost: what the subagent concluded comes back as the
+    /// `subagent` tool's result, which is where the parent reads it and
+    /// where the user sees it attributed correctly.
+    ///
+    /// `tool_start`/`tool_end` still forward, deliberately — see the
+    /// module doc. Those are what make a permission prompt for a
+    /// subagent's call legible as coming from *this* session.
+    async fn message_chunk(&self, _text: &str) {}
+
+    /// Not delegated, and this one must not be: a nested turn under an
+    /// unbounded parent would itself be unbounded, so a parent that
+    /// delegates in a loop would have no cap anywhere. A subagent is
+    /// always judged `unattended` — nobody can cancel it directly, only
+    /// the whole parent turn — whatever route the parent came in on.
+    fn round_budget(&self) -> crate::serve::RoundBudget {
+        crate::serve::RoundBudget::Unattended
+    }
 
     fn origin(&self) -> crate::tools::policy::Origin {
         self.0.origin()
@@ -590,12 +623,11 @@ impl SubagentTool {
         // subagent must reach the same person, judged by the same
         // origin. A different host here would make delegation a way
         // around the gate. `turn_error` is the one method NOT forwarded
-        // unchanged — see `ParentHostSansTurnError`'s doc for why a
+        // unchanged — see `SubagentHost`'s doc for why a
         // subagent's own provider failure must not report itself as
         // *this request's* terminal outcome.
-        let progress: std::sync::Arc<dyn crate::serve::TurnHost> = std::sync::Arc::new(
-            ParentHostSansTurnError(std::sync::Arc::clone(&ctx.progress)),
-        );
+        let progress: std::sync::Arc<dyn crate::serve::TurnHost> =
+            std::sync::Arc::new(SubagentHost(std::sync::Arc::clone(&ctx.progress)));
 
         let (text, stop) = crate::serve::TurnLoop {
             state: &ctx.state,
@@ -937,7 +969,7 @@ mod tests {
     }
 
     /// A minimal `TurnHost` that records every call it receives, so a
-    /// test can tell `ParentHostSansTurnError` actually forwards to the
+    /// test can tell `SubagentHost` actually forwards to the
     /// wrapped host rather than silently no-op'ing everything.
     #[derive(Default)]
     struct RecordingHost {
@@ -966,7 +998,7 @@ mod tests {
     #[tokio::test]
     async fn turn_error_is_swallowed_not_forwarded() {
         let inner = std::sync::Arc::new(RecordingHost::default());
-        let wrapped = ParentHostSansTurnError(inner.clone());
+        let wrapped = SubagentHost(inner.clone());
 
         crate::serve::TurnHost::turn_error(&wrapped, "the subagent's provider broke").await;
 
@@ -976,12 +1008,67 @@ mod tests {
         );
     }
 
+    /// サブエージェントの散文は親のストリームに漏れない。漏れると、
+    /// 委任先が言ったことが親エージェント自身の発言として編集画面に出る
+    /// —— 誤帰属であり、報告はツール結果として戻ってくる。
+    #[tokio::test]
+    async fn a_subagents_prose_does_not_reach_the_parents_stream() {
+        #[derive(Default)]
+        struct ChunkRecorder {
+            chunks: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl crate::serve::TurnHost for ChunkRecorder {
+            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_end(&self, _id: &str, _name: &str) {}
+            async fn turn_error(&self, _message: &str) {}
+            async fn message_chunk(&self, text: &str) {
+                self.chunks.lock().unwrap().push(text.to_string());
+            }
+        }
+
+        let parent = std::sync::Arc::new(ChunkRecorder::default());
+        let wrapped = SubagentHost(
+            std::sync::Arc::clone(&parent) as std::sync::Arc<dyn crate::serve::TurnHost>
+        );
+
+        crate::serve::TurnHost::message_chunk(&wrapped, "the subagent's own words").await;
+
+        let seen = parent.chunks.lock().unwrap().clone();
+        assert!(seen.is_empty(), "親には届かない: {seen:?}");
+    }
+
+    /// 親が無制限でも、サブエージェントは有限で回る。委譲していたら
+    /// 入れ子が無制限になり、上限が二乗で消える。
+    #[test]
+    fn a_subagent_is_unattended_even_under_an_interactive_parent() {
+        struct InteractiveParent;
+        #[async_trait]
+        impl crate::serve::TurnHost for InteractiveParent {
+            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_end(&self, _id: &str, _name: &str) {}
+            async fn turn_error(&self, _message: &str) {}
+            fn round_budget(&self) -> crate::serve::RoundBudget {
+                crate::serve::RoundBudget::Interactive
+            }
+        }
+
+        let wrapped =
+            SubagentHost(std::sync::Arc::new(InteractiveParent)
+                as std::sync::Arc<dyn crate::serve::TurnHost>);
+
+        assert_eq!(
+            crate::serve::TurnHost::round_budget(&wrapped),
+            crate::serve::RoundBudget::Unattended
+        );
+    }
+
     /// Every other method forwards unchanged — delegation must stay
     /// inside the same permission gate the parent itself is judged by.
     #[tokio::test]
     async fn every_other_method_forwards_to_the_parent_host() {
         let inner = std::sync::Arc::new(RecordingHost::default());
-        let wrapped = ParentHostSansTurnError(inner.clone());
+        let wrapped = SubagentHost(inner.clone());
 
         assert_eq!(
             crate::serve::TurnHost::origin(&wrapped),
