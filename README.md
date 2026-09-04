@@ -784,6 +784,20 @@ development work and wrong for an everyday conversation:
 skills = true   # default false
 ```
 
+Two gates, both required: this flag, and an ACP client that declared terminal
+support. When the tools are missing, the connection log says which gate is shut
+— every `initialize` records what the client can do:
+
+```
+INFO ACP: connection accepted for room profile 'dev'
+INFO ACP: Zed 0.209.3 initialized: fs.read=true fs.write=true terminal=true
+```
+
+A client with `terminal=false` will never be offered them however the namespace
+is configured; with `terminal=true` and no tools in sight, the namespace flag is
+the one to check — and misspelling it or putting it under `[room_profile.<name>]`
+now warns at startup (see [Keys nothing reads](#keys-nothing-reads)).
+
 ### The four tools
 
 | Tool | `ToolKind` | Does |
