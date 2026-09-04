@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use transport::{
-    HttpTransport, McpTransport, NotificationHandler, ServerRequestHandler, StdioTransport,
+    HttpTransport, McpTransport, NotificationHandler, ServerRequestHandler, SessionExpired,
+    StdioTransport,
 };
 
 // ---------------------------------------------------------------------------
@@ -185,8 +186,41 @@ impl McpClient {
         })
     }
 
-    /// Send a JSON-RPC request through the transport.
+    /// Send a JSON-RPC request, re-establishing the session once if the
+    /// server has forgotten it.
+    ///
+    /// A Streamable HTTP server drops idle sessions — `rmcp` after five
+    /// minutes — and the id this client holds is only ever refreshed by a
+    /// handshake, which until now happened exactly once at startup. So a
+    /// quiet afternoon was enough to turn every later tool call into a
+    /// permanent failure that nothing but a restart or a hand-run
+    /// `mcp_reconnect` could clear.
+    ///
+    /// The retry is deliberately once. A fresh session being rejected too is
+    /// not staleness, and repeating the handshake against a server that is
+    /// down or misconfigured only buries the real error.
     async fn send(&self, method: &str, params: Value) -> Result<Value> {
+        match self.send_once(method, params.clone()).await {
+            Err(e) if e.downcast_ref::<SessionExpired>().is_some() => {
+                info!(
+                    "MCP '{}': {method} found the session gone; re-establishing it",
+                    self.name
+                );
+                self.connect().await.with_context(|| {
+                    format!("MCP '{}': failed to re-establish the session", self.name)
+                })?;
+                self.send_once(method, params).await
+            }
+            other => other,
+        }
+    }
+
+    /// Send a JSON-RPC request through the transport, exactly once.
+    ///
+    /// [`Self::connect`] uses this rather than [`Self::send`]: the recovery
+    /// path *is* the handshake, and routing the handshake back through it
+    /// would recurse.
+    async fn send_once(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id().await;
         let body = json!({
             "jsonrpc": "2.0",
@@ -225,7 +259,7 @@ impl McpClient {
             }
         });
 
-        let result = self.send("initialize", params).await?;
+        let result = self.send_once("initialize", params).await?;
         info!(
             "MCP '{}': connected (server: {})",
             self.name,
