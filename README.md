@@ -689,6 +689,39 @@ answers `401` before the WebSocket upgrade. Write it bare:
 `-H` takes multiple values, so it has to come *after* the URL or it
 swallows it.
 
+### Idle connections and the proxy in front
+
+A reverse proxy terminating TLS for `/acp` will close a WebSocket that
+carries no traffic, and ACP gives it none to see: an editor with its panel
+open but nothing being asked is silent for as long as the person is away.
+Measured against one HAProxy, the tunnel is cut at **1800.005s** of
+silence.
+
+What that looks like is worse than a disconnect. The agent logs
+
+```
+ACP: connection for room profile '…' ended with an error: Internal error: {
+  "data": "IO error: Connection reset by peer (os error 104)"
+}
+```
+
+while on the editor's machine `websocat` **does not exit** — its socket
+sits in `CLOSE-WAIT` and the process stays up. Zed sees a live subprocess
+with a writable stdin, so it keeps sending into a dead socket and never
+reconnects. The symptom is an agent that has stopped answering, not an
+error.
+
+The agent prevents this by pinging on its own, every
+`[acp] keepalive_secs` seconds (30 by default), so **nothing needs
+configuring on the editor's side** — no `--ping-interval`, no change to
+`agent_servers`. Set `keepalive_secs` lower if something in front of the
+endpoint is stricter than nginx's 60s `proxy_read_timeout`, or `0` to send
+no pings at all.
+
+If you are reading this because connections still drop, the interval is
+the first thing to check against the proxy's own timeout — `timeout
+tunnel` in HAProxy, `proxy_read_timeout` in nginx.
+
 ## Skills
 
 A skill is a written procedure for a kind of work — planning, TDD,

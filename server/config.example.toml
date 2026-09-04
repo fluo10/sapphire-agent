@@ -647,3 +647,19 @@ steps  = [
 # `[[tools.mcp_servers]]` above).
 [acp]
 enabled = false
+
+# Seconds between server-initiated WebSocket pings. 0 sends none.
+#
+# ACP has no idle traffic of its own — an editor with its panel open but
+# nothing being asked sends nothing for as long as the person is away — and
+# a reverse proxy in front of this endpoint closes a connection that stays
+# silent. Measured against one HAProxy: 1800.005s, arriving here as
+# "Connection reset by peer" and arriving at the editor as a `websocat`
+# stuck in CLOSE-WAIT that never exits, so the editor keeps writing into a
+# dead socket instead of reconnecting.
+#
+# The default is half of the tightest common proxy default (nginx's 60s
+# proxy_read_timeout). Lower it if something in front is stricter still.
+# The client answers each ping with an automatic pong, so one timer keeps
+# traffic on the tunnel in both directions.
+#keepalive_secs = 30
