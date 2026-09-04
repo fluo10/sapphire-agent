@@ -2868,4 +2868,15 @@ embedding_num_threads = 4
         assert_eq!(tools.tool_rounds.interactive, 40);
         assert_eq!(tools.tool_rounds.unattended, 3);
     }
+
+    /// A table that names one field still gets the default for the other.
+    /// This is what the per-field `#[serde(default = "…")]` attributes are
+    /// for — the container-level default only covers a missing table.
+    #[test]
+    fn a_partial_tool_rounds_table_fills_the_other_field_from_the_default() {
+        let tools: crate::config::ToolsConfig =
+            toml::from_str("[tool_rounds]\ninteractive = 40").unwrap();
+        assert_eq!(tools.tool_rounds.interactive, 40);
+        assert_eq!(tools.tool_rounds.unattended, 25);
+    }
 }
