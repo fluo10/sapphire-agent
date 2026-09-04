@@ -224,6 +224,52 @@ pub fn provenance_of(workspace: &toml::Value, host: &toml::Value) -> BTreeMap<St
     out
 }
 
+/// Which layer supplied the key at `path`, for a path that is not
+/// necessarily a leaf.
+///
+/// [`provenance_of`] records leaves, because a *value* is what `verify`
+/// reports a layer for. An unknown key is not always a leaf: serde names
+/// the key it could not place, so an entire unrecognised table arrives as
+/// `foo` with only `foo.bar` and `foo.baz` recorded, and a key inside an
+/// array of tables arrives as `tools.mcp_servers.0.typo` where only the
+/// array itself was recorded. Hence the two fallbacks — descendants
+/// first, then ancestors.
+///
+/// `None` when nothing matches, which the caller renders as "the
+/// configuration" rather than naming the wrong file.
+pub fn layer_of(path: &str, provenance: &BTreeMap<String, Layer>) -> Option<Layer> {
+    if let Some(layer) = provenance.get(path) {
+        return Some(*layer);
+    }
+
+    // Descendants: the host wins wherever both layers set something
+    // beneath the path, the same way `deep_merge` resolves the value.
+    let prefix = format!("{path}.");
+    let mut found = None;
+    for (leaf, layer) in provenance.range(prefix.clone()..) {
+        if !leaf.starts_with(&prefix) {
+            break;
+        }
+        match layer {
+            Layer::Host => return Some(Layer::Host),
+            Layer::Workspace => found = Some(Layer::Workspace),
+        }
+    }
+    if found.is_some() {
+        return found;
+    }
+
+    // Ancestors, nearest first: the array or table the key sits inside.
+    let mut rest = path;
+    while let Some((parent, _)) = rest.rsplit_once('.') {
+        if let Some(layer) = provenance.get(parent) {
+            return Some(*layer);
+        }
+        rest = parent;
+    }
+    None
+}
+
 /// Collect the dot-joined path of every leaf (non-table) value.
 fn leaf_paths(value: &toml::Value, trail: &mut Vec<String>, out: &mut Vec<String>) {
     match value {
@@ -241,6 +287,59 @@ fn leaf_paths(value: &toml::Value, trail: &mut Vec<String>, out: &mut Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provenance(entries: &[(&str, Layer)]) -> BTreeMap<String, Layer> {
+        entries
+            .iter()
+            .map(|(path, layer)| ((*path).to_string(), *layer))
+            .collect()
+    }
+
+    #[test]
+    fn layer_of_reads_an_exact_leaf() {
+        let p = provenance(&[("room_profile.default.skills", Layer::Host)]);
+        assert_eq!(
+            layer_of("room_profile.default.skills", &p),
+            Some(Layer::Host)
+        );
+    }
+
+    /// A whole unrecognised table is reported by serde as the table's own
+    /// key, which is never a leaf and so is never in `provenance`.
+    #[test]
+    fn layer_of_falls_back_to_descendants() {
+        let p = provenance(&[
+            ("typo_table.a", Layer::Workspace),
+            ("typo_table.b", Layer::Workspace),
+        ]);
+        assert_eq!(layer_of("typo_table", &p), Some(Layer::Workspace));
+    }
+
+    /// The host wins the merge, so it wins the attribution too — reporting
+    /// the workspace file for a key the host also sets would send the
+    /// person to a file where deleting it changes nothing.
+    #[test]
+    fn layer_of_prefers_the_host_among_descendants() {
+        let p = provenance(&[
+            ("typo_table.a", Layer::Workspace),
+            ("typo_table.b", Layer::Host),
+        ]);
+        assert_eq!(layer_of("typo_table", &p), Some(Layer::Host));
+    }
+
+    /// `leaf_paths` stops at an array, so a key inside an array of tables
+    /// has no descendant of its own recorded — only the array above it.
+    #[test]
+    fn layer_of_falls_back_to_an_ancestor() {
+        let p = provenance(&[("tools.mcp_servers", Layer::Host)]);
+        assert_eq!(layer_of("tools.mcp_servers.0.typo", &p), Some(Layer::Host));
+    }
+
+    #[test]
+    fn layer_of_is_none_when_nothing_matches() {
+        let p = provenance(&[("anthropic.model", Layer::Host)]);
+        assert_eq!(layer_of("elsewhere.entirely", &p), None);
+    }
 
     #[test]
     fn exact_leaf_is_allowed() {

@@ -152,6 +152,35 @@ fn layer_tag(
     }
 }
 
+/// Group unrecognised config keys by the file they came from, for one
+/// warning per file rather than one per key.
+///
+/// The file is named through `provenance` so the message points at the
+/// file the person has to edit; a key that cannot be attributed to either
+/// layer is grouped under a neutral label rather than blamed on the host
+/// config, which would send them to the wrong file.
+///
+/// Returns pairs rather than logging directly so `verify` can print the
+/// same grouping it warns with, and so a test can read it.
+fn group_unknown_keys<'a>(
+    unknown: &'a [String],
+    provenance: &std::collections::BTreeMap<String, config_layer::Layer>,
+    host_path: &std::path::Path,
+    workspace_path: Option<&std::path::Path>,
+) -> Vec<(String, Vec<&'a str>)> {
+    let mut by_file: std::collections::BTreeMap<String, Vec<&'a str>> = Default::default();
+    for key in unknown {
+        let file = match config_layer::layer_of(key, provenance) {
+            Some(config_layer::Layer::Workspace) => workspace_path.map(|p| p.display().to_string()),
+            Some(config_layer::Layer::Host) => Some(host_path.display().to_string()),
+            None => None,
+        }
+        .unwrap_or_else(|| "the configuration".to_string());
+        by_file.entry(file).or_default().push(key.as_str());
+    }
+    by_file.into_iter().collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     fmt()
@@ -184,6 +213,7 @@ async fn main() -> Result<()> {
     let LoadedConfig {
         config,
         rejected,
+        unknown,
         provenance,
         workspace_path,
     } = Config::load_layered(&config_path)
@@ -201,6 +231,21 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| "<unknown>".to_string()),
             rejected.join(", "),
             config_path.display()
+        );
+    }
+
+    for (file, keys) in group_unknown_keys(
+        &unknown,
+        &provenance,
+        &config_path,
+        workspace_path.as_deref(),
+    ) {
+        tracing::warn!(
+            "Ignoring {} unrecognised key(s) in {file}: {}. Nothing reads these, so the \
+             agent is running as if they were absent — check for a typo, or for a setting \
+             written under the wrong table.",
+            keys.len(),
+            keys.join(", ")
         );
     }
 
@@ -240,6 +285,17 @@ async fn main() -> Result<()> {
                 println!("Config INVALID:");
                 for err in &profile_errors {
                     println!("  - {err}");
+                }
+            }
+            for (file, keys) in group_unknown_keys(
+                &unknown,
+                &provenance,
+                &config_path,
+                workspace_path.as_deref(),
+            ) {
+                println!("  Unknown keys      : {file}");
+                for key in keys {
+                    println!("    {key} (ignored)");
                 }
             }
             // The device -> room_profile binding is written by hand, so it
@@ -1497,6 +1553,66 @@ mod tests {
             room_profile: None,
             title: None,
         }
+    }
+
+    /// One warning per file, with the file named from provenance: a
+    /// message that says only "unknown key `x.y`" leaves the person
+    /// grepping two files for it.
+    #[test]
+    fn unknown_keys_are_grouped_under_the_file_that_supplied_them() {
+        let provenance = std::collections::BTreeMap::from([
+            (
+                "room_profile.default.skills".to_string(),
+                config_layer::Layer::Host,
+            ),
+            (
+                "memory_namespace.dev.skils".to_string(),
+                config_layer::Layer::Workspace,
+            ),
+        ]);
+        let unknown = vec![
+            "memory_namespace.dev.skils".to_string(),
+            "room_profile.default.skills".to_string(),
+        ];
+
+        let grouped = group_unknown_keys(
+            &unknown,
+            &provenance,
+            std::path::Path::new("/etc/host.toml"),
+            Some(std::path::Path::new("/ws/.sapphire-agent/config.toml")),
+        );
+
+        assert_eq!(
+            grouped,
+            vec![
+                (
+                    "/etc/host.toml".to_string(),
+                    vec!["room_profile.default.skills"]
+                ),
+                (
+                    "/ws/.sapphire-agent/config.toml".to_string(),
+                    vec!["memory_namespace.dev.skils"]
+                ),
+            ]
+        );
+    }
+
+    /// A key attributed to the workspace layer when no workspace file was
+    /// read cannot name a file, and must not fall through to the host path
+    /// — that would point at a file the key is not in.
+    #[test]
+    fn an_unattributable_unknown_key_names_no_file() {
+        let unknown = ["stray".to_string()];
+        let grouped = group_unknown_keys(
+            &unknown,
+            &std::collections::BTreeMap::new(),
+            std::path::Path::new("/etc/host.toml"),
+            None,
+        );
+        assert_eq!(
+            grouped,
+            vec![("the configuration".to_string(), vec!["stray"])]
+        );
     }
 
     #[test]
