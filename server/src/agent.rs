@@ -680,10 +680,26 @@ impl Agent {
     /// whole turn's remaining work to one refused send would be a much
     /// worse outcome than a gap in the narration.
     ///
-    /// Typing is restarted after each send: the indicator stops on its
-    /// own when a message lands, and a turn that goes quiet while it is
-    /// still working is exactly what this change exists to prevent.
-    async fn send_turn_message(&self, incoming: &crate::channel::IncomingMessage, text: &str) {
+    /// Typing is restarted after a send only when `more_to_come` is
+    /// true: the indicator stops on its own when a message lands, and a
+    /// turn that goes quiet while it is still working is exactly what
+    /// this change exists to prevent — but that only holds while more
+    /// of the turn is still ahead. Callers pass `true` from the
+    /// tool-call branch (another round is coming) and `false` from the
+    /// tool-less branch that ends the turn. Restarting unconditionally,
+    /// including on that last send, is harmless on Matrix but not on
+    /// Discord: `stop_typing` there is a no-op (Discord's indicator
+    /// expires on its own and cannot be cancelled — see the comment at
+    /// `channel/discord.rs:217`), and `broadcast_typing` lasts about
+    /// ten seconds, so a restart on the final send strands the bot
+    /// looking like it's still typing for ten seconds after the turn is
+    /// actually done.
+    async fn send_turn_message(
+        &self,
+        incoming: &crate::channel::IncomingMessage,
+        text: &str,
+        more_to_come: bool,
+    ) {
         let out = OutgoingMessage {
             content: text.to_string(),
             room_id: incoming.room_id.clone(),
@@ -692,7 +708,9 @@ impl Agent {
         if let Err(e) = self.channels.send(&out).await {
             warn!("Failed to send a turn message: {e:#}");
         }
-        let _ = self.channels.start_typing(&incoming.room_id).await;
+        if more_to_come {
+            let _ = self.channels.start_typing(&incoming.room_id).await;
+        }
     }
 
     async fn handle_message(
@@ -867,7 +885,9 @@ impl Agent {
                         .push(msg.clone());
                     let _ = self.persist(&session_id, &msg);
                     if !text.is_empty() {
-                        self.send_turn_message(&incoming, &text).await;
+                        // Turn's last send: nothing follows, so don't
+                        // restart typing.
+                        self.send_turn_message(&incoming, &text, false).await;
                     }
                     break;
                 }
@@ -875,7 +895,9 @@ impl Agent {
                     round += 1;
                     let tool_calls = resp.tool_calls.clone();
                     if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
-                        self.send_turn_message(&incoming, t).await;
+                        // Another round is still ahead: restart typing
+                        // so it doesn't lapse while that round runs.
+                        self.send_turn_message(&incoming, t, true).await;
                     }
                     let msg =
                         ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
@@ -1265,10 +1287,19 @@ mod tests {
     /// must not take the rest of the turn down with it. Counting calls
     /// rather than holding a queue of outcomes keeps the stub to the one
     /// behaviour that is actually needed.
+    ///
+    /// `typing_started_after` exists for FIX 2's test: it records, for
+    /// each `start_typing` call, how many messages `sent` already held
+    /// at that moment. That ties a typing restart to its position in
+    /// the turn rather than just counting restarts, so a test can
+    /// assert the indicator is restarted after a mid-turn send but not
+    /// after the turn's last one — the exact ordering `send_turn_message`
+    /// is responsible for.
     struct RecordingChannel {
         sent: Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>,
         fail_first: bool,
         calls: Mutex<usize>,
+        typing_started_after: Arc<Mutex<Vec<usize>>>,
     }
 
     #[async_trait::async_trait]
@@ -1287,6 +1318,12 @@ mod tests {
             Ok(())
         }
 
+        async fn start_typing(&self, _room_id: &str) -> anyhow::Result<()> {
+            let sent_so_far = self.sent.lock().unwrap().len();
+            self.typing_started_after.lock().unwrap().push(sent_so_far);
+            Ok(())
+        }
+
         // `Channels::listen_all` is never driven in these tests —
         // `handle_message` is called directly — so this only needs to
         // satisfy the trait, not do anything.
@@ -1298,6 +1335,17 @@ mod tests {
         }
     }
 
+    /// What a test gets back from `build_test_agent` and its wrappers: the
+    /// agent itself, what it sent, and — per FIX 2's
+    /// `typing_started_after` — how many sends preceded each typing
+    /// restart. Named so the three-`Arc` return type doesn't trip
+    /// clippy's `type_complexity` lint at every one of these functions.
+    type TestAgentHandles = (
+        Arc<super::Agent>,
+        Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>,
+        Arc<Mutex<Vec<usize>>>,
+    );
+
     /// Build an `Agent` whose provider replays `responses` in order and
     /// whose only channel records what it is asked to send.
     ///
@@ -1307,10 +1355,7 @@ mod tests {
     fn build_test_agent(
         responses: Vec<crate::provider::ChatResponse>,
         fail_first: bool,
-    ) -> (
-        Arc<super::Agent>,
-        Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>,
-    ) {
+    ) -> TestAgentHandles {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let base = dir.path().to_path_buf();
 
@@ -1334,10 +1379,12 @@ api_key = "test"
         );
 
         let sent = Arc::new(Mutex::new(Vec::new()));
+        let typing_started_after = Arc::new(Mutex::new(Vec::new()));
         let channel = RecordingChannel {
             sent: Arc::clone(&sent),
             fail_first,
             calls: Mutex::new(0),
+            typing_started_after: Arc::clone(&typing_started_after),
         };
         let channels = crate::channel::Channels::new(
             vec![(
@@ -1378,21 +1425,14 @@ api_key = "test"
             None,
         );
 
-        (Arc::new(agent), sent)
+        (Arc::new(agent), sent, typing_started_after)
     }
 
-    /// Build an `Agent` whose provider replays `responses` in order and
-    /// whose only channel records what it is asked to send.
-    ///
-    /// Mirrors `ServeState::build_for_test` (src/serve/mod.rs): leak the
-    /// `TempDir` on purpose — this is a test binary and the OS reclaims
-    /// the directory when it exits.
+    /// Convenience wrapper over `build_test_agent` with a channel that
+    /// accepts every send.
     fn agent_with_scripted_provider(
         responses: Vec<crate::provider::ChatResponse>,
-    ) -> (
-        Arc<super::Agent>,
-        Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>,
-    ) {
+    ) -> TestAgentHandles {
         build_test_agent(responses, false)
     }
 
@@ -1403,10 +1443,7 @@ api_key = "test"
     /// `a_failed_send_does_not_end_the_turn`.
     fn agent_with_failing_first_send(
         responses: Vec<crate::provider::ChatResponse>,
-    ) -> (
-        Arc<super::Agent>,
-        Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>,
-    ) {
+    ) -> TestAgentHandles {
         build_test_agent(responses, true)
     }
 
@@ -1428,11 +1465,12 @@ api_key = "test"
     /// until this passes.
     #[tokio::test]
     async fn the_test_harness_drives_a_turn_end_to_end() {
-        let (agent, sent) = agent_with_scripted_provider(vec![crate::provider::ChatResponse {
-            text: Some("ok".to_string()),
-            tool_calls: Vec::new(),
-            stop_reason: None,
-        }]);
+        let (agent, sent, _typing) =
+            agent_with_scripted_provider(vec![crate::provider::ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }]);
 
         agent.handle_message(incoming("hello")).await.unwrap();
 
@@ -1449,7 +1487,7 @@ api_key = "test"
     /// 「○○したぞ」が1通に潰れていたのが、この変更の直す対象である。
     #[tokio::test]
     async fn a_tool_using_turn_is_delivered_as_several_messages() {
-        let (agent, sent) = agent_with_scripted_provider(vec![
+        let (agent, sent, _typing) = agent_with_scripted_provider(vec![
             crate::provider::ChatResponse {
                 text: Some("調べます".to_string()),
                 tool_calls: vec![crate::provider::ToolCall {
@@ -1484,11 +1522,12 @@ api_key = "test"
     /// 日常の会話が細切れになってはいけない。
     #[tokio::test]
     async fn an_ordinary_reply_is_still_one_message() {
-        let (agent, sent) = agent_with_scripted_provider(vec![crate::provider::ChatResponse {
-            text: Some("こんにちは".to_string()),
-            tool_calls: Vec::new(),
-            stop_reason: None,
-        }]);
+        let (agent, sent, _typing) =
+            agent_with_scripted_provider(vec![crate::provider::ChatResponse {
+                text: Some("こんにちは".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }]);
 
         agent.handle_message(incoming("やあ")).await.unwrap();
 
@@ -1505,7 +1544,7 @@ api_key = "test"
     /// 触れうる以上、1通の失敗でターン全体を失うのは高すぎる。
     #[tokio::test]
     async fn a_failed_send_does_not_end_the_turn() {
-        let (agent, sent) = agent_with_failing_first_send(vec![
+        let (agent, sent, _typing) = agent_with_failing_first_send(vec![
             crate::provider::ChatResponse {
                 text: Some("最初".to_string()),
                 tool_calls: vec![crate::provider::ToolCall {
@@ -1532,5 +1571,42 @@ api_key = "test"
             .map(|m| m.content.clone())
             .collect();
         assert_eq!(bodies, vec!["最後".to_string()], "後続は届く");
+    }
+
+    /// FIX 2: typing restarts after a mid-turn send (more of the turn is
+    /// still coming) but must not restart after the turn's *last* send.
+    /// On Discord that restart would strand the ~10s indicator with
+    /// nothing left in the turn to clear it — see the doc on
+    /// `send_turn_message`.
+    ///
+    /// `typing_started_after` records, for every restart, how many
+    /// messages `sent` held at that moment: one entry for
+    /// `handle_message`'s own start-of-turn call (before anything is
+    /// sent, so `0`), one for the mid-turn send that follows the first,
+    /// tool-calling round (so `1`) — and, if the old unconditional
+    /// restart ever came back, a trailing `2` for the final send. The
+    /// exact sequence `[0, 1]` is the pin.
+    #[tokio::test]
+    async fn typing_is_not_restarted_after_the_turns_last_send() {
+        let (agent, _sent, typing) = agent_with_scripted_provider(vec![
+            crate::provider::ChatResponse {
+                text: Some("調べます".to_string()),
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({ "text": "ping" }),
+                }],
+                stop_reason: None,
+            },
+            crate::provider::ChatResponse {
+                text: Some("見つかりました".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            },
+        ]);
+
+        agent.handle_message(incoming("なぜ遅い")).await.unwrap();
+
+        assert_eq!(*typing.lock().unwrap(), vec![0, 1]);
     }
 }
