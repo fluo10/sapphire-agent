@@ -626,9 +626,8 @@ impl SubagentTool {
         // unchanged — see `SubagentHost`'s doc for why a
         // subagent's own provider failure must not report itself as
         // *this request's* terminal outcome.
-        let progress: std::sync::Arc<dyn crate::serve::TurnHost> = std::sync::Arc::new(
-            SubagentHost(std::sync::Arc::clone(&ctx.progress)),
-        );
+        let progress: std::sync::Arc<dyn crate::serve::TurnHost> =
+            std::sync::Arc::new(SubagentHost(std::sync::Arc::clone(&ctx.progress)));
 
         let (text, stop) = crate::serve::TurnLoop {
             state: &ctx.state,
@@ -1030,7 +1029,7 @@ mod tests {
 
         let parent = std::sync::Arc::new(ChunkRecorder::default());
         let wrapped = SubagentHost(
-            std::sync::Arc::clone(&parent) as std::sync::Arc<dyn crate::serve::TurnHost>,
+            std::sync::Arc::clone(&parent) as std::sync::Arc<dyn crate::serve::TurnHost>
         );
 
         crate::serve::TurnHost::message_chunk(&wrapped, "the subagent's own words").await;
@@ -1054,9 +1053,9 @@ mod tests {
             }
         }
 
-        let wrapped = SubagentHost(
-            std::sync::Arc::new(InteractiveParent) as std::sync::Arc<dyn crate::serve::TurnHost>,
-        );
+        let wrapped =
+            SubagentHost(std::sync::Arc::new(InteractiveParent)
+                as std::sync::Arc<dyn crate::serve::TurnHost>);
 
         assert_eq!(
             crate::serve::TurnHost::round_budget(&wrapped),
