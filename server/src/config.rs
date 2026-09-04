@@ -746,7 +746,7 @@ fn default_serve_host() -> String {
 }
 
 fn default_serve_port() -> u16 {
-    9000
+    3170
 }
 
 /// Configuration for built-in tools.
@@ -1786,7 +1786,7 @@ api_key = "test"
 [[tools.mcp_servers]]
 name = "ledger"
 type = "http"
-url  = "http://127.0.0.1:3838/mcp"
+url  = "http://127.0.0.1:3173/mcp"
 "#,
         );
         let server = &cfg.tools.mcp_servers[0];
@@ -1806,7 +1806,7 @@ api_key = "test"
 [[tools.mcp_servers]]
 name  = "reader"
 type  = "http"
-url   = "http://127.0.0.1:3838/mcp"
+url   = "http://127.0.0.1:3173/mcp"
 trust = "read"
 
 [[tools.mcp_servers]]

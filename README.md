@@ -413,7 +413,7 @@ classification:
 [[tools.mcp_servers]]
 name  = "ledger"
 type  = "http"
-url   = "http://127.0.0.1:3838/mcp"
+url   = "http://127.0.0.1:3173/mcp"
 trust = "edit"
 ```
 

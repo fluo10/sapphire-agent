@@ -8,7 +8,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use sapphire_call_core::config::CallConfig;
 
-const DEFAULT_SERVER_URL: &str = "http://localhost:9000";
+const DEFAULT_SERVER_URL: &str = "http://localhost:3170";
 
 #[derive(Parser)]
 #[command(
