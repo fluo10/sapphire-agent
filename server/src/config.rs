@@ -265,11 +265,40 @@ pub struct A2aConfig {
 ///
 /// Host-local by construction: `src/config_layer.rs` is default-deny, so the
 /// workspace layer cannot turn an endpoint on for every host that syncs it.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AcpConfig {
     /// Serve `/acp`. Off by default; the endpoint 404s while disabled.
     #[serde(default)]
     pub enabled: bool,
+    /// Seconds between server-initiated WebSocket pings on an idle `/acp`
+    /// connection. `0` sends none.
+    ///
+    /// A reverse proxy in front of the endpoint closes a WebSocket that
+    /// carries no traffic, and the interval has to stay under whatever it
+    /// allows: HAProxy's `timeout tunnel` and nginx's `proxy_read_timeout`
+    /// are the usual ones, the latter defaulting to 60s. Hence 30s — half
+    /// the tightest common default.
+    ///
+    /// The ping is the *agent's* job rather than the bridge's because it
+    /// then covers every client without any of them being configured for
+    /// it, and because a ping draws an automatic pong back: the tunnel
+    /// sees traffic in both directions, so it stays warm whichever
+    /// direction the proxy actually watches.
+    #[serde(default = "default_acp_keepalive_secs")]
+    pub keepalive_secs: u64,
+}
+
+impl Default for AcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            keepalive_secs: default_acp_keepalive_secs(),
+        }
+    }
+}
+
+fn default_acp_keepalive_secs() -> u64 {
+    30
 }
 
 /// Image cache settings. See [`Config::image_cache`] for an overview
@@ -2941,6 +2970,56 @@ enabled = true
 "#,
         );
         assert!(cfg.acp.as_ref().expect("[acp] parsed").enabled);
+    }
+
+    /// The keepalive has to work for a config that never mentions it.
+    ///
+    /// An operator who enabled `/acp` before this setting existed is
+    /// exactly the person whose connections a proxy is dropping, and they
+    /// will not add a key they have never heard of. So the default is the
+    /// fix, and 0 — "send no pings" — must not be what an absent key
+    /// means, however natural a zero default looks for an integer.
+    #[test]
+    fn acp_keepalive_defaults_to_pinging_without_being_asked() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[acp]
+enabled = true
+"#,
+        );
+        let acp = cfg.acp.as_ref().expect("[acp] parsed");
+        assert_eq!(
+            acp.keepalive_secs, 30,
+            "an [acp] block with no keepalive_secs must still ping"
+        );
+
+        // Under the tightest common proxy default (nginx's 60s
+        // `proxy_read_timeout`) the interval has to leave room for a ping
+        // to land well inside the window, not merely to tie with it.
+        assert!(
+            acp.keepalive_secs * 2 <= 60,
+            "the default interval must stay under half of a 60s proxy timeout"
+        );
+    }
+
+    /// The escape hatch: an operator on a network that needs no keepalive,
+    /// or debugging one, must be able to turn the timer off outright.
+    #[test]
+    fn acp_keepalive_can_be_switched_off() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[acp]
+enabled = true
+keepalive_secs = 0
+"#,
+        );
+        assert_eq!(cfg.acp.as_ref().expect("[acp] parsed").keepalive_secs, 0);
     }
 
     #[test]

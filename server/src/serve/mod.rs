@@ -3552,6 +3552,11 @@ impl Provider for StubProvider {
     }
 }
 
+/// Keepalive for every test fixture but the one asserting on it. Off, so
+/// no unrelated test carries a background ping timer.
+#[cfg(test)]
+const DEFAULT_TEST_ACP_KEEPALIVE_SECS: u64 = 0;
+
 #[cfg(test)]
 impl ServeState {
     /// State backed by temp directories and a stub provider that answers "ok".
@@ -3581,7 +3586,29 @@ impl ServeState {
         responses: Vec<crate::provider::ChatResponse>,
         rounds: crate::config::ToolRounds,
     ) -> Arc<Self> {
-        Self::build_for_test_with(acp_enabled, StubProvider::new(responses), rounds)
+        Self::build_for_test_with(
+            acp_enabled,
+            StubProvider::new(responses),
+            rounds,
+            DEFAULT_TEST_ACP_KEEPALIVE_SECS,
+        )
+    }
+
+    /// State whose `/acp` keepalive fires at `keepalive_secs` instead of
+    /// the shipped 30s, so a test can watch a ping arrive without waiting
+    /// half a minute for it. Every other constructor pins the keepalive
+    /// *off*, so no other test pays for a timer it does not assert on.
+    pub(crate) fn for_test_acp_keepalive(keepalive_secs: u64) -> Arc<Self> {
+        Self::build_for_test_with(
+            true,
+            StubProvider::new(vec![crate::provider::ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }]),
+            crate::config::ToolRounds::default(),
+            keepalive_secs,
+        )
     }
 
     /// Same as [`Self::for_test_scripted`], plus a [`ChatLog`] handle so
@@ -3607,13 +3634,19 @@ impl ServeState {
     }
 
     fn build_for_test(acp_enabled: bool, provider: StubProvider) -> Arc<Self> {
-        Self::build_for_test_with(acp_enabled, provider, crate::config::ToolRounds::default())
+        Self::build_for_test_with(
+            acp_enabled,
+            provider,
+            crate::config::ToolRounds::default(),
+            DEFAULT_TEST_ACP_KEEPALIVE_SECS,
+        )
     }
 
     fn build_for_test_with(
         acp_enabled: bool,
         provider: StubProvider,
         rounds: crate::config::ToolRounds,
+        acp_keepalive_secs: u64,
     ) -> Arc<Self> {
         // Leak the TempDir guard on purpose: this is a test binary and the
         // OS reclaims the directory when it exits.
@@ -3658,6 +3691,7 @@ rooms    = []
         );
         config.acp = Some(crate::config::AcpConfig {
             enabled: acp_enabled,
+            keepalive_secs: acp_keepalive_secs,
         });
         config.tools.tool_rounds = rounds;
         config.keys.file = Some(keys_file.clone());

@@ -84,6 +84,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -801,7 +802,17 @@ pub async fn handle_acp_ws(
     };
 
     info!("ACP: connection accepted for room profile '{profile_name}'");
-    ws.on_upgrade(move |socket| serve_connection(socket, state, profile_name))
+    // Read before the upgrade closure takes `state`: `keepalive_secs` is
+    // fixed for the life of the connection, so there is nothing to gain by
+    // looking it up again later.
+    let keepalive = state
+        .config
+        .acp
+        .as_ref()
+        .map(|c| c.keepalive_secs)
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs);
+    ws.on_upgrade(move |socket| serve_connection(socket, state, profile_name, keepalive))
 }
 
 /// Wrap the socket as the SDK's line transport.
@@ -812,24 +823,50 @@ pub async fn handle_acp_ws(
 /// needs reframing, buffering or splitting.
 ///
 /// Everything that is not a text frame is dropped on the floor: binary
-/// frames carry no ACP meaning, axum answers ping/pong itself, and a close
-/// frame is followed by the end of the stream, which is what actually ends
-/// the connection.
+/// frames carry no ACP meaning, axum answers incoming pings itself, and a
+/// close frame is followed by the end of the stream, which is what actually
+/// ends the connection.
 ///
 /// `connection_cancel` is cancelled when this socket stops delivering
 /// frames — see [`cancel_when_exhausted`].
+///
+/// `keepalive` is how often to put a ping on the wire, and is the reason
+/// the sink is not simply the socket's own write half. A reverse proxy in
+/// front of `/acp` closes a WebSocket that carries no traffic — measured
+/// against the HAProxy this agent runs behind, at 1800.005s — and ACP has
+/// no idle traffic of its own: an editor with its panel open but nothing
+/// being asked sends nothing for as long as the person is away. The agent
+/// pings rather than leaving it to the bridge's arguments because that
+/// covers every client at once, and because the client's automatic pong
+/// then puts traffic on the tunnel in *both* directions, whichever one the
+/// proxy is actually watching.
+///
+/// The write half therefore moves into a task of its own, which owns it and
+/// interleaves two sources: ACP messages arriving over a channel, and the
+/// ping timer. Backpressure survives the indirection — the channel is
+/// bounded, so a client that has stopped reading still blocks the sink
+/// rather than growing a queue.
 fn lines_transport(
     socket: WebSocket,
     connection_cancel: CancellationToken,
+    keepalive: Option<Duration>,
 ) -> Lines<
     impl futures_util::Sink<String, Error = std::io::Error> + Send + 'static,
     impl futures_util::Stream<Item = std::io::Result<String>> + Send + 'static,
 > {
     let (tx, rx) = socket.split();
 
-    let outgoing = tx
-        .sink_map_err(std::io::Error::other)
-        .with(|line: String| async move { Ok::<_, std::io::Error>(Message::Text(line.into())) });
+    let (lines_tx, lines_rx) = tokio::sync::mpsc::channel::<Message>(32);
+    tokio::spawn(write_frames(tx, lines_rx, keepalive));
+
+    // Dropped with the `Lines` the SDK holds, which closes the channel and
+    // is what tells `write_frames` the connection is over.
+    let outgoing = futures_util::sink::unfold(lines_tx, |tx, line: String| async move {
+        tx.send(Message::Text(line.into()))
+            .await
+            .map_err(std::io::Error::other)?;
+        Ok::<_, std::io::Error>(tx)
+    });
 
     let frames = rx.filter_map(|frame| async move {
         match frame {
@@ -843,6 +880,63 @@ fn lines_transport(
     });
 
     Lines::new(outgoing, cancel_when_exhausted(frames, connection_cancel))
+}
+
+/// Own the socket's write half: forward ACP messages, and ping on the
+/// keepalive interval.
+///
+/// Ends when the channel closes (the SDK dropped its sink, so the
+/// connection is finished) or when a write fails (the peer is gone). The
+/// ping doubles as detection for the second case: without it, a server
+/// with nothing to say never writes, so it never learns that a client
+/// which vanished without a close frame is no longer there.
+async fn write_frames(
+    mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
+    mut lines: tokio::sync::mpsc::Receiver<Message>,
+    keepalive: Option<Duration>,
+) {
+    let mut ticker = keepalive.map(|period| {
+        // `interval_at`, not `interval`: the latter's first tick completes
+        // immediately, which would ping every connection the moment it
+        // opens. The first ping belongs one full period in.
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        // A missed tick means the writer was busy, which is the one case
+        // where a keepalive is not needed. Delay, so a stall cannot queue
+        // up a burst of pings to fire back to back once it clears.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker
+    });
+
+    loop {
+        // `pending()` when there is no keepalive parks this branch forever,
+        // so the `select!` waits on the channel alone.
+        let tick = async {
+            match ticker.as_mut() {
+                Some(t) => {
+                    t.tick().await;
+                }
+                None => std::future::pending().await,
+            }
+        };
+
+        let message = tokio::select! {
+            line = lines.recv() => match line {
+                Some(message) => message,
+                // The SDK is done with the connection.
+                None => break,
+            },
+            () = tick => Message::Ping(Default::default()),
+        };
+
+        if sink.send(message).await.is_err() {
+            // The peer is gone. The incoming half sees the same thing and
+            // ends the connection; there is nothing to report here that is
+            // not already reported there.
+            return;
+        }
+    }
+
+    let _ = sink.close().await;
 }
 
 /// Cancel `token` as soon as `frames` stops producing items.
@@ -1015,7 +1109,12 @@ async fn adopt_session(
 }
 
 /// Drive one ACP connection until the peer goes away.
-async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_name: String) {
+async fn serve_connection(
+    socket: WebSocket,
+    state: Arc<ServeState>,
+    profile_name: String,
+    keepalive: Option<Duration>,
+) {
     let sessions = Arc::new(AcpSessions::default());
     // Cancelled when the socket goes away (see `lines_transport`). Every
     // turn's token is a child of this one, so one client leaving stops every
@@ -1647,7 +1746,11 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
             },
             on_receive_request!(),
         )
-        .connect_to(lines_transport(socket, connection_cancel.clone()))
+        .connect_to(lines_transport(
+            socket,
+            connection_cancel.clone(),
+            keepalive,
+        ))
         .await;
 
     // Release every session this connection held. Missing this would turn
@@ -2005,6 +2108,126 @@ mod tests {
                 other => panic!("unexpected frame: {other:?}"),
             }
         }
+    }
+
+    /// An idle connection must get a ping without having asked for one.
+    ///
+    /// Nothing in ACP keeps a silent connection warm, and a reverse proxy
+    /// in front of `/acp` closes one that stays silent: the HAProxy this
+    /// agent runs behind cuts an idle tunnel at 1800.005s, measured, which
+    /// reaches the agent as `Connection reset by peer` and reaches the
+    /// editor as a `websocat` stuck in CLOSE-WAIT that never exits — so the
+    /// editor keeps writing into a dead socket instead of reconnecting.
+    ///
+    /// The agent is the end that can fix this for every client at once,
+    /// which is why the ping originates here rather than in the bridge's
+    /// arguments. A client answers it with an automatic pong, so one timer
+    /// puts traffic on the tunnel in both directions.
+    #[tokio::test]
+    async fn an_idle_connection_gets_a_server_ping() {
+        let addr = spawn(ServeState::for_test_acp_keepalive(1)).await;
+        let mut ws = connect(&addr).await;
+
+        // Not one frame is sent from this end — not even `initialize`.
+        // Whatever arrives, arrives because the server decided to.
+        let deadline = std::time::Duration::from_secs(10);
+        // The very first frame settles it: on a connection nobody has
+        // spoken on, a ping is the only thing that should ever arrive.
+        let pinged = tokio::time::timeout(deadline, ws.next())
+            .await
+            .expect("no server ping within 10s on a connection configured to ping every 1s");
+
+        let pinged = match pinged {
+            Some(Ok(Message::Ping(_))) => true,
+            Some(Ok(other)) => panic!("unexpected frame on an idle connection: {other:?}"),
+            // The connection died instead of being kept alive.
+            Some(Err(_)) | None => false,
+        };
+
+        assert!(
+            pinged,
+            "the idle connection ended instead of receiving a keepalive ping"
+        );
+    }
+
+    /// One ping is not a keepalive. The connection has to be kept warm for
+    /// as long as it is open, so the timer must keep firing — a single
+    /// ping at the first tick would move the drop from 1800s to 1800s
+    /// after the ping and look identical in every short test.
+    #[tokio::test]
+    async fn the_keepalive_keeps_pinging() {
+        let addr = spawn(ServeState::for_test_acp_keepalive(1)).await;
+        let mut ws = connect(&addr).await;
+
+        let mut pings = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while pings < 3 {
+                match ws.next().await {
+                    Some(Ok(Message::Ping(_))) => pings += 1,
+                    Some(Ok(other)) => panic!("unexpected frame: {other:?}"),
+                    Some(Err(e)) => panic!("connection failed after {pings} ping(s): {e}"),
+                    None => panic!("connection ended after {pings} ping(s)"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("only {pings} ping(s) in 20s at a 1s interval"));
+
+        assert_eq!(pings, 3, "the keepalive stopped after the first tick");
+    }
+
+    /// `keepalive_secs = 0` means silence, and has to reach the timer as
+    /// "no timer" rather than as a zero-length period — `interval_at`
+    /// panics on one, which would take down the writer task, and with it
+    /// the connection, for every client of an agent whose operator had
+    /// merely switched the pings off.
+    #[tokio::test]
+    async fn keepalive_zero_sends_no_pings() {
+        let addr = spawn(ServeState::for_test_acp_keepalive(0)).await;
+        let mut ws = connect(&addr).await;
+
+        // The connection still has to *work*. A zero period reaching
+        // `interval_at` kills the writer task, and a dead writer is
+        // invisible from the reading end — the socket stays open and the
+        // request simply never comes back — so asking for a reply is what
+        // separates "pings are off" from "the write half is gone".
+        ws.send(Message::Text(initialize_request(1).to_string().into()))
+            .await
+            .unwrap();
+
+        let replied = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(_))) => return true,
+                    Some(Ok(Message::Ping(_))) => {
+                        panic!("a ping arrived on a connection that asked for none")
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) | None => return false,
+                }
+            }
+        })
+        .await
+        .expect("no answer to initialize: the writer task is gone");
+
+        assert!(replied, "the connection dropped instead of answering");
+
+        // Now that the socket is known good, hold it open well past the
+        // period a zero would have meant, and require silence.
+        let ping = tokio::time::timeout(std::time::Duration::from_millis(1500), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Ping(_))) => return true,
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) | None => return false,
+                }
+            }
+        })
+        .await;
+        assert!(
+            ping.is_err(),
+            "keepalive_secs = 0 must leave the connection silent"
+        );
     }
 
     /// The close arm of the frame filter, which every later task's connection
