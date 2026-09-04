@@ -13,9 +13,6 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
 
-/// Maximum number of tool-call rounds per message to prevent infinite loops.
-const MAX_TOOL_ROUNDS: usize = 10;
-
 impl Agent {
     /// Resolve the provider that should serve `room_id`, honouring the
     /// room → profile → provider mapping defined in `Config`. Falls back to
@@ -674,6 +671,30 @@ impl Agent {
     // Message handling
     // -----------------------------------------------------------------------
 
+    /// Send one piece of the turn's prose, as the round that produced it
+    /// finishes.
+    ///
+    /// A failure is logged and swallowed rather than ending the turn. A
+    /// turn can now send up to `[tools.tool_rounds] unattended` messages,
+    /// which is enough to meet a channel's rate limit, and losing the
+    /// whole turn's remaining work to one refused send would be a much
+    /// worse outcome than a gap in the narration.
+    ///
+    /// Typing is restarted after each send: the indicator stops on its
+    /// own when a message lands, and a turn that goes quiet while it is
+    /// still working is exactly what this change exists to prevent.
+    async fn send_turn_message(&self, incoming: &crate::channel::IncomingMessage, text: &str) {
+        let out = OutgoingMessage {
+            content: text.to_string(),
+            room_id: incoming.room_id.clone(),
+            thread_id: incoming.thread_id.clone(),
+        };
+        if let Err(e) = self.channels.send(&out).await {
+            warn!("Failed to send a turn message: {e:#}");
+        }
+        let _ = self.channels.start_typing(&incoming.room_id).await;
+    }
+
     async fn handle_message(
         self: Arc<Self>,
         incoming: crate::channel::IncomingMessage,
@@ -751,14 +772,21 @@ impl Agent {
         let compression_config = &self.config.compression;
 
         // Tool-calling loop
-        let mut accumulated_text: Vec<String> = Vec::new();
         // Rounds this turn, not tool calls in the history. History is
         // restored from disk now, so counting the whole thing would spend a
         // room's entire budget on what it did before the process started —
         // and the check runs before compaction, so nothing could ever trim
         // it back.
         let mut round = 0usize;
-        let final_text = loop {
+        // Matrix and Discord have no way to cancel a turn in flight, so
+        // they are judged `unattended` — the same budget every route
+        // without an interrupt gets. See `[tools.tool_rounds]`.
+        let round_limit = self
+            .config
+            .tools
+            .tool_rounds
+            .limit(crate::serve::RoundBudget::Unattended);
+        loop {
             let messages = {
                 self.history
                     .lock()
@@ -768,9 +796,9 @@ impl Agent {
                     .unwrap_or_default()
             };
 
-            if round >= MAX_TOOL_ROUNDS {
-                warn!("Reached max tool rounds ({MAX_TOOL_ROUNDS}), stopping");
-                break Some(accumulated_text.join("\n\n"));
+            if round_limit.is_some_and(|max| round >= max) {
+                warn!("Reached max tool rounds ({round}), stopping");
+                break;
             }
 
             // Check if context compression is needed
@@ -839,15 +867,15 @@ impl Agent {
                         .push(msg.clone());
                     let _ = self.persist(&session_id, &msg);
                     if !text.is_empty() {
-                        accumulated_text.push(text);
+                        self.send_turn_message(&incoming, &text).await;
                     }
-                    break Some(accumulated_text.join("\n\n"));
+                    break;
                 }
                 Ok(resp) => {
                     round += 1;
                     let tool_calls = resp.tool_calls.clone();
                     if let Some(t) = resp.text.as_ref().filter(|s| !s.is_empty()) {
-                        accumulated_text.push(t.clone());
+                        self.send_turn_message(&incoming, t).await;
                     }
                     let msg =
                         ChatMessage::assistant_with_tools(resp.text.clone(), tool_calls.clone());
@@ -964,7 +992,7 @@ impl Agent {
                     }
                 }
             }
-        };
+        }
 
         // Scrub `Image` parts in the just-completed history into compact
         // `ImageRef` references backed by the workspace-external image
@@ -981,41 +1009,30 @@ impl Agent {
 
         let _ = self.channels.stop_typing(&incoming.room_id).await;
 
-        if let Some(text) = final_text {
-            if !text.is_empty() {
-                let out = OutgoingMessage {
-                    content: text,
-                    room_id: incoming.room_id.clone(),
-                    thread_id: incoming.thread_id.clone(),
-                };
-                self.channels
-                    .send(&out)
+        // Spawn background prefetch for next turn. This turn's prose was
+        // already sent round by round via `send_turn_message` above, so
+        // there is nothing left to send here — this is purely priming the
+        // cache the *next* turn will read from.
+        if let Some(tools) = &self.tools {
+            let tools = Arc::clone(tools);
+            let agent = Arc::clone(&self);
+            let key_clone = key.clone();
+            let query = incoming.content.clone();
+            tokio::spawn(async move {
+                let input = serde_json::json!({ "query": query, "limit": 5 });
+                let result = tools
+                    .execute(&ToolCall {
+                        id: "prefetch".to_string(),
+                        name: "workspace_search".to_string(),
+                        input,
+                    })
+                    .await;
+                agent
+                    .prefetch_cache
+                    .lock()
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to send response: {e:#}"))?;
-            }
-
-            // Spawn background prefetch for next turn
-            if let Some(tools) = &self.tools {
-                let tools = Arc::clone(tools);
-                let agent = Arc::clone(&self);
-                let key_clone = key.clone();
-                let query = incoming.content.clone();
-                tokio::spawn(async move {
-                    let input = serde_json::json!({ "query": query, "limit": 5 });
-                    let result = tools
-                        .execute(&ToolCall {
-                            id: "prefetch".to_string(),
-                            name: "workspace_search".to_string(),
-                            input,
-                        })
-                        .await;
-                    agent
-                        .prefetch_cache
-                        .lock()
-                        .await
-                        .insert(key_clone, result.text);
-                });
-            }
+                    .insert(key_clone, result.text);
+            });
         }
 
         Ok(())
@@ -1429,5 +1446,82 @@ api_key = "test"
             .map(|m| m.content.clone())
             .collect();
         assert_eq!(bodies, vec!["ok".to_string()]);
+    }
+
+    /// ツールを呼ぶターンは複数メッセージに分かれる。「○○するぞ」と
+    /// 「○○したぞ」が1通に潰れていたのが、この変更の直す対象である。
+    #[tokio::test]
+    async fn a_tool_using_turn_is_delivered_as_several_messages() {
+        let (agent, sent) = agent_with_scripted_provider(vec![
+            crate::provider::ChatResponse {
+                text: Some("調べます".to_string()),
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({ "text": "ping" }),
+                }],
+                stop_reason: None,
+            },
+            crate::provider::ChatResponse {
+                text: Some("見つかりました".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            },
+        ]);
+
+        agent.handle_message(incoming("なぜ遅い")).await.unwrap();
+
+        let bodies: Vec<String> =
+            sent.lock().unwrap().iter().map(|m| m.content.clone()).collect();
+        assert_eq!(
+            bodies,
+            vec!["調べます".to_string(), "見つかりました".to_string()]
+        );
+    }
+
+    /// ツールを呼ばない普通の会話は、今までどおり1通のまま。この変更で
+    /// 日常の会話が細切れになってはいけない。
+    #[tokio::test]
+    async fn an_ordinary_reply_is_still_one_message() {
+        let (agent, sent) = agent_with_scripted_provider(vec![crate::provider::ChatResponse {
+            text: Some("こんにちは".to_string()),
+            tool_calls: Vec::new(),
+            stop_reason: None,
+        }]);
+
+        agent.handle_message(incoming("やあ")).await.unwrap();
+
+        let bodies: Vec<String> =
+            sent.lock().unwrap().iter().map(|m| m.content.clone()).collect();
+        assert_eq!(bodies, vec!["こんにちは".to_string()]);
+    }
+
+    /// 送信に失敗してもターンは落ちない。上限ぶんの連投がレート制限に
+    /// 触れうる以上、1通の失敗でターン全体を失うのは高すぎる。
+    #[tokio::test]
+    async fn a_failed_send_does_not_end_the_turn() {
+        let (agent, sent) = agent_with_failing_first_send(vec![
+            crate::provider::ChatResponse {
+                text: Some("最初".to_string()),
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({ "text": "ping" }),
+                }],
+                stop_reason: None,
+            },
+            crate::provider::ChatResponse {
+                text: Some("最後".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            },
+        ]);
+
+        let result = agent.handle_message(incoming("やって")).await;
+
+        assert!(result.is_ok(), "1通の失敗でターンを落とさない");
+        let bodies: Vec<String> =
+            sent.lock().unwrap().iter().map(|m| m.content.clone()).collect();
+        assert_eq!(bodies, vec!["最後".to_string()], "後続は届く");
     }
 }
