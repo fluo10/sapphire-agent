@@ -23,6 +23,56 @@ pub type ServerRequestHandler = Arc<dyn Fn(&str, &Value) -> Value + Send + Sync>
 /// has `method`).  Used to detect `notifications/tools/list_changed` etc.
 pub type NotificationHandler = Arc<dyn Fn(&str, &Value) + Send + Sync>;
 
+/// The server does not know the session id we sent it.
+///
+/// A Streamable HTTP server may keep per-session state, and the MCP spec has
+/// it answer `404` for any session id it no longer knows. Servers built on
+/// `rmcp` drop a session after five minutes of silence, so an agent that goes
+/// a quiet afternoon without touching one comes back holding an id that names
+/// nothing.
+///
+/// The transport cannot fix this by itself — the handshake that mints a
+/// session lives a layer up — so it clears the dead id and reports *this*
+/// rather than a message. `McpClient::send` matches on it, re-initializes,
+/// and replays the request once.
+#[derive(Debug)]
+pub struct SessionExpired {
+    /// The server that rejected the id, for the message.
+    pub url: String,
+    /// What the server said, if anything.
+    pub body: String,
+}
+
+impl std::fmt::Display for SessionExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MCP session at {} is no longer known to the server: {}",
+            self.url, self.body
+        )
+    }
+}
+
+impl std::error::Error for SessionExpired {}
+
+/// Render a response body for a one-line error message.
+///
+/// The bodies that reach here are short by convention (`Not Found: Session
+/// not found`), but nothing enforces that: a reverse proxy in front of the
+/// server answers its own errors, and those are full HTML pages. Cap the
+/// length so one misrouted request cannot flood the log.
+fn describe_body(body: &str) -> String {
+    const MAX: usize = 200;
+    let body = body.trim();
+    if body.is_empty() {
+        return "(empty body)".to_string();
+    }
+    match body.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}…", &body[..cut]),
+        None => body.to_string(),
+    }
+}
+
 #[async_trait]
 pub trait McpTransport: Send + Sync {
     /// Send a JSON-RPC request and receive the final response.
@@ -75,8 +125,13 @@ impl HttpTransport {
         }
     }
 
-    /// Build a POST request with standard headers.
-    fn build_request(&self, body: &Value, session_id: &Option<String>) -> reqwest::RequestBuilder {
+    /// A POST to the endpoint carrying the headers every message needs.
+    ///
+    /// Every outbound message goes through here, including the responses to
+    /// server-initiated requests: those are POSTs to the same authenticated
+    /// endpoint, so leaving the bearer off makes the server answer `401` to a
+    /// reply it is blocking on.
+    fn post(&self, session_id: &Option<String>) -> reqwest::RequestBuilder {
         let mut req = self
             .http
             .post(&self.url)
@@ -89,23 +144,69 @@ impl HttpTransport {
         if let Some(sid) = session_id {
             req = req.header("mcp-session-id", sid.as_str());
         }
-        req.json(body)
+        req
+    }
+
+    /// Build a POST request with standard headers.
+    fn build_request(&self, body: &Value, session_id: &Option<String>) -> reqwest::RequestBuilder {
+        self.post(session_id).json(body)
     }
 
     /// Send a JSON-RPC response back to the server (for server-initiated requests).
     async fn send_response(&self, response: &Value, session_id: &Option<String>) -> Result<()> {
-        let mut req = self
-            .http
-            .post(&self.url)
-            .header("content-type", "application/json");
-        if let Some(sid) = session_id {
-            req = req.header("mcp-session-id", sid.as_str());
-        }
-        req.json(response)
+        self.post(session_id)
+            .json(response)
             .send()
             .await
             .context("Failed to send response to MCP server")?;
         Ok(())
+    }
+
+    /// Turn a non-2xx response into what the caller should see.
+    ///
+    /// `Ok` is a real outcome here: some servers put a JSON-RPC error object
+    /// on a 4xx (rmcp answers `400` that way for a malformed request), and
+    /// that object is the server answering the request. Its `message` is what
+    /// the caller wants, not the status line — so it is handed back as a
+    /// response and reported through the same path as any other JSON-RPC
+    /// error.
+    ///
+    /// Everything else becomes an error naming the status and the body. That
+    /// matters more than it looks: these bodies are plain text, and the code
+    /// that used to run here fed them straight to a JSON parser, so a `404`,
+    /// a `401` and a proxy's error page all surfaced as
+    /// `expected value at line 1 column 1` with nothing pointing at the
+    /// server.
+    async fn interpret_error_status(
+        &self,
+        status: reqwest::StatusCode,
+        sent_session_id: bool,
+        resp: reqwest::Response,
+    ) -> Result<Value> {
+        let body = resp.text().await.unwrap_or_default();
+
+        if status == reqwest::StatusCode::NOT_FOUND && sent_session_id {
+            // Drop the dead id here rather than at the retry, so that a
+            // caller which gives up still leaves the transport able to
+            // handshake on its next use.
+            *self.session_id.lock().await = None;
+            return Err(SessionExpired {
+                url: self.url.clone(),
+                body: describe_body(&body),
+            }
+            .into());
+        }
+
+        if let Ok(value) = serde_json::from_str::<Value>(&body)
+            && value.get("error").is_some()
+        {
+            return Ok(value);
+        }
+
+        bail!(
+            "MCP server returned HTTP {status}: {}",
+            describe_body(&body)
+        )
     }
 
     /// Parse an SSE `data:` line into JSON.
@@ -136,6 +237,15 @@ impl McpTransport for HttpTransport {
             && let Ok(s) = sid.to_str()
         {
             *self.session_id.lock().await = Some(s.to_string());
+        }
+
+        // Before anything reads the body: a failing status has a body that is
+        // not a JSON-RPC message, and parsing it as one hides the status.
+        let status = resp.status();
+        if !status.is_success() {
+            return self
+                .interpret_error_status(status, session_id.is_some(), resp)
+                .await;
         }
 
         let content_type = resp
@@ -206,17 +316,42 @@ impl McpTransport for HttpTransport {
             }
         } else {
             // Plain JSON response.
-            let data: Value = resp.json().await.context("Failed to parse JSON response")?;
-            Ok(data)
+            let body = resp
+                .text()
+                .await
+                .context("Failed to read the MCP response body")?;
+            serde_json::from_str(&body).with_context(|| {
+                format!(
+                    "MCP server answered {status} as `{content_type}`, which is neither SSE nor \
+                     JSON: {}",
+                    describe_body(&body)
+                )
+            })
         }
     }
 
     async fn notify(&self, body: &Value) -> Result<()> {
         let session_id = self.session_id.lock().await.clone();
-        self.build_request(body, &session_id)
+        let resp = self
+            .build_request(body, &session_id)
             .send()
             .await
             .context("Failed to send notification to MCP server")?;
+
+        // A notification has no reply to parse, but it still has a status,
+        // and dropping it meant a rejected `notifications/initialized` looked
+        // exactly like an accepted one.
+        let status = resp.status();
+        if !status.is_success() {
+            if status == reqwest::StatusCode::NOT_FOUND && session_id.is_some() {
+                *self.session_id.lock().await = None;
+            }
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "MCP server rejected a notification with HTTP {status}: {}",
+                describe_body(&body)
+            );
+        }
         Ok(())
     }
 
@@ -376,5 +511,384 @@ impl McpTransport for StdioTransport {
         let mut child = self.child.lock().await;
         let _ = child.kill().await;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// A failing HTTP status used to be indistinguishable from a malformed
+/// answer: the transport skipped straight to `resp.json()`, so `404`, `401`
+/// and a proxy's HTML error page all surfaced as
+/// `Failed to parse JSON response: expected value at line 1 column 1`. These
+/// tests pin the status reaching the caller, and the one status that is
+/// recoverable actually being recovered from.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{McpServerConfig, McpTransportConfig, McpTrust};
+    use crate::mcp_client::McpClient;
+    use axum::Router;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::post;
+    use std::collections::HashSet;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Bind a loopback port, serve `router` on it, and return the `/mcp` URL.
+    ///
+    /// The task is left running: every test here finishes in milliseconds and
+    /// the port dies with the test binary.
+    async fn serve(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    /// Answer every POST with one canned response.
+    async fn serving(status: StatusCode, content_type: &'static str, body: &'static str) -> String {
+        let router = Router::new().route(
+            "/mcp",
+            post(move || async move {
+                (status, [("content-type", content_type)], body).into_response()
+            }),
+        );
+        serve(router).await
+    }
+
+    /// The two callbacks `request` takes, as the trait objects it wants.
+    /// Nothing under test here calls them; the transport-level tests drive
+    /// plain request/response exchanges.
+    fn handlers() -> (ServerRequestHandler, NotificationHandler) {
+        let on_request: ServerRequestHandler = Arc::new(|_: &str, _: &Value| Value::Null);
+        let on_notification: NotificationHandler = Arc::new(|_: &str, _: &Value| {});
+        (on_request, on_notification)
+    }
+
+    fn http_client(url: String, api_key: Option<&str>) -> McpServerConfig {
+        McpServerConfig {
+            name: "ledger".to_string(),
+            trust: McpTrust::Read,
+            transport: McpTransportConfig::Http {
+                url,
+                api_key: api_key.map(str::to_string),
+            },
+        }
+    }
+
+    /// Every request the stub saw, as `(method, session id sent)`.
+    type Seen = Arc<StdMutex<Vec<(String, Option<String>)>>>;
+
+    /// A stub MCP server that hands out sessions and forgets the first one.
+    ///
+    /// Forgetting happens the moment the first handshake completes, which is
+    /// the same sequence a real server produces after five idle minutes —
+    /// without the five minutes.
+    #[derive(Clone, Default)]
+    struct Stub {
+        seen: Seen,
+        /// The `authorization` header of every request, in arrival order.
+        auth: Arc<StdMutex<Vec<Option<String>>>>,
+        /// Sessions the server still knows.
+        live: Arc<StdMutex<HashSet<String>>>,
+        minted: Arc<AtomicUsize>,
+    }
+
+    impl Stub {
+        fn router(&self) -> Router {
+            Router::new()
+                .route("/mcp", post(Self::handle))
+                .with_state(self.clone())
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .expect("seen")
+                .iter()
+                .map(|(m, _)| m.clone())
+                .collect()
+        }
+
+        fn sessions(&self) -> Vec<Option<String>> {
+            self.seen
+                .lock()
+                .expect("seen")
+                .iter()
+                .map(|(_, s)| s.clone())
+                .collect()
+        }
+
+        async fn handle(State(stub): State<Stub>, headers: HeaderMap, body: String) -> Response {
+            let header = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            };
+            let message: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let method = message
+                .get("method")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            let session = header("mcp-session-id");
+
+            stub.seen
+                .lock()
+                .expect("seen")
+                .push((method.clone(), session.clone()));
+            stub.auth
+                .lock()
+                .expect("auth")
+                .push(header("authorization"));
+
+            if method == "initialize" {
+                let n = stub.minted.fetch_add(1, Ordering::Relaxed) + 1;
+                let id = format!("s{n}");
+                stub.live.lock().expect("live").insert(id.clone());
+                let result = json!({
+                    "jsonrpc": "2.0",
+                    "id": message.get("id").cloned().unwrap_or(Value::Null),
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": {"name": "stub", "version": "0"}
+                    }
+                });
+                return (
+                    StatusCode::OK,
+                    [
+                        ("content-type", "application/json"),
+                        ("mcp-session-id", id.as_str()),
+                    ],
+                    result.to_string(),
+                )
+                    .into_response();
+            }
+
+            // Anything else needs a session the server still knows. This is
+            // the branch that produced the original bug report.
+            let known = session
+                .as_ref()
+                .is_some_and(|s| stub.live.lock().expect("live").contains(s));
+            if !known {
+                return (StatusCode::NOT_FOUND, "Not Found: Session not found").into_response();
+            }
+
+            if method.starts_with("notifications/") {
+                // The first session goes idle the instant its handshake ends.
+                if session.as_deref() == Some("s1") {
+                    stub.live.lock().expect("live").remove("s1");
+                }
+                return StatusCode::ACCEPTED.into_response();
+            }
+
+            let result = json!({
+                "jsonrpc": "2.0",
+                "id": message.get("id").cloned().unwrap_or(Value::Null),
+                "result": {"content": [{"type": "text", "text": "[]"}]}
+            });
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                result.to_string(),
+            )
+                .into_response()
+        }
+    }
+
+    /// The reported failure, end to end: the handshake succeeds, the session
+    /// goes away, and the next tool call must still return a result rather
+    /// than an error that only a restart clears.
+    #[tokio::test]
+    async fn an_expired_session_is_re_established_and_the_call_retried() {
+        let stub = Stub::default();
+        let url = serve(stub.router()).await;
+        let client = McpClient::new(&http_client(url, Some("secret")), "/tmp")
+            .await
+            .expect("client");
+
+        client.connect().await.expect("the first handshake");
+        let result = client
+            .call_tool("list_accounts", &json!({}))
+            .await
+            .expect("a forgotten session must be re-established, not reported");
+
+        assert_eq!(
+            result["content"][0]["text"], "[]",
+            "the retry's result is what the caller gets"
+        );
+        assert_eq!(
+            stub.methods(),
+            vec![
+                "initialize",
+                "notifications/initialized",
+                "tools/call",
+                "initialize",
+                "notifications/initialized",
+                "tools/call",
+            ],
+            "the recovery is a full handshake, not a bare replay"
+        );
+        assert_eq!(
+            stub.sessions().last().expect("a last request"),
+            &Some("s2".to_string()),
+            "the replayed call must carry the new session, not the dead one"
+        );
+    }
+
+    /// The retry happens once. A server that answers `404` to everything is
+    /// not a stale session, and looping on it would bury the real error.
+    #[tokio::test]
+    async fn a_server_that_always_404s_is_reported_rather_than_retried_forever() {
+        let stub = Stub::default();
+        // Never mint a live session: every non-initialize request 404s.
+        stub.live.lock().expect("live").clear();
+        let url = serve(
+            Router::new()
+                .route(
+                    "/mcp",
+                    post(|headers: HeaderMap, body: String| async move {
+                        let message: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                        if message.get("method").and_then(|m| m.as_str()) == Some("initialize") {
+                            let _ = headers;
+                            return (
+                                StatusCode::OK,
+                                [
+                                    ("content-type", "application/json"),
+                                    ("mcp-session-id", "s1"),
+                                ],
+                                json!({"jsonrpc":"2.0","id":1,"result":{}}).to_string(),
+                            )
+                                .into_response();
+                        }
+                        (StatusCode::NOT_FOUND, "Not Found: Session not found").into_response()
+                    }),
+                )
+                .with_state(()),
+        )
+        .await;
+
+        let client = McpClient::new(&http_client(url, None), "/tmp")
+            .await
+            .expect("client");
+        client.connect().await.expect("handshake");
+
+        let err = client
+            .call_tool("list_accounts", &json!({}))
+            .await
+            .expect_err("a permanently unknown session must surface");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("expected value at line 1 column 1"),
+            "the JSON parser must never be what reports an HTTP status, got: {msg}"
+        );
+    }
+
+    /// `401` is what an unauthenticated request gets, and its body is empty.
+    /// The status is the entire diagnosis, so it has to reach the caller.
+    #[tokio::test]
+    async fn an_error_status_names_itself_instead_of_a_parse_failure() {
+        let url = serving(StatusCode::UNAUTHORIZED, "text/plain", "").await;
+        let transport = HttpTransport::new(url, None);
+        let (on_request, on_notification) = handlers();
+
+        let err = transport
+            .request(
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                &on_request,
+                &on_notification,
+            )
+            .await
+            .expect_err("401 is not a response");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("401"),
+            "the status must be in the message: {msg}"
+        );
+        assert!(
+            msg.contains("(empty body)"),
+            "an empty body must say so rather than read as a parse failure: {msg}"
+        );
+    }
+
+    /// `rmcp` answers a malformed request with `400` and a JSON-RPC error
+    /// object. That object is the server answering, and its `message` beats
+    /// the status line — so it must not be swallowed by the status check.
+    #[tokio::test]
+    async fn a_json_rpc_error_carried_on_a_4xx_still_reaches_the_caller() {
+        let url = serving(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"unsupported protocol version"}}"#,
+        )
+        .await;
+        let client = McpClient::new(&http_client(url, None), "/tmp")
+            .await
+            .expect("client");
+
+        let err = client
+            .connect()
+            .await
+            .expect_err("a 400 fails the handshake");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unsupported protocol version"),
+            "the server's own message is the useful part: {msg}"
+        );
+    }
+
+    /// The SSE path is the one every stateful server uses; the status check
+    /// runs before it and must not have swallowed it.
+    #[tokio::test]
+    async fn an_sse_response_is_still_parsed() {
+        let url = serving(
+            StatusCode::OK,
+            "text/event-stream",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n",
+        )
+        .await;
+        let transport = HttpTransport::new(url, None);
+        let (on_request, on_notification) = handlers();
+
+        let response = transport
+            .request(
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                &on_request,
+                &on_notification,
+            )
+            .await
+            .expect("an SSE answer is an answer");
+        assert_eq!(response["result"]["ok"], true);
+    }
+
+    /// A reply to a server-initiated request is a POST to the same guarded
+    /// endpoint. Without the bearer the server answers `401` to a message it
+    /// is blocking on, and the original request hangs until it times out.
+    #[tokio::test]
+    async fn a_reply_to_a_server_initiated_request_carries_the_bearer() {
+        let stub = Stub::default();
+        let url = serve(stub.router()).await;
+        let transport = HttpTransport::new(url, Some("secret".to_string()));
+
+        transport
+            .send_response(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}), &None)
+            .await
+            .expect("the reply is sent");
+
+        assert_eq!(
+            stub.auth.lock().expect("auth").first(),
+            Some(&Some("Bearer secret".to_string())),
+            "the reply must authenticate exactly as the request did"
+        );
     }
 }
