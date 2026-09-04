@@ -84,7 +84,7 @@ struct Cli {
     #[arg(short, long, value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// Override bind address (e.g. 127.0.0.1:9000)
+    /// Override bind address (e.g. 127.0.0.1:3170)
     #[arg(long, value_name = "ADDR")]
     bind: Option<String>,
 
@@ -1040,7 +1040,7 @@ async fn main() -> Result<()> {
                         .as_ref()
                         .map(|s| format!("{}:{}", s.host, s.port))
                 })
-                .unwrap_or_else(|| "127.0.0.1:9000".to_string());
+                .unwrap_or_else(|| "127.0.0.1:3170".to_string());
 
             serve::run(addr, Arc::clone(&serve_state), ambient_routes).await?;
 
