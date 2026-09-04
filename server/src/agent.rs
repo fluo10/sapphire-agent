@@ -1398,12 +1398,9 @@ api_key = "test"
 
     /// Same, but the channel refuses the first send.
     ///
-    /// Not yet called by any test in this file — it exists for Task 6b's
-    /// delivery-shape tests, which need to prove a refused send doesn't
-    /// take the rest of a turn down with it. `#[allow(dead_code)]` for
-    /// the same reason `SessionStore::new` carries one: an interface
-    /// function whose only caller lands in a later commit.
-    #[allow(dead_code)]
+    /// Exists for the delivery-shape tests that need to prove a refused
+    /// send doesn't take the rest of a turn down with it — see
+    /// `a_failed_send_does_not_end_the_turn`.
     fn agent_with_failing_first_send(
         responses: Vec<crate::provider::ChatResponse>,
     ) -> (
@@ -1471,8 +1468,12 @@ api_key = "test"
 
         agent.handle_message(incoming("なぜ遅い")).await.unwrap();
 
-        let bodies: Vec<String> =
-            sent.lock().unwrap().iter().map(|m| m.content.clone()).collect();
+        let bodies: Vec<String> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
         assert_eq!(
             bodies,
             vec!["調べます".to_string(), "見つかりました".to_string()]
@@ -1491,8 +1492,12 @@ api_key = "test"
 
         agent.handle_message(incoming("やあ")).await.unwrap();
 
-        let bodies: Vec<String> =
-            sent.lock().unwrap().iter().map(|m| m.content.clone()).collect();
+        let bodies: Vec<String> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
         assert_eq!(bodies, vec!["こんにちは".to_string()]);
     }
 
@@ -1520,8 +1525,12 @@ api_key = "test"
         let result = agent.handle_message(incoming("やって")).await;
 
         assert!(result.is_ok(), "1通の失敗でターンを落とさない");
-        let bodies: Vec<String> =
-            sent.lock().unwrap().iter().map(|m| m.content.clone()).collect();
+        let bodies: Vec<String> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
         assert_eq!(bodies, vec!["最後".to_string()], "後続は届く");
     }
 }
