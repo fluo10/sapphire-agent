@@ -1229,4 +1229,205 @@ mod tests {
 
         assert_eq!(permitted.len() + refused.len(), calls.len());
     }
+
+    // -------------------------------------------------------------------
+    // Turn-driving harness
+    //
+    // Everything below builds a real `Agent` — scripted provider, tool
+    // set, session store — so a test can drive `handle_message` end to
+    // end and observe what got sent, rather than only reaching the
+    // tool-policy gate as the tests above do. Nothing here is production
+    // code: it exists so Task 6b's delivery-shape tests have something
+    // to run against.
+    // -------------------------------------------------------------------
+
+    /// Records what the agent sent, so a test can assert on the shape of a
+    /// turn's delivery rather than only its final text.
+    ///
+    /// `fail_first` exists for one test: a send that the channel refuses
+    /// must not take the rest of the turn down with it. Counting calls
+    /// rather than holding a queue of outcomes keeps the stub to the one
+    /// behaviour that is actually needed.
+    struct RecordingChannel {
+        sent: Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>,
+        fail_first: bool,
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::channel::Channel for RecordingChannel {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        async fn send(&self, message: &crate::channel::OutgoingMessage) -> anyhow::Result<()> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if self.fail_first && *calls == 1 {
+                return Err(anyhow::anyhow!("simulated send failure"));
+            }
+            self.sent.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+
+        // `Channels::listen_all` is never driven in these tests —
+        // `handle_message` is called directly — so this only needs to
+        // satisfy the trait, not do anything.
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<crate::channel::IncomingMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build an `Agent` whose provider replays `responses` in order and
+    /// whose only channel records what it is asked to send.
+    ///
+    /// Mirrors `ServeState::build_for_test` (src/serve/mod.rs): leak the
+    /// `TempDir` on purpose — this is a test binary and the OS reclaims
+    /// the directory when it exits.
+    fn build_test_agent(
+        responses: Vec<crate::provider::ChatResponse>,
+        fail_first: bool,
+    ) -> (
+        Arc<super::Agent>,
+        Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>,
+    ) {
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let base = dir.path().to_path_buf();
+
+        // Minimal config: no room_profile mapping for the test room, so
+        // `ProviderRegistry::for_room` falls through to the "anthropic"
+        // key — which `for_test` below points at the same stub.
+        let config = crate::config::Config::parse_for_test(
+            r#"
+[anthropic]
+api_key = "test"
+"#,
+        );
+
+        let provider = crate::serve::StubProvider::new(responses);
+        // Registered under both names, as `ServeState::build_for_test_with`
+        // does: the fallback path (no room_profile match) resolves the
+        // built-in "anthropic" key.
+        let registry = crate::provider::registry::ProviderRegistry::for_test(
+            &["anthropic", "stub"],
+            Arc::new(provider),
+        );
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let channel = RecordingChannel {
+            sent: Arc::clone(&sent),
+            fail_first,
+            calls: Mutex::new(0),
+        };
+        let channels = crate::channel::Channels::new(
+            vec![(
+                "test".to_string(),
+                Arc::new(channel) as Arc<dyn crate::channel::Channel>,
+            )],
+            std::collections::HashMap::new(),
+        );
+
+        let workspace = Arc::new(crate::workspace::Workspace::new(
+            base.join("workspace"),
+            crate::config::DigestConfig::default(),
+        ));
+
+        // Registers the same `echo` tool `ServeState::build_for_test`
+        // advertises, so Task 6b's scripted tool calls (which name
+        // `echo`) resolve without needing the full
+        // `crate::tools::default_tool_set` wiring.
+        let tools = Arc::new(crate::tools::ToolSet::new(
+            vec![Box::new(crate::serve::EchoTool::new())],
+            Vec::new(),
+        ));
+
+        let session_store = Arc::new(crate::session::SessionStore::new(
+            base.join("sessions"),
+            "test",
+            None,
+        ));
+
+        let agent = super::Agent::new(
+            config,
+            Arc::new(channels),
+            Arc::new(registry),
+            workspace,
+            Some(tools),
+            session_store,
+            None,
+            None,
+        );
+
+        (Arc::new(agent), sent)
+    }
+
+    /// Build an `Agent` whose provider replays `responses` in order and
+    /// whose only channel records what it is asked to send.
+    ///
+    /// Mirrors `ServeState::build_for_test` (src/serve/mod.rs): leak the
+    /// `TempDir` on purpose — this is a test binary and the OS reclaims
+    /// the directory when it exits.
+    fn agent_with_scripted_provider(
+        responses: Vec<crate::provider::ChatResponse>,
+    ) -> (
+        Arc<super::Agent>,
+        Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>,
+    ) {
+        build_test_agent(responses, false)
+    }
+
+    /// Same, but the channel refuses the first send.
+    ///
+    /// Not yet called by any test in this file — it exists for Task 6b's
+    /// delivery-shape tests, which need to prove a refused send doesn't
+    /// take the rest of a turn down with it. `#[allow(dead_code)]` for
+    /// the same reason `SessionStore::new` carries one: an interface
+    /// function whose only caller lands in a later commit.
+    #[allow(dead_code)]
+    fn agent_with_failing_first_send(
+        responses: Vec<crate::provider::ChatResponse>,
+    ) -> (
+        Arc<super::Agent>,
+        Arc<Mutex<Vec<crate::channel::OutgoingMessage>>>,
+    ) {
+        build_test_agent(responses, true)
+    }
+
+    fn incoming(text: &str) -> crate::channel::IncomingMessage {
+        crate::channel::IncomingMessage {
+            id: "m1".to_string(),
+            sender: "@tester:example.com".to_string(),
+            content: text.to_string(),
+            room_id: "test-room".to_string(),
+            timestamp: 0,
+            thread_id: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// The test harness itself. `Agent` gets built, `handle_message` runs
+    /// one turn, and the reply lands on the stub channel. Task 6b's
+    /// behaviour tests all ride on this, so nothing further proceeds
+    /// until this passes.
+    #[tokio::test]
+    async fn the_test_harness_drives_a_turn_end_to_end() {
+        let (agent, sent) = agent_with_scripted_provider(vec![crate::provider::ChatResponse {
+            text: Some("ok".to_string()),
+            tool_calls: Vec::new(),
+            stop_reason: None,
+        }]);
+
+        agent.handle_message(incoming("hello")).await.unwrap();
+
+        let bodies: Vec<String> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(bodies, vec!["ok".to_string()]);
+    }
 }
