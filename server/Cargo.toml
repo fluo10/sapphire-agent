@@ -73,6 +73,12 @@ serde_json.workspace = true
 
 # Config (TOML)
 toml = "1.0"
+# Reports the keys a `Config` deserialization ignored, so a typo or a
+# setting written under the wrong table is a startup warning instead of
+# silence. `deny_unknown_fields` would be the other way to notice, but it
+# turns an unknown key into a hard failure — which makes a config written
+# for a newer build unloadable by an older one.
+serde_ignored = "0.1"
 
 # YAML (heartbeat task frontmatter)
 serde_yaml = "0.9"

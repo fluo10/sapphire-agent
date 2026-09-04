@@ -61,10 +61,10 @@ use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
-    CreateTerminalRequest, CurrentModeUpdate, Error, InitializeRequest, InitializeResponse,
-    KillTerminalRequest, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, ReadTextFileRequest,
+    CreateTerminalRequest, CurrentModeUpdate, Error, Implementation, InitializeRequest,
+    InitializeResponse, KillTerminalRequest, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse, ReadTextFileRequest,
     ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionId, SessionInfo,
     SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
@@ -245,6 +245,50 @@ fn fs_caps_from(caps: &ClientCapabilities) -> (bool, bool) {
 /// `AcpProgress`.
 fn terminal_cap_from(caps: &ClientCapabilities) -> bool {
     caps.terminal
+}
+
+/// The capability line logged when a client initializes.
+///
+/// These three flags decide which client-side tools the model is offered
+/// at all — the two `client_file_*` tools, the four `client_shell*` ones
+/// and, through the terminal flag, all four skill tools
+/// (`visible_tool_predicate`, `src/serve/mod.rs`). When a tool is missing
+/// there are exactly two possible reasons, and this was the invisible
+/// one: the namespace's `skills` flag is in a file the operator can read,
+/// while the capabilities arrive on the wire and were recorded without
+/// ever being shown. Diagnosing a missing `skill_install` meant reading
+/// the editor's source or guessing.
+///
+/// Rendered by a free function, like `fs_caps_from` above and for the
+/// same reason: a test can pin the text against a hand-built
+/// `ClientCapabilities` without standing up a connection, which is the
+/// only way to catch the two `fs` flags being printed the wrong way
+/// round.
+fn describe_capabilities(caps: &ClientCapabilities) -> String {
+    let (read, write) = fs_caps_from(caps);
+    format!(
+        "fs.read={read} fs.write={write} terminal={}",
+        terminal_cap_from(caps)
+    )
+}
+
+/// How the log names the peer.
+///
+/// `client_info` is optional in ACP v1 — the schema notes it becomes
+/// required in a later version — so a client that omits it has to be
+/// named as unidentified rather than logged as an empty string, which
+/// would read as a bug in this line rather than an omission by the
+/// client. `title` is the human-facing name when the client sends one,
+/// with `name` (the programmatic id) as the documented fallback.
+fn describe_client(info: Option<&Implementation>) -> String {
+    match info {
+        Some(info) => format!(
+            "{} {}",
+            info.title.as_deref().unwrap_or(&info.name),
+            info.version
+        ),
+        None => "an unidentified client".to_string(),
+    }
 }
 
 /// The working directory `AcpClientHandle::create_terminal` sends on
@@ -992,6 +1036,12 @@ async fn serve_connection(socket: WebSocket, state: Arc<ServeState>, profile_nam
                     // what copy it onto one, from here.
                     *sessions.client_capabilities.lock().unwrap() =
                         req.client_capabilities.clone();
+
+                    info!(
+                        "ACP: {} initialized: {}",
+                        describe_client(req.client_info.as_ref()),
+                        describe_capabilities(&req.client_capabilities)
+                    );
 
                     // Answer with the version we will actually speak, which the
                     // ACP specification defines as the client's version if we
@@ -3976,6 +4026,48 @@ mod tests {
         assert!(!terminal_cap_from(
             &ClientCapabilities::new().terminal(false)
         ));
+    }
+
+    /// The log line has to distinguish all three flags, or reading it
+    /// back during an incident answers the wrong question. Asymmetric
+    /// input for the same reason as `fs_caps_from`'s test above: a
+    /// rendering that printed one flag three times would pass on
+    /// uniform input.
+    #[test]
+    fn describe_capabilities_names_each_flag_separately() {
+        let caps = ClientCapabilities::new()
+            .fs(FileSystemCapabilities::new().read_text_file(true))
+            .terminal(true);
+        assert_eq!(
+            describe_capabilities(&caps),
+            "fs.read=true fs.write=false terminal=true"
+        );
+
+        assert_eq!(
+            describe_capabilities(&ClientCapabilities::new()),
+            "fs.read=false fs.write=false terminal=false"
+        );
+    }
+
+    /// `client_info` is optional in ACP v1, and a client that omits it
+    /// must still produce a legible line — an empty name would read as
+    /// this code being broken rather than as the client saying nothing.
+    #[test]
+    fn describe_client_falls_back_when_the_client_says_nothing() {
+        assert_eq!(describe_client(None), "an unidentified client");
+    }
+
+    /// `title` is the human-facing name and wins when the client sends
+    /// one; `name` is the programmatic id the schema documents as the
+    /// fallback.
+    #[test]
+    fn describe_client_prefers_the_title_over_the_programmatic_name() {
+        let bare = Implementation::new("some-editor".to_string(), "1.2.3".to_string());
+        assert_eq!(describe_client(Some(&bare)), "some-editor 1.2.3");
+
+        let titled = Implementation::new("some-editor".to_string(), "1.2.3".to_string())
+            .title("Some Editor".to_string());
+        assert_eq!(describe_client(Some(&titled)), "Some Editor 1.2.3");
     }
 
     /// `effective_cwd` picks between two genuinely different paths —

@@ -1665,6 +1665,22 @@ pub struct LoadedConfig {
     pub config: Config,
     /// Workspace-layer keys refused by the allowlist. Reported at startup.
     pub rejected: Vec<String>,
+    /// Dot-joined paths of keys in the loaded document that no `Config`
+    /// field consumed, sorted and deduplicated.
+    ///
+    /// A typo (`skils = true`) and a setting written under the wrong
+    /// table (`skills = true` under `[room_profile.<n>]`, where the flag
+    /// the agent reads is `[memory_namespace.<n>].skills`) are both
+    /// silent otherwise: serde drops the key without a word, so the file
+    /// reads as configured to the person who wrote it and as unset to
+    /// the agent — the exact shape of a bug report that costs an hour.
+    ///
+    /// Reported at startup and by `verify`, never fatal.
+    /// `#[serde(deny_unknown_fields)]` is the other way to notice and is
+    /// deliberately not it: a hard error would make a config written for
+    /// a newer build unloadable by an older one, which matters for a
+    /// workspace config that syncs between hosts.
+    pub unknown: Vec<String>,
     /// Which layer supplied each setting, for `verify`.
     pub provenance: BTreeMap<String, Layer>,
     /// Path of the workspace-level config, when one was actually read (the file
@@ -1745,8 +1761,18 @@ impl Config {
         };
 
         let outcome = config_layer::merge_layers(workspace, host.clone());
+        // Deserialize through `serde_ignored` rather than `try_into` so the
+        // keys serde drops are collected instead of vanishing. The merged
+        // document is what the agent actually runs on, so these are the
+        // paths a warning should name — `provenance` maps each back to the
+        // layer that supplied it.
+        let mut unknown = Vec::new();
         let deserialized: std::result::Result<Config, toml::de::Error> =
-            outcome.merged.clone().try_into();
+            serde_ignored::deserialize(outcome.merged.clone(), |path| {
+                unknown.push(path.to_string());
+            });
+        unknown.sort();
+        unknown.dedup();
 
         // Drop the workspace layer and continue on the host config alone — but
         // only once the host config is known to be good on its own. Blaming the
@@ -1755,13 +1781,22 @@ impl Config {
         // merged check too, and the mere existence of an unrelated workspace
         // file would otherwise put its name in the message.
         let fall_back_to_host_only = |reason: String| -> Result<LoadedConfig> {
-            let host_config: Config = host.clone().try_into().with_context(|| {
+            // Collected against the host document alone: the merged one is
+            // being discarded, and reporting a path the running config no
+            // longer contains would point at the wrong file.
+            let mut host_unknown = Vec::new();
+            let host_config: Config = serde_ignored::deserialize(host.clone(), |path| {
+                host_unknown.push(path.to_string());
+            })
+            .with_context(|| {
                 format!(
                     "Failed to parse config file: {} (the workspace layer had already been \
                      dropped because it {reason})",
                     host_path.display()
                 )
             })?;
+            host_unknown.sort();
+            host_unknown.dedup();
             let host_errors = host_config.validate_profiles();
             if !host_errors.is_empty() {
                 anyhow::bail!(
@@ -1781,6 +1816,7 @@ impl Config {
             Ok(LoadedConfig {
                 config: host_config,
                 rejected: Vec::new(),
+                unknown: host_unknown,
                 provenance,
                 workspace_path: workspace_path.clone(),
             })
@@ -1798,6 +1834,7 @@ impl Config {
                     Ok(LoadedConfig {
                         config,
                         rejected: outcome.rejected,
+                        unknown,
                         provenance: outcome.provenance,
                         workspace_path,
                     })
@@ -2655,6 +2692,112 @@ model = "gemma-4-31b-it"
         assert_eq!(
             loaded.provenance.get("anthropic.system_prompt"),
             Some(&crate::config_layer::Layer::Workspace)
+        );
+    }
+
+    /// The bug this check exists for. `skills` is a `[memory_namespace.<n>]`
+    /// key; written under `[room_profile.<n>]` instead, it deserializes
+    /// cleanly, reads as configured to whoever wrote it, and does nothing —
+    /// the skill tools stay hidden and the only symptom is a model that
+    /// insists it can see them.
+    #[test]
+    fn a_key_no_field_consumes_is_reported_with_its_full_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            "[anthropic]\napi_key = \"sk-test\"\n\n\
+             [profiles.local]\nprovider = \"anthropic\"\n\n\
+             [room_profile.default]\nprofile = \"local\"\nskills = true\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        assert_eq!(
+            loaded.unknown,
+            vec!["room_profile.default.skills".to_string()]
+        );
+        // Reported, never fatal: the rest of the file still took effect.
+        assert_eq!(loaded.config.room_profiles["default"].profile, "local");
+    }
+
+    /// A key serde accepts under another spelling must not be reported.
+    /// `room_id` is an alias for `room_ids`, and the cheap way to find
+    /// unknown keys — serialize the parsed `Config` back out and diff the
+    /// two documents — would call it unknown, because it round-trips under
+    /// its canonical name. Reading serde's own ignored-key callback is what
+    /// makes aliases, `flatten` and defaulted fields come out right.
+    #[test]
+    fn an_accepted_alias_is_not_reported_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            "[anthropic]\napi_key = \"sk-test\"\n\n\
+             [matrix]\nhomeserver = \"https://srv\"\naccess_token = \"t\"\n\
+             user_id = \"@a:srv\"\ndevice_id = \"D\"\nroom_id = \"!a:srv\"\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        assert!(
+            loaded.unknown.is_empty(),
+            "the `room_id` alias was reported as unknown: {:?}",
+            loaded.unknown
+        );
+        assert_eq!(
+            loaded.config.matrix.as_ref().unwrap().room_ids,
+            vec!["!a:srv".to_string()]
+        );
+    }
+
+    /// An unknown key in the workspace layer survives the merge (the
+    /// allowlist admits everything under `memory_namespace`), so it has to
+    /// be reported against the merged document — and `layer_of` has to be
+    /// able to send the person to the workspace file rather than the host
+    /// one they did not write it in.
+    #[test]
+    fn an_unknown_key_from_the_workspace_layer_is_attributed_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(&host_path, "[anthropic]\napi_key = \"sk-host\"\n").unwrap();
+        let marker = dir.path().join(".sapphire-agent");
+        std::fs::create_dir_all(&marker).unwrap();
+        std::fs::write(
+            marker.join("config.toml"),
+            "[memory_namespace.dev]\nskils = true\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        assert_eq!(
+            loaded.unknown,
+            vec!["memory_namespace.dev.skils".to_string()]
+        );
+        assert_eq!(
+            crate::config_layer::layer_of("memory_namespace.dev.skils", &loaded.provenance),
+            Some(crate::config_layer::Layer::Workspace)
+        );
+    }
+
+    /// The example config ships as the thing to copy, so a key in it that
+    /// nothing reads would hand every new deployment a warning on its first
+    /// start.
+    #[test]
+    fn the_example_config_has_no_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml")),
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        assert!(
+            loaded.unknown.is_empty(),
+            "config.example.toml contains key(s) nothing reads: {:?}",
+            loaded.unknown
         );
     }
 

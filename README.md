@@ -80,6 +80,26 @@ sapphire-agent          # start the channel listeners + HTTP control API
 sapphire-call           # one-off interactive session (separate crate)
 ```
 
+### Keys nothing reads
+
+A key no field consumes is a warning, never an error. A typo (`skils = true`)
+and a setting written under the wrong table (`skills` belongs to
+`[memory_namespace.<name>]`; under `[room_profile.<name>]` it parses fine and
+does nothing) are otherwise silent — serde drops the key, so the file reads as
+configured to whoever wrote it and as unset to the agent. Startup logs one
+warning per file, naming the file through the same provenance `verify` uses:
+
+```
+WARN Ignoring 1 unrecognised key(s) in /home/you/.config/sapphire-agent/config.toml:
+     room_profile.default.skills. Nothing reads these, so the agent is running as if
+     they were absent — check for a typo, or for a setting written under the wrong table.
+```
+
+`verify` prints the same list under `Unknown keys`. This is deliberately not
+`#[serde(deny_unknown_fields)]`: a hard error would make a config written for a
+newer build unloadable by an older one, which matters most for the workspace
+layer, since it travels between hosts.
+
 ## Subagents
 
 The main agent can delegate a task to a specialised subagent via the
@@ -763,6 +783,20 @@ development work and wrong for an everyday conversation:
 [memory_namespace.dev]
 skills = true   # default false
 ```
+
+Two gates, both required: this flag, and an ACP client that declared terminal
+support. When the tools are missing, the connection log says which gate is shut
+— every `initialize` records what the client can do:
+
+```
+INFO ACP: connection accepted for room profile 'dev'
+INFO ACP: Zed 0.209.3 initialized: fs.read=true fs.write=true terminal=true
+```
+
+A client with `terminal=false` will never be offered them however the namespace
+is configured; with `terminal=true` and no tools in sight, the namespace flag is
+the one to check — and misspelling it or putting it under `[room_profile.<name>]`
+now warns at startup (see [Keys nothing reads](#keys-nothing-reads)).
 
 ### The four tools
 
