@@ -14,6 +14,18 @@ wake / VAD / TTS plumbing, and earlier feature work live in the root
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/fluo10/sapphire-agent/compare/sapphire-call-cli-v0.7.0...sapphire-call-cli-v0.8.0) - 2026-09-05
+
+### Added
+
+- *(server)* Default the HTTP API server to port 3170 ([#229](https://github.com/fluo10/sapphire-agent/pull/229))
+
+### Changed
+
+- [**breaking**] *(workspace)* Give every binary a role-named top-level directory ([#223](https://github.com/fluo10/sapphire-agent/pull/223))
+
+
+
 ## [0.7.0] - 2026-05-23
 
 First release under the new crate name. The version is aligned with

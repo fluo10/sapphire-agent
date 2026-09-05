@@ -8131,7 +8131,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "a2a-lf",
  "agent-client-protocol",
@@ -8177,7 +8177,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent-rpc"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -8190,7 +8190,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-call-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "bzip2 0.6.1",
@@ -8212,7 +8212,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-call-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "directories",
