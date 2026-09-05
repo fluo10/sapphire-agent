@@ -81,12 +81,6 @@ pub struct Workspace {
     dir: PathBuf,
     digest_cfg: DigestConfig,
     cache: Mutex<HashMap<PathBuf, CachedFile>>,
-    /// Pre-rendered "today's cross-session digest" per memory namespace.
-    /// Populated by an external builder (`main.rs` rebuilds it after the
-    /// periodic workspace re-index), consumed by `build_system_prompt` to
-    /// inject same-day context that the heartbeat daily-log path can't
-    /// surface until 04:00 the next morning.
-    today_digests: Mutex<HashMap<String, String>>,
 }
 
 impl Workspace {
@@ -96,15 +90,7 @@ impl Workspace {
             dir,
             digest_cfg,
             cache: Mutex::new(HashMap::new()),
-            today_digests: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Replace the cached "today's digest" map. Caller is responsible for
-    /// computing the map (which walks every relevant session JSONL); this
-    /// method just swaps the cache atomically.
-    pub async fn replace_today_digests(&self, digests: HashMap<String, String>) {
-        *self.today_digests.lock().await = digests;
     }
 
     /// Build the full system prompt:
@@ -131,14 +117,12 @@ impl Workspace {
             parts.push(b.to_string());
         }
 
-        // Inject current date/time so the agent has temporal awareness
-        // (needed for tools like `memory` which write date-stamped files).
+        // Deliberately no current date/time block. It changed on every
+        // turn, so the prompt prefix every provider caches never matched
+        // the previous one and each request re-processed the whole
+        // system prompt. Temporal awareness now comes from the
+        // `current_time` tool, which the model calls when it needs it.
         let now_local = chrono::Local::now();
-        parts.push(format!(
-            "# Current Date and Time\n\n{} ({})",
-            now_local.format("%Y-%m-%d %H:%M:%S %z"),
-            now_local.format("%A")
-        ));
 
         // Channel-side room metadata (Matrix room.name+topic, Discord
         // channel.name+topic, or device-supplied "voice channel with X").
@@ -165,33 +149,7 @@ impl Workspace {
         let today = crate::session::local_date_for_timestamp(now_local, boundary_hour);
         self.inject_periodic_logs(&mut parts, today, namespace_chain);
 
-        // Same-day cross-session digest. Injected last so the most recent
-        // context lands closest to the conversation history.
-        if let Some(block) = self.build_today_digest_block(namespace_chain).await {
-            parts.push(block);
-        }
-
         parts.join("\n\n---\n\n")
-    }
-
-    async fn build_today_digest_block(&self, namespace_chain: &[String]) -> Option<String> {
-        let cache = self.today_digests.lock().await;
-        let mut subsections = Vec::new();
-        for ns in namespace_chain {
-            if let Some(text) = cache.get(ns)
-                && !text.trim().is_empty()
-            {
-                subsections.push(format!("## {ns}\n\n{}", text.trim()));
-            }
-        }
-        if subsections.is_empty() {
-            None
-        } else {
-            Some(format!(
-                "# Today's Cross-Session Notes\n\n{}",
-                subsections.join("\n\n")
-            ))
-        }
     }
 
     /// Read MEMORY.md from each namespace in the chain (closest first) and
@@ -450,5 +408,44 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
         format!("{truncated}\n\n[... truncated to {max_chars} characters ...]")
     } else {
         truncated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace_with_agents_md(dir: &tempfile::TempDir) -> Workspace {
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "# how this workspace works\n\nread the files.\n",
+        )
+        .unwrap();
+        Workspace::new(dir.path().to_path_buf(), DigestConfig::default())
+    }
+
+    /// The property the prompt cache depends on: two turns a second
+    /// apart must produce the *same bytes*.
+    ///
+    /// A clock in the system prompt broke this — every turn changed the
+    /// cached prefix, so a provider re-processed the whole prompt (and,
+    /// behind it, the whole tool-result-laden history) instead of
+    /// hitting its cache. `current_time` answers the same question
+    /// without moving the prefix.
+    #[tokio::test]
+    async fn the_system_prompt_is_byte_identical_across_turns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = workspace_with_agents_md(&dir);
+        let chain = ["default".to_string()];
+
+        let first = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+        let second = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+
+        assert_eq!(first, second);
+        assert!(
+            !first.contains("Current Date and Time"),
+            "the clock belongs in `current_time`, not in the prompt: {first}"
+        );
+        assert!(first.contains("read the files."), "{first}");
     }
 }

@@ -211,24 +211,6 @@ pub struct SummaryLine {
     pub covers_through: Option<Uuid>,
 }
 
-/// A short summary describing what happened in a single session during the
-/// current local day. Emitted on idle-flush and graceful shutdown. Distinct
-/// from `SummaryLine` because its scope is "today only" — `SessionPolicy::
-/// Compact` sessions can carry context across the day boundary, so their
-/// cumulative `SummaryLine` is not safe to splice into another room's
-/// system prompt as "what happened today."
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IntradayDigestLine {
-    pub digest_at: DateTime<Utc>,
-    pub digest: String,
-    /// Informational lower bound on the timestamps covered by this digest;
-    /// when set, consumers may reject digests whose `since` predates the
-    /// current local day. Not currently used for filtering — `digest_at`
-    /// is the canonical "today?" predicate.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub since: Option<DateTime<Utc>>,
-}
-
 // ---------------------------------------------------------------------------
 // SessionStore
 // ---------------------------------------------------------------------------
@@ -479,57 +461,6 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Walk every session file under `sessions_dir` and return the latest
-    /// intra-day digest per session whose `digest_at` falls inside the
-    /// local-time `date` window, paired with the session's metadata.
-    ///
-    /// The digest text comes from `cache` — `<cache_dir>/digests/`, one
-    /// entry per session, overwritten in place. It used to be appended
-    /// to the session's own JSONL, which put a dozen near-identical
-    /// restatements of the same afternoon inside a file the retrieve
-    /// indexer walks (#190). This read path no longer treats the file as
-    /// canonical: a cache hit is used as-is. Moving the write side off
-    /// the file too is a separate change.
-    ///
-    /// A digest line still present in the file is read as a fallback for
-    /// a session the cache has nothing for yet, so the upgrade does not
-    /// blank out the day it lands on.
-    ///
-    /// There is deliberately no mtime pre-filter here. One used to skip
-    /// files last touched before `day_start`, on the reasoning that a
-    /// quiet session has no digest today — but that only held while
-    /// writing a digest meant appending to the file, which refreshed its
-    /// mtime. A digest written to the cache leaves the file, and its
-    /// mtime, untouched, so the filter would silently drop a session
-    /// that fell quiet just before the day boundary and got its digest
-    /// just after it. The performance the filter bought is recovered
-    /// instead by reading only the meta line before touching the cache,
-    /// and scanning the rest of the file only on a cache miss.
-    pub fn intraday_digests_for_day(
-        &self,
-        date: NaiveDate,
-        boundary_hour: u8,
-        cache: Option<&crate::digest_cache::DigestCache>,
-    ) -> Vec<(SessionMeta, IntradayDigestLine)> {
-        let (day_start, day_end) = day_window(date, boundary_hour);
-        let mut out = Vec::new();
-        for path in collect_session_files(&self.base_dir, self.kind) {
-            let Some(meta) = load_session_meta(&path) else {
-                continue;
-            };
-            let digest = match cache.and_then(|c| c.get(&meta.session_id)) {
-                Some(d) => Some(d),
-                None => load_latest_intraday_digest(&path),
-            };
-            let Some(d) = digest else { continue };
-            if d.digest_at >= day_start && d.digest_at < day_end {
-                out.push((meta, d));
-            }
-        }
-        out.sort_by_key(|(meta, _)| meta.created_at);
-        out
-    }
-
     /// Close a session by appending a `closed_at` marker.
     /// The session becomes inactive; future messages create a new session.
     pub fn close_session(&self, session_id: &str) -> anyhow::Result<()> {
@@ -618,6 +549,17 @@ impl SessionStore {
             .collect();
         metas.sort_by_key(|m| m.created_at);
         metas
+    }
+
+    /// Listing rows for every session in this store, newest activity
+    /// last. One pass per file, no message bodies — see [`SessionRow`].
+    pub fn session_rows(&self) -> Vec<SessionRow> {
+        let mut rows: Vec<SessionRow> = collect_session_files(&self.base_dir, self.kind)
+            .into_iter()
+            .filter_map(|p| load_session_row(&p))
+            .collect();
+        rows.sort_by_key(|r| r.last_at.unwrap_or(r.meta.created_at));
+        rows
     }
 
     /// One session as the model should see it: the latest compaction
@@ -1295,8 +1237,10 @@ fn load_session_file(path: &Path) -> Option<LoadedSession> {
                 }
             }
         } else if value.get("digest_at").is_some() {
-            // Intra-day digest lines are not returned by this loader;
-            // `intraday_digests_for_day` reads them through its own helper.
+            // Intra-day digest lines, written by the builds that had a
+            // periodic summariser. Nothing reads them any more; they are
+            // skipped here so an old file's digest is never mistaken for
+            // a message.
             continue;
         } else if value.get("timestamp").is_some() {
             match serde_json::from_value::<StoredMessage>(value) {
@@ -1344,43 +1288,56 @@ fn model_history(loaded: &LoadedSession) -> (Option<&str>, &[StoredMessage]) {
     )
 }
 
-/// Read just the first line of a session file: its `SessionMeta`. Cheap
-/// enough to call for every session before deciding whether a full scan
-/// for a fallback digest is even needed (see `intraday_digests_for_day`).
-fn load_session_meta(path: &Path) -> Option<SessionMeta> {
+/// One session as the `session_list` tool renders it.
+///
+/// Everything here comes out of a single pass over the file that never
+/// materialises a message: the listing wants counts and timestamps, and
+/// a session's messages can be megabytes. That is the whole reason this
+/// is not `list_sessions().map(...)`.
+#[derive(Debug, Clone)]
+pub struct SessionRow {
+    pub meta: SessionMeta,
+    /// Number of stored messages (both roles, tool traffic included).
+    pub message_count: usize,
+    /// Timestamp of the last stored message, `None` for an empty session.
+    pub last_at: Option<DateTime<Utc>>,
+    pub is_closed: bool,
+}
+
+/// Scan one session file for its listing row without accumulating
+/// messages. Returns `None` when the first line is not a readable meta.
+fn load_session_row(path: &Path) -> Option<SessionRow> {
     let file = fs::File::open(path).ok()?;
     let mut lines = BufReader::new(file).lines();
     let first = lines.next()?.ok()?;
     let meta_line: MetaLine = serde_json::from_str(first.trim()).ok()?;
-    Some(meta_line.meta)
-}
-
-/// Scan a session file for its latest `IntradayDigestLine`, skipping
-/// message accumulation. Only worth calling when the digest cache has no
-/// entry for the session — the transition-era fallback in
-/// `intraday_digests_for_day` (#190).
-fn load_latest_intraday_digest(path: &Path) -> Option<IntradayDigestLine> {
-    let file = fs::File::open(path).ok()?;
-    let mut lines = BufReader::new(file).lines();
-    let _ = lines.next()?; // meta line, already consumed by `load_session_meta`
-
-    let mut latest: Option<IntradayDigestLine> = None;
+    let mut row = SessionRow {
+        meta: meta_line.meta,
+        message_count: 0,
+        last_at: None,
+        is_closed: false,
+    };
     for raw in lines.map_while(Result::ok) {
         let raw = raw.trim();
         if raw.is_empty() {
             continue;
         }
-        let value: serde_json::Value = match serde_json::from_str(raw) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            continue;
         };
-        if value.get("digest_at").is_some()
-            && let Ok(d) = serde_json::from_value::<IntradayDigestLine>(value)
-        {
-            latest = Some(d);
+        if value.get("closed_at").is_some() {
+            row.is_closed = true;
+        } else if let Some(title) = value.get("session_title").and_then(|v| v.as_str()) {
+            // Last title wins, matching `load_session_file`.
+            row.meta.title = Some(title.to_string());
+        } else if let Some(ts) = value.get("timestamp").and_then(|v| v.as_str()) {
+            row.message_count += 1;
+            if let Ok(at) = DateTime::parse_from_rfc3339(ts) {
+                row.last_at = Some(at.with_timezone(&Utc));
+            }
         }
     }
-    latest
+    Some(row)
 }
 
 /// The id of the last message a summary keeping `keep_recent` trailing
@@ -1764,114 +1721,6 @@ mod tests {
         assert_ne!(
             stale_id, fresh,
             "yesterday's session must not be picked up; daily rotation depends on it"
-        );
-    }
-
-    // ── intra-day digest がキャッシュから引かれる (#190) ──────────────────
-
-    fn store_with_one_session() -> (tempfile::TempDir, SessionStore, String) {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
-        let key = ("!room:example.org".to_string(), None);
-        let sid = store.create_session(&key, "matrix", "default").unwrap();
-        (tmp, store, sid)
-    }
-
-    /// digest はセッションファイルではなくキャッシュに置かれる。ファイル側に
-    /// 何も書かれていなくても、today ブロックには現れなければならない。
-    #[test]
-    fn a_cached_digest_is_returned_without_any_line_in_the_file() {
-        let (_tmp, store, sid) = store_with_one_session();
-        let cache_dir = tempfile::TempDir::new().unwrap();
-        let cache = crate::digest_cache::DigestCache::open(cache_dir.path().to_path_buf()).unwrap();
-        cache.put(&sid, "we fixed the parser", None).unwrap();
-
-        let today = local_date_for_timestamp(Local::now(), 4);
-        let got = store.intraday_digests_for_day(today, 4, Some(&cache));
-
-        assert_eq!(got.len(), 1, "the cached digest must be found; got {got:?}");
-        assert_eq!(got[0].1.digest, "we fixed the parser");
-        assert_eq!(got[0].0.session_id, sid);
-    }
-
-    /// アップグレード直後、キャッシュはまだ空でファイルには前バージョンが書いた
-    /// digest 行が残っている。その日の today ブロックが空になってはいけない。
-    #[test]
-    fn a_file_digest_is_the_fallback_when_the_cache_has_nothing() {
-        let (_tmp, store, sid) = store_with_one_session();
-        let path = store.absolute_path_for(&sid).unwrap();
-        let line = serde_json::to_string(&IntradayDigestLine {
-            digest_at: Utc::now(),
-            digest: "written by the previous version".to_string(),
-            since: None,
-        })
-        .unwrap();
-        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(f, "{line}").unwrap();
-        drop(f);
-
-        let cache_dir = tempfile::TempDir::new().unwrap();
-        let cache = crate::digest_cache::DigestCache::open(cache_dir.path().to_path_buf()).unwrap();
-
-        let today = local_date_for_timestamp(Local::now(), 4);
-        let got = store.intraday_digests_for_day(today, 4, Some(&cache));
-
-        assert_eq!(got.len(), 1, "the file's own line must still be read");
-        assert_eq!(got[0].1.digest, "written by the previous version");
-    }
-
-    /// キャッシュとファイルの両方にある場合、キャッシュが勝つ — そちらが
-    /// 現在の書き込み先で、常に新しい。
-    #[test]
-    fn the_cache_wins_over_a_stale_file_line() {
-        let (_tmp, store, sid) = store_with_one_session();
-        let path = store.absolute_path_for(&sid).unwrap();
-        let line = serde_json::to_string(&IntradayDigestLine {
-            digest_at: Utc::now(),
-            digest: "stale".to_string(),
-            since: None,
-        })
-        .unwrap();
-        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(f, "{line}").unwrap();
-        drop(f);
-
-        let cache_dir = tempfile::TempDir::new().unwrap();
-        let cache = crate::digest_cache::DigestCache::open(cache_dir.path().to_path_buf()).unwrap();
-        cache.put(&sid, "fresh", None).unwrap();
-
-        let today = local_date_for_timestamp(Local::now(), 4);
-        let got = store.intraday_digests_for_day(today, 4, Some(&cache));
-        assert_eq!(got[0].1.digest, "fresh");
-    }
-
-    /// A digest lives in the cache now, so the session file is not touched
-    /// when one is written. A room that fell quiet just before the day
-    /// boundary and got its digest just after it has an old file and a
-    /// fresh digest — and must still appear in today's block.
-    #[test]
-    fn a_fresh_cached_digest_survives_an_old_file_mtime() {
-        let (_tmp, store, sid) = store_with_one_session();
-        let path = store.absolute_path_for(&sid).unwrap();
-        let two_days_ago =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 3600);
-        fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(two_days_ago)
-            .unwrap();
-
-        let cache_dir = tempfile::TempDir::new().unwrap();
-        let cache = crate::digest_cache::DigestCache::open(cache_dir.path().to_path_buf()).unwrap();
-        cache.put(&sid, "quiet room, late digest", None).unwrap();
-
-        let today = local_date_for_timestamp(Local::now(), 4);
-        let got = store.intraday_digests_for_day(today, 4, Some(&cache));
-        assert_eq!(
-            got.len(),
-            1,
-            "an old file must not hide a fresh cached digest: {got:?}"
         );
     }
 

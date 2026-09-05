@@ -160,15 +160,6 @@ impl ProviderRegistry {
         }
         Self { providers }
     }
-
-    /// Register an additional, independently distinguishable provider
-    /// under `name`. For tests that need to prove a resolution path
-    /// reached one specific provider rather than another — `for_test`
-    /// alone can't do that, since it installs the *same* provider
-    /// instance under every name.
-    pub(crate) fn insert_test(&mut self, name: &str, provider: Arc<dyn Provider>) {
-        self.providers.insert(name.to_string(), provider);
-    }
 }
 
 #[cfg(test)]

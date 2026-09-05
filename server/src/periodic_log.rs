@@ -17,12 +17,10 @@
 //! - Yearly ← the 12 monthly bodies of that calendar year.
 
 use crate::acp_session::AcpSessionStore;
-use crate::digest_cache::DigestCache;
 use crate::provider::{ChatMessage, ContentPart, Provider, Role};
 use crate::session::{SessionMeta, SessionStore, StoredMessage};
 use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
 use sapphire_framework::workspace::WorkspaceState;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -1206,138 +1204,6 @@ pub async fn catchup_pending_yearly_logs(
 }
 
 // ---------------------------------------------------------------------------
-// Today's cross-session digest
-// ---------------------------------------------------------------------------
-
-/// Render the bullet block that goes under `# Today's Cross-Session Notes`
-/// for `namespace`. Walks `channel_store`, `cross_device_store`, and
-/// `device_default_store` for digests whose `digest_at` falls inside
-/// `today`'s local window, keeping only the latest per session that
-/// maps to `namespace`.
-///
-/// Returns `None` when no qualifying digest exists, so the caller can
-/// omit the namespace from the cache map and the system prompt block.
-#[allow(clippy::too_many_arguments)]
-pub fn build_today_digest_for_namespace<F>(
-    namespace: &str,
-    today: NaiveDate,
-    boundary_hour: u8,
-    channel_store: &SessionStore,
-    cross_device_store: Option<&SessionStore>,
-    device_default_store: Option<&SessionStore>,
-    acp_store: Option<&AcpSessionStore>,
-    digest_cache: Option<&DigestCache>,
-    room_to_namespace: F,
-) -> Option<String>
-where
-    F: Fn(&str) -> String,
-{
-    let mut entries: Vec<(SessionMeta, crate::session::IntradayDigestLine)> = Vec::new();
-    entries.extend(channel_store.intraday_digests_for_day(today, boundary_hour, digest_cache));
-    if let Some(s) = cross_device_store {
-        entries.extend(s.intraday_digests_for_day(today, boundary_hour, digest_cache));
-    }
-    if let Some(s) = device_default_store {
-        entries.extend(s.intraday_digests_for_day(today, boundary_hour, digest_cache));
-    }
-    if let (Some(s), Some(c)) = (acp_store, digest_cache) {
-        entries.extend(s.intraday_digests_for_day(today, boundary_hour, c));
-    }
-    if entries.is_empty() {
-        return None;
-    }
-
-    let mut lines: Vec<String> = Vec::new();
-    for (meta, digest) in entries {
-        let is_rpc = meta.channel == "rpc";
-        let is_device_default = meta.channel == "device-default";
-        let is_acp = meta.channel == "acp";
-        let ns = if is_rpc {
-            crate::config::DEFAULT_NAMESPACE_NAME.to_string()
-        } else if is_device_default || is_acp {
-            // These pin their namespace at creation time — honour it
-            // directly rather than deriving one from a room id they do
-            // not have.
-            meta.namespace
-                .clone()
-                .unwrap_or_else(|| crate::config::DEFAULT_NAMESPACE_NAME.to_string())
-        } else {
-            room_to_namespace(&meta.room_id)
-        };
-        if ns != namespace {
-            continue;
-        }
-        let room_label = if is_rpc || is_device_default || is_acp {
-            meta.title
-                .clone()
-                .unwrap_or_else(|| format!("{}/{}", meta.channel, short_id(&meta.session_id)))
-        } else {
-            format!("{}/{}", meta.channel, short_id(&meta.room_id))
-        };
-        let local_ts = digest.digest_at.with_timezone(&Local);
-        lines.push(format!(
-            "- [{}, {}] {}",
-            local_ts.format("%H:%M"),
-            room_label,
-            digest.digest.trim()
-        ));
-    }
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n"))
-    }
-}
-
-/// Convenience wrapper that produces the full `HashMap<namespace, block>`
-/// suitable for `Workspace::replace_today_digests`. Each namespace is
-/// rendered independently so a multi-namespace deployment doesn't leak
-/// rooms across the chain.
-#[allow(clippy::too_many_arguments)]
-pub fn build_all_today_digests<F>(
-    namespaces: &[String],
-    today: NaiveDate,
-    boundary_hour: u8,
-    channel_store: &SessionStore,
-    cross_device_store: Option<&SessionStore>,
-    device_default_store: Option<&SessionStore>,
-    acp_store: Option<&AcpSessionStore>,
-    digest_cache: Option<&DigestCache>,
-    room_to_namespace: F,
-) -> HashMap<String, String>
-where
-    F: Fn(&str) -> String + Copy,
-{
-    let mut out = HashMap::new();
-    for ns in namespaces {
-        if let Some(text) = build_today_digest_for_namespace(
-            ns,
-            today,
-            boundary_hour,
-            channel_store,
-            cross_device_store,
-            device_default_store,
-            acp_store,
-            digest_cache,
-            room_to_namespace,
-        ) {
-            out.insert(ns.clone(), text);
-        }
-    }
-    out
-}
-
-/// Display-friendly truncation for an arbitrary id (room_id / session_id):
-/// keeps the first 8 chars, used purely for readability in injected bullets.
-fn short_id(id: &str) -> String {
-    if id.chars().count() <= 8 {
-        id.to_string()
-    } else {
-        id.chars().take(8).collect()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1719,65 +1585,6 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(digest, vec!["fresh"]);
-    }
-
-    /// An ACP session's digest reaches the room's system prompt, and it
-    /// is routed by the namespace in its header rather than by a room id
-    /// it does not have.
-    #[test]
-    fn an_acp_digest_lands_in_its_own_namespace() {
-        let td = make_tempdir();
-        let sessions_base = td.path().join("sessions");
-        let channel_store = SessionStore::new(sessions_base.join("channel"), "channel", None);
-
-        let tool_payload_cache =
-            crate::tool_payload_cache::ToolPayloadCache::open(td.path().join("tool-payloads"))
-                .unwrap();
-        let acp_store = AcpSessionStore::new(sessions_base.join("acp"), Some(tool_payload_cache));
-        let digest_cache = DigestCache::open(td.path().join("digests")).unwrap();
-
-        acp_store.create("s1", "work", "/p").unwrap();
-        acp_store
-            .append_message("s1", &ChatMessage::user("did a thing"))
-            .unwrap();
-        digest_cache.put("s1", "we fixed the parser", None).unwrap();
-
-        let today = today(4);
-        let boundary_hour = 4u8;
-
-        let in_namespace = build_today_digest_for_namespace(
-            "work",
-            today,
-            boundary_hour,
-            &channel_store,
-            None,
-            None,
-            Some(&acp_store),
-            Some(&digest_cache),
-            |room_id: &str| room_id.to_string(),
-        );
-        assert!(
-            in_namespace
-                .as_deref()
-                .is_some_and(|body| body.contains("we fixed the parser")),
-            "expected the ACP digest in its own namespace's block: {in_namespace:?}"
-        );
-
-        let other_namespace = build_today_digest_for_namespace(
-            "default",
-            today,
-            boundary_hour,
-            &channel_store,
-            None,
-            None,
-            Some(&acp_store),
-            Some(&digest_cache),
-            |room_id: &str| room_id.to_string(),
-        );
-        assert!(
-            other_namespace.is_none(),
-            "the ACP digest must not leak into a different namespace: {other_namespace:?}"
-        );
     }
 
     // ── the two-source merge (`sessions_for_day_merged` / `pending_daily_dates`) ──

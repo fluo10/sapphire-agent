@@ -14,7 +14,6 @@ mod config;
 mod config_layer;
 mod context_compression;
 mod device_auth;
-mod digest_cache;
 mod frontmatter;
 mod heartbeat;
 mod heartbeat_config;
@@ -42,8 +41,8 @@ use clap::{Parser, Subcommand};
 use config::{Config, LoadedConfig};
 use heartbeat::Heartbeat;
 use periodic_log::{
-    build_all_today_digests, catchup_missing_daily_digests, catchup_pending_daily_logs,
-    catchup_pending_monthly_logs, catchup_pending_weekly_logs, catchup_pending_yearly_logs,
+    catchup_missing_daily_digests, catchup_pending_daily_logs, catchup_pending_monthly_logs,
+    catchup_pending_weekly_logs, catchup_pending_yearly_logs,
 };
 use provider::registry::ProviderRegistry;
 use sapphire_framework::workspace::{AppContext, Workspace as SwWorkspace, WorkspaceState};
@@ -501,6 +500,7 @@ async fn main() -> Result<()> {
                 &config.tools.mcp_servers,
                 Arc::clone(&timer_manager),
                 config.timer.presets.clone(),
+                config.day_boundary_hour,
             )
             .await;
 
@@ -631,6 +631,20 @@ async fn main() -> Result<()> {
             let device_default_session_store = Arc::new(SessionStore::with_workspace(
                 sessions_base.clone(),
                 "device-default",
+                Arc::clone(&ws_state),
+                tool_payload_cache.clone(),
+            ));
+
+            // ── Channel session store (sessions/<namespace>/channel/) ──────
+            // Sessions from every chat channel land here; each one still
+            // records its originating channel name in metadata. Built
+            // unconditionally — construction touches no filesystem — so
+            // the `session_list` / `session_read` tools can read chat
+            // sessions written by an earlier run even when this process
+            // has no channel configured.
+            let channel_session_store = Arc::new(SessionStore::with_workspace(
+                sessions_base.clone(),
+                "channel",
                 Arc::clone(&ws_state),
                 tool_payload_cache.clone(),
             ));
@@ -782,40 +796,9 @@ async fn main() -> Result<()> {
                 tool_payload_cache.clone(),
             ));
 
-            // ── Intra-day digest cache (workspace-external, store-agnostic) ─
-            // Same directory family as the tool-payload cache above, and
-            // the same degrade-not-abort treatment — a session must
-            // still load and every transport must still serve even
-            // without a place to cache "today's digest." `None` costs
-            // the ACP cross-session "today" block (`ServeState::digest_cache`'s
-            // doc) and makes the digest sweep skip its tick entirely
-            // (`spawn_acp_digest_sweep`); the daily log, built from each
-            // session's own events rather than from the digest, is
-            // unaffected. Keyed by session id alone, not ACP-specific,
-            // so #189 can reuse it for `/rpc` sessions later.
-            let digest_cache: Option<Arc<digest_cache::DigestCache>> =
-                match digest_cache::DigestCache::default_dir() {
-                    Some(dir) => match digest_cache::DigestCache::open(dir.clone()) {
-                        Ok(cache) => {
-                            tracing::info!("Digest cache opened at {dir:?}");
-                            Some(cache)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Digest cache open failed ({e:?}); today's cross-session digest will be unavailable"
-                            );
-                            None
-                        }
-                    },
-                    None => {
-                        tracing::warn!("No platform cache dir resolvable; digest cache disabled");
-                        None
-                    }
-                };
-
             // ── Subagent child-conversation cache (workspace-external) ──────
             // Same directory family and degrade-not-abort treatment as the
-            // digest cache above. `None` costs the ability to resume a
+            // tool-payload cache above. `None` costs the ability to resume a
             // subagent across calls — the `subagent` tool falls back to
             // one-shot and tells the model so — not startup.
             let subagent_cache: Option<Arc<subagent_cache::SubagentCache>> =
@@ -841,11 +824,6 @@ async fn main() -> Result<()> {
                     }
                 };
 
-            // Cloned before `ServeState` takes ownership: the channel
-            // agent writes its own rooms' digests here too, now that
-            // they no longer go into the session JSONL (#190).
-            let digest_cache_for_agent = digest_cache.clone();
-
             let serve_state = Arc::new(serve::ServeState::new(
                 config.clone(),
                 Arc::clone(&registry),
@@ -858,31 +836,47 @@ async fn main() -> Result<()> {
                 image_cache.clone(),
                 Arc::clone(&device_auth),
                 acp_session_store,
-                digest_cache,
                 subagent_cache,
             ));
             // Wire serve_state into the timer manager so voice-origin
             // timers can push fire messages back to their satellite.
             timer_manager.set_serve_state(Arc::downgrade(&serve_state));
 
-            // Captured below so main can await the agent's graceful shutdown
-            // (flush_digests_on_shutdown) before returning. Without this, the
-            // tokio runtime drops the spawned task the moment serve::run
-            // returns, cancelling any in-flight LLM call (#48).
+            // ── Session tools ───────────────────────────────────────────────
+            // Registered here rather than in `default_tool_set` because
+            // they read the session stores, which are built after it.
+            // They replace the "today's cross-session notes" block that
+            // used to be summarised into every system prompt: the model
+            // asks when it wants to know, and the prompt prefix stops
+            // changing underneath the provider's cache.
+            {
+                let sources = Arc::new(tools::session_tools::SessionSources::new(
+                    config.clone(),
+                    Some(Arc::clone(&channel_session_store)),
+                    Arc::clone(&cross_device_session_store),
+                    Arc::clone(&device_default_session_store),
+                    Arc::clone(&serve_state.acp_session_store),
+                ));
+                tool_set
+                    .register_tool(Box::new(tools::session_tools::SessionListTool::new(
+                        Arc::clone(&sources),
+                    )))
+                    .await;
+                tool_set
+                    .register_tool(Box::new(tools::session_tools::SessionReadTool::new(
+                        sources,
+                    )))
+                    .await;
+            }
+
+            // Captured below so main can await the agent's graceful
+            // shutdown before returning. Without this, the tokio runtime
+            // drops the spawned task the moment serve::run returns,
+            // cancelling any in-flight LLM call (#48).
             let mut agent_handle: Option<tokio::task::JoinHandle<()>> = None;
 
             // ── Channel + Agent (Matrix and/or Discord, if configured) ──────
             if config.matrix.is_some() || config.discord.is_some() {
-                // Sessions from every chat channel land under
-                // `sessions/<namespace>/channel/<uuid>.jsonl`. Each session
-                // still records its originating channel name in metadata.
-                let channel_session_store = Arc::new(SessionStore::with_workspace(
-                    sessions_base.clone(),
-                    "channel",
-                    Arc::clone(&ws_state),
-                    tool_payload_cache.clone(),
-                ));
-
                 let mut channel_list: Vec<(String, Arc<dyn channel::Channel>)> = Vec::new();
                 if let Some(m) = &config.matrix {
                     channel_list.push(("matrix".to_string(), Arc::new(MatrixChannel::new(m))));
@@ -977,32 +971,23 @@ async fn main() -> Result<()> {
                     Some(Arc::clone(&tool_set)),
                     Arc::clone(&channel_session_store),
                     image_cache.clone(),
-                    digest_cache_for_agent.clone(),
                 ));
                 // Wire the agent into the timer manager so chat-origin
                 // timers fire through `Agent::trigger`.
                 timer_manager.set_agent(Arc::downgrade(&agent));
 
-                // ── Periodic workspace re-index + today-digest rebuild ──
-                // Same cadence drives both: `sync()` picks up session
-                // JSONLs and notes written outside the agent, and the
-                // digest builder folds them in on the same tick so
-                // "today's notes" stay current without waiting for the
-                // next day-boundary daily-log generation.
+                // ── Periodic workspace re-index ─────────────────────────
+                // `sync()` picks up session JSONLs and notes written
+                // outside the agent. It used to also rebuild a
+                // per-namespace "today's digest" block for the system
+                // prompt; that block is gone, and `session_list` /
+                // `session_read` answer the same question on demand.
                 if let Some(dur) = ws_sync_interval {
                     tracing::info!(
                         "Periodic workspace re-index enabled: every {}s",
                         dur.as_secs()
                     );
                     let ws = Arc::clone(&ws_state);
-                    let cfg_for_loop = config.clone();
-                    let workspace_for_loop = Arc::clone(&workspace);
-                    let workspace_dir_for_loop = workspace_dir.clone();
-                    let channel_store_for_loop = Arc::clone(&channel_session_store);
-                    let cross_device_store_for_loop = Arc::clone(&cross_device_session_store);
-                    let device_default_store_for_loop = Arc::clone(&device_default_session_store);
-                    let agent_for_loop = Arc::clone(&agent);
-                    let serve_state_for_loop = Arc::clone(&serve_state);
                     tokio::spawn(async move {
                         let mut tick = tokio::time::interval(dur);
                         tick.tick().await; // skip immediate fire
@@ -1017,36 +1002,8 @@ async fn main() -> Result<()> {
                                     Err(e) => tracing::warn!("Periodic ws sync failed: {e:#}"),
                                 }
                             }
-                            rebuild_today_digests(
-                                &cfg_for_loop,
-                                &workspace_for_loop,
-                                &workspace_dir_for_loop,
-                                &channel_store_for_loop,
-                                &cross_device_store_for_loop,
-                                &device_default_store_for_loop,
-                                Some(&serve_state_for_loop.acp_session_store),
-                                serve_state_for_loop.digest_cache.as_deref(),
-                                &agent_for_loop,
-                            )
-                            .await;
                         }
                     });
-                } else {
-                    // Even without periodic sync, populate today's
-                    // cache once at startup so the first turn after
-                    // restart sees prior intra-day flushes.
-                    rebuild_today_digests(
-                        &config,
-                        &workspace,
-                        &workspace_dir,
-                        &channel_session_store,
-                        &cross_device_session_store,
-                        &device_default_session_store,
-                        Some(&serve_state.acp_session_store),
-                        serve_state.digest_cache.as_deref(),
-                        &agent,
-                    )
-                    .await;
                 }
 
                 // ── Heartbeat (day-boundary + cron loops) ───────────────────
@@ -1111,49 +1068,6 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Rebuild Workspace's per-namespace "today's digest" cache from the
-/// session JSONLs on disk and notify the agent that its cached system
-/// prompts are now stale. Invoked from the periodic re-index loop so it
-/// runs on the same tick as `WorkspaceState::sync`, picking up any
-/// session JSONLs or notes written outside the agent since the last tick.
-///
-/// Cheap when there are no fresh digests: each store walks `sessions/*`
-/// once with an mtime pre-filter that rejects files untouched before
-/// today's local-day window.
-#[allow(clippy::too_many_arguments)]
-async fn rebuild_today_digests(
-    config: &Config,
-    workspace: &Arc<Workspace>,
-    workspace_dir: &std::path::Path,
-    channel_store: &Arc<SessionStore>,
-    cross_device_store: &Arc<SessionStore>,
-    device_default_store: &Arc<SessionStore>,
-    acp_store: Option<&acp_session::AcpSessionStore>,
-    digest_cache: Option<&digest_cache::DigestCache>,
-    agent: &Arc<Agent>,
-) {
-    let today = session::local_date_for_timestamp(chrono::Local::now(), config.day_boundary_hour);
-    let namespaces = config.all_memory_namespaces();
-    let cfg = config.clone();
-    let map = build_all_today_digests(
-        &namespaces,
-        today,
-        config.day_boundary_hour,
-        channel_store,
-        Some(cross_device_store.as_ref()),
-        Some(device_default_store.as_ref()),
-        acp_store,
-        digest_cache,
-        |room_id: &str| cfg.namespace_for_room(room_id).to_string(),
-    );
-    let had_content = !map.is_empty();
-    workspace.replace_today_digests(map).await;
-    let _ = workspace_dir; // currently unused but kept for symmetry
-    if had_content {
-        agent.invalidate_system_prompts().await;
-    }
 }
 
 /// Migrate flat `sessions/<kind>/<uuid>.jsonl` layouts to the namespaced

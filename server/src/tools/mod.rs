@@ -4,6 +4,7 @@ pub mod builtin_tools;
 pub mod client_exec;
 pub mod client_tools;
 pub mod policy;
+pub mod session_tools;
 pub mod skill_tools;
 pub mod subagent;
 pub mod timer_tools;
@@ -266,15 +267,19 @@ impl ToolSet {
 /// `timer_manager` + `timer_presets`: drive the `timer_*` tools. Manager
 /// is shared with `main` so the agent/serve fire dispatchers can be
 /// wired in after construction.
+/// `day_boundary_hour`: what `current_time` reports as the agent's
+/// logical day.
 pub async fn default_tool_set(
     state: Arc<Mutex<sapphire_framework::workspace::WorkspaceState>>,
     tavily_api_key: Option<String>,
     mcp_servers: &[McpServerConfig],
     timer_manager: Arc<crate::timer::TimerManager>,
     timer_presets: Vec<crate::config::TimerPreset>,
+    day_boundary_hour: u8,
 ) -> Arc<ToolSet> {
     use builtin_tools::*;
     use client_tools::*;
+    use session_tools::CurrentTimeTool;
     use timer_tools::*;
     use workspace_tools::*;
 
@@ -286,6 +291,7 @@ pub async fn default_tool_set(
         .clone();
 
     let mut tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(CurrentTimeTool::new(day_boundary_hour)),
         Box::new(MemoryAddTool::new(Arc::clone(&state))),
         Box::new(MemoryReadTool::new(Arc::clone(&state))),
         Box::new(MemoryAppendTool::new(Arc::clone(&state))),
@@ -431,6 +437,7 @@ mod tests {
             &[],
             crate::timer::TimerManager::new(),
             Vec::new(),
+            4,
         )
         .await;
 
@@ -445,6 +452,7 @@ mod tests {
             ("client_shell_kill", ToolKind::Execute),
             ("client_shell_output", ToolKind::Read),
             ("client_shell_start", ToolKind::Execute),
+            ("current_time", ToolKind::Read),
             ("dir_list", ToolKind::Search),
             ("dir_walk", ToolKind::Search),
             ("file_append", ToolKind::Edit),

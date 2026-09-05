@@ -105,22 +105,25 @@ fn string_field<'a>(input: &'a serde_json::Value, key: &str) -> anyhow::Result<O
     }
 }
 
-/// A subagent's whole system prompt.
+/// A subagent's whole system prompt: the definition's body, and
+/// nothing else.
 ///
-/// The definition's body, plus the date — and nothing else is baked
-/// into the *prompt text*: not the workspace files (`SOUL.md`,
-/// `IDENTITY.md`, `USER.md`, `AGENTS.md`, `TOOLS.md`), not a MEMORY.md
-/// digest, not the day's cross-session digest, not the room metadata,
-/// not the configured base prompt.
+/// Not the workspace files (`SOUL.md`, `IDENTITY.md`, `USER.md`,
+/// `AGENTS.md`, `TOOLS.md`), not a MEMORY.md digest, not the room
+/// metadata, not the configured base prompt. Dropping those is not an
+/// oversight, it is the feature: the main agent carries them
+/// deliberately — it is someone to work *with* — and a code review does
+/// not need yesterday's conversation. Inheriting them by default would
+/// defeat the reason this exists.
 ///
-/// Dropping those is not an oversight, it is the feature: the main
-/// agent carries them deliberately — it is someone to work *with* — and
-/// a code review does not need yesterday's conversation. Inheriting
-/// them by default would defeat the reason this exists.
-///
-/// The date is the one exception, because an agent that does not know
-/// today's date cannot use a tool that writes one, and that is a fact
-/// rather than a personality.
+/// The date used to be the one exception, on the grounds that an agent
+/// which does not know today's date cannot use a tool that writes one.
+/// It is a tool now (`current_time`), for the reason it stopped being
+/// injected into the main agent's prompt: a timestamp in the prompt
+/// text changes on every call, and a resumed subagent then re-processes
+/// its whole conversation instead of hitting the provider's prompt
+/// cache. A definition that restricts `tools:` and needs the date has
+/// to list `current_time`; an unrestricted one inherits it.
 ///
 /// This is a statement about the prompt, not about reach: an
 /// unrestricted definition (`tools: None`) still inherits whichever
@@ -131,13 +134,7 @@ fn string_field<'a>(input: &'a serde_json::Value, key: &str) -> anyhow::Result<O
 /// memory; it is not prevented from asking, unless its own `tools:`
 /// list says so.
 pub(crate) fn subagent_system_prompt(def: &AgentDef) -> String {
-    let now = chrono::Local::now();
-    format!(
-        "{}\n\n# Current Date and Time\n\n{} ({})",
-        def.prompt,
-        now.format("%Y-%m-%d %H:%M:%S %z"),
-        now.format("%A")
-    )
+    def.prompt.clone()
 }
 
 /// The tools a subagent may use.
@@ -838,14 +835,17 @@ mod tests {
 
     /// The point of the feature: a subagent's system prompt is its own
     /// definition and nothing else. A `SOUL.md` in the workspace must
-    /// not reach it.
+    /// not reach it — and neither does a clock, which would change the
+    /// prompt on every call and cost a resumed subagent its prompt
+    /// cache. `current_time` is how it asks.
     #[test]
-    fn the_system_prompt_is_the_definition_body_plus_the_date() {
+    fn the_system_prompt_is_the_definition_body_and_nothing_else() {
         let sys = subagent_system_prompt(&defs()[0]);
+        assert_eq!(sys, defs()[0].prompt);
         assert!(sys.contains("You are a reviewer."));
         assert!(
-            sys.contains("Current Date and Time"),
-            "the date is the one inherited fact: {sys}"
+            !sys.contains("Current Date and Time"),
+            "a clock in the prompt is what `current_time` replaced: {sys}"
         );
         for absent in ["# Soul", "# Identity", "# User", "# Agent Instructions"] {
             assert!(

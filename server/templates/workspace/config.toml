@@ -28,9 +28,6 @@ heartbeat_enabled = false
 # Periodically compact MEMORY.md.
 # memory_compaction_enabled = true
 
-# Close an idle session after this many minutes.
-# intraday_idle_minutes = 180
-
 # Re-index the workspace this often, in minutes.
 # sync_interval_minutes = 15
 
