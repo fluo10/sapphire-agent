@@ -8138,7 +8138,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bzip2 0.6.1",
  "chrono",
  "clap",
@@ -8180,7 +8180,7 @@ name = "sapphire-agent-rpc"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "futures-util",
  "reedline",
  "reqwest 0.12.28",

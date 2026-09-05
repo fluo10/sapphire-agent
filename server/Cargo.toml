@@ -155,7 +155,7 @@ tokio-util = "0.7"
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 
 # Base64 encoding (image attachments → Anthropic API)
-base64 = "0.22"
+base64 = "0.23"
 
 # SHA-256 for content-addressing voice/config payloads (so satellites
 # can cache the openWakeWord model by hash instead of re-downloading).
