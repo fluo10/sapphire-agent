@@ -94,6 +94,6 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# sapphire-framework is a sibling app in the project-sapphire superproject,
-# consumed straight from git because it is not published to crates.io.
-allow-git = ["https://github.com/fluo10/sapphire-framework"]
+# sapphire-framework is published to crates.io as of 0.13.0, so nothing in the
+# graph comes from git any more.
+allow-git = []

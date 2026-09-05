@@ -130,7 +130,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # authenticates ambient capture devices. It drags in the whole JSON-RPC sync
 # server (axum, redb, blob, retrieve, track) for that one struct; splitting it
 # out is fluo10/sapphire-framework#103, after which this becomes `keys`.
-sapphire-framework = { version = "0.1", git = "https://github.com/fluo10/sapphire-framework", branch = "main", default-features = false, features = ["workspace", "remote-server", "registry"] }
+sapphire-framework = { version = "0.13.0", default-features = false, features = ["workspace", "remote-server", "registry"] }
 
 # Human-readable ids: session ids, and the device/user ids in the workspace
 # registry. Must match the version sapphire-framework uses — `KeyEntry.device_id`
