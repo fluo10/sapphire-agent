@@ -218,24 +218,7 @@ impl Heartbeat {
                     )
                     .await
                     {
-                        Ok(true) => {
-                            any_generated = true;
-                            // The permanent record for that day now
-                            // exists, so the digests that were standing
-                            // in for it can go.
-                            if let Some(cache) = self
-                                .serve_state
-                                .as_ref()
-                                .and_then(|s| s.digest_cache.as_ref())
-                            {
-                                let (_, day_end) =
-                                    crate::session::day_window(yesterday, self.day_boundary_hour);
-                                let removed = cache.prune_before(day_end);
-                                if removed > 0 {
-                                    info!("Pruned {removed} digest(s) covered by the daily log");
-                                }
-                            }
-                        }
+                        Ok(true) => any_generated = true,
                         Ok(false) => {}
                         Err(e) => warn!(
                             "Heartbeat: failed to generate daily log for {yesterday} in '{ns}': {e:#}"

@@ -393,8 +393,10 @@ mod tests {
     /// `generate_summary`'s tool-result truncation slices at a raw byte
     /// index. A CJK tool result long enough to cross the 500-byte cutoff
     /// must not land byte 500 inside a multi-byte character — this is
-    /// the exact panic that `spawn_acp_digest_sweep` started hitting
-    /// twice an hour once ACP sessions began persisting tool results.
+    /// the exact panic the half-hourly ACP digest sweep started hitting
+    /// once ACP sessions began persisting tool results. That sweep is
+    /// gone, but `generate_summary` still runs on every compaction, and
+    /// the cutoff is still a byte index.
     #[tokio::test]
     async fn a_long_cjk_tool_result_does_not_panic_on_the_byte_cutoff() {
         // 3 bytes per character; 200 characters is 600 bytes, comfortably

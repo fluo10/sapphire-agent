@@ -45,11 +45,6 @@ pub struct Agent {
     /// Workspace-external image cache. `None` disables in-memory image
     /// scrubbing entirely (PR1 hash-marker on disk still applies).
     image_cache: Option<Arc<ImageCache>>,
-    /// Workspace-external intra-day digest cache. `None` disables the
-    /// cross-session "today" block for this agent's rooms — the digest
-    /// has nowhere to go, and writing it back into the session JSONL is
-    /// what #190 exists to stop.
-    digest_cache: Option<Arc<crate::digest_cache::DigestCache>>,
     /// In-memory conversation history, keyed by (room_id, thread_id).
     /// Seeded at startup from the session log — including tool traffic,
     /// which is why there is no restart summary any more (#194).
@@ -64,16 +59,6 @@ pub struct Agent {
     /// Prevents re-firing within the same day for policies that don't rotate
     /// the session file (Compact, None).
     boundary_handled: Mutex<HashMap<ConversationKey, NaiveDate>>,
-    /// Wall-clock of the latest activity (user message or our reply) per
-    /// conversation. Used by the idle-flush task to decide when to emit a
-    /// same-day digest summarising what happened in this session for
-    /// cross-session injection.
-    last_activity_at: Mutex<HashMap<ConversationKey, chrono::DateTime<chrono::Utc>>>,
-    /// Mark of the latest `last_activity_at` value at which we already
-    /// flushed an intra-day digest for this key. Prevents repeated flushes
-    /// firing on the same idle window — only a fresh activity bump
-    /// reopens the window.
-    last_flushed_at: Mutex<HashMap<ConversationKey, chrono::DateTime<chrono::Utc>>>,
 }
 
 impl Agent {
@@ -86,7 +71,6 @@ impl Agent {
         tools: Option<Arc<ToolSet>>,
         session_store: Arc<SessionStore>,
         image_cache: Option<Arc<ImageCache>>,
-        digest_cache: Option<Arc<crate::digest_cache::DigestCache>>,
     ) -> Self {
         let (active_sessions, mut histories) = session_store.load_all();
 
@@ -152,78 +136,11 @@ impl Agent {
             tools,
             session_store,
             image_cache,
-            digest_cache,
             history: Mutex::new(histories),
             active_sessions: Mutex::new(active_sessions),
             snapshots: Mutex::new(HashMap::new()),
             prefetch_cache: Mutex::new(HashMap::new()),
             boundary_handled: Mutex::new(HashMap::new()),
-            last_activity_at: Mutex::new(HashMap::new()),
-            last_flushed_at: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Publish an intra-day digest for each active session so the
-    /// cross-session today block picks up what they covered before we
-    /// went down.
-    ///
-    /// No `SummaryLine` here any more. That one existed to bridge a
-    /// restart, and the log now carries the conversation itself (#194).
-    /// A summary written here would be worse than useless: it would
-    /// establish a checkpoint covering the whole session, so the next
-    /// start would replay a stub instead of the history it just gained.
-    /// Compaction still writes one — that is what bounds context, and it
-    /// is written at a point where the history really was compacted.
-    async fn flush_digests_on_shutdown(&self) {
-        let Some(cache) = self.digest_cache.clone() else {
-            return;
-        };
-        let snapshot: Vec<(ConversationKey, String, Vec<ChatMessage>)> = {
-            let history = self.history.lock().await;
-            let sessions = self.active_sessions.lock().await;
-            let activity = self.last_activity_at.lock().await;
-            history
-                .iter()
-                .filter_map(|(key, msgs)| {
-                    // Restored from disk, `history` holds every active
-                    // session under this store, including rooms that were
-                    // silent this run and rooms this instance doesn't even
-                    // own (test rooms sharing the directory). Only a key
-                    // `last_activity_at` recorded — written on every
-                    // inbound message — actually spoke to this process.
-                    activity.get(key)?;
-                    if msgs.len() < 2 {
-                        return None;
-                    }
-                    let sid = sessions.get(key)?.clone();
-                    if sid.is_empty() {
-                        return None;
-                    }
-                    Some((key.clone(), sid, msgs.clone()))
-                })
-                .collect()
-        };
-
-        if snapshot.is_empty() {
-            return;
-        }
-
-        info!(
-            "Graceful shutdown: digesting {} active session(s)",
-            snapshot.len()
-        );
-
-        for (key, session_id, messages) in snapshot {
-            let provider = self.provider_for(&key.0);
-            match generate_summary(&*provider, &messages).await {
-                Ok(summary) if !summary.trim().is_empty() => {
-                    if let Err(e) = cache.put(&session_id, &summary, None) {
-                        warn!("Failed to cache the shutdown digest for {session_id}: {e}");
-                    }
-                }
-                Ok(_) => warn!("Shutdown digest for {session_id} was empty; skipping"),
-                Err(e) => warn!("Shutdown digest generation failed for {session_id}: {e:#}"),
-            }
         }
     }
 
@@ -271,17 +188,6 @@ impl Agent {
             }
         });
 
-        // Idle-flush task: every minute, scan last_activity_at and emit a
-        // same-day digest line for any conversation that's been quiet long
-        // enough. Disabled by `intraday_idle_minutes = 0`.
-        let idle_flush_handle = self
-            .config
-            .intraday_idle_threshold_minutes()
-            .map(|threshold| {
-                let agent = Arc::clone(&self);
-                tokio::spawn(async move { agent.run_idle_flush_loop(threshold).await })
-            });
-
         let shutdown = tokio::signal::ctrl_c();
         tokio::pin!(shutdown);
 
@@ -312,117 +218,8 @@ impl Agent {
             }
         }
 
-        self.flush_digests_on_shutdown().await;
         listen_handle.abort();
-        if let Some(h) = idle_flush_handle {
-            h.abort();
-        }
         Ok(())
-    }
-
-    /// Background loop that wakes once a minute and flushes a same-day
-    /// digest line for any conversation idle longer than `threshold_minutes`.
-    async fn run_idle_flush_loop(self: Arc<Self>, threshold_minutes: u32) {
-        let interval = std::time::Duration::from_secs(60);
-        info!(
-            "Idle-flush loop active (threshold: {} minute(s))",
-            threshold_minutes
-        );
-        loop {
-            tokio::time::sleep(interval).await;
-            self.maybe_flush_idle(threshold_minutes).await;
-        }
-    }
-
-    /// One sweep of the idle-flush check. Public for testing — exposes
-    /// the same body the background loop runs.
-    async fn maybe_flush_idle(&self, threshold_minutes: u32) {
-        let now = chrono::Utc::now();
-        let threshold = chrono::Duration::minutes(threshold_minutes as i64);
-
-        // Collect candidates while only briefly holding the lock.
-        let candidates: Vec<ConversationKey> = {
-            let last = self.last_activity_at.lock().await;
-            let flushed = self.last_flushed_at.lock().await;
-            last.iter()
-                .filter(|(key, ts)| {
-                    let idle_long_enough = now - **ts >= threshold;
-                    let already_flushed = flushed.get(*key) == Some(*ts);
-                    idle_long_enough && !already_flushed
-                })
-                .map(|(k, _)| k.clone())
-                .collect()
-        };
-
-        for key in candidates {
-            self.flush_intraday_digest(&key).await;
-        }
-    }
-
-    /// Generate an intra-day digest of the current in-memory history for
-    /// `key` and write it into the digest cache. Recorded with `since` =
-    /// the timestamp this Agent first observed activity for the key after
-    /// its last flush (or session start), so consumers can sanity-check
-    /// the window. Idempotent: marks `last_flushed_at` to the activity
-    /// timestamp so the next flush only fires after fresh activity.
-    async fn flush_intraday_digest(&self, key: &ConversationKey) {
-        let messages = {
-            let history = self.history.lock().await;
-            history.get(key).cloned().unwrap_or_default()
-        };
-        let has_real_content = messages.iter().any(|m| {
-            m.parts
-                .iter()
-                .any(|p| matches!(p, ContentPart::Text(t) if !t.trim().is_empty()))
-        });
-        if messages.len() < 2 || !has_real_content {
-            return;
-        }
-        let session_id = {
-            let sessions = self.active_sessions.lock().await;
-            match sessions.get(key) {
-                Some(id) if !id.is_empty() => id.clone(),
-                _ => return,
-            }
-        };
-        // Resolved before the model call, not after: with nowhere to put
-        // the result, generating it would burn a provider call for
-        // nothing.
-        let Some(cache) = self.digest_cache.clone() else {
-            debug!("No digest cache; skipping the intra-day digest for {session_id}");
-            return;
-        };
-        let activity_ts = match self.last_activity_at.lock().await.get(key) {
-            Some(ts) => *ts,
-            None => return,
-        };
-
-        info!("Idle flush: summarising session {session_id} for cross-room digest");
-        let provider = self.provider_for(&key.0);
-        let summary = match generate_summary(&*provider, &messages).await {
-            Ok(s) if !s.trim().is_empty() => s,
-            Ok(_) => {
-                warn!("Idle-flush summary for {session_id} was empty; skipping");
-                self.last_flushed_at
-                    .lock()
-                    .await
-                    .insert(key.clone(), activity_ts);
-                return;
-            }
-            Err(e) => {
-                warn!("Idle-flush summary generation failed for {session_id}: {e:#}");
-                return;
-            }
-        };
-
-        if let Err(e) = cache.put(&session_id, &summary, None) {
-            warn!("Failed to cache the intra-day digest for {session_id}: {e}");
-            return;
-        }
-        self.last_flushed_at
-            .lock()
-            .await
-            .insert(key.clone(), activity_ts);
     }
 
     // -----------------------------------------------------------------------
@@ -547,8 +344,6 @@ impl Agent {
                 self.active_sessions.lock().await.remove(key);
                 self.snapshots.lock().await.remove(key);
                 self.prefetch_cache.lock().await.remove(key);
-                self.last_activity_at.lock().await.remove(key);
-                self.last_flushed_at.lock().await.remove(key);
                 // Reset rotates the session file, so no need to mark handled;
                 // the new session will have today's created_at.
             }
@@ -749,14 +544,6 @@ impl Agent {
                 .push(msg.clone());
             let _ = self.persist(&session_id, &msg);
         }
-        // Mark activity for the idle-flush loop. Done after the message
-        // is queued so a freshly-active key won't be culled by a flush
-        // that's already running this turn.
-        self.last_activity_at
-            .lock()
-            .await
-            .insert(key.clone(), chrono::Utc::now());
-
         let _ = self.channels.start_typing(&incoming.room_id).await;
 
         // Refresh MCP tools if any server signalled a change.
@@ -1145,6 +932,7 @@ mod tests {
             &[],
             crate::timer::TimerManager::new(),
             Vec::new(),
+            4,
         )
         .await;
         let kinds = tools.kinds().await;
@@ -1421,7 +1209,6 @@ api_key = "test"
             workspace,
             Some(tools),
             session_store,
-            None,
             None,
         );
 

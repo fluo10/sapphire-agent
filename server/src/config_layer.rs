@@ -39,7 +39,6 @@ pub const WORKSPACE_ALLOWLIST: &[&[&str]] = &[
     &["daily_log_enabled"],
     &["memory_compaction_enabled"],
     &["heartbeat_enabled"],
-    &["intraday_idle_minutes"],
     &["sync_interval_minutes"],
     &["digest"],
     &["timer"],
@@ -642,7 +641,6 @@ session_policy = "compact"
 daily_log_enabled = true
 memory_compaction_enabled = true
 heartbeat_enabled = true
-intraday_idle_minutes = 45
 sync_interval_minutes = 15
 
 [anthropic]

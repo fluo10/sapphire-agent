@@ -15,6 +15,11 @@ tool. What you do need to do is *act* on them.
 2. Check `USER.md` for directives that apply to what you are about to do.
 3. Yesterday's log and the recent digests are already injected. Use them
    instead of asking the user to repeat themselves.
+4. Two things are deliberately *not* injected, because they change under
+   the prompt cache and would make every turn re-read the whole system
+   prompt: the clock, and what your other sessions are doing. Call
+   `current_time` before anything date-stamped, and `session_list` /
+   `session_read` when today's other conversations matter.
 
 ## Speaking While You Work
 
