@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/fluo10/sapphire-agent/compare/sapphire-call-core-v0.7.0...sapphire-call-core-v0.7.1) - 2026-09-05
+
+### Documentation
+
+- Point sibling crates at [room_profile.*].devices, not api_keys
+
+
+
 ## [0.7.0] - 2026-05-23
 
 First release of `sapphire-call-core` as a standalone crate. Extracted

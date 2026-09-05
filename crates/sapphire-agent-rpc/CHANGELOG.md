@@ -10,6 +10,14 @@ version with `sapphire-agent`) are recorded in the root `CHANGELOG.md`.
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-rpc-v0.7.0...sapphire-agent-rpc-v0.7.1) - 2026-09-05
+
+### Documentation
+
+- Point sibling crates at [room_profile.*].devices, not api_keys
+
+
+
 ## [0.7.0] - 2026-05-23
 
 Aligns the crate version with `sapphire-agent` 0.7.0. `0.6.1` was an

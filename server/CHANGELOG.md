@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.7.2...sapphire-agent-v0.8.0) - 2026-09-05
+
+### Added
+
+- *(server)* Default the HTTP API server to port 3170 ([#229](https://github.com/fluo10/sapphire-agent/pull/229))
+- *(acp)* Keep an idle connection alive with server-side pings ([#231](https://github.com/fluo10/sapphire-agent/pull/231))
+- 動き続けるシステムプロンプトをやめ、時刻とセッションはツールで引く ([#237](https://github.com/fluo10/sapphire-agent/pull/237))
+
+### Changed
+
+- [**breaking**] *(workspace)* Give every binary a role-named top-level directory ([#223](https://github.com/fluo10/sapphire-agent/pull/223))
+
+
+
 ### Breaking
 
 - **`standby_mode` removed** — its only purpose was git sync on a backup

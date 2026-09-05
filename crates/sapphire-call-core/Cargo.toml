@@ -1,13 +1,13 @@
 [package]
 name = "sapphire-call-core"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 description = "Shared config + identity helpers for sapphire-call CLI / desktop clients"
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-sapphire-agent-rpc = { path = "../sapphire-agent-rpc", version = "0.7.0" }
+sapphire-agent-rpc = { path = "../sapphire-agent-rpc", version = "0.7.1" }
 
 anyhow.workspace = true
 
