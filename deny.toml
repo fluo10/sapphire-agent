@@ -27,6 +27,14 @@ ignore = [
     # neither package now, even under --all-features.
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained but pulled in via many proc-macro consumers; no drop-in replacement." },
 
+    # --- unmaintained, reached only through the bevy/egui text stack ---
+    # ttf-parser is unmaintained upstream (author-declared). It reaches us via
+    # bevy_text > cosmic-text > fontdb and egui > epaint > ab_glyph >
+    # owned_ttf_parser (winit/sctk-adwaita also pull it). RustSec lists no safe
+    # upgrade; the suggested alternative (skrifa) is a different font stack.
+    # Drop this once the upstream stacks migrate.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser is unmaintained; transitive via bevy_text → cosmic-text → fontdb and egui → epaint → ab_glyph. No safe upgrade; the suggested alternative (skrifa) is a different stack." },
+
     # --- rustls-webpki 0.102.x advisories pinned by serenity → tokio-tungstenite 0.21 → tokio-rustls 0.25 → rustls 0.22 ---
     # Fixes are in rustls-webpki 0.103.x, which requires rustls 0.23. serenity
     # 0.12.5 (latest) is locked to the older rustls stack, so we can't upgrade
@@ -37,6 +45,13 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102.x URI name-constraint acceptance; transitive via serenity → tokio-tungstenite 0.21." },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102.x wildcard-name constraint acceptance; transitive via serenity → tokio-tungstenite 0.21." },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102.x CRL parsing panic; transitive via serenity → tokio-tungstenite 0.21." },
+
+    # --- quick-xml 0.39.x advisories (RUSTSEC-2026-0194/0195, DTD/attribute
+    # DoS) ---
+    # Fixed in quick-xml 0.41.0, reached transitively via wayland-scanner 0.31.
+    # Updated past the advisory in the same commit as this note; kept as a
+    # marker in case the wayland stack pins back down.
+    # Drop these once wayland-scanner moves off the affected quick-xml range.
 
     # --- unmaintained, reached only through matrix-sdk 0.16 ---
     # RustSec lists no safe upgrade for either, and both are several layers
