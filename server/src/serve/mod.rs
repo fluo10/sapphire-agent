@@ -2348,13 +2348,17 @@ impl TurnLoop<'_> {
             // Check if context compression is needed
             match maybe_compress(provider, system, history, compression_config).await {
                 Ok(Some(result)) => {
-                    *history = result.compressed;
                     // Persist the checkpoint so a reload starts the model's
                     // history from here instead of replaying the whole
-                    // session and re-paying for this compaction.
-                    if let Some(p) = self.persistence {
-                        p.append_summary(&result.summary, result.keep_recent);
+                    // session and re-paying for this compaction. A trim-only
+                    // pass carries no summary and moves no checkpoint: the
+                    // log keeps the full text, and the trim is re-derived
+                    // whenever it is needed again.
+                    if let (Some(p), Some(summary)) = (self.persistence, result.summary.as_deref())
+                    {
+                        p.append_summary(summary, result.keep_recent);
                     }
+                    *history = result.compressed;
                 }
                 Ok(None) => {}
                 Err(e) => {

@@ -93,7 +93,11 @@ pub fn compaction_stub(summary: &str) -> Vec<ChatMessage> {
 /// Outcome of a compression attempt.
 pub struct CompressionResult {
     pub compressed: Vec<ChatMessage>,
-    pub summary: String,
+    /// The summary that replaced the absorbed prefix, or `None` when
+    /// nothing was summarized and the pass only trimmed oversized parts
+    /// out of the preserved window. There is no checkpoint to record in
+    /// that case — the log still holds every message, untrimmed.
+    pub summary: Option<String>,
     /// How many trailing messages survived verbatim. The store turns
     /// this into a checkpoint cursor by counting back from its file's
     /// tip — the caller has no way to map an in-memory index onto a line
@@ -131,30 +135,206 @@ pub async fn maybe_compress(
 
     let split = find_safe_split_point(messages, config.preserve_recent);
 
-    if split == 0 {
+    let (mut compressed, summary, keep_recent) = if split == 0 {
+        // Nothing is old enough to summarize: the whole history sits inside
+        // the window we promised to keep verbatim. That is not a reason to
+        // give up — one oversized tool result is enough to push a
+        // five-message session past the window — so fall through to the
+        // trim with the history as it stands.
+        (messages.to_vec(), None, messages.len())
+    } else {
+        let to_summarize = &messages[..split];
+        let to_keep = &messages[split..];
+
+        let summary = generate_summary(provider, to_summarize).await?;
+
+        info!(
+            "Compressed {} messages into summary ({} → ~{} tokens)",
+            split,
+            estimate_total_tokens(None, to_summarize),
+            estimate_tokens(&summary),
+        );
+
+        let mut compressed = compaction_stub(&summary);
+        compressed.extend_from_slice(to_keep);
+        (compressed, Some(summary), to_keep.len())
+    };
+
+    // A summary only shrinks what it absorbed. The preserved window goes to
+    // the provider verbatim, and a single tool result that arrived inside it
+    // can be larger than the entire budget — which is how a turn overflows
+    // *after* a successful compaction. Trim what survived so the call we are
+    // about to make actually fits.
+    let trimmed = trim_to_budget(system, &mut compressed, threshold_tokens);
+
+    if summary.is_none() && !trimmed {
+        // Nothing summarized, nothing trimmed: no new history to hand back.
         return Ok(None);
     }
-
-    let to_summarize = &messages[..split];
-    let to_keep = &messages[split..];
-
-    let summary = generate_summary(provider, to_summarize).await?;
-
-    info!(
-        "Compressed {} messages into summary ({} → ~{} tokens)",
-        split,
-        estimate_total_tokens(None, to_summarize),
-        estimate_tokens(&summary),
-    );
-
-    let mut compressed = compaction_stub(&summary);
-    compressed.extend_from_slice(to_keep);
 
     Ok(Some(CompressionResult {
         compressed,
         summary,
-        keep_recent: to_keep.len(),
+        keep_recent,
     }))
+}
+
+/// Note left where a trim removed text, so the model can tell a short tool
+/// result from a shortened one.
+fn trim_marker(omitted_chars: usize) -> String {
+    format!("\n… [trimmed: {omitted_chars} chars omitted to fit the context window]")
+}
+
+/// What `trim_marker` costs, generously rounded up. Subtracted from every
+/// per-part cap so appending the marker cannot push a part back over the cap
+/// it was just truncated to.
+const TRIM_MARKER_TOKENS: usize = 24;
+
+/// Cut `text` down to roughly `max_tokens` by `estimate_tokens`, with a
+/// marker naming what went missing.
+///
+/// The cut walks characters rather than bytes: the estimator prices ASCII and
+/// non-ASCII differently, and slicing at a byte index inside a CJK tool
+/// result panics (the same trap `generate_summary` documents).
+fn truncate_to_token_budget(text: &str, max_tokens: usize) -> String {
+    let mut ascii = 0usize;
+    let mut non_ascii = 0usize;
+    let mut end = 0usize;
+    let mut kept = 0usize;
+    for (i, ch) in text.char_indices() {
+        let (a, n) = if ch.is_ascii() {
+            (ascii + 1, non_ascii)
+        } else {
+            (ascii, non_ascii + 1)
+        };
+        if a / 4 + (n * 2).div_ceil(3) > max_tokens {
+            break;
+        }
+        ascii = a;
+        non_ascii = n;
+        end = i + ch.len_utf8();
+        kept += 1;
+    }
+    let omitted = text.chars().count() - kept;
+    format!("{}{}", &text[..end], trim_marker(omitted))
+}
+
+/// How much of a part is text we are allowed to cut, in tokens.
+///
+/// `None` marks a part with nothing to give: images cost a flat tile price,
+/// and the un-hydrated `*Ref` forms are already stand-ins.
+fn trimmable_tokens(part: &ContentPart) -> Option<usize> {
+    match part {
+        ContentPart::Text(t) => Some(estimate_tokens(t)),
+        ContentPart::ToolResult { content, .. } => Some(estimate_tokens(content)),
+        // The call's arguments, not its name — the name is what keeps a
+        // trimmed call legible, and it is tiny. A file-sized argument is as
+        // real an overflow as a file-sized result.
+        ContentPart::ToolUse { input, .. } => Some(estimate_tokens(&input.to_string())),
+        ContentPart::Image { .. }
+        | ContentPart::ImageRef { .. }
+        | ContentPart::ToolUseRef { .. }
+        | ContentPart::ToolResultRef { .. } => None,
+    }
+}
+
+/// The largest per-part cap under which every trimmable part fits the budget
+/// — the classic water-filling level.
+///
+/// Capping every part at one ceiling is what keeps a trim proportionate: the
+/// single 300k-token tool result is cut down to the level, and the dozens of
+/// small results around it are left alone.
+fn water_fill_cap(sizes: &[usize], fixed: usize, budget: usize) -> usize {
+    let mut sizes = sizes.to_vec();
+    sizes.sort_unstable();
+    let mut remaining = budget.saturating_sub(fixed);
+    for (i, &size) in sizes.iter().enumerate() {
+        let above = sizes.len() - i;
+        if size.saturating_mul(above) <= remaining {
+            remaining -= size;
+        } else {
+            return remaining / above;
+        }
+    }
+    usize::MAX
+}
+
+/// Shrink `messages` in place until the estimate fits `budget`, by truncating
+/// the text of its largest parts. Returns whether anything changed.
+///
+/// Messages are never dropped and never reordered: `keep_recent` is a count
+/// of trailing messages that the store turns into a checkpoint cursor, and
+/// tool-use/tool-result pairing is what the provider validates. Cutting
+/// contents leaves both intact.
+///
+/// Callers write the result back into the in-memory history, so a trimmed
+/// part stays trimmed for the rest of the process. The session log keeps
+/// every message at full length either way: nothing is lost on disk, and a
+/// reload starts from the full text and trims again only if it still has to.
+fn trim_to_budget(system: Option<&str>, messages: &mut [ChatMessage], budget: usize) -> bool {
+    let total = estimate_total_tokens(system, messages);
+    if total <= budget {
+        return false;
+    }
+
+    let mut slots: Vec<(usize, usize, usize)> = Vec::new();
+    for (m, msg) in messages.iter().enumerate() {
+        for (p, part) in msg.parts.iter().enumerate() {
+            if let Some(tokens) = trimmable_tokens(part) {
+                slots.push((m, p, tokens));
+            }
+        }
+    }
+    if slots.is_empty() {
+        warn!(
+            "Context is ~{total} tokens against a budget of {budget} and nothing in it \
+             can be trimmed (images and stand-ins only); the request may be rejected"
+        );
+        return false;
+    }
+
+    let sizes: Vec<usize> = slots.iter().map(|(_, _, tokens)| *tokens).collect();
+    let fixed = total.saturating_sub(sizes.iter().sum());
+    let cap = water_fill_cap(&sizes, fixed, budget);
+    let keep = cap.saturating_sub(TRIM_MARKER_TOKENS);
+
+    let mut changed = false;
+    for &(m, p, tokens) in &slots {
+        if tokens <= cap {
+            continue;
+        }
+        match &mut messages[m].parts[p] {
+            ContentPart::Text(text) => *text = truncate_to_token_budget(text, keep),
+            ContentPart::ToolResult { content, .. } => {
+                *content = truncate_to_token_budget(content, keep);
+            }
+            // Tool input has to stay an object for the provider, so the
+            // truncated JSON comes back as the value of one field rather than
+            // as a mangled object of its own.
+            ContentPart::ToolUse { input, .. } => {
+                *input = serde_json::json!({
+                    "trimmed": truncate_to_token_budget(&input.to_string(), keep),
+                });
+            }
+            _ => continue,
+        }
+        changed = true;
+    }
+
+    if !changed {
+        return false;
+    }
+
+    let after = estimate_total_tokens(system, messages);
+    info!("Trimmed history to fit the budget: ~{total} → ~{after} tokens (budget {budget})");
+    if after > budget {
+        warn!(
+            "Context is still ~{after} tokens after trimming (budget {budget}); the \
+             untrimmable remainder — images, tool names, message framing — is larger \
+             than the budget and the request may be rejected"
+        );
+    }
+    true
 }
 
 /// Find a safe split point that doesn't break tool-call/result pairs.
@@ -418,6 +598,192 @@ mod tests {
         // all rather than unwinding inside the tokio task).
         let summary = generate_summary(&StubProvider, &messages).await.unwrap();
         assert_eq!(summary, "a summary");
+    }
+
+    /// A window small enough that a single fat tool result blows past it,
+    /// with a `preserve_recent` large enough to protect everything.
+    fn tight_config() -> CompressionConfig {
+        CompressionConfig {
+            enabled: true,
+            context_window: 1_000,
+            threshold: 0.8,
+            preserve_recent: 20,
+        }
+    }
+
+    fn tool_result_msg(id: &str, content: &str) -> ChatMessage {
+        ChatMessage::tool_results_with_images(vec![(id.into(), content.into())], vec![])
+    }
+
+    fn tool_use_msg(id: &str) -> ChatMessage {
+        ChatMessage::assistant_with_tools(
+            None,
+            vec![crate::provider::ToolCall {
+                id: id.into(),
+                name: "search".into(),
+                input: serde_json::json!({}),
+            }],
+        )
+    }
+
+    fn tool_result_text(msg: &ChatMessage) -> String {
+        msg.parts
+            .iter()
+            .find_map(|p| match p {
+                ContentPart::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("a tool result")
+    }
+
+    /// The overflow this whole path exists for: one tool result arrives
+    /// mid-turn that is larger than the window, in a session too short to
+    /// have anything worth summarizing. Compaction used to bail out here
+    /// (`split == 0`) and hand the provider a request it would reject.
+    #[tokio::test]
+    async fn a_huge_tool_result_is_trimmed_even_when_there_is_nothing_to_summarize() {
+        let config = tight_config();
+        let messages = vec![
+            ChatMessage::user("find it"),
+            tool_use_msg("t1"),
+            tool_result_msg("t1", &"x".repeat(400_000)),
+        ];
+
+        let result = maybe_compress(&StubProvider, None, &messages, &config)
+            .await
+            .unwrap()
+            .expect("an oversized history must come back trimmed");
+
+        assert!(
+            result.summary.is_none(),
+            "nothing was old enough to summarize, so there is no checkpoint to record"
+        );
+        let budget = 800; // 1000 * 0.8
+        let after = estimate_total_tokens(None, &result.compressed);
+        assert!(
+            after <= budget,
+            "still ~{after} tokens against a budget of {budget}"
+        );
+        assert_eq!(
+            result.compressed.len(),
+            messages.len(),
+            "trimming cuts contents; it must not drop messages and orphan a tool result"
+        );
+        assert!(tool_result_text(&result.compressed[2]).contains("trimmed"));
+    }
+
+    /// The failure that follows a *successful* compaction: the summary
+    /// absorbs the old messages, and the preserved window it hands back is
+    /// still over the window all by itself.
+    #[tokio::test]
+    async fn a_preserved_window_that_is_itself_over_budget_is_trimmed_too() {
+        let config = tight_config();
+        let mut messages: Vec<ChatMessage> = (0..25)
+            .map(|i| {
+                if i % 2 == 0 {
+                    ChatMessage::user(format!("question {i}"))
+                } else {
+                    ChatMessage::assistant(format!("answer {i}"))
+                }
+            })
+            .collect();
+        messages.push(tool_use_msg("t1"));
+        messages.push(tool_result_msg("t1", &"x".repeat(400_000)));
+
+        let result = maybe_compress(&StubProvider, None, &messages, &config)
+            .await
+            .unwrap()
+            .expect("an oversized history must come back compressed");
+
+        assert_eq!(result.summary.as_deref(), Some("a summary"));
+        let budget = 800;
+        let after = estimate_total_tokens(None, &result.compressed);
+        assert!(
+            after <= budget,
+            "still ~{after} tokens against a budget of {budget}"
+        );
+        assert!(
+            matches!(
+                result.compressed.last().unwrap().parts.first(),
+                Some(ContentPart::ToolResult { .. })
+            ),
+            "the trimmed tool result must still be there to answer its call"
+        );
+    }
+
+    /// Water-filling, not a flat cut: the trim takes what it needs from the
+    /// one part that is over the line and leaves the rest of the window
+    /// exactly as it was.
+    #[tokio::test]
+    async fn trimming_takes_from_the_giant_and_leaves_the_small_results_alone() {
+        let config = tight_config();
+        let messages = vec![
+            ChatMessage::user("go"),
+            tool_use_msg("t1"),
+            tool_result_msg("t1", "a small result"),
+            tool_use_msg("t2"),
+            tool_result_msg("t2", &"x".repeat(400_000)),
+        ];
+
+        let result = maybe_compress(&StubProvider, None, &messages, &config)
+            .await
+            .unwrap()
+            .expect("an oversized history must come back trimmed");
+
+        assert_eq!(
+            tool_result_text(&result.compressed[2]),
+            "a small result",
+            "the small result was never the problem"
+        );
+        assert!(tool_result_text(&result.compressed[4]).contains("trimmed"));
+    }
+
+    /// The estimator prices CJK at two thirds of a token per character, so a
+    /// token cap lands on some byte offset it never computed. Cutting there
+    /// has to stay on a character boundary — the same panic
+    /// `generate_summary` guards against, one cutoff over.
+    #[tokio::test]
+    async fn a_huge_cjk_tool_result_is_trimmed_without_panicking() {
+        let config = tight_config();
+        let messages = vec![
+            ChatMessage::user("探して"),
+            tool_use_msg("t1"),
+            tool_result_msg("t1", &"日本語".repeat(50_000)),
+        ];
+
+        let result = maybe_compress(&StubProvider, None, &messages, &config)
+            .await
+            .unwrap()
+            .expect("an oversized history must come back trimmed");
+
+        let after = estimate_total_tokens(None, &result.compressed);
+        assert!(
+            after <= 800,
+            "still ~{after} tokens against a budget of 800"
+        );
+        assert!(tool_result_text(&result.compressed[2]).starts_with("日本語"));
+    }
+
+    /// A history that fits is left alone — the trim must not fire on every
+    /// turn just because it exists.
+    #[tokio::test]
+    async fn a_history_under_the_threshold_is_left_untouched() {
+        let config = tight_config();
+        let messages = vec![ChatMessage::user("hi"), ChatMessage::assistant("hello")];
+        assert!(
+            maybe_compress(&StubProvider, None, &messages, &config)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn truncation_reports_what_it_removed_and_stops_under_the_cap() {
+        let text = "y".repeat(10_000);
+        let cut = truncate_to_token_budget(&text, 100);
+        assert!(estimate_tokens(&cut) <= 100 + TRIM_MARKER_TOKENS);
+        assert!(cut.contains("chars omitted"));
     }
 
     /// The stub has one generator so the compaction path and the restore

@@ -620,11 +620,16 @@ impl Agent {
                     // Replace in-memory history with compressed version
                     *self.history.lock().await.entry(key.clone()).or_default() =
                         result.compressed.clone();
-                    if let Err(e) = self.session_store.append_summary(
-                        &session_id,
-                        &result.summary,
-                        result.keep_recent,
-                    ) {
+                    // No summary means nothing was summarized — the pass
+                    // only trimmed oversized parts down to the budget, and
+                    // there is no checkpoint to move.
+                    if let Some(summary) = &result.summary
+                        && let Err(e) = self.session_store.append_summary(
+                            &session_id,
+                            summary,
+                            result.keep_recent,
+                        )
+                    {
                         warn!("Failed to persist compaction summary: {e}");
                     }
                     result.compressed
