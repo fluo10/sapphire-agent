@@ -1105,6 +1105,7 @@ mod tests {
 
     fn text_response(text: &str) -> crate::provider::ChatResponse {
         crate::provider::ChatResponse {
+            prompt_usage: None,
             text: Some(text.to_string()),
             tool_calls: Vec::new(),
             stop_reason: None,

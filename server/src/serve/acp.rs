@@ -2425,6 +2425,7 @@ mod tests {
         let state = ServeState::for_test_scripted(
             true,
             vec![crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("hello from the agent".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -2450,6 +2451,7 @@ mod tests {
             true,
             vec![
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("checking the config".to_string()),
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -2459,6 +2461,7 @@ mod tests {
                     stop_reason: None,
                 },
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("it was the timeout".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -2488,6 +2491,7 @@ mod tests {
         let state = ServeState::for_test_scripted(
             true,
             vec![crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("just this".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -2510,6 +2514,7 @@ mod tests {
     async fn an_acp_turn_runs_past_ten_rounds_by_default() {
         let mut script: Vec<crate::provider::ChatResponse> = (0..12)
             .map(|i| crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: None,
                 tool_calls: vec![crate::provider::ToolCall {
                     id: format!("call-{i}"),
@@ -2520,6 +2525,7 @@ mod tests {
             })
             .collect();
         script.push(crate::provider::ChatResponse {
+            prompt_usage: None,
             text: Some("finished".to_string()),
             tool_calls: Vec::new(),
             stop_reason: None,
@@ -2541,6 +2547,7 @@ mod tests {
         let state = ServeState::for_test_scripted(
             true,
             vec![crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("hello from the agent".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -2577,6 +2584,7 @@ mod tests {
         let state = ServeState::for_test_scripted(
             true,
             vec![crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -2603,6 +2611,7 @@ mod tests {
         let state = ServeState::for_test_scripted(
             true,
             vec![crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -2650,6 +2659,7 @@ mod tests {
             true,
             vec![
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -2659,6 +2669,7 @@ mod tests {
                     stop_reason: None,
                 },
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -2734,6 +2745,7 @@ mod tests {
 
         let script: Vec<crate::provider::ChatResponse> = (0..ROUNDS)
             .map(|i| crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some(format!("step {i}")),
                 tool_calls: vec![crate::provider::ToolCall {
                     id: format!("call-{i}"),
@@ -3052,6 +3064,7 @@ mod tests {
     fn risky_then_reply(reply: &str) -> Vec<crate::provider::ChatResponse> {
         vec![
             crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: None,
                 tool_calls: vec![crate::provider::ToolCall {
                     id: "call-1".to_string(),
@@ -3061,6 +3074,7 @@ mod tests {
                 stop_reason: None,
             },
             crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some(reply.to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -3129,6 +3143,7 @@ mod tests {
             true,
             vec![
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -3138,6 +3153,7 @@ mod tests {
                     stop_reason: None,
                 },
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -3161,6 +3177,7 @@ mod tests {
             true,
             vec![
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -3170,6 +3187,7 @@ mod tests {
                     stop_reason: None,
                 },
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-2".to_string(),
@@ -3179,6 +3197,7 @@ mod tests {
                     stop_reason: None,
                 },
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -3853,6 +3872,7 @@ mod tests {
         let state = ServeState::for_test_scripted(
             true,
             vec![crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("third".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -3926,6 +3946,7 @@ mod tests {
         let state = ServeState::for_test_scripted(
             true,
             vec![crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("second".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,

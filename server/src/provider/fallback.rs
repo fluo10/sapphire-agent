@@ -84,6 +84,12 @@ impl Provider for FallbackProvider {
         self.primary.name()
     }
 
+    fn calibration_keys(&self) -> Vec<&str> {
+        let mut keys = self.primary.calibration_keys();
+        keys.extend(self.fallback.calibration_keys());
+        keys
+    }
+
     async fn chat(
         &self,
         system: Option<&str>,
@@ -162,6 +168,7 @@ mod tests {
 
     fn refusal_response() -> ChatResponse {
         ChatResponse {
+            prompt_usage: None,
             text: Some("I can't help with that request.".into()),
             tool_calls: vec![],
             stop_reason: Some("refusal".into()),
@@ -170,6 +177,7 @@ mod tests {
 
     fn ok_response(text: &str) -> ChatResponse {
         ChatResponse {
+            prompt_usage: None,
             text: Some(text.into()),
             tool_calls: vec![],
             stop_reason: Some("end_turn".into()),
@@ -184,6 +192,7 @@ mod tests {
     #[test]
     fn content_filter_stop_reason_is_detected() {
         let resp = ChatResponse {
+            prompt_usage: None,
             text: Some("...".into()),
             tool_calls: vec![],
             stop_reason: Some("content_filter".into()),
@@ -194,6 +203,7 @@ mod tests {
     #[test]
     fn apology_pattern_without_stop_reason_is_detected() {
         let resp = ChatResponse {
+            prompt_usage: None,
             text: Some("I'm unable to assist with that one.".into()),
             tool_calls: vec![],
             stop_reason: Some("end_turn".into()),
@@ -204,6 +214,7 @@ mod tests {
     #[test]
     fn legitimate_short_answer_is_not_a_refusal() {
         let resp = ChatResponse {
+            prompt_usage: None,
             text: Some("The file is at src/main.rs.".into()),
             tool_calls: vec![],
             stop_reason: Some("end_turn".into()),
@@ -217,6 +228,7 @@ mod tests {
             "I'm unable to immediately answer, but here's a detailed walkthrough: ".to_string();
         text.push_str(&"x".repeat(800));
         let resp = ChatResponse {
+            prompt_usage: None,
             text: Some(text),
             tool_calls: vec![],
             stop_reason: Some("end_turn".into()),
@@ -227,6 +239,7 @@ mod tests {
     #[test]
     fn tool_call_short_circuits_text_heuristic() {
         let resp = ChatResponse {
+            prompt_usage: None,
             text: Some("I can't help directly, calling tool…".into()),
             tool_calls: vec![ToolCall {
                 id: "x".into(),
@@ -275,5 +288,17 @@ mod tests {
         assert_eq!(resp.text.as_deref(), Some("hi"));
         assert_eq!(primary.calls(), 1);
         assert_eq!(fallback.calls(), 0);
+    }
+    /// The wrapper answers to its primary's name, so calibration would learn
+    /// the fallback's token prices under the primary's key. Both names have
+    /// to be on the record.
+    #[test]
+    fn a_fallback_chain_reports_both_tokenizers() {
+        let chain = FallbackProvider::new(
+            ScriptedProvider::new("primary", vec![Ok(ok_response("hi"))]),
+            ScriptedProvider::new("secondary", vec![Ok(ok_response("hi"))]),
+        );
+        assert_eq!(chain.name(), "primary");
+        assert_eq!(chain.calibration_keys(), vec!["primary", "secondary"]);
     }
 }

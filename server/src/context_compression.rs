@@ -9,9 +9,11 @@
 //! 5. Return the compressed history
 
 use crate::config::CompressionConfig;
-use crate::provider::{ChatMessage, ContentPart, Provider, Role};
+use crate::provider::{ChatMessage, ContentPart, PromptUsage, Provider, Role, ToolSpec};
 use crate::session_storage::{MISSING_RESULT, missing_input};
-use tracing::{info, warn};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use tracing::{debug, info, warn};
 
 /// Rough token estimate for a string.
 ///
@@ -39,6 +41,107 @@ pub fn estimate_total_tokens(system: Option<&str>, messages: &[ChatMessage]) -> 
     let message_tokens: usize = messages.iter().map(estimate_message_tokens).sum();
     // Add a small overhead for message framing (~4 tokens per message)
     system_tokens + message_tokens + messages.len() * 4
+}
+
+/// Estimate the tokens the tool schemas add to every request.
+///
+/// These are not history and they are never compacted, but the provider
+/// counts them: a couple of dozen MCP tools is a fixed five-figure tax on
+/// the window that the message estimate alone does not see. Leaving them out
+/// is one of the two reasons the budget used to read low.
+pub fn estimate_tools_tokens(tools: Option<&[ToolSpec]>) -> usize {
+    tools
+        .unwrap_or(&[])
+        .iter()
+        .map(|t| {
+            estimate_tokens(&t.name)
+                + estimate_tokens(&t.description)
+                + estimate_tokens(&t.input_schema.to_string())
+                // The JSON wrapper each spec is served in.
+                + 8
+        })
+        .sum()
+}
+
+/// What a request costs by our own reckoning: history, system prompt and the
+/// tool schemas that ride along with it.
+///
+/// This is the quantity `record_prompt_usage` calibrates, so it must stay the
+/// whole of what the provider is about to count. Estimating one thing and
+/// correcting another would make the factor meaningless.
+pub fn estimate_request_tokens(
+    system: Option<&str>,
+    messages: &[ChatMessage],
+    tools: Option<&[ToolSpec]>,
+) -> usize {
+    estimate_total_tokens(system, messages) + estimate_tools_tokens(tools)
+}
+
+/// Per-provider correction factor: what the provider says a request cost,
+/// divided by what `estimate_request_tokens` said it would.
+///
+/// A chars-per-token rule of thumb cannot be right for every tokenizer and
+/// every language at once — Japanese prose and dense JSON both cost far more
+/// per character than the 4:1 the estimate assumes. Rather than guess harder,
+/// take the number the provider already reports and let it correct the guess.
+/// The factor is keyed by tokenizer (provider name), starts at 1.0, and is
+/// smoothed so a single odd request cannot swing the budget.
+///
+/// It lives in memory only: a restart re-learns it from the first response
+/// that reports usage.
+static CALIBRATION: LazyLock<Mutex<HashMap<String, f64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How much of each observation to fold in. Low enough that one outlier
+/// cannot move the budget far, high enough to converge within a handful of
+/// turns.
+const CALIBRATION_ALPHA: f64 = 0.3;
+
+/// Bounds on a single observation. A ratio outside these says the estimate
+/// and the report are measuring different things (an empty prompt, a server
+/// reporting nonsense) rather than that the tokenizer is that expensive.
+const CALIBRATION_MIN: f64 = 0.5;
+const CALIBRATION_MAX: f64 = 8.0;
+
+/// Below this the request is too small for the ratio to mean anything —
+/// framing overhead dominates and the number would be noise.
+const CALIBRATION_MIN_TOKENS: usize = 200;
+
+/// Fold one provider-reported prompt size into its tokenizer's factor.
+///
+/// `estimated` must be `estimate_request_tokens` over exactly what was sent.
+/// Responses that report no usage (a server that ignores `include_usage`)
+/// teach nothing and are dropped.
+pub fn record_prompt_usage(estimated: usize, usage: Option<&PromptUsage>) {
+    let Some(usage) = usage else { return };
+    if estimated < CALIBRATION_MIN_TOKENS || usage.tokens == 0 {
+        return;
+    }
+    let ratio = (usage.tokens as f64 / estimated as f64).clamp(CALIBRATION_MIN, CALIBRATION_MAX);
+    let Ok(mut map) = CALIBRATION.lock() else {
+        return;
+    };
+    let entry = map.entry(usage.provider.clone()).or_insert(1.0);
+    *entry = *entry * (1.0 - CALIBRATION_ALPHA) + ratio * CALIBRATION_ALPHA;
+    debug!(
+        "Context estimate calibration for '{}': observed {} actual vs ~{estimated} estimated \
+         (ratio {ratio:.2}) → factor {:.2}",
+        usage.provider, usage.tokens, *entry
+    );
+}
+
+/// The factor to apply for a provider that may answer through any of `keys`.
+///
+/// The largest wins. A fallback chain shares one budget but not one
+/// tokenizer, and the budget has to hold for whichever member actually takes
+/// the call — which, by the time we find out, is too late to compact.
+fn calibration_for(keys: &[&str]) -> f64 {
+    let Ok(map) = CALIBRATION.lock() else {
+        return 1.0;
+    };
+    keys.iter()
+        .filter_map(|k| map.get(*k).copied())
+        .fold(1.0f64, f64::max)
 }
 
 /// Estimate tokens for a single ChatMessage.
@@ -107,6 +210,10 @@ pub struct CompressionResult {
 
 /// Check whether compression is needed and, if so, compress the history.
 ///
+/// `tools` is the spec list this turn will send. It is not history and
+/// nothing here compacts it, but it is part of what the provider counts, so
+/// it is part of the budget.
+///
 /// Returns `Ok(None)` if no compression was needed.
 /// Returns `Ok(Some(CompressionResult))` with the new message history and the
 /// raw summary text (to be persisted as a `SummaryLine`) if compressed.
@@ -114,13 +221,20 @@ pub async fn maybe_compress(
     provider: &dyn Provider,
     system: Option<&str>,
     messages: &[ChatMessage],
+    tools: Option<&[ToolSpec]>,
     config: &CompressionConfig,
 ) -> anyhow::Result<Option<CompressionResult>> {
     if !config.enabled {
         return Ok(None);
     }
 
-    let total_tokens = estimate_total_tokens(system, messages);
+    // Everything from here on is in two currencies. `raw_*` is what the local
+    // estimate says; the threshold is in the provider's tokens. `factor`
+    // converts between them, and the two must never be compared directly.
+    let factor = calibration_for(&provider.calibration_keys());
+    let tools_tokens = estimate_tools_tokens(tools);
+    let raw_total = estimate_total_tokens(system, messages) + tools_tokens;
+    let total_tokens = (raw_total as f64 * factor) as usize;
     let threshold_tokens = (config.context_window as f64 * config.threshold) as usize;
 
     if total_tokens < threshold_tokens {
@@ -129,7 +243,8 @@ pub async fn maybe_compress(
 
     info!(
         "Context compression triggered: ~{total_tokens} tokens estimated \
-         (threshold: {threshold_tokens}, window: {})",
+         (~{raw_total} raw × {factor:.2} calibration, of which ~{tools_tokens} raw is tool \
+         schemas; threshold: {threshold_tokens}, window: {})",
         config.context_window
     );
 
@@ -165,7 +280,13 @@ pub async fn maybe_compress(
     // can be larger than the entire budget — which is how a turn overflows
     // *after* a successful compaction. Trim what survived so the call we are
     // about to make actually fits.
-    let trimmed = trim_to_budget(system, &mut compressed, threshold_tokens);
+    //
+    // The budget goes back into raw currency first, because the trim measures
+    // what it cuts with the same estimate that under-counted to begin with.
+    // The tool schemas come off the top: they are part of the budget, and none
+    // of them is ours to cut.
+    let raw_budget = ((threshold_tokens as f64 / factor) as usize).saturating_sub(tools_tokens);
+    let trimmed = trim_to_budget(system, &mut compressed, raw_budget);
 
     if summary.is_none() && !trimmed {
         // Nothing summarized, nothing trimmed: no new history to hand back.
@@ -600,6 +721,190 @@ mod tests {
         assert_eq!(summary, "a summary");
     }
 
+    /// A stub that answers to a caller-chosen name, so a test can own its
+    /// own calibration key: the table is process-global and the suite runs
+    /// in parallel.
+    struct NamedStub(&'static str);
+
+    #[async_trait::async_trait]
+    impl Provider for NamedStub {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        async fn chat(
+            &self,
+            _system: Option<&str>,
+            _messages: &[ChatMessage],
+            _tools: Option<&[crate::provider::ToolSpec]>,
+        ) -> anyhow::Result<crate::provider::ChatResponse> {
+            Ok(crate::provider::ChatResponse::text_only("a summary".into()))
+        }
+    }
+
+    fn usage(provider: &str, tokens: u32) -> PromptUsage {
+        PromptUsage {
+            provider: provider.to_string(),
+            tokens,
+        }
+    }
+
+    fn big_tool_spec(name: &'static str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: "d".repeat(4_000).into(),
+            input_schema: serde_json::json!({ "type": "object", "blurb": "s".repeat(4_000) }),
+        }
+    }
+
+    #[test]
+    fn tool_schemas_are_counted_and_scale_with_the_tool_list() {
+        assert_eq!(estimate_tools_tokens(None), 0);
+        let one = estimate_tools_tokens(Some(&[big_tool_spec("a")]));
+        let two = estimate_tools_tokens(Some(&[big_tool_spec("a"), big_tool_spec("b")]));
+        assert!(one > 1_000, "a 8k-char schema is not free: {one}");
+        assert!(two > one * 3 / 2, "{two} should be about twice {one}");
+    }
+
+    #[test]
+    fn calibration_folds_in_what_the_provider_reports() {
+        let key = "calib-folds";
+        assert_eq!(
+            calibration_for(&[key]),
+            1.0,
+            "unknown providers start at 1.0"
+        );
+
+        record_prompt_usage(10_000, Some(&usage(key, 30_000)));
+        let after_one = calibration_for(&[key]);
+        // One observation of 3.0, smoothed from 1.0.
+        assert!(
+            (after_one - 1.6).abs() < 0.01,
+            "expected ~1.6 after one 3.0 observation, got {after_one}"
+        );
+
+        // Repeated agreement converges toward the observed ratio.
+        for _ in 0..20 {
+            record_prompt_usage(10_000, Some(&usage(key, 30_000)));
+        }
+        let settled = calibration_for(&[key]);
+        assert!(
+            settled > 2.9 && settled <= 3.0,
+            "expected convergence on 3.0, got {settled}"
+        );
+    }
+
+    #[test]
+    fn calibration_ignores_what_it_cannot_learn_from() {
+        let key = "calib-ignores";
+        record_prompt_usage(10_000, None);
+        record_prompt_usage(10, Some(&usage(key, 5_000))); // too small to mean anything
+        record_prompt_usage(10_000, Some(&usage(key, 0))); // a server reporting nothing
+        assert_eq!(calibration_for(&[key]), 1.0);
+    }
+
+    /// A fallback chain shares one budget but not one tokenizer, so the
+    /// budget takes the worse of the two.
+    #[test]
+    fn a_chain_of_keys_takes_the_largest_factor() {
+        record_prompt_usage(10_000, Some(&usage("calib-chain-cheap", 10_000)));
+        for _ in 0..20 {
+            record_prompt_usage(10_000, Some(&usage("calib-chain-dear", 25_000)));
+        }
+        let dear = calibration_for(&["calib-chain-dear"]);
+        assert!(dear > 2.0, "{dear}");
+        assert_eq!(
+            calibration_for(&["calib-chain-cheap", "calib-chain-dear"]),
+            dear
+        );
+    }
+
+    /// The regression this whole path exists for: an estimate that fits the
+    /// threshold on paper while the provider counts far more. Once the
+    /// provider has said so once, the same history compacts.
+    #[tokio::test]
+    async fn a_history_that_only_fits_on_paper_compacts_once_the_provider_says_otherwise() {
+        let key = "calib-triggers";
+        let config = CompressionConfig {
+            enabled: true,
+            context_window: 100_000,
+            threshold: 0.8, // 80_000
+            preserve_recent: 2,
+        };
+        let mut messages: Vec<ChatMessage> = (0..10)
+            .map(|i| ChatMessage::user(format!("turn {i}")))
+            .collect();
+        messages.push(tool_use_msg("t1"));
+        messages.push(tool_result_msg("t1", &"x".repeat(220_000))); // ~55k raw
+
+        let raw = estimate_total_tokens(None, &messages);
+        assert!(
+            (50_000..80_000).contains(&raw),
+            "fixture must fit the threshold on paper: {raw}"
+        );
+        assert!(
+            maybe_compress(&NamedStub(key), None, &messages, None, &config)
+                .await
+                .unwrap()
+                .is_none(),
+            "uncalibrated, this history looks like it fits"
+        );
+
+        // The provider reports 1.6x what we estimated for a comparable request.
+        record_prompt_usage(10_000, Some(&usage(key, 30_000)));
+        let factor = calibration_for(&[key]);
+
+        let result = maybe_compress(&NamedStub(key), None, &messages, None, &config)
+            .await
+            .unwrap()
+            .expect("calibrated, the same history is over budget");
+
+        let after = estimate_total_tokens(None, &result.compressed);
+        assert!(
+            (after as f64 * factor) as usize <= 80_000,
+            "~{after} raw x {factor:.2} must land inside the threshold"
+        );
+    }
+
+    /// Tool schemas are budget too: the same history fits without them and
+    /// does not fit with them.
+    #[tokio::test]
+    async fn tool_schemas_count_against_the_budget() {
+        let config = CompressionConfig {
+            enabled: true,
+            context_window: 100_000,
+            threshold: 0.8, // 80_000
+            preserve_recent: 2,
+        };
+        let messages = vec![
+            ChatMessage::user("go"),
+            tool_use_msg("t1"),
+            tool_result_msg("t1", &"x".repeat(300_000)), // ~75k raw
+        ];
+        assert!(
+            maybe_compress(&NamedStub("tools-budget"), None, &messages, None, &config)
+                .await
+                .unwrap()
+                .is_none(),
+            "without tool schemas this history fits"
+        );
+
+        let tools: Vec<ToolSpec> = (0..4).map(|_| big_tool_spec("t")).collect();
+        assert!(
+            maybe_compress(
+                &NamedStub("tools-budget"),
+                None,
+                &messages,
+                Some(&tools),
+                &config
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "with them it does not"
+        );
+    }
+
     /// A window small enough that a single fat tool result blows past it,
     /// with a `preserve_recent` large enough to protect everything.
     fn tight_config() -> CompressionConfig {
@@ -649,7 +954,7 @@ mod tests {
             tool_result_msg("t1", &"x".repeat(400_000)),
         ];
 
-        let result = maybe_compress(&StubProvider, None, &messages, &config)
+        let result = maybe_compress(&StubProvider, None, &messages, None, &config)
             .await
             .unwrap()
             .expect("an oversized history must come back trimmed");
@@ -690,7 +995,7 @@ mod tests {
         messages.push(tool_use_msg("t1"));
         messages.push(tool_result_msg("t1", &"x".repeat(400_000)));
 
-        let result = maybe_compress(&StubProvider, None, &messages, &config)
+        let result = maybe_compress(&StubProvider, None, &messages, None, &config)
             .await
             .unwrap()
             .expect("an oversized history must come back compressed");
@@ -725,7 +1030,7 @@ mod tests {
             tool_result_msg("t2", &"x".repeat(400_000)),
         ];
 
-        let result = maybe_compress(&StubProvider, None, &messages, &config)
+        let result = maybe_compress(&StubProvider, None, &messages, None, &config)
             .await
             .unwrap()
             .expect("an oversized history must come back trimmed");
@@ -751,7 +1056,7 @@ mod tests {
             tool_result_msg("t1", &"日本語".repeat(50_000)),
         ];
 
-        let result = maybe_compress(&StubProvider, None, &messages, &config)
+        let result = maybe_compress(&StubProvider, None, &messages, None, &config)
             .await
             .unwrap()
             .expect("an oversized history must come back trimmed");
@@ -771,7 +1076,7 @@ mod tests {
         let config = tight_config();
         let messages = vec![ChatMessage::user("hi"), ChatMessage::assistant("hello")];
         assert!(
-            maybe_compress(&StubProvider, None, &messages, &config)
+            maybe_compress(&StubProvider, None, &messages, None, &config)
                 .await
                 .unwrap()
                 .is_none()

@@ -1,6 +1,8 @@
 use crate::channel::{Attachment, Channels, OutgoingMessage};
 use crate::config::{Config, SessionPolicy};
-use crate::context_compression::{generate_summary, maybe_compress};
+use crate::context_compression::{
+    estimate_request_tokens, generate_summary, maybe_compress, record_prompt_usage,
+};
 use crate::image_cache::{ImageCache, hydrate_history, scrub_history_inplace};
 use crate::provider::registry::ProviderRegistry;
 use crate::provider::{ChatMessage, ContentPart, Provider, ToolCall};
@@ -612,6 +614,7 @@ impl Agent {
                 &*provider,
                 system_with_context.as_deref(),
                 &messages,
+                tool_specs.as_deref(),
                 compression_config,
             )
             .await
@@ -645,6 +648,14 @@ impl Agent {
             // sees the actual bytes. Cache misses degrade to a text
             // marker that preserves the hash for context references.
             let messages_for_provider = hydrate_history(&messages);
+            // Measured against exactly what goes on the wire, hydration
+            // included — the response's own token count is what teaches the
+            // estimate how wrong it is.
+            let estimated = estimate_request_tokens(
+                system_with_context.as_deref(),
+                &messages_for_provider,
+                tool_specs.as_deref(),
+            );
             let response = provider
                 .chat(
                     system_with_context.as_deref(),
@@ -652,6 +663,9 @@ impl Agent {
                     tool_specs.as_deref(),
                 )
                 .await;
+            if let Ok(resp) = &response {
+                record_prompt_usage(estimated, resp.prompt_usage.as_ref());
+            }
 
             match response {
                 Err(e) => {
@@ -1259,6 +1273,7 @@ api_key = "test"
     async fn the_test_harness_drives_a_turn_end_to_end() {
         let (agent, sent, _typing) =
             agent_with_scripted_provider(vec![crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -1281,6 +1296,7 @@ api_key = "test"
     async fn a_tool_using_turn_is_delivered_as_several_messages() {
         let (agent, sent, _typing) = agent_with_scripted_provider(vec![
             crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("調べます".to_string()),
                 tool_calls: vec![crate::provider::ToolCall {
                     id: "call-1".to_string(),
@@ -1290,6 +1306,7 @@ api_key = "test"
                 stop_reason: None,
             },
             crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("見つかりました".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -1316,6 +1333,7 @@ api_key = "test"
     async fn an_ordinary_reply_is_still_one_message() {
         let (agent, sent, _typing) =
             agent_with_scripted_provider(vec![crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("こんにちは".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -1338,6 +1356,7 @@ api_key = "test"
     async fn a_failed_send_does_not_end_the_turn() {
         let (agent, sent, _typing) = agent_with_failing_first_send(vec![
             crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("最初".to_string()),
                 tool_calls: vec![crate::provider::ToolCall {
                     id: "call-1".to_string(),
@@ -1347,6 +1366,7 @@ api_key = "test"
                 stop_reason: None,
             },
             crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("最後".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -1382,6 +1402,7 @@ api_key = "test"
     async fn typing_is_not_restarted_after_the_turns_last_send() {
         let (agent, _sent, typing) = agent_with_scripted_provider(vec![
             crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("調べます".to_string()),
                 tool_calls: vec![crate::provider::ToolCall {
                     id: "call-1".to_string(),
@@ -1391,6 +1412,7 @@ api_key = "test"
                 stop_reason: None,
             },
             crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("見つかりました".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
