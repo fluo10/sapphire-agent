@@ -10,8 +10,8 @@ This workspace ships five crates and uses **conventional-commit scopes** to rout
 |---|---|
 | `(desktop)` | `desktop/` (bevy GUI client) |
 | `(cli)` or `(call)` | `cli/` (voice satellite binary) |
-| `(rpc)` | `crates/sapphire-agent-rpc/` (RPC client library) |
-| `(core)` | `crates/sapphire-call-core/` (shared config + device_id) |
+| `(rpc)` | `crates/sapphire-agent-core/` (RPC client library) |
+| `(core)` | `crates/sapphire-agent-client/` (shared config + device_id) |
 | unscoped, or `(agent)` / `(messages)` / `(voice)` / `(serve)` / `(channel)` / `(matrix)` / `(discord)` / `(sessions)` / `(chat)` / `(timer)` / `(heartbeat)` / `(memory)` / `(image-cache)` / `(api)` / `(tools)` / `(search)` / `(fts)` / `(mcp)` / `(features)` / `(workspace)` / `(deps)` | the agent binary (`server/`) |
 | `(release)`, `(release-plz)`, `(fmt)`, `(ci)`, `(test)` | infrastructure — workspace-wide, no semver impact intended |
 
@@ -23,15 +23,15 @@ The repo root is a **virtual workspace manifest** (`[workspace]` only, no `[pack
 
 | Directory | Package | Kind |
 |---|---|---|
-| `server/` | `sapphire-agent` | bin (`sapphire-agent`) |
-| `cli/` | `sapphire-call-cli` | bin (`sapphire-call`) |
-| `desktop/` | `sapphire-call-desktop` | bin (`sapphire-call-desktop`) |
-| `crates/sapphire-agent-rpc/` | `sapphire-agent-rpc` | lib |
-| `crates/sapphire-call-core/` | `sapphire-call-core` | lib |
+| `server/` | `sapphire-agent-server` | bin (`sapphire-agent-server`) |
+| `cli/` | `sapphire-agent-cli` | bin (`sapphire-agent-cli`) |
+| `desktop/` | `sapphire-agent-desktop` | bin (`sapphire-agent-desktop`) |
+| `crates/sapphire-agent-core/` | `sapphire-agent-core` | lib |
+| `crates/sapphire-agent-client/` | `sapphire-agent-client` | lib |
 
 `server/` still carries the agent's own `templates/`, `config.example.toml`, and `CHANGELOG.md` (the binary embeds the templates via `include_str!` and reads `config.example.toml` via `CARGO_MANIFEST_DIR`). `default-members = ["server"]` keeps a bare `cargo build` / `cargo test` at the root scoped to the agent, as it was when `sapphire-agent` was the root package.
 
-A package rename (`sapphire-agent` → `-server`, `sapphire-call-cli` → `sapphire-agent-cli`, …) is a possible future step; it is deliberately decoupled from this move, so directory and package names are temporarily out of sync. A future ESP32-S3 client firmware would live in a separate nested workspace (its own `Cargo.lock` / `rust-toolchain.toml` / `.cargo/config.toml`), added to `[workspace] exclude`, not as a member.
+Package names now match their directory roles (`sapphire-agent-server`, `sapphire-agent-cli`, `sapphire-agent-desktop`, `sapphire-agent-core`, `sapphire-agent-client`); the rename was applied after the directory move. Note the crates.io packages retain their pre-rename names until republished: the server publishes as `sapphire-agent`, the RPC lib as `sapphire-agent-rpc`, the client-core lib as `sapphire-call-core` (see the crates.io publish-plan in the tracking issue). A future ESP32-S3 client firmware would live in a separate nested workspace (its own `Cargo.lock` / `rust-toolchain.toml` / `.cargo/config.toml`), added to `[workspace] exclude`, not as a member.
 
 ### Two ONNX Runtimes cannot share a binary — keep `ort` out of the default build
 
@@ -48,8 +48,8 @@ The resolution is to keep `ort` out of the default graph, which restores static 
 So `cargo build --workspace` works on Linux and macOS. It still does **not** link on Windows for `server/`, which is fine — the agent is a headless server app with no Windows build (#182). Build the clients by name there:
 
 ```sh
-cargo build --package sapphire-call-cli
-cargo build --package sapphire-call-desktop
+cargo build --package sapphire-agent-cli
+cargo build --package sapphire-agent-desktop
 ```
 
 If you enable `fastembed-embed`, drop `voice-sherpa`: `--no-default-features --features redb-store,fastembed-embed`.
@@ -73,7 +73,7 @@ Rust's `regex` crate has no negative lookahead, so the filter is an allowlist of
 
 ## Release flow recap
 
-- `release-plz` creates per-package tags (`sapphire-agent-v*`, `sapphire-call-desktop-v*`, ...) and GitHub releases on push to main.
+- `release-plz` creates per-package tags (`sapphire-agent-v*`, `sapphire-agent-desktop-v*`, ...) and GitHub releases on push to main.
 - `.github/workflows/release-plz.yml` parses the `releases` output with `jq` and chains into reusable build workflows (`release.yml`, `release-cli.yml`, `release-desktop.yml`) which attach platform binaries to each release.
 - Tags pushed by `GITHUB_TOKEN` don't fire downstream workflows on their own — the `workflow_call` chain inside `release-plz.yml` is the path; `workflow_dispatch` with `-f tag=…` is the retroactive escape hatch.
-- `sapphire-call-desktop` carries `publish = false`; release-plz still tags + releases it because `release-plz.toml` sets `release = true` explicitly (the default for `publish = false` crates is to skip them).
+- `sapphire-agent-desktop` carries `publish = false`; release-plz still tags + releases it because `release-plz.toml` sets `release = true` explicitly (the default for `publish = false` crates is to skip them).

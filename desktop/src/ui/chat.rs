@@ -36,7 +36,7 @@ pub fn ui(
     };
     egui::TopBottomPanel::top("chat_topbar").show(ctx, |ui| {
         ui.horizontal(|ui| {
-            ui.heading("sapphire-call");
+            ui.heading("sapphire-agent-cli");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(egui::Button::image(icon_image(ICON_SETTINGS)))

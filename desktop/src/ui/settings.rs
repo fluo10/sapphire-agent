@@ -17,7 +17,7 @@ pub fn ui(mut contexts: EguiContexts, mut state: ResMut<AppState>, bridge: NonSe
         return;
     };
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.heading("sapphire-call-desktop · Connection");
+        ui.heading("sapphire-agent-desktop · Connection");
         ui.add_space(8.0);
 
         let url = state.config.server.url.get_or_insert_default();

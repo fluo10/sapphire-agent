@@ -1,6 +1,6 @@
 name: Release desktop binaries
 
-# Builds the cross-platform sapphire-call-desktop binaries and uploads
+# Builds the cross-platform sapphire-agent-desktop binaries and uploads
 # them as release assets onto an existing GitHub release.
 #
 # Triggered as a reusable workflow from release-plz.yml (right after
@@ -19,13 +19,13 @@ on:
       tag:
         required: true
         type: string
-        description: 'Existing release tag to attach binaries to (e.g. sapphire-call-desktop-v0.1.0).'
+        description: 'Existing release tag to attach binaries to (e.g. sapphire-agent-desktop-v0.1.0).'
   workflow_dispatch:
     inputs:
       tag:
         required: true
         type: string
-        description: 'Existing release tag to attach binaries to (e.g. sapphire-call-desktop-v0.1.0).'
+        description: 'Existing release tag to attach binaries to (e.g. sapphire-agent-desktop-v0.1.0).'
 
 jobs:
   build:
@@ -35,20 +35,20 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            binary: sapphire-call-desktop
-            asset_name: sapphire-call-desktop-linux-x86_64
+            binary: sapphire-agent-desktop
+            asset_name: sapphire-agent-desktop-linux-x86_64
             continue-on-error: false
           - os: ubuntu-24.04-arm
-            binary: sapphire-call-desktop
-            asset_name: sapphire-call-desktop-linux-aarch64
+            binary: sapphire-agent-desktop
+            asset_name: sapphire-agent-desktop-linux-aarch64
             continue-on-error: false
           - os: macos-latest
-            binary: sapphire-call-desktop
-            asset_name: sapphire-call-desktop-macos-aarch64
+            binary: sapphire-agent-desktop
+            asset_name: sapphire-agent-desktop-macos-aarch64
             continue-on-error: true
           - os: windows-latest
-            binary: sapphire-call-desktop.exe
-            asset_name: sapphire-call-desktop-windows-x86_64.exe
+            binary: sapphire-agent-desktop.exe
+            asset_name: sapphire-agent-desktop-windows-x86_64.exe
             continue-on-error: true
     runs-on: ${{ matrix.os }}
     permissions:
@@ -82,7 +82,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/refresh-sherpa-onnx-libs
-      - run: cargo build --release --package sapphire-call-desktop
+      - run: cargo build --release --package sapphire-agent-desktop
 
       # This crate never pulled `ort` — it only followed the workspace onto
       # shared sherpa linking, because Cargo unifies features additively and

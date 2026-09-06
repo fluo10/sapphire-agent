@@ -1,6 +1,6 @@
 name: Release CLI binaries
 
-# Builds the cross-platform sapphire-call (CLI satellite) binaries and
+# Builds the cross-platform sapphire-agent-cli (CLI satellite) binaries and
 # uploads them as release assets onto an existing GitHub release.
 #
 # Same trigger model as release.yml — invoked by release-plz.yml via
@@ -14,13 +14,13 @@ on:
       tag:
         required: true
         type: string
-        description: 'Existing release tag to attach binaries to (e.g. sapphire-call-cli-v0.7.0).'
+        description: 'Existing release tag to attach binaries to (e.g. sapphire-agent-cli-v0.7.0).'
   workflow_dispatch:
     inputs:
       tag:
         required: true
         type: string
-        description: 'Existing release tag to attach binaries to (e.g. sapphire-call-cli-v0.7.0).'
+        description: 'Existing release tag to attach binaries to (e.g. sapphire-agent-cli-v0.7.0).'
 
 jobs:
   build:
@@ -30,20 +30,20 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            binary: sapphire-call
-            asset_name: sapphire-call-linux-x86_64
+            binary: sapphire-agent-cli
+            asset_name: sapphire-agent-cli-linux-x86_64
             continue-on-error: false
           - os: ubuntu-24.04-arm
-            binary: sapphire-call
-            asset_name: sapphire-call-linux-aarch64
+            binary: sapphire-agent-cli
+            asset_name: sapphire-agent-cli-linux-aarch64
             continue-on-error: false
           - os: macos-latest
-            binary: sapphire-call
-            asset_name: sapphire-call-macos-aarch64
+            binary: sapphire-agent-cli
+            asset_name: sapphire-agent-cli-macos-aarch64
             continue-on-error: true
           - os: windows-latest
-            binary: sapphire-call.exe
-            asset_name: sapphire-call-windows-x86_64.exe
+            binary: sapphire-agent-cli.exe
+            asset_name: sapphire-agent-cli-windows-x86_64.exe
             continue-on-error: true
     runs-on: ${{ matrix.os }}
     permissions:
@@ -66,7 +66,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/refresh-sherpa-onnx-libs
-      - run: cargo build --release --package sapphire-call-cli
+      - run: cargo build --release --package sapphire-agent-cli
 
       # Both link modes produce a runnable exe in `target/release`, but only
       # the static one survives being copied away from it: shared linking

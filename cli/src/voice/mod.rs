@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use sapphire_agent_rpc::{
+use sapphire_agent_core::{
     VoiceEvent, VoicePushEvent, voice::PIPELINE_SAMPLE_RATE, voice_pipeline_run, voice_subscribe,
 };
 use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
@@ -75,13 +75,13 @@ pub struct VoiceOptions {
     pub output_device: Option<String>,
     /// Optional device identity sent in every `voice/pipeline_run` so the
     /// agent can render "voice channel with <name>" in the system prompt.
-    pub device: Option<sapphire_agent_rpc::DeviceMetadata>,
+    pub device: Option<sapphire_agent_core::DeviceMetadata>,
     /// Listen-state UX: confirmation beeps + post-reply follow-up
-    /// listening window. See [`sapphire_call_core::config::BehaviorConfig`].
-    pub behavior: sapphire_call_core::config::BehaviorConfig,
+    /// listening window. See [`sapphire_agent_client::config::BehaviorConfig`].
+    pub behavior: sapphire_agent_client::config::BehaviorConfig,
     /// Mic gain + wake/VAD sensitivity knobs (issue #87). Defaults
     /// preserve the historical hard-coded values.
-    pub sensitivity: sapphire_call_core::config::SensitivityConfig,
+    pub sensitivity: sapphire_agent_client::config::SensitivityConfig,
 }
 
 /// Frequency / duration of the confirmation beeps. Picked to be
@@ -276,7 +276,7 @@ fn handle_stream_error(
     }
 }
 
-/// Entry point for `sapphire-call voice`.
+/// Entry point for `sapphire-agent-cli voice`.
 pub async fn run(
     server: String,
     _session: Option<String>,
@@ -296,18 +296,18 @@ pub async fn run(
     // the satellite picks up where it left off across restarts. The
     // room_profile is resolved server-side from the bearer `token`.
     // `session` (legacy chat session id) is ignored in voice mode.
-    let device_id = sapphire_call_core::device_id::ensure_device_id()
-        .context("failed to load or generate sapphire-call device id")?;
-    eprintln!("sapphire-call voice (device: {device_id})");
+    let device_id = sapphire_agent_client::device_id::ensure_device_id()
+        .context("failed to load or generate sapphire-agent-cli device id")?;
+    eprintln!("sapphire-agent-cli voice (device: {device_id})");
 
     // ── Wake-word config: fetch the inline ONNX from the server ─────────
-    let server_wake = sapphire_agent_rpc::voice_config(&client, &base, &token)
+    let server_wake = sapphire_agent_core::voice_config(&client, &base, &token)
         .await
         .unwrap_or_else(|e| {
             eprintln!(
                 "warning: voice/config fetch failed ({e:#}); proceeding without wake-word gating"
             );
-            sapphire_agent_rpc::WakeWordConfig::default()
+            sapphire_agent_core::WakeWordConfig::default()
         });
 
     // ── VAD model ────────────────────────────────────────────────────────
@@ -369,7 +369,7 @@ pub async fn run(
 
     let (input_ready_tx, input_ready_rx) = tokio::sync::oneshot::channel::<Result<(u32, u16)>>();
     let input_handle = std::thread::Builder::new()
-        .name("sapphire-call input-supervisor".into())
+        .name("sapphire-agent-cli input-supervisor".into())
         .spawn({
             let name = options.input_device.clone();
             let enabled = Arc::clone(&mic_enabled);
@@ -399,7 +399,7 @@ pub async fn run(
 
     let (output_ready_tx, output_ready_rx) = tokio::sync::oneshot::channel::<Result<(u32, u16)>>();
     let output_handle = std::thread::Builder::new()
-        .name("sapphire-call output-supervisor".into())
+        .name("sapphire-agent-cli output-supervisor".into())
         .spawn({
             let name = options.output_device.clone();
             let queue = Arc::clone(&playback_queue);
@@ -531,7 +531,7 @@ struct ListenCtx {
     token: String,
     device_id: String,
     language: Option<String>,
-    device: Option<sapphire_agent_rpc::DeviceMetadata>,
+    device: Option<sapphire_agent_core::DeviceMetadata>,
     shutdown: Arc<AtomicBool>,
     vad: VoiceActivityDetector,
     /// `Some` enables wake-word mode; the satellite gates VAD behind
@@ -542,7 +542,7 @@ struct ListenCtx {
     /// Always false in VAD-only mode.
     awaiting_wake: bool,
     /// Listen-state UX (beeps + follow-up window).
-    behavior: sapphire_call_core::config::BehaviorConfig,
+    behavior: sapphire_agent_client::config::BehaviorConfig,
     /// In wake-word mode, when set, the satellite is in the post-reply
     /// follow-up window: VAD is active without requiring another wake
     /// word until this deadline. Cleared when a follow-up utterance
@@ -982,7 +982,7 @@ fn ensure_silero_model() -> Result<PathBuf> {
 
 fn build_vad(
     model_path: &std::path::Path,
-    sensitivity: &sapphire_call_core::config::SensitivityConfig,
+    sensitivity: &sapphire_agent_client::config::SensitivityConfig,
 ) -> Result<VoiceActivityDetector> {
     let silero = SileroVadModelConfig {
         model: Some(model_path.to_string_lossy().into_owned()),
@@ -1510,7 +1510,7 @@ async fn process_utterance(
     device_id: &str,
     pcm_16khz: &[i16],
     language: Option<&str>,
-    device_meta: Option<&sapphire_agent_rpc::DeviceMetadata>,
+    device_meta: Option<&sapphire_agent_core::DeviceMetadata>,
     playback_queue: Arc<std::sync::Mutex<VecDeque<i16>>>,
     output_rate: u32,
 ) -> Result<()> {

@@ -1,19 +1,19 @@
 //! Desktop client configuration.
 //!
-//! Persisted to `~/.config/sapphire-call-desktop/config.toml`. The
+//! Persisted to `~/.config/sapphire-agent-desktop/config.toml`. The
 //! schema is intentionally separate from the CLI's `CallConfig`
-//! ([`sapphire_call_core::config::CallConfig`]) — the satellite cares
+//! ([`sapphire_agent_client::config::CallConfig`]) — the satellite cares
 //! about wake-word / VAD knobs we don't surface in the GUI, and the
 //! GUI cares about its own `tts` opt-in and (later) window-state /
 //! avatar settings the CLI doesn't.
 //!
-//! The shared `ServerConfig` block is re-used from `sapphire-call-core`
+//! The shared `ServerConfig` block is re-used from `sapphire-agent-client`
 //! so endpoint + token map 1:1 between the two clients.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use sapphire_call_core::config::ServerConfig;
+use sapphire_agent_client::config::ServerConfig;
 use serde::{Deserialize, Serialize};
 
 /// Top-level config schema written to disk.
@@ -38,10 +38,10 @@ pub struct TtsConfig {
 
 impl DesktopConfig {
     /// Conventional XDG path. Distinct from the CLI's
-    /// `~/.config/sapphire-call/config.toml` so the two clients can
+    /// `~/.config/sapphire-agent-cli/config.toml` so the two clients can
     /// co-exist with separate endpoint / token bindings if needed.
     pub fn default_path() -> Option<PathBuf> {
-        directories::ProjectDirs::from("", "", "sapphire-call-desktop")
+        directories::ProjectDirs::from("", "", "sapphire-agent-desktop")
             .map(|p| p.config_dir().join("config.toml"))
     }
 

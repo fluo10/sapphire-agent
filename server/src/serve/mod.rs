@@ -102,7 +102,7 @@ pub struct ServeState {
     /// on resume.
     pub(crate) session_room_profiles: tokio::sync::Mutex<HashMap<String, String>>,
     /// Per-session room metadata supplied by the client at `initialize`
-    /// (sapphire-call's `[device]` block, principally). Mirrors the
+    /// (sapphire-agent-cli's `[device]` block, principally). Mirrors the
     /// channel-side `Channel::room_info()` lookup so the agent can tell
     /// the model "you are speaking through the living-room speaker; STT
     /// may have introduced typos" without baking that into AGENTS.md.
@@ -761,7 +761,7 @@ async fn handle_initialize(
         .await
         .insert(session_id.clone(), profile_name.clone());
 
-    // Optional `params.device = { name, description }` from sapphire-call /
+    // Optional `params.device = { name, description }` from sapphire-agent-cli /
     // other voice clients. We treat `name` as the device handle (e.g.
     // "living-room-speaker") and render the full room name server-side
     // — that way every voice client doesn't have to agree on a template

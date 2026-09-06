@@ -7,7 +7,7 @@
 //! (`transcript`, `assistant_text`).
 //!
 //! Audio I/O is intentionally not handled here — that's the
-//! satellite's job (see `sapphire-call`'s voice subcommand). This
+//! satellite's job (see `sapphire-agent-cli`'s voice subcommand). This
 //! module deals only in `Vec<i16>` PCM and JSON-RPC over HTTP/SSE.
 
 use anyhow::Result;

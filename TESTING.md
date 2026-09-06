@@ -3,7 +3,7 @@
 Two paths for trying the voice pipeline end-to-end:
 
 1. **Mock smoke test** — fastest. Verifies the MCP wire format, SSE
-   streaming, and the `sapphire-call ↔ sapphire-agent` plumbing without
+   streaming, and the `sapphire-agent-cli ↔ sapphire-agent` plumbing without
    downloading any models or starting Irodori-TTS. ~2 minutes.
 2. **Real test** — SenseVoice STT + Irodori-TTS. ~30 minutes the first
    time (sherpa-onnx C++ build, model downloads, Irodori-TTS setup).
@@ -28,7 +28,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 ### Build
 
 ```sh
-cargo build --bin sapphire-agent --bin sapphire-call
+cargo build --bin sapphire-agent-server --bin sapphire-agent-cli
 ```
 
 No `--features voice-sherpa` needed — the mock providers are part of
@@ -39,18 +39,18 @@ the default build.
 Terminal A (server):
 
 ```sh
-cargo run --bin sapphire-agent -- \
+cargo run --bin sapphire-agent-server -- \
     --config test-configs/voice-mock.toml serve
 ```
 
 Terminal B (satellite, microphone + speaker required):
 
 ```sh
-cargo run --bin sapphire-call -- voice --token "<voice_test api_key>"
+cargo run --bin sapphire-agent-cli -- voice --token "<voice_test api_key>"
 ```
 
 The first satellite run downloads the Silero VAD ONNX (~2 MB) to
-`~/.local/share/sapphire-call/voice-models/`.
+`~/.local/share/sapphire-agent-cli/voice-models/`.
 
 ### What to expect
 
@@ -87,7 +87,7 @@ cold on the satellite side — distribute via prebuilt binaries in
 production.
 
 ```sh
-cargo build --release --bin sapphire-call
+cargo build --release --bin sapphire-agent-cli
 ```
 
 #### c. Irodori-TTS server
@@ -120,7 +120,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 Terminal A (server):
 
 ```sh
-cargo run --release --features voice-sherpa --bin sapphire-agent -- \
+cargo run --release --features voice-sherpa --bin sapphire-agent-server -- \
     --config test-configs/voice-irodori.toml serve
 ```
 
@@ -131,12 +131,12 @@ sherpa-onnx GitHub releases to
 Terminal B (satellite):
 
 ```sh
-cargo run --release --bin sapphire-call -- voice \
+cargo run --release --bin sapphire-agent-cli -- voice \
     --token "<voice_irodori api_key>" --language ja
 ```
 
 First boot auto-downloads Silero VAD (~2 MB) to
-`~/.local/share/sapphire-call/voice-models/`.
+`~/.local/share/sapphire-agent-cli/voice-models/`.
 
 ### What to expect
 
@@ -150,7 +150,7 @@ First boot auto-downloads Silero VAD (~2 MB) to
 ### Tuning knobs
 
 - **VAD too sensitive / not sensitive enough** — edit
-  `crates/sapphire-call/src/voice/mod.rs`, the `silero_config` values
+  `crates/sapphire-agent-cli/src/voice/mod.rs`, the `silero_config` values
   inside `build_vad()`:
     - `threshold` (default 0.5): lower → more permissive
     - `min_silence_duration` (0.25): higher → longer pause needed to
@@ -186,10 +186,10 @@ in the path at startup; missing files surface as a clean
 No extra CLI flags. The satellite fetches the ONNX at startup along
 with the openWakeWord shared frontend models (mel + embedding,
 ~6 MB total, downloaded once from the openWakeWord v0.5.1 GitHub
-release to `~/.local/share/sapphire-call/voice-models/oww/`):
+release to `~/.local/share/sapphire-agent-cli/voice-models/oww/`):
 
 ```sh
-cargo run --release --bin sapphire-call -- voice \
+cargo run --release --bin sapphire-agent-cli -- voice \
     --token "<voice_irodori api_key>"
 ```
 
@@ -209,7 +209,7 @@ pip install -e . piper-tts
 ```
 
 Drop the resulting `.onnx` on the server, point
-`[voice].wake_word_model` at it, restart sapphire-agent. Each
+`[voice].wake_word_model` at it, restart sapphire-agent-server. Each
 satellite picks up the new model on its next boot (cache hits
 re-use existing models; new SHA = re-download once).
 
@@ -228,9 +228,9 @@ re-use existing models; new SHA = re-download once).
 ## 4. Persistent satellite config
 
 So you don't have to type `--server …` every boot, drop a TOML
-config at `~/.config/sapphire-call/config.toml` (XDG location;
+config at `~/.config/sapphire-agent-cli/config.toml` (XDG location;
 override with `--config <path>`). See
-`crates/sapphire-call/config.example.toml` for the schema. Minimum:
+`crates/sapphire-agent-cli/config.example.toml` for the schema. Minimum:
 
 ```toml
 [server]
@@ -252,7 +252,7 @@ Speak, AnkerWork, eMeet, etc.) attached:
 ### Discover devices
 
 ```sh
-sapphire-call voice --list-devices
+sapphire-agent-cli voice --list-devices
 ```
 
 prints every input / output device cpal can see, marks the system
@@ -262,7 +262,7 @@ them verbatim into the selection flags.
 ### Pin specific devices
 
 ```sh
-sapphire-call voice \
+sapphire-agent-cli voice \
     --input-device  "Jabra SPEAK 510 USB"  \
     --output-device "Jabra SPEAK 510 USB"  \
     --language ja --token "<voice_irodori api_key>"
@@ -273,7 +273,7 @@ usually picks the internal codec instead.
 
 ### Make the service survive logout
 
-If you're running `sapphire-call voice` as a systemd user service
+If you're running `sapphire-agent-cli voice` as a systemd user service
 under a non-login account, the PipeWire / PulseAudio user daemons
 shut down when no session is active. Enable lingering so the audio
 graph (and the satellite) keep running:
@@ -299,7 +299,7 @@ mic from the speaker.
 | Silent reply, no errors | Output device muted or output_rate mismatch in the satellite's log | Check `output: <rate> Hz` line; raise system volume |
 | `[error: Internal error: Provider error: ...]` from satellite | Anthropic key absent / invalid on the server side | Verify `ANTHROPIC_API_KEY` env var on the **server** terminal |
 | `Failed to read voice_pipeline 'irodori'` validation error at server startup | room_profile.voice_pipeline points at undefined block | Match name with `[voice_pipeline.<n>]` |
-| `failed to fetch Silero VAD model` | No network / proxy | Pre-download the model manually and place at `~/.local/share/sapphire-call/voice-models/silero_vad.onnx` |
+| `failed to fetch Silero VAD model` | No network / proxy | Pre-download the model manually and place at `~/.local/share/sapphire-agent-cli/voice-models/silero_vad.onnx` |
 | First sherpa-onnx build OOM-kills CI | C++ compile is memory-heavy | Use a runner with ≥4 GB / 2 cores or set `CARGO_BUILD_JOBS=1` |
 
 ---

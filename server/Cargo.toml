@@ -1,5 +1,5 @@
 [package]
-name = "sapphire-agent"
+name = "sapphire-agent-server"
 version = "0.7.2"
 edition.workspace = true
 description = "A personal AI assistant agent with Matrix/Discord channels, Anthropic backend, and a sapphire-framework memory layer"
@@ -11,7 +11,7 @@ categories = ["command-line-utilities"]
 exclude = ["/.github", "/.gitignore", "/.claude", "/.vscode", "/rust-toolchain.toml", "/config.example.toml"]
 
 [[bin]]
-name = "sapphire-agent"
+name = "sapphire-agent-server"
 path = "src/main.rs"
 
 [features]

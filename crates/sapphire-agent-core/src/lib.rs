@@ -3,7 +3,7 @@
 //! Provides an HTTP client for the sapphire-agent RPC surface
 //! (`/rpc`, JSON-RPC 2.0) and an interactive REPL that can be embedded
 //! in any binary (`sapphire-agent call` or the standalone
-//! `sapphire-call`).
+//! `sapphire-agent-cli`).
 
 pub mod chat;
 pub mod voice;
@@ -115,7 +115,7 @@ fn next_id() -> u64 {
 /// Run the interactive call client.
 ///
 /// This is the shared entry point used by both `sapphire-agent call` and
-/// the standalone `sapphire-call` binary. `token` is forwarded as
+/// the standalone `sapphire-agent-cli` binary. `token` is forwarded as
 /// `Authorization: Bearer <token>` on every `/rpc` call — resolving it to
 /// the device it was minted for, and that device's
 /// `[room_profile.<n>].devices` binding server-side, is what pins the

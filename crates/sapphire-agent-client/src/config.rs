@@ -2,7 +2,7 @@
 //!
 //! All fields are optional and override-able from the CLI; this file
 //! exists so you don't have to type `--server https://… --token …`
-//! every time you start `sapphire-call`. Wake-word configuration is
+//! every time you start `sapphire-agent-cli`. Wake-word configuration is
 //! intentionally **not** here — the server is the source of truth for
 //! the AI's name (see `[room_profile.<n>].wake_word` on the server).
 //!
@@ -75,7 +75,7 @@ pub struct ServerConfig {
 #[serde(deny_unknown_fields)]
 pub struct AudioConfig {
     /// Exact cpal name of the input device. Discover with
-    /// `sapphire-call voice --list-devices`.
+    /// `sapphire-agent-cli voice --list-devices`.
     pub input_device: Option<String>,
     /// Exact cpal name of the output device.
     pub output_device: Option<String>,
@@ -107,11 +107,11 @@ pub struct DeviceConfig {
 impl DeviceConfig {
     /// Convert into the API crate's wire-format struct. Empty when no
     /// field is set so we don't send a meaningless `device: {}` block.
-    pub fn to_api(&self) -> Option<sapphire_agent_rpc::DeviceMetadata> {
+    pub fn to_api(&self) -> Option<sapphire_agent_core::DeviceMetadata> {
         if self.name.is_none() && self.description.is_none() {
             return None;
         }
-        Some(sapphire_agent_rpc::DeviceMetadata {
+        Some(sapphire_agent_core::DeviceMetadata {
             name: self.name.clone(),
             description: self.description.clone(),
         })
@@ -255,11 +255,11 @@ impl CallConfig {
         Ok(cfg)
     }
 
-    /// Conventional XDG path: `~/.config/sapphire-call/config.toml`.
+    /// Conventional XDG path: `~/.config/sapphire-agent-cli/config.toml`.
     /// Returns `None` when the platform has no notion of a config
     /// directory (e.g. WASM, exotic embedded targets).
     pub fn default_path() -> Option<PathBuf> {
-        directories::ProjectDirs::from("", "", "sapphire-call")
+        directories::ProjectDirs::from("", "", "sapphire-agent-cli")
             .map(|p| p.config_dir().join("config.toml"))
     }
 }
