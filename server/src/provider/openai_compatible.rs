@@ -4,7 +4,9 @@
 //! against llama.cpp's `llama-server`, Ollama (`/v1`), vLLM, and the OpenAI
 //! API itself. Tool calls follow the OpenAI `tools` / `tool_calls` shape.
 
-use crate::provider::{ChatMessage, ChatResponse, ContentPart, Provider, Role, ToolCall, ToolSpec};
+use crate::provider::{
+    ChatMessage, ChatResponse, ContentPart, PromptUsage, Provider, Role, ToolCall, ToolSpec,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -83,8 +85,18 @@ struct Request<'a> {
     messages: Vec<ApiMessage>,
     max_tokens: u32,
     stream: bool,
+    /// Ask for the usage block a streaming response otherwise omits. It
+    /// arrives as a final chunk carrying no choices, and it is the only way
+    /// to learn what the server actually counted for a prompt we can only
+    /// estimate.
+    stream_options: StreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ApiToolSpec<'a>>>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -189,6 +201,15 @@ struct ApiAssistantToolFunction {
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    /// Only present on the extra final chunk `include_usage` asks for, and
+    /// only on servers that honour it.
+    usage: Option<Usage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -417,6 +438,9 @@ impl Provider for OpenAICompatibleProvider {
             messages: api_messages,
             max_tokens: self.max_tokens,
             stream: true,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
             tools: api_tools,
         };
 
@@ -452,6 +476,7 @@ impl Provider for OpenAICompatibleProvider {
         let mut text_acc = String::new();
         let mut tool_acc: BTreeMap<usize, ToolCallAccum> = BTreeMap::new();
         let mut stop_reason: Option<String> = None;
+        let mut prompt_tokens: Option<u32> = None;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("Error reading SSE stream")?;
@@ -476,6 +501,9 @@ impl Provider for OpenAICompatibleProvider {
                             continue;
                         }
                     };
+                    if let Some(usage) = parsed.usage {
+                        prompt_tokens = Some(usage.prompt_tokens);
+                    }
                     for choice in parsed.choices {
                         if let Some(reason) = choice.finish_reason {
                             stop_reason = Some(reason);
@@ -534,6 +562,10 @@ impl Provider for OpenAICompatibleProvider {
         Ok(ChatResponse {
             text,
             tool_calls,
+            prompt_usage: prompt_tokens.map(|tokens| PromptUsage {
+                provider: self.name.clone(),
+                tokens,
+            }),
             stop_reason,
         })
     }
@@ -683,6 +715,9 @@ mod tests {
             messages: Vec::new(),
             max_tokens: 1,
             stream: true,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
             tools: api_tools(Some(empty)),
         };
         let json = serde_json::to_value(&body).unwrap();
@@ -704,5 +739,39 @@ mod tests {
         let mapped = api_tools(Some(&specs)).expect("a non-empty list must stay Some");
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].function.name, "get_weather");
+    }
+    /// The usage block only arrives if we ask for it, and it arrives on a
+    /// chunk carrying no choices — which must not be mistaken for an empty
+    /// response.
+    #[test]
+    fn the_request_asks_for_usage_and_the_final_chunk_carries_it() {
+        let body = Request {
+            model: "m",
+            messages: Vec::new(),
+            max_tokens: 1,
+            stream: true,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
+            tools: None,
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["stream_options"]["include_usage"], true);
+
+        let chunk: StreamChunk = serde_json::from_str(
+            r#"{"choices":[],"usage":{"prompt_tokens":151673,"completion_tokens":0}}"#,
+        )
+        .unwrap();
+        assert!(chunk.choices.is_empty());
+        assert_eq!(chunk.usage.unwrap().prompt_tokens, 151673);
+    }
+
+    /// A server that ignores `stream_options` sends chunks with no usage at
+    /// all; that has to stay a parse, not an error.
+    #[test]
+    fn a_chunk_without_usage_still_parses() {
+        let chunk: StreamChunk =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"hi"}}]}"#).unwrap();
+        assert!(chunk.usage.is_none());
     }
 }

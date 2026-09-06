@@ -17,7 +17,7 @@ pub mod mcp;
 use crate::acp_session::AcpSessionStore;
 use crate::channel::RoomInfo;
 use crate::config::Config;
-use crate::context_compression::maybe_compress;
+use crate::context_compression::{estimate_request_tokens, maybe_compress, record_prompt_usage};
 use crate::provider::registry::ProviderRegistry;
 use crate::provider::{ChatMessage, ContentPart, Provider, ToolSpec, UserInputKind};
 use crate::session::{ConversationKey, SessionStore};
@@ -2346,7 +2346,15 @@ impl TurnLoop<'_> {
             }
 
             // Check if context compression is needed
-            match maybe_compress(provider, system, history, compression_config).await {
+            match maybe_compress(
+                provider,
+                system,
+                history,
+                Some(tool_specs),
+                compression_config,
+            )
+            .await
+            {
                 Ok(Some(result)) => {
                     // Persist the checkpoint so a reload starts the model's
                     // history from here instead of replaying the whole
@@ -2380,9 +2388,17 @@ impl TurnLoop<'_> {
                     .into_iter()
                     .map(apply_input_kind_label)
                     .collect();
+            // Measured against exactly what goes on the wire, hydration and
+            // input-kind labels included — the response's own token count is
+            // what teaches the estimate how wrong it is.
+            let estimated =
+                estimate_request_tokens(system, &history_for_provider, Some(tool_specs));
             let response = provider
                 .chat(system, &history_for_provider, Some(tool_specs))
                 .await;
+            if let Ok(resp) = &response {
+                record_prompt_usage(estimated, resp.prompt_usage.as_ref());
+            }
 
             match response {
                 Err(e) => {
@@ -3433,6 +3449,7 @@ impl ServeState {
         Self::for_test_scripted(
             acp_enabled,
             vec![crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -3471,6 +3488,7 @@ impl ServeState {
         Self::build_for_test_with(
             true,
             StubProvider::new(vec![crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -3674,6 +3692,7 @@ mod tests {
             true,
             vec![
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -3683,6 +3702,7 @@ mod tests {
                     stop_reason: None,
                 },
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("could not run that".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -3748,6 +3768,7 @@ mod tests {
             true,
             vec![
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -3757,6 +3778,7 @@ mod tests {
                     stop_reason: None,
                 },
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("ran it".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -3836,6 +3858,7 @@ mod tests {
             vec![
                 // Parent round 1: delegate to the subagent.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -3847,6 +3870,7 @@ mod tests {
                 // Subagent round 1: try the Execute-kind tool the
                 // parent itself could not run under this host.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "sub-call-1".to_string(),
@@ -3857,12 +3881,14 @@ mod tests {
                 },
                 // Subagent round 2: give up after the refusal.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("could not run it".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
                 },
                 // Parent round 2.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -3918,6 +3944,7 @@ mod tests {
             vec![
                 // Parent round 1: delegate.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -3930,6 +3957,7 @@ mod tests {
                 // itself — never in this round's own `tool_specs`, but
                 // still a name the shared `ToolSet` has registered.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "sub-call-1".to_string(),
@@ -3940,12 +3968,14 @@ mod tests {
                 },
                 // Subagent round 2: give up after the refusal.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("gave up".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
                 },
                 // Parent round 2.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -4004,6 +4034,7 @@ mod tests {
             vec![
                 // Parent round 1: delegate.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -4017,6 +4048,7 @@ mod tests {
                 // would allow it unconditionally, but the definition
                 // never named it.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "sub-call-1".to_string(),
@@ -4027,12 +4059,14 @@ mod tests {
                 },
                 // Subagent round 2: give up after the refusal.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("could not run it".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
                 },
                 // Parent round 2.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -4119,6 +4153,7 @@ mod tests {
                 // the shared `ToolSet` but excluded from this round's
                 // own advertised list.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -4129,6 +4164,7 @@ mod tests {
                 },
                 // Round 2: give up after the refusal.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -4187,6 +4223,7 @@ mod tests {
             vec![
                 // Parent round 1: delegate.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -4205,6 +4242,7 @@ mod tests {
                 // by contrast, lives only in the subagent's local,
                 // never-persisted `history`.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "sub-call-1".to_string(),
@@ -4215,12 +4253,14 @@ mod tests {
                 },
                 // Subagent round 2: its final answer.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("FINAL ANSWER: 42".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
                 },
                 // Parent round 2.
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("relayed".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -4542,6 +4582,7 @@ mod tests {
         let state = ServeState::for_test_scripted(
             true,
             vec![crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("scripted reply".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -4708,6 +4749,7 @@ mod tests {
             StubProvider::new_scripted(vec![
                 // Parent round 1: delegate.
                 Ok(crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -4721,6 +4763,7 @@ mod tests {
                 // Parent round 2, after the subagent's tool result
                 // reports its own failure back as ordinary tool output.
                 Ok(crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -4790,6 +4833,7 @@ mod tests {
             true,
             vec![
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -4799,6 +4843,7 @@ mod tests {
                     stop_reason: None,
                 },
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -4922,6 +4967,7 @@ mod tests {
             true,
             vec![
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -4931,6 +4977,7 @@ mod tests {
                     stop_reason: None,
                 },
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -5010,6 +5057,7 @@ mod tests {
             true,
             vec![
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -5019,6 +5067,7 @@ mod tests {
                     stop_reason: None,
                 },
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -5371,6 +5420,7 @@ mod tests {
         let state = ServeState::for_test_scripted_with_rounds(
             true,
             vec![crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 stop_reason: None,
@@ -5527,6 +5577,7 @@ mod tests {
             false,
             vec![
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("looking now".to_string()),
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -5536,6 +5587,7 @@ mod tests {
                     stop_reason: None,
                 },
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("found it".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -5583,6 +5635,7 @@ mod tests {
             false,
             vec![
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
@@ -5592,6 +5645,7 @@ mod tests {
                     stop_reason: None,
                 },
                 crate::provider::ChatResponse {
+                    prompt_usage: None,
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     stop_reason: None,
@@ -5619,6 +5673,7 @@ mod tests {
 
         let script: Vec<crate::provider::ChatResponse> = (0..3)
             .map(|i| crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: Some(format!("step {i}")),
                 tool_calls: vec![crate::provider::ToolCall {
                     id: format!("call-{i}"),
@@ -5670,6 +5725,7 @@ mod tests {
 
         let mut script: Vec<crate::provider::ChatResponse> = (0..12)
             .map(|i| crate::provider::ChatResponse {
+                prompt_usage: None,
                 text: None,
                 tool_calls: vec![crate::provider::ToolCall {
                     id: format!("call-{i}"),
@@ -5680,6 +5736,7 @@ mod tests {
             })
             .collect();
         script.push(crate::provider::ChatResponse {
+            prompt_usage: None,
             text: Some("finished".to_string()),
             tool_calls: Vec::new(),
             stop_reason: None,

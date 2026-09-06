@@ -1,5 +1,7 @@
 use crate::config::AnthropicConfig;
-use crate::provider::{ChatMessage, ChatResponse, ContentPart, Provider, Role, ToolCall, ToolSpec};
+use crate::provider::{
+    ChatMessage, ChatResponse, ContentPart, PromptUsage, Provider, Role, ToolCall, ToolSpec,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -223,6 +225,30 @@ enum SseEvent {
 struct MessageStartData {
     id: String,
     model: String,
+    usage: Option<Usage>,
+}
+
+/// The prompt half of Anthropic's usage block, as `message_start` reports it.
+///
+/// Cached input is billed differently but read all the same, so all three
+/// counters add up to what the model actually had in front of it — which is
+/// the number the context budget cares about.
+#[derive(Debug, Deserialize)]
+struct Usage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+}
+
+impl Usage {
+    fn prompt_tokens(&self) -> u32 {
+        self.input_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,6 +428,7 @@ impl Provider for AnthropicProvider {
         // BTreeMap preserves insertion order by index.
         let mut blocks: BTreeMap<usize, Block> = BTreeMap::new();
         let mut stop_reason: Option<String> = None;
+        let mut prompt_tokens: Option<u32> = None;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("Error reading SSE stream")?;
@@ -457,6 +484,9 @@ impl Provider for AnthropicProvider {
                                 }
                             }
                         },
+                        Ok(SseEvent::MessageStart { message }) => {
+                            prompt_tokens = message.usage.map(|u| u.prompt_tokens());
+                        }
                         Ok(SseEvent::MessageDelta { delta }) => {
                             if let Some(reason) = delta.stop_reason {
                                 stop_reason = Some(reason);
@@ -507,6 +537,10 @@ impl Provider for AnthropicProvider {
         Ok(ChatResponse {
             text,
             tool_calls,
+            prompt_usage: prompt_tokens.map(|tokens| PromptUsage {
+                provider: self.name().to_string(),
+                tokens,
+            }),
             stop_reason,
         })
     }
@@ -558,5 +592,35 @@ mod tests {
         let mapped = api_tools(Some(&specs)).expect("a non-empty list must stay Some");
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].name, "get_weather");
+    }
+    /// Cached input is read even when it is not re-billed, so all three
+    /// counters are part of what the model had in front of it — and the
+    /// context budget cares about what was read, not what it cost.
+    #[test]
+    fn prompt_tokens_sum_the_cached_and_uncached_input() {
+        let event: SseEvent = serde_json::from_str(
+            r#"{"type":"message_start","message":{"id":"m","model":"claude","usage":
+               {"input_tokens":100,"cache_creation_input_tokens":20,
+                "cache_read_input_tokens":4000,"output_tokens":1}}}"#,
+        )
+        .unwrap();
+        let SseEvent::MessageStart { message } = event else {
+            panic!("expected message_start");
+        };
+        assert_eq!(message.usage.unwrap().prompt_tokens(), 4120);
+    }
+
+    /// An older or trimmed `message_start` must not break the parse; it just
+    /// teaches the calibration nothing.
+    #[test]
+    fn a_message_start_without_usage_still_parses() {
+        let event: SseEvent = serde_json::from_str(
+            r#"{"type":"message_start","message":{"id":"m","model":"claude"}}"#,
+        )
+        .unwrap();
+        let SseEvent::MessageStart { message } = event else {
+            panic!("expected message_start");
+        };
+        assert!(message.usage.is_none());
     }
 }

@@ -288,11 +288,30 @@ impl ChatMessage {
 // Provider response
 // ---------------------------------------------------------------------------
 
+/// What the provider that actually answered says it read for a request:
+/// the prompt token count, and the name of the provider that counted it.
+///
+/// The name travels with the number because `FallbackProvider` reports its
+/// *primary*'s name while a fallback may be what answered — and the two
+/// speak to different tokenizers. Calibration keyed off the call site would
+/// then teach one model's correction to another.
+#[derive(Debug, Clone)]
+pub struct PromptUsage {
+    pub provider: String,
+    pub tokens: u32,
+}
+
 /// A completed response from the provider.
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
     pub text: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Prompt tokens as the provider counted them, when it says. This is
+    /// the ground truth `context_compression` calibrates its estimate
+    /// against: it covers the tool schemas and the request framing, which
+    /// no local estimate sees, and it is priced by the model's own
+    /// tokenizer rather than by a chars-per-token rule of thumb.
+    pub prompt_usage: Option<PromptUsage>,
     /// Provider-reported stop / finish reason. Captured verbatim so that
     /// higher-level wrappers (notably the refusal-fallback layer) can
     /// inspect it. Anthropic emits values like `"end_turn"`, `"refusal"`,
@@ -307,6 +326,7 @@ impl ChatResponse {
         Self {
             text: Some(text),
             tool_calls: vec![],
+            prompt_usage: None,
             stop_reason: None,
         }
     }
@@ -328,6 +348,17 @@ impl ChatResponse {
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
+
+    /// Every tokenizer a call through this provider might actually reach,
+    /// for `context_compression`'s calibration to key off.
+    ///
+    /// Almost everyone answers with their own name. `FallbackProvider` is the
+    /// exception that makes the method worth having: it reports its primary's
+    /// name, but the fallback is a different model with a different tokenizer,
+    /// and the budget has to hold for whichever one takes the call.
+    fn calibration_keys(&self) -> Vec<&str> {
+        vec![self.name()]
+    }
 
     async fn chat(
         &self,
