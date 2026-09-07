@@ -2027,3 +2027,135 @@ mod recall_image_tests {
         assert!(format!("{err:#}").contains("64-char"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// refresh_system_prompt
+// ---------------------------------------------------------------------------
+
+/// Tool the agent calls to explicitly re-read workspace files into the
+/// system prompt. System-prompt file reads are pinned (see
+/// `Workspace::read_file`); this drops the pinned cache AND every channel
+/// snapshot so the next turn rebuilds from the current files — one of the
+/// two moments the prompt legitimately changes (the other is the
+/// day-boundary snapshot rebuild). Delegates to `Agent::invalidate_system_prompts`.
+pub struct RefreshSystemPromptTool {
+    agent: std::sync::Weak<crate::agent::Agent>,
+    spec: ToolSpec,
+}
+
+impl RefreshSystemPromptTool {
+    pub fn new(agent: std::sync::Weak<crate::agent::Agent>) -> Self {
+        Self {
+            agent,
+            spec: ToolSpec {
+                name: "refresh_system_prompt".to_string().into(),
+                description: "システムプロンプトの読み込みキャッシュをクリアし、\
+ワークスペースファイルを再読み込みさせます。メモリ等を編集して即時反映させたい時に呼んでください。"
+                    .to_string()
+                    .into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for RefreshSystemPromptTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
+        let agent = self
+            .agent
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("agent unavailable"))?;
+        agent.invalidate_system_prompts().await;
+        Ok("システムプロンプトの読み込みキャッシュをクリアしました".to_string())
+    }
+}
+
+#[cfg(test)]
+mod refresh_system_prompt_tests {
+    use super::*;
+    use crate::channel::Channels;
+    use crate::provider::registry::ProviderRegistry;
+    use crate::session::SessionStore;
+    use crate::workspace::Workspace;
+
+    /// A real `Agent`, built the way `agent.rs`'s `build_test_agent`
+    /// builds one. The tool only ever holds the `Weak` reference, but
+    /// constructing a real `Agent` keeps the wiring under test identical
+    /// to the one `main.rs` wires at runtime: `Weak<Agent>` pointing at
+    /// a live agent, registered into a `ToolSet` via `register_tool`.
+    /// The `TempDir` is leaked on purpose — same test-binary reasoning
+    /// as every other fixture in this crate.
+    fn agent_weak() -> (Arc<crate::agent::Agent>, Weak<crate::agent::Agent>) {
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let agent = Arc::new(crate::agent::Agent::new(
+            crate::config::Config::parse_for_test("[anthropic]\napi_key = \"test\"\n"),
+            Arc::new(Channels::new(Vec::new(), std::collections::HashMap::new())),
+            Arc::new(ProviderRegistry::for_test(
+                &["anthropic", "stub"],
+                Arc::new(crate::serve::StubProvider::new(Vec::new())),
+            )),
+            Arc::new(Workspace::new(
+                dir.path().to_path_buf(),
+                crate::config::DigestConfig::default(),
+            )),
+            None,
+            Arc::new(SessionStore::new(dir.path().join("sessions"), "test", None)),
+            None,
+        ));
+        let weak = Arc::downgrade(&agent);
+        (agent, weak)
+    }
+
+    /// (1) a registered `refresh_system_prompt` is visible through
+    /// `ToolSet::specs_filtered`, and (2) `execute` on a live agent
+    /// returns the success text. The tool is also the case that
+    /// deliberately relies on the default `Other` kind, like
+    /// `mcp_reconnect` — asserted here because this tool is registered
+    /// outside `default_tool_set`, so `every_tool_declares_its_kind`
+    /// never sees it.
+    #[tokio::test]
+    async fn registered_tool_is_visible_and_execute_returns_success_text() {
+        let (agent, weak) = agent_weak();
+        let set = ToolSet::new(
+            vec![Box::new(RefreshSystemPromptTool::new(weak)) as Box<dyn Tool>],
+            Vec::new(),
+        );
+
+        let names: Vec<String> = set
+            .specs_filtered(|_| true)
+            .await
+            .into_iter()
+            .map(|s| s.name.to_string())
+            .collect();
+        assert_eq!(names, vec!["refresh_system_prompt".to_string()]);
+
+        let tool = RefreshSystemPromptTool::new(Arc::downgrade(&agent));
+        assert_eq!(tool.kind(), ToolKind::Other);
+        assert_eq!(tool.spec().name, "refresh_system_prompt");
+        assert!(
+            tool.spec().input_schema["properties"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            tool.execute(&json!({})).await.unwrap(),
+            "システムプロンプトの読み込みキャッシュをクリアしました"
+        );
+    }
+
+    /// The tool body is a thin wrapper: upgrade the `Weak<Agent>` and
+    /// call `Agent::invalidate_system_prompts` — nothing else. With the
+    /// agent gone there is nothing else to do either, and the upgrade
+    /// failure surfaces as this error text.
+    #[tokio::test]
+    async fn execute_errors_when_the_agent_is_gone() {
+        let tool = RefreshSystemPromptTool::new(Weak::new());
+        let err = tool.execute(&json!({})).await.unwrap_err();
+        assert_eq!(format!("{err:#}"), "agent unavailable");
+    }
+}

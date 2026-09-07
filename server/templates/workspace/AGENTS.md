@@ -80,6 +80,8 @@ Use `memory_add`, `memory_update`, `memory_append`, `memory_remove` and
 `memory_read` rather than editing the files by hand — the tools keep the
 namespace resolution and the compaction bookkeeping honest.
 
+メモリファイル（MEMORY.md / 日次ログ）の編集は即座にはシステムプロンプトへ反映されません。日次ログ生成時（day boundary）または `refresh_system_prompt` ツール呼び出し時に反映されます。即時反映したい場合は `refresh_system_prompt` を呼んでください。
+
 ## Red Lines
 
 - Private things stay private. This workspace holds someone's life.
