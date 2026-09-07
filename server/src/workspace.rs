@@ -3,7 +3,6 @@ use crate::config::DigestConfig;
 use crate::periodic_log::{self, LogKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
@@ -59,13 +58,16 @@ static WORKSPACE_FILES: &[WorkspaceFileDef] = &[
 ];
 
 // ---------------------------------------------------------------------------
-// File cache
+// Pinned file cache
 // ---------------------------------------------------------------------------
 
-struct CachedFile {
-    content: String,
-    mtime: SystemTime,
-}
+// Pinned file contents live in `Workspace::cache`: a path → raw-contents
+// map where a `None` value pins a *missing* file, so a file created later
+// stays invisible until the pin map is cleared. Workspace files are read
+// through `read_file` (which truncates to `MAX_FILE_CHARS` on every read);
+// periodic-log files are read through `read_pinned_log` (raw contents —
+// their callers strip frontmatter or parse digests out of them). Every
+// injected path is distinct, so the two kinds never collide on a key.
 
 // ---------------------------------------------------------------------------
 // Workspace
@@ -75,12 +77,14 @@ struct CachedFile {
 /// HEARTBEAT.md, BOOTSTRAP.md, MEMORY.md) and assembles them into the system
 /// prompt on every turn.
 ///
-/// Files are cached by mtime so edits take effect immediately on the next
-/// message without restarting the agent.
+/// File contents are **pinned** per path: the first read wins and every
+/// later read serves the pinned copy, so an edit on disk no longer changes
+/// the prompt bytes (and busts the provider prompt cache) until
+/// [`Workspace::clear_pinned_cache`] is called.
 pub struct Workspace {
     dir: PathBuf,
     digest_cfg: DigestConfig,
-    cache: Mutex<HashMap<PathBuf, CachedFile>>,
+    cache: Mutex<HashMap<PathBuf, Option<String>>>,
 }
 
 impl Workspace {
@@ -147,7 +151,8 @@ impl Workspace {
         // Inject periodic logs (yesterday's full body + digest blocks for
         // this week / month / year / past years).
         let today = crate::session::local_date_for_timestamp(now_local, boundary_hour);
-        self.inject_periodic_logs(&mut parts, today, namespace_chain);
+        self.inject_periodic_logs(&mut parts, today, namespace_chain)
+            .await;
 
         parts.join("\n\n---\n\n")
     }
@@ -175,8 +180,10 @@ impl Workspace {
 
     /// Append log injection blocks to `parts`: yesterday's full body
     /// (room's own namespace only) plus top-N digest blocks aggregated
-    /// across the namespace chain.
-    fn inject_periodic_logs(
+    /// across the namespace chain. Log contents are read through the same
+    /// pinned map as `read_file`, so the injected bytes stay stable until
+    /// the pin map is cleared.
+    async fn inject_periodic_logs(
         &self,
         parts: &mut Vec<String>,
         today: chrono::NaiveDate,
@@ -188,30 +195,32 @@ impl Workspace {
         // conveyed through digest items below.
         if let Some(direct_ns) = namespace_chain.first()
             && let Some(yesterday) = today.pred_opt()
-            && let Some(body) = periodic_log::read_body(
-                &self.dir,
-                direct_ns,
-                LogKind::Daily,
-                &periodic_log::daily_stem(yesterday),
-            )
-            && !body.trim().is_empty()
         {
-            let truncated = truncate_chars(&body, MAX_FILE_CHARS);
-            debug!("Injecting yesterday's daily log from '{direct_ns}': {yesterday}");
-            parts.push(format!("# Yesterday's Log\n\n{truncated}"));
+            let stem = periodic_log::daily_stem(yesterday);
+            let body = self
+                .read_pinned_log(direct_ns, LogKind::Daily, &stem)
+                .await
+                .map(|raw| periodic_log::body_without_frontmatter(&raw));
+            if let Some(body) = body.filter(|b| !b.trim().is_empty()) {
+                let truncated = truncate_chars(&body, MAX_FILE_CHARS);
+                debug!("Injecting yesterday's daily log from '{direct_ns}': {yesterday}");
+                parts.push(format!("# Yesterday's Log\n\n{truncated}"));
+            }
         }
 
         // "This Week's Digests" — daily files in `[iso_week_start, yesterday)`.
         if self.digest_cfg.daily_items > 0 {
             let stems = periodic_log::daily_stems_in_current_iso_week_before(today);
-            if let Some(b) = build_chained_digest_block(
-                "# This Week's Digests",
-                &self.dir,
-                namespace_chain,
-                LogKind::Daily,
-                &stems,
-                self.digest_cfg.daily_items,
-            ) {
+            if let Some(b) = self
+                .build_chained_digest_block(
+                    "# This Week's Digests",
+                    namespace_chain,
+                    LogKind::Daily,
+                    &stems,
+                    self.digest_cfg.daily_items,
+                )
+                .await
+            {
                 parts.push(b);
             }
         }
@@ -220,14 +229,16 @@ impl Workspace {
         // calendar month, excluding the current ISO week.
         if self.digest_cfg.weekly_items > 0 {
             let stems = periodic_log::week_stems_in_month_before(today);
-            if let Some(b) = build_chained_digest_block(
-                "# This Month's Digests",
-                &self.dir,
-                namespace_chain,
-                LogKind::Weekly,
-                &stems,
-                self.digest_cfg.weekly_items,
-            ) {
+            if let Some(b) = self
+                .build_chained_digest_block(
+                    "# This Month's Digests",
+                    namespace_chain,
+                    LogKind::Weekly,
+                    &stems,
+                    self.digest_cfg.weekly_items,
+                )
+                .await
+            {
                 parts.push(b);
             }
         }
@@ -235,14 +246,16 @@ impl Workspace {
         // "This Year's Digests" — monthly files Jan..(current month - 1).
         if self.digest_cfg.monthly_items > 0 {
             let stems = periodic_log::month_stems_in_year_before(today);
-            if let Some(b) = build_chained_digest_block(
-                "# This Year's Digests",
-                &self.dir,
-                namespace_chain,
-                LogKind::Monthly,
-                &stems,
-                self.digest_cfg.monthly_items,
-            ) {
+            if let Some(b) = self
+                .build_chained_digest_block(
+                    "# This Year's Digests",
+                    namespace_chain,
+                    LogKind::Monthly,
+                    &stems,
+                    self.digest_cfg.monthly_items,
+                )
+                .await
+            {
                 parts.push(b);
             }
         }
@@ -255,13 +268,10 @@ impl Workspace {
             for ns in namespace_chain {
                 let stems = periodic_log::existing_yearly_stems(&self.dir, ns);
                 for stem in &stems {
-                    if let Some(items) = periodic_log::read_digest_top_n(
-                        &self.dir,
-                        ns,
-                        LogKind::Yearly,
-                        stem,
-                        self.digest_cfg.yearly_items,
-                    ) {
+                    if let Some(items) = self
+                        .read_digest_top_n(ns, LogKind::Yearly, stem, self.digest_cfg.yearly_items)
+                        .await
+                    {
                         if items.is_empty() {
                             continue;
                         }
@@ -280,6 +290,54 @@ impl Workspace {
         }
     }
 
+    /// Assemble a heading + per-`(namespace, stem)` bulleted subsections of
+    /// top-N digest items, walking each stem against every namespace in the
+    /// chain. Each subsection is introduced by `## {namespace}/{stem}`.
+    /// `(namespace, stem)` pairs whose pinned file is missing or has an
+    /// empty digest are skipped. Returns `None` if no pair produced a
+    /// subsection.
+    async fn build_chained_digest_block(
+        &self,
+        heading: &str,
+        namespace_chain: &[String],
+        kind: LogKind,
+        stems: &[String],
+        n: usize,
+    ) -> Option<String> {
+        let mut subsections = Vec::new();
+        for ns in namespace_chain {
+            for stem in stems {
+                let items = self
+                    .read_digest_top_n(ns, kind, stem, n)
+                    .await
+                    .unwrap_or_default();
+                if items.is_empty() {
+                    continue;
+                }
+                let bullets: Vec<String> = items.into_iter().map(|i| format!("- {i}")).collect();
+                subsections.push(format!("## {ns}/{stem}\n\n{}", bullets.join("\n")));
+            }
+        }
+        if subsections.is_empty() {
+            None
+        } else {
+            debug!("Injecting {heading} ({} subsection(s))", subsections.len());
+            Some(format!("{heading}\n\n{}", subsections.join("\n\n")))
+        }
+    }
+
+    /// Drop every pinned file so the next read re-reads from disk. Called by
+    /// `Agent::invalidate_system_prompts` after the daily log is regenerated
+    /// or when the agent calls the `refresh_system_prompt` tool.
+    ///
+    /// TODO(prompt-pinning Task 2): remove the `allow(dead_code)` once
+    /// `Agent::invalidate_system_prompts` and the `refresh_system_prompt`
+    /// tool call this — until then only tests use it.
+    #[allow(dead_code)]
+    pub async fn clear_pinned_cache(&self) {
+        self.cache.lock().await.clear();
+    }
+
     /// Try each candidate filename in order; return the first one found.
     async fn read_first_existing(&self, candidates: &[&str]) -> Option<(String, String)> {
         for &filename in candidates {
@@ -290,104 +348,59 @@ impl Workspace {
         None
     }
 
-    /// Read a workspace file with mtime caching. Returns `None` if not found.
+    /// Read a workspace file from the pinned cache. Once a path has been
+    /// read it is pinned until `clear_pinned_cache` — edits on disk are NOT
+    /// reflected until then. A missing file is also pinned (as `None`) so a
+    /// file created later is invisible until the next clear. Pinned because
+    /// the system prompt is rebuilt per turn and a byte change busts the
+    /// provider prompt cache.
     async fn read_file(&self, filename: &str) -> Option<String> {
         let path = self.dir.join(filename);
+        let content = self.read_pinned(&path).await;
+        content.map(|raw| truncate_chars(&raw, MAX_FILE_CHARS))
+    }
 
-        match Self::file_mtime(&path) {
-            None => {
-                self.cache.lock().await.remove(&path);
-                None
-            }
-            Some(mtime) => {
-                {
-                    let cache = self.cache.lock().await;
-                    if let Some(entry) = cache.get(&path)
-                        && entry.mtime == mtime
-                    {
-                        debug!("Workspace cache hit: {filename}");
-                        return Some(entry.content.clone());
-                    }
-                }
-
-                match std::fs::read_to_string(&path) {
-                    Ok(raw) => {
-                        let content = truncate_chars(&raw, MAX_FILE_CHARS);
-                        info!(
-                            "Loaded workspace file: {filename} ({} chars)",
-                            content.len()
-                        );
-                        self.cache.lock().await.insert(
-                            path,
-                            CachedFile {
-                                content: content.clone(),
-                                mtime,
-                            },
-                        );
-                        Some(content)
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to read {filename}: {e}");
-                        None
-                    }
-                }
-            }
+    /// Return the pinned contents of `path`, reading it from disk on first
+    /// access and pinning the result — including a missing file, pinned as
+    /// `None` — in the map shared by `read_file` and the periodic-log
+    /// injection reads.
+    async fn read_pinned(&self, path: &Path) -> Option<String> {
+        let mut cache = self.cache.lock().await;
+        if let Some(entry) = cache.get(path) {
+            return entry.clone();
         }
+        let content = std::fs::read_to_string(path).ok();
+        cache.insert(path.to_path_buf(), content.clone());
+        content
     }
 
-    fn file_mtime(path: &Path) -> Option<SystemTime> {
-        std::fs::metadata(path).ok()?.modified().ok()
+    /// Pinned raw read of one periodic-log file at
+    /// `periodic_log::log_abs_path(&self.dir, namespace, kind, stem)`.
+    /// Shares the map `read_file` pins into; unlike `read_file` the stored
+    /// contents are raw (frontmatter included) — callers strip or parse.
+    async fn read_pinned_log(&self, namespace: &str, kind: LogKind, stem: &str) -> Option<String> {
+        let path = periodic_log::log_abs_path(&self.dir, namespace, kind, stem);
+        self.read_pinned(&path).await
     }
-}
 
-#[cfg(test)]
-impl Workspace {
-    /// The workspace root `build_system_prompt` reads `AGENTS.md`,
-    /// `SOUL.md`, etc. from. Test-only: production code has no reason to
-    /// reach behind `build_system_prompt`'s own file reads, but a test
-    /// that wants to assert a workspace file's content is (or is not)
-    /// reflected in the prompt needs somewhere to write that file first.
-    pub(crate) fn dir(&self) -> &Path {
-        &self.dir
+    /// First `n` items of the `digest:` array in a pinned log file's
+    /// frontmatter. Returns `None` when the file or its digest is missing;
+    /// returns `Some(vec![])` when `digest: []` is explicitly empty.
+    async fn read_digest_top_n(
+        &self,
+        namespace: &str,
+        kind: LogKind,
+        stem: &str,
+        n: usize,
+    ) -> Option<Vec<String>> {
+        let raw = self.read_pinned_log(namespace, kind, stem).await?;
+        periodic_log::digest_items(&raw, n)
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Assemble a heading + per-`(namespace, stem)` bulleted subsections of
-/// top-N digest items, walking each stem against every namespace in the
-/// chain. Each subsection is introduced by `## {namespace}/{stem}`.
-/// `(namespace, stem)` pairs whose file is missing or has an empty digest
-/// are skipped. Returns `None` if no pair produced a subsection.
-fn build_chained_digest_block(
-    heading: &str,
-    workspace_dir: &Path,
-    namespace_chain: &[String],
-    kind: LogKind,
-    stems: &[String],
-    n: usize,
-) -> Option<String> {
-    let mut subsections = Vec::new();
-    for ns in namespace_chain {
-        for stem in stems {
-            let items = periodic_log::read_digest_top_n(workspace_dir, ns, kind, stem, n)
-                .unwrap_or_default();
-            if items.is_empty() {
-                continue;
-            }
-            let bullets: Vec<String> = items.into_iter().map(|i| format!("- {i}")).collect();
-            subsections.push(format!("## {ns}/{stem}\n\n{}", bullets.join("\n")));
-        }
-    }
-    if subsections.is_empty() {
-        None
-    } else {
-        debug!("Injecting {heading} ({} subsection(s))", subsections.len());
-        Some(format!("{heading}\n\n{}", subsections.join("\n\n")))
-    }
-}
 
 /// Render `RoomInfo` into a Markdown block injected into the system prompt.
 /// Kept free-standing (not a method on `RoomInfo`) so the channel module
@@ -408,6 +421,18 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
         format!("{truncated}\n\n[... truncated to {max_chars} characters ...]")
     } else {
         truncated
+    }
+}
+
+#[cfg(test)]
+impl Workspace {
+    /// The workspace root `build_system_prompt` reads `AGENTS.md`,
+    /// `SOUL.md`, etc. from. Test-only: production code has no reason to
+    /// reach behind `build_system_prompt`'s own file reads, but a test
+    /// that wants to assert a workspace file's content is (or is not)
+    /// reflected in the prompt needs somewhere to write that file first.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
     }
 }
 
@@ -447,5 +472,52 @@ mod tests {
             "the clock belongs in `current_time`, not in the prompt: {first}"
         );
         assert!(first.contains("read the files."), "{first}");
+    }
+
+    /// ピン留めの本体性質：編集してもクリアするまでバイト列は不変。
+    #[tokio::test]
+    async fn the_system_prompt_pins_edits_until_cleared() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = workspace_with_agents_md(&dir);
+        let chain = ["default".to_string()];
+
+        let before = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+
+        // 編集する（mtime が変わる）
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "# how this works\n\nedited content.\n",
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let pinned = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+        assert_eq!(before, pinned, "ピン留め中は編集が反映されない");
+        assert!(!pinned.contains("edited content."));
+
+        ws.clear_pinned_cache().await;
+        let refreshed = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+        assert!(
+            refreshed.contains("edited content."),
+            "クリア後は反映される"
+        );
+    }
+
+    /// ピン留め中に新規作成されたファイルは、クリアするまで見えない。
+    #[tokio::test]
+    async fn newly_created_files_are_invisible_until_cleared() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
+        let chain = ["default".to_string()];
+
+        let before = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+        std::fs::write(dir.path().join("SOUL.md"), "# Soul\n\nnew soul.\n").unwrap();
+
+        let pinned = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+        assert_eq!(before, pinned, "新規ファイルはクリアまで見えない");
+
+        ws.clear_pinned_cache().await;
+        let refreshed = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+        assert!(refreshed.contains("new soul."));
     }
 }
