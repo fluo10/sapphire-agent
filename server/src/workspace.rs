@@ -329,11 +329,6 @@ impl Workspace {
     /// Drop every pinned file so the next read re-reads from disk. Called by
     /// `Agent::invalidate_system_prompts` after the daily log is regenerated
     /// or when the agent calls the `refresh_system_prompt` tool.
-    ///
-    /// TODO(prompt-pinning Task 2): remove the `allow(dead_code)` once
-    /// `Agent::invalidate_system_prompts` and the `refresh_system_prompt`
-    /// tool call this — until then only tests use it.
-    #[allow(dead_code)]
     pub async fn clear_pinned_cache(&self) {
         self.cache.lock().await.clear();
     }
