@@ -1,18 +1,26 @@
 # Changelog
 
-All notable changes to `sapphire-agent-rpc` will be documented in this file.
+All notable changes to `sapphire-agent-core` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Historical changes prior to `0.7.0` (when this crate shared the workspace
-version with `sapphire-agent`) are recorded in the root `CHANGELOG.md`.
+version with `sapphire-agent-server`) are recorded in the root `CHANGELOG.md`.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-07
+
+### Changed
+
+- **Renamed from `sapphire-agent-rpc` to `sapphire-agent-core`** — the crate is the shared client
+
+server module crate; the RPC-specific name would mislead once the agent loop is shared with the client side. crates.io history stays under `sapphire-agent-rpc` through 0.7.1.
+
 ## [0.7.0] - 2026-05-23
 
-Aligns the crate version with `sapphire-agent` 0.7.0. `0.6.1` was an
+Aligns the crate version with `sapphire-agent-server` 0.7.0. `0.6.1` was an
 unintended interim publication produced by the first release-plz run
 before this crate had its own deliberate release; the source between
 `0.6.1` and `0.7.0` is identical apart from the version bumps and
@@ -29,7 +37,7 @@ path-dep updates.
 
 ### Changed
 
-- **Crate renamed from `sapphire-agent-api` to `sapphire-agent-rpc`** to
+- **Crate renamed from `sapphire-agent-server-api` to `sapphire-agent-core`** to
   match the `/rpc` endpoint it talks to. Clients depending on the old
   crate name should update their `Cargo.toml`; the type surface is the
   same. The session-kind directory on the server side also moves from

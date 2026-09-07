@@ -1,6 +1,6 @@
 //! Async RPC bridge between tokio and the bevy main thread.
 //!
-//! Bevy systems run sync, but the RPC client (`sapphire-agent-rpc`) is
+//! Bevy systems run sync, but the RPC client (`sapphire-agent-core`) is
 //! all `async`. We park a multi-threaded tokio runtime in a bevy
 //! `Resource`, expose `submit_*` helpers that spawn async tasks on it,
 //! and hand a `tokio::sync::mpsc::UnboundedReceiver<BridgeEvent>` to
@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use sapphire_agent_rpc::{
+use sapphire_agent_core::{
     ChatEvent, ChatModality, DeviceMetadata, VoiceEvent, chat_stream, initialize,
     voice_pipeline_run,
 };
@@ -119,7 +119,7 @@ impl RpcBridge {
         // same thread.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .thread_name("sapphire-call-desktop-rt")
+            .thread_name("sapphire-agent-desktop-rt")
             .build()?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         Ok((

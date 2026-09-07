@@ -93,7 +93,7 @@ confidence-threshold = 0.93
 #
 # Only visible since the workspace root became a virtual manifest: cargo-deny
 # assumes `--workspace` for a virtual manifest, but takes a root *package* as
-# the sole graph root otherwise, so `sapphire-call-desktop`'s tree had never
+# the sole graph root otherwise, so `sapphire-agent-desktop`'s tree had never
 # been checked before.
 exceptions = [
     { name = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },

@@ -1,6 +1,6 @@
 [package]
-name = "sapphire-call-desktop"
-version = "0.1.0"
+name = "sapphire-agent-desktop"
+version = "0.8.0"
 edition.workspace = true
 description = "Desktop GUI client for sapphire-agent (bevy + egui)"
 license.workspace = true
@@ -8,12 +8,12 @@ repository.workspace = true
 publish = false
 
 [[bin]]
-name = "sapphire-call-desktop"
+name = "sapphire-agent-desktop"
 path = "src/main.rs"
 
 [dependencies]
-sapphire-agent-rpc = { path = "../crates/sapphire-agent-rpc", version = "0.7.0" }
-sapphire-call-core = { path = "../crates/sapphire-call-core", version = "0.7.0" }
+sapphire-agent-core = { path = "../crates/sapphire-agent-core", version = "0.8.0" }
+sapphire-agent-client = { path = "../crates/sapphire-agent-client", version = "0.8.0" }
 
 # Game engine — needed up front for the eventual 3D character work
 # (desktop-mate-style avatar). For the chat-only first cut we use only

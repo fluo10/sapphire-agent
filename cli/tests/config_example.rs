@@ -1,9 +1,9 @@
 //! Smoke test: the shipped `config.example.toml` must parse with the
 //! current `CallConfig` schema. Lives here (CLI crate) because the
 //! example file ships alongside the CLI; the schema itself lives in
-//! `sapphire-call-core`.
+//! `sapphire-agent-client`.
 
-use sapphire_call_core::config::CallConfig;
+use sapphire_agent_client::config::CallConfig;
 
 #[test]
 fn shipped_example_parses() {

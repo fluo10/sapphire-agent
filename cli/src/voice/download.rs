@@ -35,13 +35,13 @@ impl BundleCategory {
 }
 
 pub fn cache_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var("SAPPHIRE_CALL_CACHE_DIR") {
+    if let Ok(custom) = std::env::var("SAPPHIRE_AGENT_CLI_CACHE_DIR") {
         return PathBuf::from(shellexpand::tilde(&custom).into_owned());
     }
-    if let Some(dirs) = directories::ProjectDirs::from("", "", "sapphire-call") {
+    if let Some(dirs) = directories::ProjectDirs::from("", "", "sapphire-agent-cli") {
         return dirs.data_local_dir().join("voice-models");
     }
-    PathBuf::from(".sapphire-call/voice-models")
+    PathBuf::from(".sapphire-agent-cli/voice-models")
 }
 
 /// Download a single file (not a bundle) and place it at `dest`. Used

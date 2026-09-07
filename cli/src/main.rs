@@ -6,13 +6,13 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use sapphire_call_core::config::CallConfig;
+use sapphire_agent_client::config::CallConfig;
 
 const DEFAULT_SERVER_URL: &str = "http://localhost:3170";
 
 #[derive(Parser)]
 #[command(
-    name = "sapphire-call",
+    name = "sapphire-agent-cli",
     about = "Interactive client for sapphire-agent (text or voice)"
 )]
 struct Cli {
@@ -36,7 +36,7 @@ struct Cli {
     token: Option<String>,
 
     /// Path to a TOML config file. Defaults to
-    /// `~/.config/sapphire-call/config.toml` when present; missing is
+    /// `~/.config/sapphire-agent-cli/config.toml` when present; missing is
     /// fine (all values fall back to CLI flags / built-ins).
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    sapphire_agent_rpc::run(
+    sapphire_agent_core::run(
         server,
         session,
         cli.list,

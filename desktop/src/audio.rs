@@ -16,7 +16,7 @@
 //! this module.
 //!
 //! The whole module is intentionally bevy-free so it can move to a
-//! shared `sapphire-call-gui` crate when mobile lands.
+//! shared `sapphire-agent-gui` crate when mobile lands.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 
 /// Server-side pipeline sample rate. The agent ships TTS PCM at this
 /// rate and expects mic uploads in the same shape; keep the constant
-/// here so this crate doesn't pull `sapphire-agent-rpc`'s.
+/// here so this crate doesn't pull `sapphire-agent-core`'s.
 pub const PIPELINE_SAMPLE_RATE: u32 = 16_000;
 
 /// Silero VAD window. The model is trained on 32 ms frames at 16 kHz,
@@ -79,7 +79,7 @@ impl AudioPlayer {
             let queue = Arc::clone(&queue);
             let shutdown = Arc::clone(&shutdown);
             std::thread::Builder::new()
-                .name("sapphire-call-desktop audio-out".into())
+                .name("sapphire-agent-desktop audio-out".into())
                 .spawn(move || run_output_thread(queue, shutdown, ready_tx))
                 .context("spawn audio-out thread")?
         };
@@ -303,7 +303,7 @@ impl MicRecorder {
         let join = {
             let stop_flag = Arc::clone(&stop_flag);
             std::thread::Builder::new()
-                .name("sapphire-call-desktop mic".into())
+                .name("sapphire-agent-desktop mic".into())
                 .spawn(move || run_mic_thread(stop_flag, poll_tx))
                 .ok()
         };
@@ -544,7 +544,7 @@ fn ensure_silero_model() -> Result<PathBuf> {
 }
 
 fn cache_dir() -> Result<PathBuf> {
-    directories::ProjectDirs::from("", "", "sapphire-call-desktop")
+    directories::ProjectDirs::from("", "", "sapphire-agent-desktop")
         .map(|p| p.data_local_dir().join("voice-models"))
         .ok_or_else(|| anyhow!("no XDG data dir available"))
 }

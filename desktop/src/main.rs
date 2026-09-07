@@ -1,4 +1,4 @@
-//! sapphire-call-desktop entry point.
+//! sapphire-agent-desktop entry point.
 //!
 //! Wires together:
 //! - bevy app + bevy_egui plugin
@@ -94,9 +94,9 @@ fn main() {
 
     // Shared with the CLI satellite — the two clients aren't expected
     // to run side-by-side, and reusing the same id lets users move
-    // between sapphire-call and sapphire-call-desktop without the
+    // between sapphire-agent-cli and sapphire-agent-desktop without the
     // server treating each launch as a new device.
-    let device_id = match sapphire_call_core::device_id::ensure_device_id() {
+    let device_id = match sapphire_agent_client::device_id::ensure_device_id() {
         Ok(id) => id,
         Err(e) => {
             eprintln!("failed to resolve device id: {e:#}");
@@ -150,7 +150,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "sapphire-call-desktop".to_string(),
+                title: "sapphire-agent-desktop".to_string(),
                 resolution: (640u32, 720u32).into(),
                 ..default()
             }),

@@ -7,7 +7,7 @@
 //! schedule: "0 8 * * *"
 //! room_id: "..."          # optional chat target, defaults to channel default
 //! voice:                   # optional voice satellite target
-//!   device_id: "01J..."   # the satellite's device id (see sapphire-call)
+//!   device_id: "01J..."   # the satellite's device id (see sapphire-agent-cli)
 //! enabled: true            # optional, default true
 //! ---
 //!

@@ -3,7 +3,7 @@
 //! The voice satellite needs a stable handle the server can map to a
 //! conversation thread (since voice doesn't carry an explicit session
 //! id). Generated once on first run as a UUID v7, persisted under the
-//! XDG data dir (`~/.local/share/sapphire-call/device-id` on Linux).
+//! XDG data dir (`~/.local/share/sapphire-agent-cli/device-id` on Linux).
 //!
 //! Plain-text storage is intentional — this isn't a secret, just a
 //! routing key. Anyone with shell access to the box already has full
@@ -41,16 +41,16 @@ pub fn ensure_device_id() -> Result<String> {
 }
 
 /// XDG path where the device id is stored. Override via the
-/// `SAPPHIRE_CALL_DEVICE_ID_PATH` env var (used by tests + container
+/// `SAPPHIRE_AGENT_CLI_DEVICE_ID_PATH` env var (used by tests + container
 /// deployments).
 fn path() -> Result<PathBuf> {
-    if let Ok(custom) = std::env::var("SAPPHIRE_CALL_DEVICE_ID_PATH") {
+    if let Ok(custom) = std::env::var("SAPPHIRE_AGENT_CLI_DEVICE_ID_PATH") {
         return Ok(PathBuf::from(shellexpand::tilde(&custom).into_owned()));
     }
-    if let Some(dirs) = directories::ProjectDirs::from("", "", "sapphire-call") {
+    if let Some(dirs) = directories::ProjectDirs::from("", "", "sapphire-agent-cli") {
         return Ok(dirs.data_local_dir().join("device-id"));
     }
-    anyhow::bail!("no XDG data dir available — set SAPPHIRE_CALL_DEVICE_ID_PATH")
+    anyhow::bail!("no XDG data dir available — set SAPPHIRE_AGENT_CLI_DEVICE_ID_PATH")
 }
 
 #[cfg(test)]
@@ -67,7 +67,7 @@ mod tests {
         // test; if multi-threaded test introduces races, switch to
         // a per-test env-isolation helper.
         unsafe {
-            std::env::set_var("SAPPHIRE_CALL_DEVICE_ID_PATH", &path);
+            std::env::set_var("SAPPHIRE_AGENT_CLI_DEVICE_ID_PATH", &path);
         }
         let first = ensure_device_id().unwrap();
         let second = ensure_device_id().unwrap();
@@ -75,7 +75,7 @@ mod tests {
         // UUID format sanity.
         assert_eq!(first.len(), 36);
         unsafe {
-            std::env::remove_var("SAPPHIRE_CALL_DEVICE_ID_PATH");
+            std::env::remove_var("SAPPHIRE_AGENT_CLI_DEVICE_ID_PATH");
         }
     }
 }

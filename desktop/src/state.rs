@@ -1,7 +1,7 @@
 //! Pure (bevy-free) application state.
 //!
 //! Kept independent of bevy types so future mobile / cross-platform GUI
-//! crates (`sapphire-call-mobile`, `sapphire-call-gui`) can reuse it.
+//! crates (`sapphire-agent-mobile`, `sapphire-agent-gui`) can reuse it.
 
 /// Which screen is currently rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

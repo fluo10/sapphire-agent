@@ -25,7 +25,7 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install ALSA dev libs (cpal build-time dep for sapphire-call-cli)
+      - name: Install ALSA dev libs (cpal build-time dep for sapphire-agent-cli)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/refresh-sherpa-onnx-libs
@@ -60,9 +60,9 @@ jobs:
         env:
           RELEASES: ${{ needs.release-plz-release.outputs.releases }}
         run: |
-          agent_tag=$(jq -r '.[] | select(.package_name == "sapphire-agent") | .tag // empty' <<<"$RELEASES")
-          cli_tag=$(jq -r '.[] | select(.package_name == "sapphire-call-cli") | .tag // empty' <<<"$RELEASES")
-          desktop_tag=$(jq -r '.[] | select(.package_name == "sapphire-call-desktop") | .tag // empty' <<<"$RELEASES")
+          agent_tag=$(jq -r '.[] | select(.package_name == "sapphire-agent-server") | .tag // empty' <<<"$RELEASES")
+          cli_tag=$(jq -r '.[] | select(.package_name == "sapphire-agent-cli") | .tag // empty' <<<"$RELEASES")
+          desktop_tag=$(jq -r '.[] | select(.package_name == "sapphire-agent-desktop") | .tag // empty' <<<"$RELEASES")
           {
             echo "agent_tag=$agent_tag"
             echo "cli_tag=$cli_tag"
@@ -70,7 +70,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   build-agent:
-    name: Build sapphire-agent binaries
+    name: Build sapphire-agent-server binaries
     needs: parse-releases
     if: needs.parse-releases.outputs.agent_tag != ''
     permissions:
@@ -80,7 +80,7 @@ jobs:
       tag: ${{ needs.parse-releases.outputs.agent_tag }}
 
   build-cli:
-    name: Build sapphire-call CLI binaries
+    name: Build sapphire-agent-cli CLI binaries
     needs: parse-releases
     if: needs.parse-releases.outputs.cli_tag != ''
     permissions:
@@ -90,7 +90,7 @@ jobs:
       tag: ${{ needs.parse-releases.outputs.cli_tag }}
 
   build-desktop:
-    name: Build sapphire-call-desktop binaries
+    name: Build sapphire-agent-desktop binaries
     needs: parse-releases
     if: needs.parse-releases.outputs.desktop_tag != ''
     permissions:
@@ -113,7 +113,7 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install ALSA dev libs (cpal build-time dep for sapphire-call-cli)
+      - name: Install ALSA dev libs (cpal build-time dep for sapphire-agent-cli)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/refresh-sherpa-onnx-libs

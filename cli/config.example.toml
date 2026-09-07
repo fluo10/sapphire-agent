@@ -1,6 +1,6 @@
-# Example sapphire-call configuration.
+# Example sapphire-agent-cli configuration.
 #
-# Place at `~/.config/sapphire-call/config.toml` (XDG) for the
+# Place at `~/.config/sapphire-agent-cli/config.toml` (XDG) for the
 # satellite to pick up automatically, or pass `--config <path>`.
 #
 # Wake-word configuration intentionally lives server-side under the
@@ -20,7 +20,7 @@ token = "sa-call-REPLACE_ME"   # bearer minted by `sapphire-agent device add`; t
 # session = "abc1234"          # 7-char grain id to resume an existing session
 
 [audio]
-# Discover names via `sapphire-call voice --list-devices`. Either or
+# Discover names via `sapphire-agent-cli voice --list-devices`. Either or
 # both may be omitted to fall back to the host's defaults.
 # input_device  = "Jabra SPEAK 510 USB"
 # output_device = "Jabra SPEAK 510 USB"

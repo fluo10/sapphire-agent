@@ -1,20 +1,26 @@
 # Changelog
 
-All notable changes to `sapphire-call-core` will be documented in this file.
+All notable changes to `sapphire-agent-client` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-07
+
+### Changed
+
+- **Renamed from `sapphire-call-core` to `sapphire-agent-client`** — the crate shared by the CLI and desktop clients. crates.io history stays under `sapphire-call-core` through 0.7.x.
+
 ## [0.7.0] - 2026-05-23
 
-First release of `sapphire-call-core` as a standalone crate. Extracted
-from the former `sapphire-call` crate so the CLI (`sapphire-call-cli`)
-and the desktop GUI (`sapphire-call-desktop`) can share the same source
+First release of `sapphire-agent-client` as a standalone crate. Extracted
+from the former `sapphire-agent-cli` crate so the CLI (`sapphire-agent-cli`)
+and the desktop GUI (`sapphire-agent-desktop`) can share the same source
 of truth for endpoint configuration and per-installation identity.
 
-The version is aligned with `sapphire-agent` / `sapphire-agent-rpc`
+The version is aligned with `sapphire-agent-server` / `sapphire-agent-core`
 0.7.0 to make the workspace easy to read at a glance; future patch and
 minor bumps will track this crate's own change cadence.
 
@@ -22,8 +28,8 @@ minor bumps will track this crate's own change cadence.
 
 - **`ServerConfig`** — TOML schema covering the agent endpoint URL and
   per-`room_profile` bearer-token map. Loaded from
-  `~/.config/sapphire-call/config.toml` by the CLI and from
-  `~/.config/sapphire-call-desktop/config.toml` by the desktop client;
+  `~/.config/sapphire-agent-cli/config.toml` by the CLI and from
+  `~/.config/sapphire-agent-desktop/config.toml` by the desktop client;
   both reuse the same struct.
 - **`device_id` resolution** — UUID v7 generated on first run and
   persisted alongside the config, so the agent's voice / device-default
