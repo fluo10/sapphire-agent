@@ -10,6 +10,14 @@ version with `sapphire-agent-server`) are recorded in the root `CHANGELOG.md`.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-07
+
+### Changed
+
+- **Renamed from `sapphire-agent-rpc` to `sapphire-agent-core`** — the crate is the shared client
+
+server module crate; the RPC-specific name would mislead once the agent loop is shared with the client side. crates.io history stays under `sapphire-agent-rpc` through 0.7.1.
+
 ## [0.7.0] - 2026-05-23
 
 Aligns the crate version with `sapphire-agent-server` 0.7.0. `0.6.1` was an

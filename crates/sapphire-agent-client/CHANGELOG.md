@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-07
+
+### Changed
+
+- **Renamed from `sapphire-call-core` to `sapphire-agent-client`** — the crate shared by the CLI and desktop clients. crates.io history stays under `sapphire-call-core` through 0.7.x.
+
 ## [0.7.0] - 2026-05-23
 
 First release of `sapphire-agent-client` as a standalone crate. Extracted

@@ -5,7 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.7.2...sapphire-agent-server-v0.8.0) - 2026-09-07
+
+### Changed
+
+
+- **Package + binary rename** — the server crate and binary are now `sapphire-agent-server` (was `sapphire-agent`). First release published to crates.io under the new name; history before this lives under `sapphire-agent` through 0.7.2.
+
 
 ### Breaking
 
