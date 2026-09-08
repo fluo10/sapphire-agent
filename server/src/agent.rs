@@ -444,6 +444,9 @@ impl Agent {
                 self.config.day_boundary_hour,
                 &chain,
                 room_info.as_ref(),
+                // Matrix/Discord rooms have no client working directory —
+                // the block's absence there is the whole point of `None`.
+                None,
             )
             .await;
 

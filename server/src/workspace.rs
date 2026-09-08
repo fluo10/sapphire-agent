@@ -108,12 +108,19 @@ impl Workspace {
     /// `Config::resolve_namespace_chain(Config::namespace_for_room(room_id))`.
     /// The first entry is the room's own namespace; later entries are
     /// included parents.
+    ///
+    /// `cwd`, when present, is this turn's ACP session working directory
+    /// (see `TurnHost::cwd` in `serve`): an absolute path on the *client's*
+    /// machine, injected verbatim as its own block right after the room
+    /// block. It is never canonicalised or existence-checked here — the
+    /// server cannot resolve a path that lives on another machine.
     pub async fn build_system_prompt(
         &self,
         base: Option<&str>,
         boundary_hour: u8,
         namespace_chain: &[String],
         room_info: Option<&RoomInfo>,
+        cwd: Option<&str>,
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
 
@@ -134,6 +141,14 @@ impl Workspace {
         // before reading any other instructions.
         if let Some(info) = room_info {
             parts.push(render_room_info(info));
+        }
+
+        // The ACP session's working directory, right after the room block
+        // and before the workspace files: like the room block, it tells the
+        // model where it is working, so it belongs ahead of the
+        // instructions. Injected verbatim (see this method's doc).
+        if let Some(cwd) = cwd {
+            parts.push(render_working_directory(cwd));
         }
 
         for def in WORKSPACE_FILES {
@@ -400,6 +415,16 @@ impl Workspace {
 /// Render `RoomInfo` into a Markdown block injected into the system prompt.
 /// Kept free-standing (not a method on `RoomInfo`) so the channel module
 /// stays unaware of system-prompt formatting.
+/// Render an ACP session's working directory into a Markdown block
+/// injected into the system prompt. The path is inserted **verbatim**: it
+/// names a location on the *client's* machine, so canonicalising it or
+/// checking it against this server's filesystem would be wrong here (see
+/// `AcpSession::cwd` in `serve::acp`). Kept free-standing for the same
+/// reason as `render_room_info`.
+fn render_working_directory(cwd: &str) -> String {
+    format!("# Current Workspace\n\n- Working directory: {cwd}")
+}
+
 fn render_room_info(info: &RoomInfo) -> String {
     let mut body = format!("- Channel: {}\n- Name: {}", info.kind, info.name);
     if let Some(desc) = info.description.as_ref().filter(|s| !s.trim().is_empty()) {
@@ -458,8 +483,12 @@ mod tests {
         let ws = workspace_with_agents_md(&dir);
         let chain = ["default".to_string()];
 
-        let first = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
-        let second = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+        let first = ws
+            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .await;
+        let second = ws
+            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .await;
 
         assert_eq!(first, second);
         assert!(
@@ -476,7 +505,9 @@ mod tests {
         let ws = workspace_with_agents_md(&dir);
         let chain = ["default".to_string()];
 
-        let before = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+        let before = ws
+            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .await;
 
         // 編集する（mtime が変わる）
         std::fs::write(
@@ -486,12 +517,16 @@ mod tests {
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
-        let pinned = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+        let pinned = ws
+            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .await;
         assert_eq!(before, pinned, "ピン留め中は編集が反映されない");
         assert!(!pinned.contains("edited content."));
 
         ws.clear_pinned_cache().await;
-        let refreshed = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+        let refreshed = ws
+            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .await;
         assert!(
             refreshed.contains("edited content."),
             "クリア後は反映される"
@@ -505,14 +540,63 @@ mod tests {
         let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
         let chain = ["default".to_string()];
 
-        let before = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+        let before = ws
+            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .await;
         std::fs::write(dir.path().join("SOUL.md"), "# Soul\n\nnew soul.\n").unwrap();
 
-        let pinned = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+        let pinned = ws
+            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .await;
         assert_eq!(before, pinned, "新規ファイルはクリアまで見えない");
 
         ws.clear_pinned_cache().await;
-        let refreshed = ws.build_system_prompt(Some("base"), 4, &chain, None).await;
+        let refreshed = ws
+            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .await;
         assert!(refreshed.contains("new soul."));
+    }
+
+    #[tokio::test]
+    async fn a_cwd_reaches_the_prompt_as_its_own_block() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
+        let chain = ["default".to_string()];
+        let prompt = ws
+            .build_system_prompt(Some("base"), 4, &chain, None, Some("/work/proj"))
+            .await;
+        assert!(
+            prompt.contains("# Current Workspace\n\n- Working directory: /work/proj"),
+            "{prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cwd_block_precedes_the_workspace_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = workspace_with_agents_md(&dir);
+        let chain = ["default".to_string()];
+        let prompt = ws
+            .build_system_prompt(Some("base"), 4, &chain, None, Some("/work/proj"))
+            .await;
+        let cwd_at = prompt.find("# Current Workspace").expect("cwd block");
+        let files_at = prompt
+            .find("# Agent Instructions")
+            .expect("workspace file block");
+        assert!(
+            cwd_at < files_at,
+            "cwd @{cwd_at}, files @{files_at}: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_cwd_adds_no_block() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
+        let chain = ["default".to_string()];
+        let prompt = ws
+            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .await;
+        assert!(!prompt.contains("# Current Workspace"), "{prompt}");
     }
 }

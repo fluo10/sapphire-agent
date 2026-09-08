@@ -208,11 +208,11 @@ struct AcpProgress {
     /// `client_terminal_cap` reads `terminal` off it the same way.
     client_capabilities: ClientCapabilities,
     /// This turn's session's recorded [`AcpSession::cwd`], copied in at
-    /// construction time the same way `client_capabilities` is. Handed
-    /// to `AcpClientHandle` by `acp_client()` below, which is what lets
-    /// `ClientShell` default a terminal's working directory to the
-    /// session's without this struct exposing a bespoke `TurnHost`
-    /// accessor for it.
+    /// construction time the same way `client_capabilities` is. Two uses:
+    /// handed to `AcpClientHandle` by `acp_client()` below, which is what
+    /// lets `ClientShell` default a terminal's working directory to the
+    /// session's; and exposed to `run_llm_turn` through the `TurnHost::cwd`
+    /// override below, which injects it into the session's system prompt.
     cwd: PathBuf,
     /// The whole host's terminal registry (`ServeState.acp_terminals`),
     /// cloned in at construction time. Handed to `AcpClientHandle` by
@@ -437,6 +437,14 @@ impl super::TurnHost for AcpProgress {
         }))
     }
 
+    /// The session's recorded cwd, verbatim — `AcpSession::cwd`'s doc
+    /// spells out why it must not be canonicalised or existence-checked
+    /// here: it is a path on the *client's* machine, and this process is
+    /// not on it.
+    fn cwd(&self) -> Option<String> {
+        Some(self.cwd.to_string_lossy().into_owned())
+    }
+
     /// Read straight off this turn's recorded `client_capabilities`,
     /// via `fs_caps_from` — see that function's doc for why the read
     /// is pulled out rather than written here.
@@ -581,7 +589,9 @@ struct AcpClientHandle {
     session_id: SessionId,
     connection: ConnectionTo<Client>,
     /// This turn's session's cwd, copied in from [`AcpProgress::cwd`].
-    /// `create_terminal` falls back to it when called with `cwd: None`.
+    /// `create_terminal` falls back to it when called with `cwd: None`
+    /// (the system-prompt injection goes through `TurnHost::cwd` on
+    /// `AcpProgress` itself, not through this handle).
     cwd: PathBuf,
     /// Shared with `ServeState.acp_terminals` via [`AcpProgress::terminals`].
     /// `try_reserve_terminal_slot`/`track_terminal`/`untrack_terminal`
@@ -2599,6 +2609,40 @@ mod tests {
             .summary(&session_id)
             .expect("session/new persisted the session's header");
         assert_eq!(summary.header.cwd, test_cwd());
+    }
+
+    /// issue #245: an ACP turn's system prompt must carry the session's
+    /// recorded cwd — an absolute path on the *client's* machine, injected
+    /// verbatim — so the model knows where it is working. Asserted where
+    /// the feature is wired: the `system` string the provider call was
+    /// actually made with (`StubProvider`'s call log), not where it is
+    /// computed.
+    #[tokio::test]
+    async fn a_prompt_turn_injects_the_session_cwd_into_the_system_prompt() {
+        let (state, chat_log) = ServeState::for_test_scripted_with_log(
+            true,
+            vec![crate::provider::ChatResponse {
+                prompt_usage: None,
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let addr = spawn(state).await;
+        let (_session_id, _updates, _reply) = drive(&addr, text_prompt("hi")).await;
+
+        let calls = chat_log.calls();
+        assert_eq!(calls.len(), 1, "unexpected call count: {calls:?}");
+        let system = calls[0].0.as_deref().unwrap_or_default();
+        assert!(
+            system.contains(&format!(
+                "# Current Workspace\n\n- Working directory: {}",
+                test_cwd()
+            )),
+            "the turn's system prompt must carry the session cwd verbatim \
+             (no canonicalisation — it names a path on the client's \
+             machine): {system}"
+        );
     }
 
     /// Zed sends every `@file` mention as a `resource_link` block, which
