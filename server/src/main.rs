@@ -976,6 +976,19 @@ async fn main() -> Result<()> {
                 // timers fire through `Agent::trigger`.
                 timer_manager.set_agent(Arc::downgrade(&agent));
 
+                // ── refresh_system_prompt ───────────────────────────────
+                // Registered here, right after the agent is built, and
+                // only in this channel-configured branch: an ACP-only
+                // configuration has no Agent and thus no snapshots, so
+                // the pinned file reads alone are enough there. Held as
+                // `Weak` to avoid a cycle — the tool set is itself owned
+                // (transitively) by the agent.
+                tool_set
+                    .register_tool(Box::new(
+                        tools::builtin_tools::RefreshSystemPromptTool::new(Arc::downgrade(&agent)),
+                    ))
+                    .await;
+
                 // ── Periodic workspace re-index ─────────────────────────
                 // `sync()` picks up session JSONLs and notes written
                 // outside the agent. It used to also rebuild a

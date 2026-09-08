@@ -146,11 +146,15 @@ impl Agent {
         }
     }
 
-    /// Drop all cached system-prompt snapshots so the next message rebuilds
-    /// from disk. Call this after writing any file that `build_system_prompt`
-    /// reads (e.g. a freshly generated daily log) so the change is visible to
-    /// the model without waiting for the next day-boundary cache miss.
+    /// Drop all cached system-prompt snapshots AND the workspace's pinned file
+    /// cache, so the next build re-reads every file from disk. Called after a
+    /// daily/weekly/monthly/yearly log is regenerated (so the fresh log shows
+    /// up) and by the `refresh_system_prompt` tool. Pinned reads mean the
+    /// prompt is otherwise byte-stable; this is one of the two moments it
+    /// legitimately changes (the other being the day-boundary snapshot rebuild,
+    /// which re-reads only after a clear).
     pub async fn invalidate_system_prompts(&self) {
+        self.workspace.clear_pinned_cache().await;
         self.snapshots.lock().await.clear();
     }
 
@@ -440,6 +444,9 @@ impl Agent {
                 self.config.day_boundary_hour,
                 &chain,
                 room_info.as_ref(),
+                // Matrix/Discord rooms have no client working directory —
+                // the block's absence there is the whole point of `None`.
+                None,
             )
             .await;
 
@@ -1422,5 +1429,43 @@ api_key = "test"
         agent.handle_message(incoming("なぜ遅い")).await.unwrap();
 
         assert_eq!(*typing.lock().unwrap(), vec![0, 1]);
+    }
+
+    /// Task 2 の本題: `invalidate_system_prompts` はスナップショット全消去
+    /// とピン留めキャッシュ全クリアの *両方* を行う。スナップショットだけ
+    /// 消えてもピンが古いままなら編集は反映されず、ピンだけ消えてもスナッ
+    /// プショットが古いままなら反映されない。両方消えて初めて、ディスク上
+    /// の編集がプロンプトに現れる。
+    #[tokio::test]
+    async fn invalidate_system_prompts_clears_snapshots_and_pins() {
+        let (agent, _sent, _typing) = agent_with_scripted_provider(vec![]);
+        let workspace = Arc::clone(&agent.workspace);
+        let dir = workspace.dir().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "first content.\n").unwrap();
+
+        let key: crate::session::ConversationKey = ("test-room".to_string(), None);
+        let first = agent
+            .get_system_prompt(&key)
+            .await
+            .expect("AGENTS.md exists, so the prompt is non-empty");
+        assert!(first.contains("first content."), "{first}");
+
+        // pin とスナップショットの両方が v1 を保持している状態で編集する
+        std::fs::write(dir.join("AGENTS.md"), "second content.\n").unwrap();
+        let pinned = agent.get_system_prompt(&key).await.expect("pinned prompt");
+        assert!(
+            pinned.contains("first content."),
+            "ピンとスナップショット中は編集が反映されない"
+        );
+        assert!(!pinned.contains("second content."));
+
+        agent.invalidate_system_prompts().await;
+
+        let refreshed = agent.get_system_prompt(&key).await.expect("rebuilt prompt");
+        assert!(
+            refreshed.contains("second content."),
+            "両方のキャッシュが消えた後は編集が反映される"
+        );
     }
 }

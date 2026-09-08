@@ -68,7 +68,12 @@ pub fn log_rel_path(namespace: &str, kind: LogKind, stem: &str) -> PathBuf {
 }
 
 /// Absolute path to the log file under `workspace_dir`.
-pub fn log_abs_path(workspace_dir: &Path, namespace: &str, kind: LogKind, stem: &str) -> PathBuf {
+pub(crate) fn log_abs_path(
+    workspace_dir: &Path,
+    namespace: &str,
+    kind: LogKind,
+    stem: &str,
+) -> PathBuf {
     workspace_dir.join(log_rel_path(namespace, kind, stem))
 }
 
@@ -492,18 +497,13 @@ pub fn read_body(
     })
 }
 
-/// Return the first `n` items of the `digest:` array in
-/// `memory/{kind}/{stem}.md`. Returns `None` when the file or digest is
-/// missing; returns `Some(vec![])` when `digest: []` is explicitly empty.
-pub fn read_digest_top_n(
-    workspace_dir: &Path,
-    namespace: &str,
-    kind: LogKind,
-    stem: &str,
-    n: usize,
-) -> Option<Vec<String>> {
-    let raw = std::fs::read_to_string(log_abs_path(workspace_dir, namespace, kind, stem)).ok()?;
-    let (fm, _) = crate::frontmatter::split(&raw)?;
+/// Parse the first `n` items of the `digest:` array out of an already-read
+/// log file's frontmatter. Split out so `Workspace`'s pinned digest reads
+/// (which read the raw text through the pin map, not here) can share it.
+/// Returns `None` when the frontmatter or digest is missing; returns
+/// `Some(vec![])` when `digest: []` is explicitly empty.
+pub fn digest_items(raw: &str, n: usize) -> Option<Vec<String>> {
+    let (fm, _) = crate::frontmatter::split(raw)?;
     let mapping = crate::frontmatter::parse_mapping(fm);
     let seq = mapping.get("digest")?.as_sequence()?;
     Some(
@@ -808,8 +808,10 @@ block."
 }
 
 /// Strip any leading frontmatter from `raw` and return the body. Used as
-/// LLM input during digest back-fill so the model sees only the summary.
-fn body_without_frontmatter(raw: &str) -> String {
+/// LLM input during digest back-fill so the model sees only the summary,
+/// and by `Workspace`'s pinned yesterday-log injection (the raw text
+/// arrives via the Workspace pin map, stripped here).
+pub fn body_without_frontmatter(raw: &str) -> String {
     match crate::frontmatter::split(raw) {
         Some((_, body)) => body.trim_start_matches('\n').to_string(),
         None => raw.to_string(),

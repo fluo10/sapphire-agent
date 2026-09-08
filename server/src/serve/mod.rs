@@ -1915,6 +1915,20 @@ pub(crate) trait TurnHost: Send + Sync {
         None
     }
 
+    /// The session's working directory, when this turn has one: ACP
+    /// sessions carry the `cwd` the editor sent in `session/new` (or
+    /// `load`/`resume`). `run_llm_turn` passes it to
+    /// `Workspace::build_system_prompt`, which injects it into the system
+    /// prompt verbatim — verbatim on purpose: the path names a location on
+    /// the *client's* machine, so this server can neither resolve nor
+    /// validate it.
+    ///
+    /// `None` by default: `/rpc`, `/a2a`, Matrix, Discord and the voice
+    /// pipeline have no client working directory to inject.
+    fn cwd(&self) -> Option<String> {
+        None
+    }
+
     /// The editor's declared file-system capabilities for this turn, as
     /// `(read, write)`. A client can implement `fs/read_text_file`
     /// without `fs/write_text_file` or vice versa, so the two are read
@@ -2791,6 +2805,7 @@ pub(crate) async fn run_llm_turn(
                 state.config.day_boundary_hour,
                 &namespace_chain,
                 room_info.as_ref(),
+                progress.cwd().as_deref(),
             )
             .await;
         if sp.is_empty() { None } else { Some(sp) }

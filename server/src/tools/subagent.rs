@@ -314,6 +314,13 @@ impl crate::serve::TurnHost for SubagentHost {
         self.0.acp_client()
     }
 
+    /// Forwarded, like `acp_client`: a subagent delegated from an ACP
+    /// session works in the same session cwd, so its system prompt carries
+    /// the same `# Current Workspace` block as its parent's.
+    fn cwd(&self) -> Option<String> {
+        self.0.cwd()
+    }
+
     fn client_fs_caps(&self) -> (bool, bool) {
         self.0.client_fs_caps()
     }
