@@ -412,9 +412,6 @@ impl Workspace {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Render `RoomInfo` into a Markdown block injected into the system prompt.
-/// Kept free-standing (not a method on `RoomInfo`) so the channel module
-/// stays unaware of system-prompt formatting.
 /// Render an ACP session's working directory into a Markdown block
 /// injected into the system prompt. The path is inserted **verbatim**: it
 /// names a location on the *client's* machine, so canonicalising it or
@@ -425,6 +422,9 @@ fn render_working_directory(cwd: &str) -> String {
     format!("# Current Workspace\n\n- Working directory: {cwd}")
 }
 
+/// Render `RoomInfo` into a Markdown block injected into the system prompt.
+/// Kept free-standing (not a method on `RoomInfo`) so the channel module
+/// stays unaware of system-prompt formatting.
 fn render_room_info(info: &RoomInfo) -> String {
     let mut body = format!("- Channel: {}\n- Name: {}", info.kind, info.name);
     if let Some(desc) = info.description.as_ref().filter(|s| !s.trim().is_empty()) {
