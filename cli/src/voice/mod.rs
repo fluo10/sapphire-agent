@@ -1132,7 +1132,7 @@ fn open_input_stream(
     let rate = supported.sample_rate();
     let channels = supported.channels();
     let format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.clone().into();
+    let config: cpal::StreamConfig = supported.into();
 
     // err_fn lives on cpal's worker thread. Funnel its events through
     // [`handle_stream_error`] so stderr only prints once per
@@ -1404,7 +1404,7 @@ fn open_output_stream(
     let rate = supported.sample_rate();
     let channels = supported.channels();
     let format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.clone().into();
+    let config: cpal::StreamConfig = supported.into();
 
     // Same rate-limit / restart-request plumbing as the input side —
     // see [`handle_stream_error`].

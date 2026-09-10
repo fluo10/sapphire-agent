@@ -173,7 +173,7 @@ fn open_output_stream(queue: &Arc<Mutex<VecDeque<i16>>>) -> Result<(cpal::Stream
     let rate = supported.sample_rate();
     let channels = supported.channels();
     let format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.clone().into();
+    let config: cpal::StreamConfig = supported.into();
 
     let err_fn = |e| tracing::warn!("audio output stream error: {e}");
 
@@ -560,7 +560,7 @@ fn open_input_stream(tx: std::sync::mpsc::Sender<Vec<i16>>) -> Result<(cpal::Str
     let rate = supported.sample_rate();
     let channels = supported.channels();
     let format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.clone().into();
+    let config: cpal::StreamConfig = supported.into();
 
     let err_fn = |e| tracing::warn!("audio input stream error: {e}");
 
