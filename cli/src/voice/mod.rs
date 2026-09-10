@@ -248,11 +248,7 @@ fn record_stream_error(window: &mut ErrorWindow, now: Instant) -> ErrorDecision 
 /// supervisor's restart flag when the window crosses the threshold.
 /// Used by both `open_input_stream` and `open_output_stream` so the
 /// behaviour is identical on either side; only the `label` differs.
-fn handle_stream_error(
-    supervisor: &Arc<StreamSupervisor>,
-    label: &'static str,
-    e: cpal::StreamError,
-) {
+fn handle_stream_error(supervisor: &Arc<StreamSupervisor>, label: &'static str, e: cpal::Error) {
     let now = Instant::now();
     let decision = {
         let mut w = supervisor
@@ -1136,7 +1132,7 @@ fn open_input_stream(
     let rate = supported.sample_rate();
     let channels = supported.channels();
     let format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.clone().into();
+    let config: cpal::StreamConfig = supported.into();
 
     // err_fn lives on cpal's worker thread. Funnel its events through
     // [`handle_stream_error`] so stderr only prints once per
@@ -1156,7 +1152,7 @@ fn open_input_stream(
             let tx = tx.clone();
             let enabled = Arc::clone(&enabled);
             device.build_input_stream(
-                &config,
+                config,
                 move |data: &[f32], _| {
                     if !enabled.load(Ordering::SeqCst) {
                         return;
@@ -1178,7 +1174,7 @@ fn open_input_stream(
             let tx = tx.clone();
             let enabled = Arc::clone(&enabled);
             device.build_input_stream(
-                &config,
+                config,
                 move |data: &[i16], _| {
                     if !enabled.load(Ordering::SeqCst) {
                         return;
@@ -1198,7 +1194,7 @@ fn open_input_stream(
             let tx = tx.clone();
             let enabled = Arc::clone(&enabled);
             device.build_input_stream(
-                &config,
+                config,
                 move |data: &[u16], _| {
                     if !enabled.load(Ordering::SeqCst) {
                         return;
@@ -1408,7 +1404,7 @@ fn open_output_stream(
     let rate = supported.sample_rate();
     let channels = supported.channels();
     let format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.clone().into();
+    let config: cpal::StreamConfig = supported.into();
 
     // Same rate-limit / restart-request plumbing as the input side —
     // see [`handle_stream_error`].
@@ -1421,7 +1417,7 @@ fn open_output_stream(
         SampleFormat::F32 => {
             let queue = Arc::clone(&queue);
             device.build_output_stream(
-                &config,
+                config,
                 move |data: &mut [f32], _| {
                     let mut q = match queue.lock() {
                         Ok(g) => g,
@@ -1447,7 +1443,7 @@ fn open_output_stream(
         SampleFormat::I16 => {
             let queue = Arc::clone(&queue);
             device.build_output_stream(
-                &config,
+                config,
                 move |data: &mut [i16], _| {
                     let mut q = match queue.lock() {
                         Ok(g) => g,
@@ -1472,7 +1468,7 @@ fn open_output_stream(
         SampleFormat::U16 => {
             let queue = Arc::clone(&queue);
             device.build_output_stream(
-                &config,
+                config,
                 move |data: &mut [u16], _| {
                     let mut q = match queue.lock() {
                         Ok(g) => g,

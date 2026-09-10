@@ -173,7 +173,7 @@ fn open_output_stream(queue: &Arc<Mutex<VecDeque<i16>>>) -> Result<(cpal::Stream
     let rate = supported.sample_rate();
     let channels = supported.channels();
     let format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.clone().into();
+    let config: cpal::StreamConfig = supported.into();
 
     let err_fn = |e| tracing::warn!("audio output stream error: {e}");
 
@@ -181,7 +181,7 @@ fn open_output_stream(queue: &Arc<Mutex<VecDeque<i16>>>) -> Result<(cpal::Stream
         SampleFormat::F32 => {
             let queue = Arc::clone(queue);
             device.build_output_stream(
-                &config,
+                config,
                 move |data: &mut [f32], _| {
                     let mut q = match queue.lock() {
                         Ok(g) => g,
@@ -207,7 +207,7 @@ fn open_output_stream(queue: &Arc<Mutex<VecDeque<i16>>>) -> Result<(cpal::Stream
         SampleFormat::I16 => {
             let queue = Arc::clone(queue);
             device.build_output_stream(
-                &config,
+                config,
                 move |data: &mut [i16], _| {
                     let mut q = match queue.lock() {
                         Ok(g) => g,
@@ -232,7 +232,7 @@ fn open_output_stream(queue: &Arc<Mutex<VecDeque<i16>>>) -> Result<(cpal::Stream
         SampleFormat::U16 => {
             let queue = Arc::clone(queue);
             device.build_output_stream(
-                &config,
+                config,
                 move |data: &mut [u16], _| {
                     let mut q = match queue.lock() {
                         Ok(g) => g,
@@ -560,7 +560,7 @@ fn open_input_stream(tx: std::sync::mpsc::Sender<Vec<i16>>) -> Result<(cpal::Str
     let rate = supported.sample_rate();
     let channels = supported.channels();
     let format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.clone().into();
+    let config: cpal::StreamConfig = supported.into();
 
     let err_fn = |e| tracing::warn!("audio input stream error: {e}");
 
@@ -568,7 +568,7 @@ fn open_input_stream(tx: std::sync::mpsc::Sender<Vec<i16>>) -> Result<(cpal::Str
         SampleFormat::F32 => {
             let tx = tx.clone();
             device.build_input_stream(
-                &config,
+                config,
                 move |data: &[f32], _| {
                     let pcm: Vec<i16> = data
                         .iter()
@@ -583,7 +583,7 @@ fn open_input_stream(tx: std::sync::mpsc::Sender<Vec<i16>>) -> Result<(cpal::Str
         SampleFormat::I16 => {
             let tx = tx.clone();
             device.build_input_stream(
-                &config,
+                config,
                 move |data: &[i16], _| {
                     let _ = tx.send(data.to_vec());
                 },
@@ -594,7 +594,7 @@ fn open_input_stream(tx: std::sync::mpsc::Sender<Vec<i16>>) -> Result<(cpal::Str
         SampleFormat::U16 => {
             let tx = tx.clone();
             device.build_input_stream(
-                &config,
+                config,
                 move |data: &[u16], _| {
                     let pcm: Vec<i16> = data.iter().map(|s| (*s as i32 - 32768) as i16).collect();
                     let _ = tx.send(pcm);
