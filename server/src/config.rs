@@ -1433,6 +1433,29 @@ api_key = "test"
         errors
     }
 
+    /// Validate the `profile:` references of loaded subagent definitions
+    /// against `profiles`. Called by `main` once both the definitions
+    /// (`load_agents_dir`) and this config exist — the loader stays
+    /// lenient (one broken definition must not take the others down) and
+    /// the strictness lives here instead: an unknown name in a *server*
+    /// config is a static reference error, and failing startup beats
+    /// silently running that agent on `for_profile`'s fallback provider.
+    /// The permissive variant the future client/local-loop layout wants
+    /// (warn + fallback) is a policy change at the *resolution* point
+    /// (`ProviderRegistry::for_profile`), not a reason to soften this check.
+    ///
+    /// Returns human-readable error messages, one per definition that names
+    /// an unknown profile, in definition order.
+    pub fn validate_subagent_profiles(&self, defs: &[crate::agents::AgentDef]) -> Vec<String> {
+        defs.iter()
+            .filter_map(|d| Some((d.name.as_str(), d.profile.as_deref()?)))
+            .filter(|(_, name)| !self.profiles.contains_key(*name))
+            .map(|(agent, name)| {
+                format!("subagent definition '{agent}' references unknown profile '{name}'")
+            })
+            .collect()
+    }
+
     /// Settings that were removed when device-based auth landed.
     ///
     /// Reported as a hard error at start-up rather than ignored, following the
@@ -2091,6 +2114,73 @@ rooms   = ["!x:srv"]
             errors.iter().any(|e| e.contains("missing")),
             "got: {errors:?}"
         );
+    }
+
+    /// An agent definition naming a profile that config never defines is a
+    /// static reference error in a server config: better to fail at startup
+    /// than to silently run the agent on `for_profile`'s fallback provider.
+    /// The error list enumerates every occurrence, like `validate_profiles`.
+    #[test]
+    fn a_subagent_definition_naming_an_unknown_profile_is_an_error() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.dev]
+provider = "anthropic"
+"#,
+        );
+        let defs = vec![
+            crate::agents::AgentDef {
+                name: "reviewer".into(),
+                description: "Reviews.".into(),
+                tools: None,
+                prompt: "Review.".into(),
+                profile: Some("dev".into()),
+            },
+            crate::agents::AgentDef {
+                name: "impl".into(),
+                description: "Implements.".into(),
+                tools: None,
+                prompt: "Implement.".into(),
+                profile: Some("missing".into()),
+            },
+            crate::agents::AgentDef {
+                name: "helper".into(),
+                description: "Thinks.".into(),
+                tools: None,
+                prompt: "Think.".into(),
+                profile: None,
+            },
+        ];
+        let errors = cfg.validate_subagent_profiles(&defs);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("impl"), "{errors:?}");
+        assert!(errors[0].contains("missing"), "{errors:?}");
+    }
+
+    /// A defined profile — including one whose *provider* would fall back —
+    /// is not an error. Existence of the profile name is the whole check.
+    #[test]
+    fn a_subagent_definition_naming_a_defined_profile_is_fine() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.dev]
+provider = "anthropic"
+"#,
+        );
+        let defs = vec![crate::agents::AgentDef {
+            name: "reviewer".into(),
+            description: "Reviews.".into(),
+            tools: None,
+            prompt: "Review.".into(),
+            profile: Some("dev".into()),
+        }];
+        assert!(cfg.validate_subagent_profiles(&defs).is_empty());
     }
 
     #[test]

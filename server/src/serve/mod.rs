@@ -3922,6 +3922,7 @@ mod tests {
                     description: "Delegates a risky call.".to_string(),
                     tools: Some(vec!["risky".to_string()]),
                     prompt: "You are a delegator.".to_string(),
+                    profile: None,
                 },
             ])))
             .await;
@@ -4006,6 +4007,7 @@ mod tests {
                     description: "Delegates.".to_string(),
                     tools: None,
                     prompt: "You are a delegator.".to_string(),
+                    profile: None,
                 },
             ])))
             .await;
@@ -4100,6 +4102,7 @@ mod tests {
                     description: "Delegates, but only echoes.".to_string(),
                     tools: Some(vec!["echo".to_string()]),
                     prompt: "You are a delegator.".to_string(),
+                    profile: None,
                 },
             ])))
             .await;
@@ -4291,6 +4294,7 @@ mod tests {
                     description: "Investigates something.".to_string(),
                     tools: Some(vec!["echo".to_string()]),
                     prompt: "You are an investigator.".to_string(),
+                    profile: None,
                 },
             ])))
             .await;
@@ -4793,6 +4797,7 @@ mod tests {
                     description: "Delegates.".to_string(),
                     tools: None,
                     prompt: "You are a delegator.".to_string(),
+                    profile: None,
                 },
             ])))
             .await;

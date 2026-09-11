@@ -120,6 +120,7 @@ body for the prompt:
 ---
 description: Reviews a diff. Reads and reports; does not edit.
 tools: [client_file_read, workspace_search, memory_read]
+profile: dev
 ---
 You are a reviewer. Read the diff, report problems, and stop there.
 ```
@@ -132,6 +133,14 @@ You are a reviewer. Read the diff, report problems, and stop there.
   the one exception); give it a list — including `[]` — and the subagent is
   restricted to exactly that. Both are legitimate: an empty list is a valid
   definition, for an agent that only needs the prompt to summarise or judge.
+- **`profile`** is optional and names a `[profiles.<name>]` entry — the
+  subagent then runs on *that* provider (with its `fallback_provider`
+  included) instead of the parent's. Omit it and the subagent runs on
+  whatever model the delegating turn runs on: both are legitimate, and
+  "no profile" is the pre-existing behaviour unchanged. A name that
+  config's `[profiles]` does not define fails startup outright — a
+  typo'd profile name should not silently run the agent on a different
+  model.
 - **The body** is the subagent's entire system prompt. That is genuinely
   all of it — see below.
 
@@ -168,6 +177,13 @@ namespace the delegating conversation is already in. So "a subagent has no
 memory" is true of what it's told up front, not of what it's able to go
 look up — that distinction is entirely in the definition's own `tools:`
 list.
+
+The provider is the one element a subagent does not always inherit: a
+definition that names a `profile:` runs on that profile's provider instead
+of the parent's. Everything else here is entirely unchanged by whether a
+profile is set — the same permission gate, the same enforced tool list, the
+same isolation. A profile changes only *which model* runs the subagent,
+never what it may do or see.
 
 **Isolation is about history and the store, not about visibility.** A
 subagent's tool calls still fire the same `tool_start`/`tool_end`

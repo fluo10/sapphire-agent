@@ -623,6 +623,21 @@ impl SubagentTool {
         // rather than being stripped like the workspace files are.
         let namespace = crate::tools::workspace_tools::current_memory_namespace();
 
+        // A definition that pins a profile runs on that profile's provider —
+        // resolved through the very same `ProviderRegistry::for_profile` that
+        // room/session turns use, so profile-resolution semantics exist in one
+        // function, not two. The "unknown name" policy that future
+        // client/local-loop configs may want to change (warn + fallback
+        // instead of failing startup) is a change to that one function; a
+        // server config cannot reach it at runtime —
+        // `Config::validate_subagent_profiles` bails at startup first.
+        // `fallback_provider` wrapping happens inside `for_profile`, so a
+        // profiled subagent inherits the refusal-fallback behaviour for free.
+        let provider: std::sync::Arc<dyn crate::provider::Provider> = match def.profile.as_deref() {
+            Some(name) => ctx.state.registry.for_profile(&ctx.state.config, name),
+            None => std::sync::Arc::clone(&ctx.provider),
+        };
+
         // The parent's host, deliberately: a permission request from a
         // subagent must reach the same person, judged by the same
         // origin. A different host here would make delegation a way
@@ -635,7 +650,7 @@ impl SubagentTool {
 
         let (text, stop) = crate::serve::TurnLoop {
             state: &ctx.state,
-            provider: &ctx.provider,
+            provider: &provider,
             system: Some(&system),
             tool_specs: &specs,
             progress: &progress,
@@ -790,6 +805,7 @@ mod tests {
             description: "Reviews a diff.".to_string(),
             tools: Some(vec!["client_file_read".to_string()]),
             prompt: "You are a reviewer.".to_string(),
+            profile: None,
         }]
     }
 
@@ -881,6 +897,7 @@ mod tests {
 
         let unrestricted = crate::agents::AgentDef {
             tools: None,
+            profile: None,
             ..defs()[0].clone()
         };
         let inherited = subagent_tool_specs(&unrestricted, &parent_visible);
@@ -896,6 +913,7 @@ mod tests {
                 SUBAGENT_TOOL_NAME.to_string(),
                 "client_file_read".to_string(),
             ]),
+            profile: None,
             ..defs()[0].clone()
         };
         let parent_visible = [
@@ -911,6 +929,7 @@ mod tests {
     fn an_empty_tools_list_yields_no_tools() {
         let toolless = crate::agents::AgentDef {
             tools: Some(vec![]),
+            profile: None,
             ..defs()[0].clone()
         };
         let parent_visible = [spec_named("client_file_read")];
@@ -936,6 +955,7 @@ mod tests {
 
         let unknown = crate::agents::AgentDef {
             tools: Some(vec!["client_file_read".to_string(), "retrieve".to_string()]),
+            profile: None,
             ..def.clone()
         };
 
@@ -956,6 +976,7 @@ mod tests {
     fn subagent_itself_is_never_reported_as_unknown() {
         let tool = SubagentTool::new(vec![crate::agents::AgentDef {
             tools: Some(vec![SUBAGENT_TOOL_NAME.to_string()]),
+            profile: None,
             ..defs()[0].clone()
         }]);
         let def = &tool.agents[0];
@@ -969,6 +990,7 @@ mod tests {
     fn an_unrestricted_definition_has_nothing_to_warn_about() {
         let tool = SubagentTool::new(vec![crate::agents::AgentDef {
             tools: None,
+            profile: None,
             ..defs()[0].clone()
         }]);
         let def = &tool.agents[0];
@@ -1107,6 +1129,7 @@ mod tests {
                 "client_shell".to_string(),
             ]),
             prompt: "You are impl.".to_string(),
+            profile: None,
         }]
     }
 
@@ -1187,6 +1210,13 @@ mod tests {
                 .expect("a call was recorded")
                 .2
                 .clone()
+        }
+
+        /// How many `chat()` calls this double received. `last_messages`
+        /// panics on an empty log by design; "this provider received
+        /// nothing" needs a count instead.
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
         }
     }
 
@@ -1514,6 +1544,7 @@ mod tests {
             description: "Implements a task.".to_string(),
             tools: None,
             prompt: "You are impl.".to_string(),
+            profile: None,
         }]);
         let dispatch_provider = ScriptedProvider::new(vec![text_response("dispatch answer")]);
         let dispatch_input = serde_json::json!({"agent": "impl", "prompt": "go"});
@@ -1744,5 +1775,126 @@ mod tests {
             assert!(tool.busy_handles.lock().unwrap().contains(&handle));
         }
         assert!(tool.busy_handles.lock().unwrap().is_empty());
+    }
+
+    /// A definition with `profile:` runs on that profile's provider, not the
+    /// parent's — the point of the feature. The fixture's registry
+    /// (`serve::build_for_test_with`) registers one scripted provider under
+    /// both the `"anthropic"` and `"stub"` names, so profile resolution and
+    /// the ctx provider cannot be told apart by *identity* here — the
+    /// distinction is made by *recorded calls*: the ctx provider is a
+    /// separate record-only double whose log must stay empty.
+    #[tokio::test]
+    async fn a_definition_with_a_profile_runs_on_that_profiles_provider() {
+        let tool = SubagentTool::new(vec![crate::agents::AgentDef {
+            name: "impl".to_string(),
+            description: "Implements a task.".to_string(),
+            tools: Some(vec![]),
+            prompt: "You are impl.".to_string(),
+            profile: Some("dev".to_string()),
+        }]);
+        let state = crate::serve::ServeState::for_test_scripted(
+            false,
+            vec![text_response("profile answer")],
+        );
+        let parent_provider = ScriptedProvider::new(vec![]);
+        let out = crate::serve::scope_turn_context(
+            turn_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&parent_provider)
+                    as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+            ),
+            tool.execute(&serde_json::json!({"agent": "impl", "prompt": "go"})),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("profile answer"), "{out}");
+        assert_eq!(
+            parent_provider.call_count(),
+            0,
+            "the ctx (parent's) provider must not serve a profiled agent"
+        );
+    }
+
+    /// The mirror image: no `profile:`, the parent's provider serves the
+    /// turn — the pre-feature default is unchanged behaviour, not an
+    /// accidental second path. Same fixture shape as above; here the ctx
+    /// provider IS the one that must receive the call.
+    #[tokio::test]
+    async fn a_definition_without_a_profile_runs_on_the_parents_provider() {
+        let tool = SubagentTool::new(resumable_defs()); // profile: None
+        let state = crate::serve::ServeState::for_test(false);
+        let parent_provider = ScriptedProvider::new(vec![text_response("parent answer")]);
+        let out = crate::serve::scope_turn_context(
+            turn_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&parent_provider)
+                    as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+            ),
+            tool.execute(&serde_json::json!({"agent": "impl", "prompt": "go"})),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("parent answer"), "{out}");
+        assert_eq!(parent_provider.call_count(), 1);
+    }
+
+    /// A handle stays resumable after the definition's `profile:` changes:
+    /// the cache stores model-agnostic `ChatMessage` history, so a resume
+    /// simply runs on whatever provider the reloaded definition resolves
+    /// to. This is the existing `an_agent_definition_that_disappeared_is_
+    /// reported` pattern — two tool instances sharing one cache-backed
+    /// state, standing in for "definitions reloaded between dispatch and
+    /// resume" — with the one differing field being `profile`: dispatch
+    /// runs with `profile: None` (the ctx provider), resume runs with
+    /// `profile: Some("dev")` and must still continue the stored history.
+    #[tokio::test]
+    async fn a_resumed_handle_survives_a_profile_change() {
+        let state = crate::serve::ServeState::for_test_scripted(
+            false,
+            vec![
+                text_response("dispatch answer"),
+                text_response("resume answer"),
+            ],
+        );
+        let base = crate::agents::AgentDef {
+            name: "impl".to_string(),
+            description: "Implements a task.".to_string(),
+            tools: Some(vec![]),
+            prompt: "You are impl.".to_string(),
+            profile: None,
+        };
+        let dispatched = crate::serve::scope_turn_context(
+            turn_context(
+                std::sync::Arc::clone(&state),
+                state.registry.anthropic(),
+                Vec::new(),
+            ),
+            SubagentTool::new(vec![base.clone()])
+                .execute(&serde_json::json!({"agent": "impl", "prompt": "first task"})),
+        )
+        .await
+        .unwrap();
+        let handle = extract_handle(&dispatched);
+
+        let resumed_def = crate::agents::AgentDef {
+            profile: Some("dev".to_string()),
+            ..base
+        };
+        let resumed = crate::serve::scope_turn_context(
+            turn_context(
+                std::sync::Arc::clone(&state),
+                state.registry.anthropic(),
+                Vec::new(),
+            ),
+            SubagentTool::new(vec![resumed_def])
+                .execute(&serde_json::json!({"resume": handle, "prompt": "second instruction"})),
+        )
+        .await
+        .unwrap();
+        assert!(resumed.contains("resume answer"), "{resumed}");
+        assert!(resumed.contains(&handle), "still resumable: {resumed}");
     }
 }
