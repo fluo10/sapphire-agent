@@ -204,7 +204,11 @@ mod tests {
     #[test]
     fn an_omitted_profile_is_none_not_empty() {
         let d = tempfile::tempdir().unwrap();
-        write(d.path(), "helper.md", "---\ndescription: Thinks.\n---\nThink.\n");
+        write(
+            d.path(),
+            "helper.md",
+            "---\ndescription: Thinks.\n---\nThink.\n",
+        );
 
         let agents = load_agents_dir(d.path());
         assert_eq!(agents[0].profile, None);
