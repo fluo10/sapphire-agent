@@ -513,6 +513,13 @@ async fn main() -> Result<()> {
             // registered when at least one definition loaded: a tool
             // with nobody to delegate to has no reason to be offered.
             let agent_defs = agents::load_agents_dir(&workspace_dir.join("agents"));
+            let profile_errors = config.validate_subagent_profiles(&agent_defs);
+            if !profile_errors.is_empty() {
+                anyhow::bail!(
+                    "invalid subagent profile references:\n  - {}",
+                    profile_errors.join("\n  - ")
+                );
+            }
             if !agent_defs.is_empty() {
                 tool_set
                     .register_tool(Box::new(tools::subagent::SubagentTool::new(agent_defs)))
