@@ -94,6 +94,14 @@ impl ProviderRegistry {
     /// Resolve the provider for a named profile, honouring its primary +
     /// optional fallback. Falls back to the Anthropic provider if the
     /// profile isn't defined or names an unknown provider.
+    ///
+    /// The single entry point for profile → provider resolution: room and
+    /// session turns go through here, and so do subagent definitions'
+    /// `profile:`. The "name not found → Anthropic fallback" behaviour
+    /// below is deliberately concentrated here: server configs make it
+    /// unreachable by rejecting unknown names at startup
+    /// (`Config::validate_subagent_profiles`); a future client/local-loop
+    /// config that wants warn-and-fallback instead changes only this point.
     pub fn for_profile(&self, config: &Config, profile_name: &str) -> Arc<dyn Provider> {
         let Some(profile) = config.profiles.get(profile_name) else {
             return self.anthropic();
