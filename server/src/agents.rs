@@ -17,6 +17,11 @@ struct AgentMeta {
     description: String,
     #[serde(default)]
     tools: Option<Vec<String>>,
+    /// Name of the `[profiles.<name>]` entry this agent runs on. `None`
+    /// means "the parent turn's provider, unchanged" — the default and
+    /// the pre-feature behaviour.
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +34,12 @@ pub struct AgentDef {
     pub tools: Option<Vec<String>>,
     /// The body, which becomes the whole system prompt.
     pub prompt: String,
+    /// The name in `[profiles.<n>]` this agent runs on, or `None` for
+    /// "the parent's provider". The name is validated against
+    /// `Config::profiles` at startup (`Config::validate_subagent_profiles`)
+    /// — a server config with an unknown name fails to boot rather than
+    /// silently running the agent on a different model.
+    pub profile: Option<String>,
 }
 
 /// Load every definition under `dir`, skipping the ones that cannot be
@@ -80,6 +91,7 @@ fn parse_agent(name: String, raw: &str) -> Option<AgentDef> {
         description: meta.description,
         tools: meta.tools,
         prompt: body.trim_start_matches(['\n', '\r']).to_string(),
+        profile: meta.profile,
     })
 }
 
@@ -168,6 +180,34 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         write(d.path(), "mystery.md", "---\ntools: []\n---\nHello.\n");
         assert!(load_agents_dir(d.path()).is_empty());
+    }
+
+    /// `profile:` is parsed onto the definition — it is the whole point
+    /// of the field: a definition pins its own provider with it.
+    #[test]
+    fn a_profile_is_parsed_onto_the_definition() {
+        let d = tempfile::tempdir().unwrap();
+        write(
+            d.path(),
+            "reviewer.md",
+            "---\ndescription: Reviews.\nprofile: dev\n---\nReview.\n",
+        );
+
+        let agents = load_agents_dir(d.path());
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].profile.as_deref(), Some("dev"));
+    }
+
+    /// Absent `profile:` means "the parent's provider, unchanged" — that
+    /// must be distinguishable from `Some`. Same shape as the `tools` test:
+    /// absent is `None`, never an empty string or anything else.
+    #[test]
+    fn an_omitted_profile_is_none_not_empty() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "helper.md", "---\ndescription: Thinks.\n---\nThink.\n");
+
+        let agents = load_agents_dir(d.path());
+        assert_eq!(agents[0].profile, None);
     }
 
     #[test]

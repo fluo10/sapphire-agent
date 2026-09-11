@@ -790,6 +790,7 @@ mod tests {
             description: "Reviews a diff.".to_string(),
             tools: Some(vec!["client_file_read".to_string()]),
             prompt: "You are a reviewer.".to_string(),
+            profile: None,
         }]
     }
 
@@ -881,6 +882,7 @@ mod tests {
 
         let unrestricted = crate::agents::AgentDef {
             tools: None,
+            profile: None,
             ..defs()[0].clone()
         };
         let inherited = subagent_tool_specs(&unrestricted, &parent_visible);
@@ -896,6 +898,7 @@ mod tests {
                 SUBAGENT_TOOL_NAME.to_string(),
                 "client_file_read".to_string(),
             ]),
+            profile: None,
             ..defs()[0].clone()
         };
         let parent_visible = [
@@ -911,6 +914,7 @@ mod tests {
     fn an_empty_tools_list_yields_no_tools() {
         let toolless = crate::agents::AgentDef {
             tools: Some(vec![]),
+            profile: None,
             ..defs()[0].clone()
         };
         let parent_visible = [spec_named("client_file_read")];
@@ -936,6 +940,7 @@ mod tests {
 
         let unknown = crate::agents::AgentDef {
             tools: Some(vec!["client_file_read".to_string(), "retrieve".to_string()]),
+            profile: None,
             ..def.clone()
         };
 
@@ -956,6 +961,7 @@ mod tests {
     fn subagent_itself_is_never_reported_as_unknown() {
         let tool = SubagentTool::new(vec![crate::agents::AgentDef {
             tools: Some(vec![SUBAGENT_TOOL_NAME.to_string()]),
+            profile: None,
             ..defs()[0].clone()
         }]);
         let def = &tool.agents[0];
@@ -969,6 +975,7 @@ mod tests {
     fn an_unrestricted_definition_has_nothing_to_warn_about() {
         let tool = SubagentTool::new(vec![crate::agents::AgentDef {
             tools: None,
+            profile: None,
             ..defs()[0].clone()
         }]);
         let def = &tool.agents[0];
@@ -1107,6 +1114,7 @@ mod tests {
                 "client_shell".to_string(),
             ]),
             prompt: "You are impl.".to_string(),
+            profile: None,
         }]
     }
 
@@ -1514,6 +1522,7 @@ mod tests {
             description: "Implements a task.".to_string(),
             tools: None,
             prompt: "You are impl.".to_string(),
+            profile: None,
         }]);
         let dispatch_provider = ScriptedProvider::new(vec![text_response("dispatch answer")]);
         let dispatch_input = serde_json::json!({"agent": "impl", "prompt": "go"});
