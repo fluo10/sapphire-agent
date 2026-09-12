@@ -474,16 +474,15 @@ impl SubagentTool {
         // over-cap `put` here just means the handle never becomes
         // resumable at all — there is no earlier, shorter copy for the
         // model to be misled by (contrast `resume`'s own message).
-        Ok(self
-            .run_and_store(
-                &ctx,
-                def,
-                &handle,
-                created_at,
-                &mut history,
-                "history exceeded the cache limit",
-            )
-            .await)
+        self.run_and_store(
+            &ctx,
+            def,
+            &handle,
+            created_at,
+            &mut history,
+            "history exceeded the cache limit",
+        )
+        .await
     }
 
     /// Continue the child conversation stored under `handle`.
@@ -566,18 +565,17 @@ impl SubagentTool {
         // this prompt and its answer with no signal that anything
         // diverged. Name that explicitly rather than reusing dispatch's
         // message.
-        Ok(self
-            .run_and_store(
-                &ctx,
-                def,
-                handle,
-                stored.created_at,
-                &mut history,
-                "this exchange exceeded the cache limit and was not saved; \
-                 the stored copy still ends before it, so a later resume \
-                 will not include this prompt or its answer",
-            )
-            .await)
+        self.run_and_store(
+            &ctx,
+            def,
+            handle,
+            stored.created_at,
+            &mut history,
+            "this exchange exceeded the cache limit and was not saved; \
+             the stored copy still ends before it, so a later resume \
+             will not include this prompt or its answer",
+        )
+        .await
     }
 
     /// Run `def`'s nested `TurnLoop` to completion on `history`, then
@@ -589,6 +587,9 @@ impl SubagentTool {
     /// the one thing the two callers have to say differently, since
     /// only `resume` risks leaving a stale, shorter copy behind when
     /// `put` refuses.
+    ///
+    /// The one `Err` is a turn that outran `[tools.subagent]
+    /// turn_timeout_secs` — see [`timed_out`].
     async fn run_and_store(
         &self,
         ctx: &crate::serve::TurnContext,
@@ -597,7 +598,7 @@ impl SubagentTool {
         created_at: chrono::DateTime<chrono::Utc>,
         history: &mut Vec<ChatMessage>,
         over_cap_reason: &'static str,
-    ) -> String {
+    ) -> anyhow::Result<String> {
         // A typo, a renamed tool, or a name that was never registered
         // yields a subagent silently missing it — no warning at load,
         // no error at call time, it is simply never offered. Warn
@@ -648,7 +649,7 @@ impl SubagentTool {
         let progress: std::sync::Arc<dyn crate::serve::TurnHost> =
             std::sync::Arc::new(SubagentHost(std::sync::Arc::clone(&ctx.progress)));
 
-        let (text, stop) = crate::serve::TurnLoop {
+        let turn = crate::serve::TurnLoop {
             state: &ctx.state,
             provider: &provider,
             system: Some(&system),
@@ -663,8 +664,28 @@ impl SubagentTool {
             // not a promise that this history reaches the store.
             persistence: None,
         }
-        .run(history)
-        .await;
+        .run(history);
+
+        // The whole turn runs under one deadline, on top of the provider's
+        // own idle deadline — see `SubagentConfig` for what this catches
+        // that that one cannot.
+        let (text, stop) = match ctx.state.config.tools.subagent.turn_timeout() {
+            None => turn.await,
+            Some(limit) => match tokio::time::timeout(limit, turn).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return Err(timed_out(
+                        ctx,
+                        def,
+                        handle,
+                        created_at,
+                        history,
+                        over_cap_reason,
+                        limit,
+                    ));
+                }
+            },
+        };
 
         let answer = answer_text(text, stop);
         let history = std::mem::take(history);
@@ -676,8 +697,65 @@ impl SubagentTool {
             created_at,
             over_cap_reason,
         );
-        prefixed(&def.name, resumability, &answer)
+        Ok(prefixed(&def.name, resumability, &answer))
     }
+}
+
+/// Wind up a subagent turn that outran its deadline: save what it had, and
+/// build the error the parent model reads in place of an answer.
+///
+/// An error rather than an answer with a marker, because nothing was
+/// answered — the parent has to decide what to do next (resume, retry
+/// smaller, or carry on without it), and a tool error is the shape that
+/// says so. Before this existed the same situation said nothing at all:
+/// the `subagent` call just never returned (#258).
+///
+/// `history` is repaired before it is stored. The turn was dropped
+/// wherever it happened to be, and that can be between pushing an
+/// assistant message's `tool_use` and pushing the `tool_result` answering
+/// it — a history the provider API rejects, which would make the saved
+/// handle fail on its first resume instead of continuing.
+/// `repair_tool_pairing` answers such a call with the same placeholder a
+/// cache miss produces, which tells the model to call the tool again if it
+/// still needs it; that is exactly right for a call that never finished.
+fn timed_out(
+    ctx: &crate::serve::TurnContext,
+    def: &AgentDef,
+    handle: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+    history: &mut Vec<ChatMessage>,
+    over_cap_reason: &'static str,
+    limit: std::time::Duration,
+) -> anyhow::Error {
+    let secs = limit.as_secs();
+    warn!(
+        "subagent '{}' (handle {handle}) did not finish its turn within {secs}s; \
+         stopping it and reporting a timeout to the parent",
+        def.name
+    );
+    let history = crate::session_storage::repair_tool_pairing(std::mem::take(history));
+    let resumability = persist(
+        ctx.state.subagent_cache.as_deref(),
+        handle,
+        &def.name,
+        history,
+        created_at,
+        over_cap_reason,
+    );
+    let saved = match resumability {
+        Resumability::Resumable(handle) => format!(
+            "Its conversation so far was saved: pass handle {handle} as `resume` \
+             to continue it."
+        ),
+        Resumability::NotResumable(reason) => {
+            format!("Its conversation so far is not resumable: {reason}.")
+        }
+    };
+    anyhow::anyhow!(
+        "subagent '{}' timed out: its turn did not finish within {secs}s \
+         ([tools.subagent] turn_timeout_secs) and was stopped. {saved}",
+        def.name
+    )
 }
 
 /// How a dispatched or resumed child's answer should describe its own
@@ -1896,5 +1974,133 @@ mod tests {
         .unwrap();
         assert!(resumed.contains("resume answer"), "{resumed}");
         assert!(resumed.contains(&handle), "still resumable: {resumed}");
+    }
+
+    /// A tool whose call never returns — the other way, besides a stalled
+    /// provider stream, that a subagent's turn can hang inside one round
+    /// (#258).
+    struct HangingTool(ToolSpec);
+
+    #[async_trait]
+    impl Tool for HangingTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.0
+        }
+
+        fn kind(&self) -> ToolKind {
+            // Allowed from every origin, so the call actually runs — and
+            // hangs — rather than being refused before it starts.
+            ToolKind::Read
+        }
+
+        async fn execute(&self, _input: &serde_json::Value) -> anyhow::Result<String> {
+            std::future::pending().await
+        }
+    }
+
+    /// A subagent stuck inside a round must not hold its parent's call open
+    /// forever, and what it did get done must not be thrown away.
+    ///
+    /// Stuck on a hanging tool rather than a hanging provider because that
+    /// is the harder case for the saved history: the turn is dropped after
+    /// the assistant's `tool_use` was pushed and before any `tool_result`
+    /// was. Stored as-is, the provider API would reject the handle's very
+    /// first resume — so the resume below is the real assertion, not just
+    /// the error text.
+    #[tokio::test]
+    async fn a_subagent_turn_past_its_deadline_errors_and_stays_resumable() {
+        let mut state = crate::serve::ServeState::for_test(false);
+        std::sync::Arc::get_mut(&mut state)
+            .expect("uniquely owned immediately after construction")
+            .config
+            .tools
+            .subagent
+            .turn_timeout_secs = 1;
+        let hang_spec = spec_named("hang");
+        state
+            .tools
+            .register_tool(Box::new(HangingTool(hang_spec.clone())))
+            .await;
+
+        // Unrestricted, so `hang` is actually offered — `defs()`' reviewer
+        // would refuse it as not in its `tools:` list and never hang at all.
+        let tool = SubagentTool::new(vec![crate::agents::AgentDef {
+            name: "worker".to_string(),
+            description: "Works.".to_string(),
+            tools: None,
+            prompt: "You are a worker.".to_string(),
+            profile: None,
+        }]);
+        let provider = ScriptedProvider::new(vec![crate::provider::ChatResponse {
+            prompt_usage: None,
+            text: None,
+            tool_calls: vec![crate::provider::ToolCall {
+                id: "call_hang".to_string(),
+                name: "hang".to_string(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: None,
+        }]);
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::serve::scope_turn_context(
+                turn_context(
+                    std::sync::Arc::clone(&state),
+                    std::sync::Arc::clone(&provider)
+                        as std::sync::Arc<dyn crate::provider::Provider>,
+                    vec![hang_spec.clone()],
+                ),
+                tool.execute(&serde_json::json!({"agent": "worker", "prompt": "go"})),
+            ),
+        )
+        .await
+        .expect("the subagent's own deadline must fire before the test's")
+        .expect_err("a turn past its deadline is an error, not an answer")
+        .to_string();
+        assert!(err.contains("timed out"), "got: {err}");
+        let handle = err
+            .split("pass handle ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_else(|| panic!("the error must carry a resumable handle: {err}"))
+            .to_string();
+
+        let resume_provider = ScriptedProvider::new(vec![text_response("picked back up")]);
+        let resumed = crate::serve::scope_turn_context(
+            turn_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&resume_provider)
+                    as std::sync::Arc<dyn crate::provider::Provider>,
+                vec![hang_spec],
+            ),
+            tool.execute(&serde_json::json!({"resume": handle, "prompt": "carry on"})),
+        )
+        .await
+        .unwrap();
+        assert!(resumed.contains("picked back up"), "got: {resumed}");
+
+        // The interrupted call is answered in the very next message, which
+        // is the adjacency the API validates.
+        let messages = resume_provider.last_messages();
+        let use_at = messages
+            .iter()
+            .position(|m| {
+                m.parts.iter().any(|p| {
+                    matches!(p, crate::provider::ContentPart::ToolUse { id, .. } if id == "call_hang")
+                })
+            })
+            .expect("the interrupted tool_use is part of the saved history");
+        assert!(
+            messages
+                .get(use_at + 1)
+                .is_some_and(|next| next.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        crate::provider::ContentPart::ToolResult { tool_use_id, .. }
+                            if tool_use_id == "call_hang"
+                    )
+                })),
+            "the interrupted tool_use must be answered by the next message: {messages:?}"
+        );
     }
 }

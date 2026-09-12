@@ -92,6 +92,14 @@ model = "claude-opus-4-6"
 max_tokens = 8192
 # System prompt sent at the beginning of every conversation.
 system_prompt = "You are a helpful personal assistant."
+# Seconds connecting to the API may take. Defaults to 15; 0 disables.
+# connect_timeout_secs = 15
+# Seconds the API may send nothing at all — before its response headers
+# or between two chunks of the stream — before the request fails. This is
+# an idle deadline, not a total one: a long answer that keeps streaming is
+# never cut off, only a stream that has gone silent. Defaults to 300; 0
+# disables. Without it a stalled upstream hangs the turn forever.
+# stream_idle_timeout_secs = 300
 
 # ── Additional providers ────────────────────────────────────────────────
 # Beyond the built-in Anthropic provider above, you can declare any number
@@ -106,6 +114,11 @@ system_prompt = "You are a helpful personal assistant."
 # model    = "gemma-4-31b-it"
 # api_key  = ""                          # optional; llama.cpp does not need one
 # max_tokens = 4096
+# connect_timeout_secs     = 15          # see [anthropic]; 0 disables
+# stream_idle_timeout_secs = 300         # see [anthropic]; 0 disables. A local
+#                                        # server can stay silent while it
+#                                        # processes a very large prompt —
+#                                        # raise this if that trips it.
 
 # ── Profiles (LLM presets) ──────────────────────────────────────────────
 # A profile is a *pure* LLM preset: a provider plus an optional
@@ -306,6 +319,13 @@ system_prompt = "You are a helpful personal assistant."
 #     side; subagents are always judged `unattended`, whatever their
 #     parent is. These bound spend, not context — `[compression]` is what
 #     keeps the history in the window.
+#   - `[tools.subagent]` — `turn_timeout_secs` bounds how long one
+#     delegated subagent turn may run in total, default 3600, `0` for no
+#     limit. A turn past it is stopped and reported to the parent as a
+#     tool error, with its conversation so far saved under a handle the
+#     parent can `resume`. It is a backstop for hangs a round cap cannot
+#     see — a tool call that never returns — not a budget, so keep it well
+#     above how long real delegated work takes.
 #   - `[[tools.mcp_servers]]` — outbound MCP client. Connects to
 #     external MCP servers and exposes their tools to the agent as
 #     `mcp__<name>__<tool_name>`. Distinct from the inbound MCP
@@ -359,6 +379,9 @@ system_prompt = "You are a helpful personal assistant."
 # [tools.tool_rounds]
 # interactive = 0                           # ACP; 0 = unbounded
 # unattended  = 25                          # everything else
+#
+# [tools.subagent]
+# turn_timeout_secs = 3600                  # 0 = no limit
 #
 # # Example: HTTP transport to a remote MCP server.
 # [[tools.mcp_servers]]

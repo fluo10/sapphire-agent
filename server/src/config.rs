@@ -782,6 +782,57 @@ pub struct ToolsConfig {
     /// How many tool rounds one turn may spend. See [`ToolRounds`].
     #[serde(default)]
     pub tool_rounds: ToolRounds,
+    /// Limits on a delegated subagent's turn. See [`SubagentConfig`].
+    #[serde(default)]
+    pub subagent: SubagentConfig,
+}
+
+/// Limits on one delegated subagent turn, as a whole.
+///
+/// `[tools.tool_rounds]` already bounds how much a subagent may *spend*;
+/// this bounds how long its parent may be kept *waiting*. They are not the
+/// same thing: a turn stuck inside a single round — a provider stream that
+/// never ends, a tool call that never returns — spends nothing more and so
+/// never reaches a round cap, and before this existed it simply held the
+/// parent's `subagent` call open forever with nothing in the log (#258).
+///
+/// The provider-level idle deadline (`stream_idle_timeout_secs` on each
+/// provider) is what catches the common case; this is the backstop for
+/// everything that deadline cannot see.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SubagentConfig {
+    /// Seconds one subagent turn — every round and every tool call in it —
+    /// may run before it is stopped and reported to the parent as an error.
+    /// Its conversation so far is saved first, so the parent can resume it.
+    /// `0` means no limit.
+    ///
+    /// An hour by default, deliberately loose: this is not a budget, it is
+    /// the point past which "still working" is no longer the likely
+    /// explanation. A planning or implementation subagent can legitimately
+    /// run for twenty minutes and more, and cutting that off would lose
+    /// real work to a guard meant only for hangs.
+    #[serde(default = "SubagentConfig::default_turn_timeout_secs")]
+    pub turn_timeout_secs: u64,
+}
+
+impl SubagentConfig {
+    fn default_turn_timeout_secs() -> u64 {
+        3600
+    }
+
+    /// The deadline, or `None` when it is disabled.
+    pub fn turn_timeout(&self) -> Option<std::time::Duration> {
+        (self.turn_timeout_secs != 0)
+            .then(|| std::time::Duration::from_secs(self.turn_timeout_secs))
+    }
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            turn_timeout_secs: Self::default_turn_timeout_secs(),
+        }
+    }
 }
 
 /// Whether the agent may touch the machine it runs on.
@@ -1019,6 +1070,16 @@ pub struct AnthropicConfig {
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     pub system_prompt: Option<String>,
+    /// Seconds establishing a connection to the API may take. `0`
+    /// disables. See `crate::provider::http::default_connect_timeout_secs`.
+    #[serde(default = "crate::provider::http::default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Seconds the API may go without sending anything — before its
+    /// response headers or between two stream chunks — before the request
+    /// fails. `0` disables. See
+    /// `crate::provider::http::default_stream_idle_timeout_secs`.
+    #[serde(default = "crate::provider::http::default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
 }
 
 /// Env var consulted when `[anthropic].api_key` is absent.
@@ -3168,5 +3229,40 @@ embedding_num_threads = 4
             toml::from_str("[tool_rounds]\ninteractive = 40").unwrap();
         assert_eq!(tools.tool_rounds.interactive, 40);
         assert_eq!(tools.tool_rounds.unattended, 25);
+    }
+
+    /// An existing config names none of the #258 timeouts; it has to come up
+    /// with every deadline on, not with none of them.
+    #[test]
+    fn the_timeouts_default_on_when_a_config_names_none_of_them() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[providers.local]
+type = "openai_compatible"
+base_url = "http://127.0.0.1:8080/v1"
+model = "m"
+"#,
+        );
+        assert_eq!(cfg.anthropic.connect_timeout_secs, 15);
+        assert_eq!(cfg.anthropic.stream_idle_timeout_secs, 300);
+        let ProviderConfig::OpenAiCompatible(local) = &cfg.providers["local"];
+        assert_eq!(local.connect_timeout_secs, 15);
+        assert_eq!(local.stream_idle_timeout_secs, 300);
+        assert_eq!(
+            cfg.tools.subagent.turn_timeout(),
+            Some(std::time::Duration::from_secs(3600))
+        );
+    }
+
+    /// `0` turns the subagent deadline off, the same spelling
+    /// `[tools.tool_rounds]` uses for unbounded.
+    #[test]
+    fn a_zero_subagent_turn_timeout_means_no_deadline() {
+        let tools: crate::config::ToolsConfig =
+            toml::from_str("[subagent]\nturn_timeout_secs = 0").unwrap();
+        assert_eq!(tools.subagent.turn_timeout(), None);
     }
 }

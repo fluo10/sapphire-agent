@@ -5,7 +5,7 @@
 //! API itself. Tool calls follow the OpenAI `tools` / `tool_calls` shape.
 
 use crate::provider::{
-    ChatMessage, ChatResponse, ContentPart, PromptUsage, Provider, Role, ToolCall, ToolSpec,
+    ChatMessage, ChatResponse, ContentPart, PromptUsage, Provider, Role, ToolCall, ToolSpec, http,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -14,6 +14,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::time::Duration;
 use tracing::debug;
 
 /// Configuration for an OpenAI-compatible endpoint.
@@ -39,6 +40,16 @@ pub struct OpenAICompatibleConfig {
     pub provider_name: Option<String>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Seconds establishing a connection may take. `0` disables. See
+    /// `crate::provider::http::default_connect_timeout_secs`.
+    #[serde(default = "crate::provider::http::default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Seconds the endpoint may go without sending anything — before its
+    /// response headers or between two stream chunks — before the request
+    /// fails. `0` disables. See
+    /// `crate::provider::http::default_stream_idle_timeout_secs`.
+    #[serde(default = "crate::provider::http::default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
 }
 
 fn default_max_tokens() -> u32 {
@@ -52,6 +63,7 @@ pub struct OpenAICompatibleProvider {
     name: String,
     max_tokens: u32,
     client: Client,
+    stream_idle_timeout: Option<Duration>,
 }
 
 impl OpenAICompatibleProvider {
@@ -66,7 +78,8 @@ impl OpenAICompatibleProvider {
                 .clone()
                 .unwrap_or_else(|| "openai_compatible".to_string()),
             max_tokens: cfg.max_tokens,
-            client: Client::new(),
+            client: http::client(http::secs(cfg.connect_timeout_secs)),
+            stream_idle_timeout: http::secs(cfg.stream_idle_timeout_secs),
         }
     }
 
@@ -459,14 +472,22 @@ impl Provider for OpenAICompatibleProvider {
             req = req.bearer_auth(key);
         }
 
-        let response = req
-            .send()
-            .await
+        // Every read below runs under the idle deadline — the wait for the
+        // headers included, since an upstream can stall before them just as
+        // well as after. See `crate::provider::http`.
+        let idle = self.stream_idle_timeout;
+        let stalled = || format!("OpenAI-compatible endpoint {url}");
+        let response = http::idle(idle, stalled, req.send())
+            .await?
             .with_context(|| format!("Failed to send request to {url}"))?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = http::idle(idle, stalled, response.text())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
             bail!("OpenAI-compatible API error {status}: {body}");
         }
 
@@ -478,7 +499,7 @@ impl Provider for OpenAICompatibleProvider {
         let mut stop_reason: Option<String> = None;
         let mut prompt_tokens: Option<u32> = None;
 
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = http::idle(idle, stalled, stream.next()).await? {
             let chunk = chunk.context("Error reading SSE stream")?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -653,6 +674,8 @@ mod tests {
             model: "gemma".to_string(),
             provider_name: None,
             max_tokens: 4096,
+            connect_timeout_secs: 15,
+            stream_idle_timeout_secs: 300,
         });
         assert_eq!(p.endpoint(), "http://localhost:8080/v1/chat/completions");
     }
@@ -665,6 +688,8 @@ mod tests {
             model: "m".to_string(),
             provider_name: None,
             max_tokens: 1,
+            connect_timeout_secs: 15,
+            stream_idle_timeout_secs: 300,
         });
         assert_eq!(default.name(), "openai_compatible");
 
@@ -674,6 +699,8 @@ mod tests {
             model: "m".to_string(),
             provider_name: Some("llama_cpp".to_string()),
             max_tokens: 1,
+            connect_timeout_secs: 15,
+            stream_idle_timeout_secs: 300,
         });
         assert_eq!(custom.name(), "llama_cpp");
     }
@@ -764,6 +791,81 @@ mod tests {
         .unwrap();
         assert!(chunk.choices.is_empty());
         assert_eq!(chunk.usage.unwrap().prompt_tokens, 151673);
+    }
+
+    /// A provider pointed at `addr`, with an idle deadline short enough for a
+    /// test to wait out.
+    fn stalling_target(addr: std::net::SocketAddr) -> OpenAICompatibleProvider {
+        let mut p = OpenAICompatibleProvider::new(&OpenAICompatibleConfig {
+            base_url: format!("http://{addr}/v1"),
+            api_key: None,
+            model: "m".to_string(),
+            provider_name: None,
+            max_tokens: 1,
+            connect_timeout_secs: 15,
+            stream_idle_timeout_secs: 300,
+        });
+        p.stream_idle_timeout = Some(Duration::from_millis(200));
+        p
+    }
+
+    /// Accept one connection, drain the request, write `preamble`, then hold
+    /// the socket open without another byte — the shape of an upstream that
+    /// stalls (#258). Returns the address to point a provider at.
+    async fn stalling_server(preamble: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+            socket.write_all(preamble.as_bytes()).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        addr
+    }
+
+    /// The hang #258 was filed for: headers and the first chunk arrive, then
+    /// the stream goes silent. The turn has to fail at the idle deadline
+    /// rather than wait on `stream.next()` forever.
+    #[tokio::test]
+    async fn a_stream_that_stalls_mid_response_fails_at_the_idle_deadline() {
+        let addr = stalling_server(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             transfer-encoding: chunked\r\n\r\n\
+             22\r\ndata: {\"choices\":[{\"delta\":{}}]}\n\n\r\n",
+        )
+        .await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            stalling_target(addr).chat(None, &[ChatMessage::user("hi")], None),
+        )
+        .await
+        .expect("the provider's own deadline must fire before the test's");
+        let err = result.expect_err("a stalled stream must be an error, not a reply");
+        assert!(
+            format!("{err:#}").contains("sent nothing"),
+            "the error must say the stream stalled: {err:#}"
+        );
+    }
+
+    /// The same stall one step earlier: the connection is accepted but the
+    /// headers never come. `send()` is under the deadline too.
+    #[tokio::test]
+    async fn an_upstream_that_never_sends_headers_fails_at_the_idle_deadline() {
+        let addr = stalling_server("").await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            stalling_target(addr).chat(None, &[ChatMessage::user("hi")], None),
+        )
+        .await
+        .expect("the provider's own deadline must fire before the test's");
+        let err = result.expect_err("a silent upstream must be an error, not a reply");
+        assert!(
+            format!("{err:#}").contains("sent nothing"),
+            "the error must say the upstream stalled: {err:#}"
+        );
     }
 
     /// A server that ignores `stream_options` sends chunks with no usage at
