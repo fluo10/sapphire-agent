@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-server-v0.8.0...sapphire-agent-server-v0.8.1) - 2026-09-12
+
+### Added
+
+- *(workspace)* Pin system-prompt file reads until an explicit clear
+- *(agent)* Invalidate_system_prompts also clears the pinned file cache
+- *(tools)* Add refresh_system_prompt tool + document pinned prompt
+- *(serve)* Inject ACP session cwd into the system prompt
+- *(agents)* Parse an optional `profile:` onto agent definitions
+- *(config)* Reject agent definitions naming an unknown profile at startup
+- *(subagent)* Run profiled definitions on their profile's provider
+
+### Changed
+
+- Rustfmt the profile-parsing test added in the profile feature
+
+### Documentation
+
+- *(workspace)* Restore render_room_info doc comment placement
+
+### Fixed
+
+- Time out stalled provider streams and hung subagent turns ([#258](https://github.com/fluo10/sapphire-agent/pull/258))
+
+
+
 ## [0.8.0](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.7.2...sapphire-agent-server-v0.8.0) - 2026-09-07
 
 ### Changed
