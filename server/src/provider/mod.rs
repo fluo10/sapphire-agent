@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod fallback;
+pub mod http;
 pub mod openai_compatible;
 pub mod registry;
 

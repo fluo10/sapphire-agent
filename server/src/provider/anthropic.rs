@@ -1,6 +1,6 @@
 use crate::config::AnthropicConfig;
 use crate::provider::{
-    ChatMessage, ChatResponse, ContentPart, PromptUsage, Provider, Role, ToolCall, ToolSpec,
+    ChatMessage, ChatResponse, ContentPart, PromptUsage, Provider, Role, ToolCall, ToolSpec, http,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -9,6 +9,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::time::Duration;
 use tracing::debug;
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -20,6 +21,7 @@ pub struct AnthropicProvider {
     light_model: Option<String>,
     max_tokens: u32,
     client: Client,
+    stream_idle_timeout: Option<Duration>,
 }
 
 impl AnthropicProvider {
@@ -29,7 +31,8 @@ impl AnthropicProvider {
             model: cfg.model.clone(),
             light_model: cfg.light_model.clone(),
             max_tokens: cfg.max_tokens,
-            client: Client::new(),
+            client: http::client(http::secs(cfg.connect_timeout_secs)),
+            stream_idle_timeout: http::secs(cfg.stream_idle_timeout_secs),
         })
     }
 
@@ -405,20 +408,30 @@ impl Provider for AnthropicProvider {
 
         debug!("Sending request to Anthropic API (model={model})");
 
-        let response = self
+        // Every read below runs under the idle deadline — the wait for the
+        // headers included, since an upstream can stall before them just as
+        // well as after. See `crate::provider::http`.
+        let idle = self.stream_idle_timeout;
+        let stalled = || "Anthropic API".to_string();
+        let request = self
             .client
             .post(ANTHROPIC_API_URL)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&body)
-            .send()
-            .await
+            .send();
+        let response = http::idle(idle, stalled, request)
+            .await?
             .context("Failed to send request to Anthropic API")?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = http::idle(idle, stalled, response.text())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
             bail!("Anthropic API error {status}: {body}");
         }
 
@@ -430,7 +443,7 @@ impl Provider for AnthropicProvider {
         let mut stop_reason: Option<String> = None;
         let mut prompt_tokens: Option<u32> = None;
 
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = http::idle(idle, stalled, stream.next()).await? {
             let chunk = chunk.context("Error reading SSE stream")?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
