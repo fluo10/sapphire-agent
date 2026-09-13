@@ -99,6 +99,11 @@ pub struct SessionSources {
     channel: Option<Arc<SessionStore>>,
     cross_device: Arc<SessionStore>,
     device_default: Arc<SessionStore>,
+    /// The autonomous store (kind = `"autonomous"`). Included for the same
+    /// reason the others are: the loop's sessions are ordinary sessions, and
+    /// `session_list` is where a human finds out what happened overnight —
+    /// nothing is posted to a chat (design decision 11).
+    autonomous: Arc<SessionStore>,
     acp: Arc<AcpSessionStore>,
 }
 
@@ -108,6 +113,7 @@ impl SessionSources {
         channel: Option<Arc<SessionStore>>,
         cross_device: Arc<SessionStore>,
         device_default: Arc<SessionStore>,
+        autonomous: Arc<SessionStore>,
         acp: Arc<AcpSessionStore>,
     ) -> Self {
         Self {
@@ -115,6 +121,7 @@ impl SessionSources {
             channel,
             cross_device,
             device_default,
+            autonomous,
             acp,
         }
     }
@@ -139,6 +146,7 @@ impl SessionSources {
         }
         rows.extend(self.cross_device.session_rows());
         rows.extend(self.device_default.session_rows());
+        rows.extend(self.autonomous.session_rows());
         rows.extend(self.acp.session_rows());
         rows
     }
@@ -351,6 +359,7 @@ impl SessionReadTool {
                 self.sources.channel.as_ref(),
                 Some(&self.sources.cross_device),
                 Some(&self.sources.device_default),
+                Some(&self.sources.autonomous),
             ];
             stores
                 .into_iter()
@@ -564,6 +573,7 @@ provider = "anthropic"
             Some(Arc::new(SessionStore::new(base.clone(), "channel", None))),
             Arc::new(SessionStore::new(base.clone(), "cross-device", None)),
             Arc::new(SessionStore::new(base.clone(), "device-default", None)),
+            Arc::new(SessionStore::new(base.clone(), "autonomous", None)),
             Arc::new(AcpSessionStore::new(base, None)),
         ))
     }
@@ -803,5 +813,42 @@ provider = "anthropic"
             read.contains("port the parser") && read.contains("on it"),
             "{read}"
         );
+    }
+
+    /// Autonomous sessions are ordinary sessions as far as reading back
+    /// goes: last night's work is listed and readable from a chat, which
+    /// is the *only* way a human sees it (nothing is posted to a channel).
+    #[tokio::test]
+    async fn an_autonomous_session_is_listed_and_readable() {
+        let d = tempfile::tempdir().unwrap();
+        let sources = sources(&d);
+        let sid = sources
+            .autonomous
+            .create_autonomous_session("journal", "default")
+            .unwrap();
+        sources
+            .autonomous
+            .append(
+                &sid,
+                &ChatMessage::user("[Autonomous: journal]\n\nSummarise the day."),
+            )
+            .unwrap();
+        sources
+            .autonomous
+            .append(&sid, &ChatMessage::assistant("Done in three lines."))
+            .unwrap();
+
+        let listed = SessionListTool::new(Arc::clone(&sources))
+            .execute(&json!({}))
+            .await
+            .unwrap();
+        assert!(listed.contains(&sid), "listing was {listed}");
+        assert!(listed.contains("server/journal"), "listing was {listed}");
+
+        let read = SessionReadTool::new(sources)
+            .execute(&json!({"session_id": sid}))
+            .await
+            .unwrap();
+        assert!(read.contains("Done in three lines."), "read was {read}");
     }
 }

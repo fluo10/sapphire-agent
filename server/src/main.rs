@@ -897,6 +897,7 @@ async fn main() -> Result<()> {
                     Some(Arc::clone(&channel_session_store)),
                     Arc::clone(&cross_device_session_store),
                     Arc::clone(&device_default_session_store),
+                    Arc::clone(&autonomous_session_store),
                     Arc::clone(&serve_state.acp_session_store),
                 ));
                 tool_set
