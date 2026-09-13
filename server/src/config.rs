@@ -1320,11 +1320,11 @@ pub struct AutonomousConfig {
     pub poll_seconds: u64,
     /// Which row of the permission table an autonomous turn is judged by.
     ///
-    /// `Trusted` by default because the point of the feature is work
-    /// that needs `shell` (filing issues, committing). That is a
-    /// deliberate hole, not an oversight: the workspace is the
-    /// operator's, and the future "file edits are tool-only and
-    /// per-profile" policy is what closes it. See decision 10.
+    /// `Channel` by default — the safe default, the same row the
+    /// heartbeat's chat leg runs on: reads and unapproved edits, no
+    /// `Execute`/`Other`. An operator who wants the agent to run `shell`
+    /// on its own (filing issues, committing) sets `origin = "trusted"`
+    ///; see decision 10.
     ///
     /// Note this is only half the gate — `[tools] host_access.enabled`
     /// has to be on too, or `host_tool_denied` refuses `shell` and
@@ -1339,7 +1339,7 @@ impl Default for AutonomousConfig {
             enabled: false,
             idle_minutes: default_autonomous_idle_minutes(),
             poll_seconds: default_autonomous_poll_seconds(),
-            origin: AutonomousOrigin::Trusted,
+            origin: AutonomousOrigin::Channel,
         }
     }
 }
@@ -1355,13 +1355,14 @@ fn default_autonomous_poll_seconds() -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AutonomousOrigin {
+    /// `Origin::Channel`: reads and unapproved edits; `Execute` and
+    /// `Other` refused. The heartbeat's chat leg's row. The default —
+    /// the safe row; `trusted` is opt-in.
+    #[default]
+    Channel,
     /// `Origin::Trusted`: `/rpc`, voice and `/a2a`'s row. Everything,
     /// subject to `host_access`.
-    #[default]
     Trusted,
-    /// `Origin::Channel`: reads and unapproved edits; `Execute` and
-    /// `Other` refused. The heartbeat's chat leg's row.
-    Channel,
 }
 
 impl Config {
@@ -2037,7 +2038,11 @@ mod tests {
         assert!(!cfg.autonomous.enabled);
         assert_eq!(cfg.autonomous.idle_minutes, 30);
         assert_eq!(cfg.autonomous.poll_seconds, 60);
-        assert_eq!(cfg.autonomous.origin, AutonomousOrigin::Trusted);
+        assert_eq!(
+            cfg.autonomous.origin,
+            AutonomousOrigin::Channel,
+            "the default is the safe row; `trusted` is opt-in"
+        );
     }
 
     #[test]
