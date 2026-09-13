@@ -120,6 +120,11 @@ pub struct Config {
     /// session store.
     #[serde(default)]
     pub subagent_cache: SubagentCacheConfig,
+    /// Autonomous sessions: work the agent does on its own when no other
+    /// session is active. Off unless an operator turns it on — it is the
+    /// one feature here that spends compute with nobody waiting.
+    #[serde(default)]
+    pub autonomous: AutonomousConfig,
     /// Voice pipeline presets, referenced by `[room_profile.<n>].voice_pipeline`.
     #[serde(default, rename = "voice_pipeline")]
     pub voice_pipelines: HashMap<String, VoicePipelineConfig>,
@@ -1294,6 +1299,71 @@ fn default_subagent_cache_retain_days() -> u32 {
     7
 }
 
+/// Autonomous-session configuration. See the design doc, decisions 8–12.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutonomousConfig {
+    /// Whether the idle loop runs at all. Default false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How long every other session must have been quiet for the agent
+    /// to consider itself idle, in minutes. See `autonomous::is_idle`.
+    #[serde(default = "default_autonomous_idle_minutes")]
+    pub idle_minutes: u64,
+    /// How often the loop looks for work, including while it is idle.
+    ///
+    /// This is a poll, not a cadence: a cycle that finds nothing due
+    /// costs one directory read and one append-free scan, so a short
+    /// interval is cheap, but it is also the granularity at which an
+    /// edited task file takes effect.
+    #[serde(default = "default_autonomous_poll_seconds")]
+    pub poll_seconds: u64,
+    /// Which row of the permission table an autonomous turn is judged by.
+    ///
+    /// `Trusted` by default because the point of the feature is work
+    /// that needs `shell` (filing issues, committing). That is a
+    /// deliberate hole, not an oversight: the workspace is the
+    /// operator's, and the future "file edits are tool-only and
+    /// per-profile" policy is what closes it. See decision 10.
+    ///
+    /// Note this is only half the gate — `[tools] host_access.enabled`
+    /// has to be on too, or `host_tool_denied` refuses `shell` and
+    /// `file_write` before the table is consulted at all.
+    #[serde(default)]
+    pub origin: AutonomousOrigin,
+}
+
+impl Default for AutonomousConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_minutes: default_autonomous_idle_minutes(),
+            poll_seconds: default_autonomous_poll_seconds(),
+            origin: AutonomousOrigin::Trusted,
+        }
+    }
+}
+
+fn default_autonomous_idle_minutes() -> u64 {
+    30
+}
+
+fn default_autonomous_poll_seconds() -> u64 {
+    60
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomousOrigin {
+    /// `Origin::Trusted`: `/rpc`, voice and `/a2a`'s row. Everything,
+    /// subject to `host_access`.
+    #[default]
+    Trusted,
+    /// `Origin::Channel`: reads and unapproved edits; `Execute` and
+    /// `Other` refused. The heartbeat's chat leg's row.
+    Channel,
+}
+
 impl Config {
     /// Minimal valid config for tests outside this module. `anthropic` is
     /// the only field without a `#[serde(default)]`, so this is the
@@ -1956,6 +2026,39 @@ mod tests {
 
     fn parse(s: &str) -> Config {
         Config::parse_for_test(s)
+    }
+
+    /// The default is off. An agent that starts working on its own
+    /// because a new build shipped is not a behaviour change anyone
+    /// asked for.
+    #[test]
+    fn autonomous_is_disabled_by_default() {
+        let cfg = parse("[anthropic]\napi_key = \"test\"\n");
+        assert!(!cfg.autonomous.enabled);
+        assert_eq!(cfg.autonomous.idle_minutes, 30);
+        assert_eq!(cfg.autonomous.poll_seconds, 60);
+        assert_eq!(cfg.autonomous.origin, AutonomousOrigin::Trusted);
+    }
+
+    #[test]
+    fn the_autonomous_table_is_read() {
+        let cfg = parse(
+            "[anthropic]\napi_key = \"test\"\n\n\
+             [autonomous]\nenabled = true\nidle_minutes = 5\npoll_seconds = 1\norigin = \"channel\"\n",
+        );
+        assert!(cfg.autonomous.enabled);
+        assert_eq!(cfg.autonomous.idle_minutes, 5);
+        assert_eq!(cfg.autonomous.poll_seconds, 1);
+        assert_eq!(cfg.autonomous.origin, AutonomousOrigin::Channel);
+    }
+
+    /// A misspelled key in this table is a permission or a cadence the
+    /// operator believes is set and is not.
+    #[test]
+    fn a_typo_in_the_autonomous_table_is_rejected() {
+        let raw =
+            "[anthropic]\napi_key = \"test\"\n\n[autonomous]\nenabled = true\nidle_minute = 5\n";
+        assert!(toml::from_str::<Config>(raw).is_err());
     }
 
     const MINIMAL: &str = r#"
