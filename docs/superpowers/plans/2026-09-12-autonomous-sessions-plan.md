@@ -1451,23 +1451,8 @@ fn is_due(
     }
 }
 
-/// Where this task's work goes next: the newest *open* session for it, or
-/// `None`, meaning "start a new one".
-fn resume_target(rows: &[SessionRow], task: &str) -> Option<String> {
-    rows.iter()
-        .filter(|r| r.meta.room_id == task && !r.is_closed)
-        .max_by_key(|r| r.last_at.unwrap_or(r.meta.created_at))
-        .map(|r| r.meta.session_id.clone())
-}
-
-/// How many turns this session has already spent. User messages, because
-/// every turn of this loop appends exactly one.
-fn turns_spent(store: &SessionStore, session_id: &str) -> usize {
-    store
-        .load_session(session_id)
-        .map(|h| h.iter().filter(|m| m.role == Role::User).count())
-        .unwrap_or(0)
-}
+// There is no resume: every run starts a fresh session and runs it to the
+// end of the cycle (design decisions 5 and 13).
 
 /// The idle loop.
 pub struct AutonomousLoop {
@@ -1570,23 +1555,21 @@ impl AutonomousLoop {
             return Ok(());
         };
 
-        self.run_task(&task, &store, &rows).await
+        self.run_task(&task, &store).await
     }
 
-    /// The session-level unit of work: resume or create, then turn until
-    /// done, capped, or interrupted by somebody else starting to talk.
+    /// The session-level unit of work: create a fresh session for the
+    /// task, then turn until done or capped. There is no resume — every
+    /// run starts a new session and closes it at the end (design
+    /// decisions 5 and 13).
     async fn run_task(
         &mut self,
         task: &AutonomousTask,
         store: &Arc<SessionStore>,
-        rows: &[SessionRow],
     ) -> anyhow::Result<()> {
         let namespace = DEFAULT_NAMESPACE_NAME;
-        let session_id = match resume_target(rows, &task.name) {
-            Some(sid) => sid,
-            None => store.create_autonomous_session(&task.name, namespace)?,
-        };
-        let mut turns = turns_spent(store, &session_id);
+        let session_id = store.create_autonomous_session(&task.name, namespace)?;
+        let mut turns = 0;
 
         // The session's own path, workspace-relative: the second line of
         // the first message, so a task that keeps a journal can name the
@@ -1643,6 +1626,9 @@ impl AutonomousLoop {
             let spent = outcome.text.is_none();
             let capped = turns >= task.max_turns;
 
+            // Every run runs the session to the end of the cycle: done or
+            // capped closes it; there is no paused state to fall back to
+            // (design decision 13).
             if said_done || spent || capped {
                 if let Err(e) = store.close_session(&session_id) {
                     warn!("autonomous: cannot close {}: {e}", task.name);
@@ -1666,18 +1652,6 @@ impl AutonomousLoop {
                 return Ok(());
             }
 
-            // Between turns only: interrupting a turn in flight is out of
-            // scope (design decision 13). Somebody talking now means stop
-            // *after* this turn and leave the session open, so the next
-            // quiet moment continues it instead of starting over.
-            if !is_idle(&self.busy_rows(), Utc::now(), self.idle) {
-                write_state(
-                    &self.workspace_dir,
-                    "idle",
-                    format!("busy: paused {}, {turns} turn(s) spent", task.name),
-                );
-                return Ok(());
-            }
         }
     }
 }
@@ -2028,8 +2002,8 @@ Three things separate this from a heartbeat task:
 - **It starts on idleness, not on a clock.** A heartbeat fires at a time; this
   waits until no other session has moved.
 - **It keeps going until the task is done.** A heartbeat is one prompt; this is
-  a session, resumed across quiet moments and closed when the model answers
-  `DONE` or `max_turns` runs out.
+  a session, run to the end of one cycle and closed when the model answers
+  `DONE` or `max_turns` runs out (mid-run pausing is out of scope).
 - **One task is one session.** `session_list` shows them as `server/<task>` and
   `session_read` shows the transcript, so last night's work is something you
   read rather than something that was posted at you.
@@ -2116,8 +2090,8 @@ cargo fmt --all -- --check
 |---|---|
 | 1. 既定で無効 | `config::tests::autonomous_is_disabled_by_default`、`main.rs` の `enabled` 分岐 |
 | 2. 1セッションが作られ本文が最初の user メッセージになる | `autonomous::tests::one_cycle_runs_the_task_and_closes_the_session`、Task 6 Step 5 の手動確認 |
-| 3. 動きがある間は始まらない／静かになったら同じセッションの続き | `autonomous::tests::a_busy_agent_starts_nothing`（開始しない側）、`resume_target` が `!is_closed` で絞る（再開側） |
-| 4. `max_turns` 到達で閉じ、次は新規セッション | 同テストの `is_closed` 表明と `resume_target` |
+| 3. 動きがある間は始まらない（開始のみ。中座・再開はスコープ外: 仕様 決定 13） | `autonomous::tests::a_busy_agent_starts_nothing` |
+| 4. `max_turns` 到達で閉じ、次は新規セッション | 同テストの `is_closed` 表明（セッションは常に新規で、走り切りで閉じる） |
 | 5. `cooldown_days` の内側では due にならない | `autonomous::tests::the_store_anchor_is_what_makes_a_task_due`、`a_cooled_down_task_starts_nothing` |
 | 6. タスク0件／壊れたファイルは飛ばす | `autonomous_config::tests` の6件 |
 | 7. `state/autonomous.json` に理由が出る | サイクルテスト3件の `AutonomousState` 表明 |
