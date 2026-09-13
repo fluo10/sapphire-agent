@@ -12,14 +12,10 @@
 //! (see the design doc, decisions 3 and 5), so a definition file holds
 //! only what a human decides.
 
-// The whole module is dead code until the autonomous loop (Issue #248
-// Task 5) wires it in; each item carries a scoped allow instead of a
-// module-wide one, mirroring SessionStore's convention.
 use serde::Deserialize;
 use std::path::Path;
 use tracing::warn;
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AutonomousTaskMeta {
@@ -39,22 +35,18 @@ struct AutonomousTaskMeta {
     max_turns: usize,
 }
 
-#[allow(dead_code)]
 fn default_true() -> bool {
     true
 }
 
-#[allow(dead_code)]
 fn default_priority() -> i64 {
     100
 }
 
-#[allow(dead_code)]
 fn default_max_turns() -> usize {
     3
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct AutonomousTask {
     /// The file stem, which is also the session's `room_id`.
@@ -69,7 +61,6 @@ pub struct AutonomousTask {
 
 /// Load every task under `dir`, skipping the ones that cannot be read.
 /// A missing directory is no tasks, not an error.
-#[allow(dead_code)]
 pub fn load_autonomous_dir(dir: &Path) -> Vec<AutonomousTask> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -106,7 +97,6 @@ pub fn load_autonomous_dir(dir: &Path) -> Vec<AutonomousTask> {
     out
 }
 
-#[allow(dead_code)]
 fn parse_task(name: String, raw: &str) -> Option<AutonomousTask> {
     let (fm, body) = crate::frontmatter::split(raw)?;
     let meta: AutonomousTaskMeta = match serde_yaml::from_str(fm) {

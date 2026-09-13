@@ -227,8 +227,6 @@ pub enum FileNaming {
     /// session id from the file stem and would read back
     /// `2026-09-12-<uuid>` — a date prefix the resolver here does not
     /// accept. Dated stores use `session_rows` / `resolve_path` instead.
-    #[allow(dead_code)] // Reached only via `with_dated_files`, which no
-    // non-test caller uses until the autonomous loop lands.
     Dated { boundary_hour: u8 },
 }
 
@@ -311,8 +309,6 @@ impl SessionStore {
     /// store wants it and every other call site — four in `main.rs`,
     /// eleven in tests — would otherwise have to name the `Plain`
     /// default explicitly.
-    #[allow(dead_code)] // Public API the autonomous loop (a later task)
-    // consumes; `create_autonomous_session` below is the other half.
     pub fn with_dated_files(mut self, boundary_hour: u8) -> Self {
         self.naming = FileNaming::Dated { boundary_hour };
         self
@@ -489,8 +485,6 @@ impl SessionStore {
     /// `channel` is `"server"`: the same value a `/rpc` session uses,
     /// because an autonomous session is not a chat and has no channel of
     /// its own.
-    #[allow(dead_code)] // Callers arrive with the autonomous loop; the
-    // tests here are the only ones today.
     pub fn create_autonomous_session(&self, task: &str, namespace: &str) -> anyhow::Result<String> {
         self.create_session(&(task.to_string(), None), "server", namespace)
     }

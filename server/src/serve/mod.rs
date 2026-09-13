@@ -81,7 +81,6 @@ pub struct ServeState {
     /// sessions for the purpose of reading them back, and not chat for
     /// the purpose of anything else. Its files are named by agent-day
     /// (`{date}-{uuid}.jsonl`) — see `SessionStore::with_dated_files`.
-    #[allow(dead_code)] // Consumed by the autonomous loop (issue 248 Task 5).
     pub(crate) autonomous_session_store: Arc<SessionStore>,
     /// MCP session store (kind = `"mcp"`). Holds long-lived
     /// per-project sessions written through `/mcp`'s `write_report`
@@ -2080,7 +2079,6 @@ impl TurnHost for NullProgress {
 /// `round_budget` is *not* implemented: `Unattended` is the correct
 /// answer, because nobody can cancel an autonomous turn in flight, and
 /// the default is already that.
-#[allow(dead_code)] // Consumed by the autonomous loop (issue 248 Task 5).
 pub(crate) struct AutonomousHost {
     pub(crate) origin: crate::tools::policy::Origin,
 }
@@ -2156,12 +2154,12 @@ pub(crate) struct LlmTurnOutcome {
     /// Final assistant text, when the turn completed successfully. `None`
     /// on provider error or when the `[tools.tool_rounds]` budget was hit
     /// without resolving.
-    text: Option<String>,
+    pub(crate) text: Option<String>,
     /// True iff the session had no prior turns before this one. Used by
     /// callers to decide whether to spawn a title-generation task.
-    was_first_turn: bool,
+    pub(crate) was_first_turn: bool,
     /// Which of those endings this was. See [`TurnStop`].
-    stop: TurnStop,
+    pub(crate) stop: TurnStop,
 }
 
 /// Which tools a turn's model may see.
