@@ -657,6 +657,23 @@ async fn main() -> Result<()> {
                 tool_payload_cache.clone(),
             ));
 
+            // ── Autonomous session store (sessions/<ns>/autonomous/) ────────
+            // Where the idle loop's sessions live. Built unconditionally —
+            // construction touches nothing — so `session_list` can read what
+            // last night's loop wrote even in a process that has autonomous
+            // sessions turned off. Files are named `{agent-day}-{uuid}.jsonl`
+            // so an overnight run reads as a run in a directory listing; the
+            // session's own metadata is one line away and unchanged.
+            let autonomous_session_store = Arc::new(
+                SessionStore::with_workspace(
+                    sessions_base.clone(),
+                    "autonomous",
+                    Arc::clone(&ws_state),
+                    tool_payload_cache.clone(),
+                )
+                .with_dated_files(config.day_boundary_hour),
+            );
+
             // ── MCP session store (sessions/<namespace>/mcp/) ──────────────
             // External AI clients (Claude Code, etc.) reach this through
             // the `/mcp` `write_report` / `recall_memory` tools. Kept in
@@ -839,6 +856,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&tool_set),
                 Arc::clone(&cross_device_session_store),
                 Arc::clone(&device_default_session_store),
+                Arc::clone(&autonomous_session_store),
                 Arc::clone(&mcp_session_store),
                 voice_providers,
                 image_cache.clone(),
