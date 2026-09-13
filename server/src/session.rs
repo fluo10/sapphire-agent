@@ -222,6 +222,11 @@ pub enum FileNaming {
     Plain,
     /// `{date}-{session_id}.jsonl`, `date` being the agent-day (per
     /// `boundary_hour`) the file was created in.
+    ///
+    /// Not supported by [`SessionStore::load_all`], which derives its
+    /// session id from the file stem and would read back
+    /// `2026-09-12-<uuid>` — a date prefix the resolver here does not
+    /// accept. Dated stores use `session_rows` / `resolve_path` instead.
     #[allow(dead_code)] // Reached only via `with_dated_files`, which no
     // non-test caller uses until the autonomous loop lands.
     Dated { boundary_hour: u8 },
@@ -2387,6 +2392,13 @@ mod tests {
     /// The autonomous store names its files by agent-day, and every write
     /// path has to still find them: `append` is the first thing that runs
     /// after the session is created.
+    ///
+    /// Both halves matter. The first store sees every resolution as a
+    /// `path_cache` hit, so it only pins the name `create_session`
+    /// wrote; the second is opened cold over the same directory and is
+    /// what actually exercises the Dated branch of `resolve_path` — the
+    /// scan that strips `-{session_id}.jsonl` and checks for the
+    /// 10-character date in front of it.
     #[test]
     fn a_dated_store_creates_and_resolves_its_own_filenames() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2414,10 +2426,54 @@ mod tests {
         assert_eq!(rows[0].meta.room_id, "refactor");
         assert_eq!(rows[0].meta.channel, "server");
         assert_eq!(rows[0].meta.namespace.as_deref(), Some("default"));
+
+        // Cold cache: a store that never created this session must still
+        // find it by name, through the Dated suffix scan rather than the
+        // path cache.
+        let cold =
+            SessionStore::new(tmp.path().to_path_buf(), "autonomous", None).with_dated_files(4);
+        let resolved = cold
+            .absolute_path_for(&sid)
+            .expect("a cold store must resolve the dated file");
+        assert_eq!(resolved, path);
+        assert_eq!(cold.load_session(&sid).unwrap().len(), 1);
+        assert_eq!(cold.session_rows().len(), 1);
+
+        // The scan is keyed on the id, and the date prefix is not one:
+        // an id embedded in a different day's name is a different file.
+        let mut longer_sid = sid.clone();
+        longer_sid.push('0');
+        assert!(
+            cold.absolute_path_for(&longer_sid).is_none(),
+            "the id must match whole, not as a prefix of a longer name"
+        );
+
+        // ... and a name that ends in the right id but has no 10-char
+        // date before it is not this session either.
+        std::fs::write(
+            tmp.path()
+                .join("default")
+                .join("autonomous")
+                .join(format!("backup-{sid}.jsonl")),
+            "",
+        )
+        .unwrap();
+        let cold_again =
+            SessionStore::new(tmp.path().to_path_buf(), "autonomous", None).with_dated_files(4);
+        assert_eq!(
+            cold_again.absolute_path_for(&sid).unwrap(),
+            path,
+            "the 10-character-date requirement must pick the dated file"
+        );
     }
 
     /// A plain store must not change: its filename is still exactly
     /// `{session_id}.jsonl`, and a dated-looking neighbour does not resolve.
+    ///
+    /// The collision check goes through a fresh store, because the one
+    /// that created the session answers from `path_cache` and would not
+    /// notice if the exact-name match had been replaced by the Dated
+    /// suffix match.
     #[test]
     fn a_plain_store_still_matches_its_filename_exactly() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2441,6 +2497,14 @@ mod tests {
                 .unwrap()
                 .file_name()
                 .unwrap(),
+            std::ffi::OsStr::new(&format!("{sid}.jsonl"))
+        );
+
+        // Cold cache: the exact-name branch of `resolve_path` is what
+        // decides here, and it must ignore the dated neighbour.
+        let cold = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
+        assert_eq!(
+            cold.absolute_path_for(&sid).unwrap().file_name().unwrap(),
             std::ffi::OsStr::new(&format!("{sid}.jsonl"))
         );
     }
