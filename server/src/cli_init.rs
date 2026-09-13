@@ -49,6 +49,10 @@ const TEMPLATES: &[(&str, &str)] = &[
         "heartbeat/example-morning.md",
         include_str!("../templates/workspace/example-morning.md"),
     ),
+    (
+        "autonomous/example-autonomous.md",
+        include_str!("../templates/workspace/example-autonomous.md"),
+    ),
 ];
 
 /// Directories created empty. The periodic-log writers fill them at their own
@@ -182,6 +186,7 @@ mod tests {
         ".sapphire-agent/config.toml",
         "agents/example-reviewer.md",
         "heartbeat/example-morning.md",
+        "autonomous/example-autonomous.md",
     ];
 
     #[test]
