@@ -31,6 +31,16 @@ heartbeat_enabled = false
 # Re-index the workspace this often, in minutes.
 # sync_interval_minutes = 15
 
+# Autonomous sessions: the agent works on tasks from autonomous/*.md
+# when no other session has been active for this long. Off in a fresh
+# workspace for the same reason heartbeat is — a test rig sharing a
+# machine should not start working on its own.
+# [autonomous]
+# enabled = false
+# idle_minutes = 30
+# poll_seconds = 60
+# origin = "trusted"   # "trusted" (everything, needs [tools] host_access) | "channel" (no shell)
+
 # The agent's model and framing. The API key itself is host-local.
 # [anthropic]
 # model = "claude-sonnet-5"

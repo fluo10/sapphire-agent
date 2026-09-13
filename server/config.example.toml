@@ -43,6 +43,28 @@
 # environments that share the same workspace to avoid duplicate tasks.
 # heartbeat_enabled = false
 
+# Autonomous sessions: when no other session has been active for
+# `idle_minutes`, the agent picks the highest-priority due task from
+# `<workspace>/autonomous/*.md` and works on it for up to that task's
+# `max_turns`, as a normal session you can read back with `session_list`
+# and `session_read`.
+#
+# Off by default. Two switches have to agree before an autonomous turn
+# can do outward work like filing a GitHub issue:
+#
+#   - `origin = "trusted"` lets the permission table allow `shell` and
+#     `file_write`. With `origin = "channel"` they are refused and the
+#     feature can only read and edit workspace files.
+#   - `[tools] host_access.enabled = true` — without it the host tools
+#     are refused before the permission table is consulted at all, for
+#     every origin.
+#
+# [autonomous]
+# enabled = true
+# idle_minutes = 30
+# poll_seconds = 60
+# origin = "trusted"
+
 # Day-boundary session policy. One of:
 #   "reset"   — close the session; next message starts a new one (legacy default)
 #   "compact" — keep the session; force-summarize prior-day history into a stub

@@ -39,6 +39,13 @@ pub const WORKSPACE_ALLOWLIST: &[&[&str]] = &[
     &["daily_log_enabled"],
     &["memory_compaction_enabled"],
     &["heartbeat_enabled"],
+    // The autonomous loop's switch and cadence. Allowed for the same
+    // reason `heartbeat_enabled` is: it describes how the agent behaves,
+    // not where its credentials live. The cost of allowing it is that
+    // whoever can write the workspace can set `enabled = true` and
+    // `idle_minutes = 0` — the same power `heartbeat_enabled` already
+    // hands them, so not a new hole (design doc, risk 5).
+    &["autonomous"],
     &["sync_interval_minutes"],
     &["digest"],
     &["timer"],
@@ -642,6 +649,11 @@ daily_log_enabled = true
 memory_compaction_enabled = true
 heartbeat_enabled = true
 sync_interval_minutes = 15
+
+[autonomous]
+enabled = true
+idle_minutes = 15
+origin = "channel"
 
 [anthropic]
 model = "claude-opus-5"

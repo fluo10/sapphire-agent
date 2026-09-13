@@ -75,6 +75,13 @@ pub struct ServeState {
     /// pushes target and that a satellite falls into when no other session
     /// is selected. Lazy-created, daily-rotated. See #122.
     pub(crate) device_default_session_store: Arc<SessionStore>,
+    /// Autonomous session store (kind = `"autonomous"`). Holds the
+    /// sessions the idle loop runs, one per task — kept in its own
+    /// directory for the same reason the ACP store is: they are ordinary
+    /// sessions for the purpose of reading them back, and not chat for
+    /// the purpose of anything else. Its files are named by agent-day
+    /// (`{date}-{uuid}.jsonl`) — see `SessionStore::with_dated_files`.
+    pub(crate) autonomous_session_store: Arc<SessionStore>,
     /// MCP session store (kind = `"mcp"`). Holds long-lived
     /// per-project sessions written through `/mcp`'s `write_report`
     /// tool — kept physically separate from `cross_device_session_store` so the
@@ -186,6 +193,8 @@ impl ServeState {
         tools: Arc<ToolSet>,
         cross_device_session_store: Arc<SessionStore>,
         device_default_session_store: Arc<SessionStore>,
+        // Autonomous sessions, one per task. See the field's doc.
+        autonomous_session_store: Arc<SessionStore>,
         mcp_session_store: Arc<SessionStore>,
         voice: Option<Arc<VoiceProviders>>,
         image_cache: Option<Arc<crate::image_cache::ImageCache>>,
@@ -224,6 +233,7 @@ impl ServeState {
             )),
             cross_device_session_store,
             device_default_session_store,
+            autonomous_session_store,
             mcp_session_store,
             mcp_project_index: tokio::sync::Mutex::new(mcp_index),
             sessions: tokio::sync::Mutex::new(HashMap::new()),
@@ -250,14 +260,27 @@ impl ServeState {
         self.acp_sessions.lock().await.contains(session_id)
     }
 
-    /// Pick the [`SessionStore`] that owns `session_id`. Device-default
-    /// sessions land in `device-default/`; everything else (cross-device
-    /// text sessions, deferred sessions awaiting their first message)
-    /// lives in `cross_device_session_store`'s `rpc/` tree. Falls back
-    /// to the cross-device store so newly-`ensure_session`'d files
-    /// (which haven't hit disk yet) commit to the right place. See #122.
+    /// Pick the [`SessionStore`] that owns `session_id`. Autonomous
+    /// sessions land in `autonomous/`, device-default sessions in
+    /// `device-default/`; everything else (cross-device text sessions,
+    /// deferred sessions awaiting their first message) lives in
+    /// `cross_device_session_store`'s `rpc/` tree. Falls back to the
+    /// cross-device store so newly-`ensure_session`'d files (which
+    /// haven't hit disk yet) commit to the right place. See #122.
+    ///
+    /// Autonomous is checked first because its store is the one whose
+    /// files are named by agent-day: a session created by the loop is
+    /// found through its store's own path cache and nowhere else, so
+    /// asking the device-default store first would strand every append
+    /// of an autonomous turn in the cross-device tree.
     pub(crate) fn store_for_session(&self, session_id: &str) -> &Arc<SessionStore> {
         if self
+            .autonomous_session_store
+            .absolute_path_for(session_id)
+            .is_some()
+        {
+            &self.autonomous_session_store
+        } else if self
             .device_default_session_store
             .absolute_path_for(session_id)
             .is_some()
@@ -2043,6 +2066,36 @@ impl TurnHost for NullProgress {
     async fn turn_error(&self, _message: &str) {}
 }
 
+/// The host for an autonomous turn.
+///
+/// Deliberately tiny: it carries the permission-table row and nothing
+/// else. Everything an autonomous session *is* — the system prompt, the
+/// tools, the persistence — is decided by `run_llm_turn` and the
+/// configuration, exactly as it is for any other session. This type
+/// exists so that the day the workspace-access policy lands (design doc,
+/// decision 10) there is one place to teach about a directory scope
+/// rather than four.
+///
+/// `round_budget` is *not* implemented: `Unattended` is the correct
+/// answer, because nobody can cancel an autonomous turn in flight, and
+/// the default is already that.
+pub(crate) struct AutonomousHost {
+    pub(crate) origin: crate::tools::policy::Origin,
+}
+
+#[async_trait::async_trait]
+impl TurnHost for AutonomousHost {
+    async fn tool_start(&self, _id: &str, _name: &str) {}
+    async fn tool_end(&self, _id: &str, _name: &str) {}
+    async fn turn_error(&self, message: &str) {
+        warn!("Autonomous turn error: {message}");
+    }
+
+    fn origin(&self) -> crate::tools::policy::Origin {
+        self.origin
+    }
+}
+
 /// Which round budget a turn is judged by.
 ///
 /// A property of the *route*, not of the request: what separates the two
@@ -2101,12 +2154,12 @@ pub(crate) struct LlmTurnOutcome {
     /// Final assistant text, when the turn completed successfully. `None`
     /// on provider error or when the `[tools.tool_rounds]` budget was hit
     /// without resolving.
-    text: Option<String>,
+    pub(crate) text: Option<String>,
     /// True iff the session had no prior turns before this one. Used by
     /// callers to decide whether to spawn a title-generation task.
-    was_first_turn: bool,
+    pub(crate) was_first_turn: bool,
     /// Which of those endings this was. See [`TurnStop`].
-    stop: TurnStop,
+    pub(crate) stop: TurnStop,
 }
 
 /// Which tools a turn's model may see.
@@ -3646,6 +3699,14 @@ rooms    = []
                 "device-default",
                 None,
             )),
+            // Same layout production builds (`<sessions_base>/<ns>/autonomous/`,
+            // here under the workspace dir) so a test asserting the
+            // workspace-relative path a loop run writes actually exercises
+            // the derived path, not a fallback string.
+            autonomous_session_store: Arc::new(
+                SessionStore::new(base.join("workspace").join("sessions"), "autonomous", None)
+                    .with_dated_files(4),
+            ),
             mcp_session_store: Arc::new(SessionStore::new(base.join("mcp"), "mcp", None)),
             mcp_project_index: Default::default(),
             sessions: Default::default(),
@@ -5780,5 +5841,39 @@ mod tests {
         .await;
 
         assert_eq!(outcome.text.as_deref(), Some("finished"));
+    }
+
+    /// The autonomous store owns its sessions, and `store_for_session`
+    /// has to say so — otherwise every `append` in an autonomous turn
+    /// lands in the cross-device tree and the session is never found
+    /// again.
+    #[tokio::test]
+    async fn an_autonomous_session_resolves_to_the_autonomous_store() {
+        let state = ServeState::for_test(false);
+        let sid = state
+            .autonomous_session_store
+            .create_autonomous_session("refactor", "default")
+            .unwrap();
+
+        let store = state.store_for_session(&sid);
+        assert!(Arc::ptr_eq(store, &state.autonomous_session_store));
+        assert!(!Arc::ptr_eq(store, &state.cross_device_session_store));
+    }
+
+    /// The default host is `Trusted`, and `round_budget` is left at the
+    /// `Unattended` default — nobody can cancel an autonomous turn, so
+    /// its budget must stay finite.
+    #[test]
+    fn the_autonomous_host_is_trusted_and_unattended() {
+        let host = AutonomousHost {
+            origin: crate::tools::policy::Origin::Trusted,
+        };
+        assert_eq!(host.origin(), crate::tools::policy::Origin::Trusted);
+        assert_eq!(host.round_budget(), RoundBudget::Unattended);
+
+        let host = AutonomousHost {
+            origin: crate::tools::policy::Origin::Channel,
+        };
+        assert_eq!(host.origin(), crate::tools::policy::Origin::Channel);
     }
 }

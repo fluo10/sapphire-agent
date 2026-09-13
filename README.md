@@ -760,6 +760,44 @@ If you are reading this because connections still drop, the interval is
 the first thing to check against the proxy's own timeout — `timeout
 tunnel` in HAProxy, `proxy_read_timeout` in nginx.
 
+## Autonomous sessions
+
+When nothing else has touched the agent for `idle_minutes`, it picks the
+highest-priority due task out of `<workspace>/autonomous/*.md` and works on it
+as an ordinary session, for up to that task's `max_turns`.
+
+Three things separate this from a heartbeat task:
+
+- **It starts on idleness, not on a clock.** A heartbeat fires at a time; this
+  waits until no other session has moved.
+- **It keeps going until the task is done.** A heartbeat is one prompt; this is
+  a session, run to the end of one cycle and closed when the model answers
+  `DONE` or `max_turns` runs out (mid-run pausing is out of scope).
+- **One task is one session.** `session_list` shows them as `server/<task>` and
+  `session_read` shows the transcript, so last night’s work is something you
+  read rather than something that was posted at you.
+
+Off by default:
+
+```toml
+[autonomous]
+enabled = true
+idle_minutes = 30    # how quiet everything else has to be
+poll_seconds = 60    # how often the loop looks for work
+origin = "channel"   # "channel" (default) | "trusted"
+```
+
+`origin = "channel"` runs tasks with the same permissions as a chat message:
+reads and unapproved edits, no `shell`. Tasks that need `shell` (filing an
+issue, committing) need `origin = "trusted"` **and**
+`[tools] host_access.enabled = true` — without the latter, the host tools are
+refused before permissions are consulted at all.
+
+While a task runs, `<workspace>/state/autonomous.json` carries a one-line
+reason (`task: journal, turn 2/3`) so you can tell what the agent is doing
+without reading the session. Task definitions are re-read every cycle, so
+editing one takes effect without a restart.
+
 ## Skills
 
 A skill is a written procedure for a kind of work — planning, TDD,

@@ -444,13 +444,11 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     }
 }
 
-#[cfg(test)]
 impl Workspace {
     /// The workspace root `build_system_prompt` reads `AGENTS.md`,
-    /// `SOUL.md`, etc. from. Test-only: production code has no reason to
-    /// reach behind `build_system_prompt`'s own file reads, but a test
-    /// that wants to assert a workspace file's content is (or is not)
-    /// reflected in the prompt needs somewhere to write that file first.
+    /// `SOUL.md`, etc. from. Also the workspace-relative path base the
+    /// autonomous loop names session files by. Tests use it to write a
+    /// workspace file before asserting on the rendered prompt.
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }

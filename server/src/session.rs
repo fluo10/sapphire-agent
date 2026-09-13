@@ -215,6 +215,21 @@ pub struct SummaryLine {
 // SessionStore
 // ---------------------------------------------------------------------------
 
+/// How a [`SessionStore`] names the files it writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileNaming {
+    /// `{session_id}.jsonl`. Every store but the autonomous one.
+    Plain,
+    /// `{date}-{session_id}.jsonl`, `date` being the agent-day (per
+    /// `boundary_hour`) the file was created in.
+    ///
+    /// Not supported by [`SessionStore::load_all`], which derives its
+    /// session id from the file stem and would read back
+    /// `2026-09-12-<uuid>` — a date prefix the resolver here does not
+    /// accept. Dated stores use `session_rows` / `resolve_path` instead.
+    Dated { boundary_hour: u8 },
+}
+
 pub struct SessionStore {
     /// Base sessions directory (e.g. `<workspace>/sessions`). Per-session
     /// files live under `<base_dir>/<namespace>/<kind>/<session_id>.jsonl`
@@ -228,6 +243,14 @@ pub struct SessionStore {
     /// `"mcp"` for MCP project sessions. Lets the Agent and ServeState
     /// keep separate `SessionStore` instances while sharing one base dir.
     pub kind: &'static str,
+    /// How this store names its session files.
+    ///
+    /// `Plain` for every store but the autonomous one. A `Dated` store
+    /// prefixes the agent-day the file was created in, which is what
+    /// makes an overnight run of autonomous sessions readable in a
+    /// directory listing — the session's own metadata is still one line
+    /// away, this is for the human doing the looking.
+    naming: FileNaming,
     /// Optional sapphire-framework workspace state. When set, file
     /// modifications notify the workspace so the index/cache stay in
     /// sync.
@@ -257,6 +280,7 @@ impl SessionStore {
         Self {
             base_dir,
             kind,
+            naming: FileNaming::Plain,
             ws_state: None,
             path_cache: Mutex::new(HashMap::new()),
             tool_payloads,
@@ -272,21 +296,40 @@ impl SessionStore {
         Self {
             base_dir,
             kind,
+            naming: FileNaming::Plain,
             ws_state: Some(ws_state),
             path_cache: Mutex::new(HashMap::new()),
             tool_payloads,
         }
     }
 
+    /// Name this store's files by agent-day. See [`FileNaming`].
+    ///
+    /// A builder rather than a constructor argument because exactly one
+    /// store wants it and every other call site — four in `main.rs`,
+    /// eleven in tests — would otherwise have to name the `Plain`
+    /// default explicitly.
+    pub fn with_dated_files(mut self, boundary_hour: u8) -> Self {
+        self.naming = FileNaming::Dated { boundary_hour };
+        self
+    }
+
     /// Compute (without filesystem checks) the path a new session file
     /// should live at. Used by `create_session` / `ensure_session`. Also
     /// seeds the path cache so subsequent `append` calls hit it directly.
     fn path_for_new(&self, session_id: &str, namespace: &str) -> PathBuf {
+        let file_name = match self.naming {
+            FileNaming::Plain => format!("{session_id}.jsonl"),
+            FileNaming::Dated { boundary_hour } => {
+                let date = local_date_for_timestamp(Local::now(), boundary_hour);
+                format!("{date}-{session_id}.jsonl")
+            }
+        };
         let p = self
             .base_dir
             .join(namespace)
             .join(self.kind)
-            .join(format!("{session_id}.jsonl"));
+            .join(file_name);
         if let Ok(mut cache) = self.path_cache.lock() {
             cache.insert(session_id.to_string(), p.clone());
         }
@@ -312,7 +355,20 @@ impl SessionStore {
         }
         let target = format!("{session_id}.jsonl");
         for path in collect_session_files(&self.base_dir, self.kind) {
-            if path.file_name().and_then(|s| s.to_str()) == Some(target.as_str()) {
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let hit = match self.naming {
+                FileNaming::Plain => name == target,
+                // A v7 UUID is 36 characters with four hyphens, so
+                // `-{session_id}.jsonl` with a 10-character date in
+                // front of it cannot collide with another session's
+                // file.
+                FileNaming::Dated { .. } => name
+                    .strip_suffix(&format!("-{session_id}.jsonl"))
+                    .is_some_and(|date| date.len() == 10),
+            };
+            if hit {
                 if let Ok(mut cache) = self.path_cache.lock() {
                     cache.insert(session_id.to_string(), path.clone());
                 }
@@ -320,6 +376,13 @@ impl SessionStore {
             }
         }
         None
+    }
+
+    /// Test-only: the resolver, so a test can assert which file an id
+    /// maps to when two candidates exist.
+    #[cfg(test)]
+    pub fn resolve_path_for_test(&self, session_id: &str) -> Option<PathBuf> {
+        self.resolve_path(session_id)
     }
 
     /// Notify the sapphire-framework workspace that a session file was created or modified.
@@ -412,6 +475,18 @@ impl SessionStore {
         drop(file);
         self.notify_updated(&path);
         Ok(session_id)
+    }
+
+    /// Create one autonomous session for a task. `room_id` carries the
+    /// task name — that is the reverse index the loop searches by, and
+    /// it is why there is no separate state file for "which session is
+    /// this task in" (spec decision 3).
+    ///
+    /// `channel` is `"server"`: the same value a `/rpc` session uses,
+    /// because an autonomous session is not a chat and has no channel of
+    /// its own.
+    pub fn create_autonomous_session(&self, task: &str, namespace: &str) -> anyhow::Result<String> {
+        self.create_session(&(task.to_string(), None), "server", namespace)
     }
 
     /// Append a `ChatMessage` (with current timestamp) to an existing session.
@@ -2305,6 +2380,126 @@ mod tests {
             !histories.contains_key(&key),
             "the newer, empty session must evict the older session's \
              history, not lose to it: {histories:?}"
+        );
+    }
+
+    /// The autonomous store names its files by agent-day, and every write
+    /// path has to still find them: `append` is the first thing that runs
+    /// after the session is created.
+    ///
+    /// Both halves matter. The first store sees every resolution as a
+    /// `path_cache` hit, so it only pins the name `create_session`
+    /// wrote; the second is opened cold over the same directory and is
+    /// what actually exercises the Dated branch of `resolve_path` — the
+    /// scan that strips `-{session_id}.jsonl` and checks for the
+    /// 10-character date in front of it.
+    #[test]
+    fn a_dated_store_creates_and_resolves_its_own_filenames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            SessionStore::new(tmp.path().to_path_buf(), "autonomous", None).with_dated_files(4);
+
+        let sid = store
+            .create_autonomous_session("refactor", "default")
+            .unwrap();
+
+        let path = store
+            .absolute_path_for(&sid)
+            .expect("the file must resolve");
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let expected_date = local_date_for_timestamp(Local::now(), 4).to_string();
+        assert_eq!(name, format!("{expected_date}-{sid}.jsonl"));
+        assert!(path.starts_with(tmp.path().join("default").join("autonomous")));
+
+        store.append(&sid, &ChatMessage::user("hello")).unwrap();
+        assert_eq!(store.load_session(&sid).unwrap().len(), 1);
+
+        // The meta line carries what the loop searches by.
+        let rows = store.session_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].meta.room_id, "refactor");
+        assert_eq!(rows[0].meta.channel, "server");
+        assert_eq!(rows[0].meta.namespace.as_deref(), Some("default"));
+
+        // Cold cache: a store that never created this session must still
+        // find it by name, through the Dated suffix scan rather than the
+        // path cache.
+        let cold =
+            SessionStore::new(tmp.path().to_path_buf(), "autonomous", None).with_dated_files(4);
+        let resolved = cold
+            .absolute_path_for(&sid)
+            .expect("a cold store must resolve the dated file");
+        assert_eq!(resolved, path);
+        assert_eq!(cold.load_session(&sid).unwrap().len(), 1);
+        assert_eq!(cold.session_rows().len(), 1);
+
+        // The scan is keyed on the id, and the date prefix is not one:
+        // an id embedded in a different day's name is a different file.
+        let mut longer_sid = sid.clone();
+        longer_sid.push('0');
+        assert!(
+            cold.absolute_path_for(&longer_sid).is_none(),
+            "the id must match whole, not as a prefix of a longer name"
+        );
+
+        // ... and a name that ends in the right id but has no 10-char
+        // date before it is not this session either.
+        std::fs::write(
+            tmp.path()
+                .join("default")
+                .join("autonomous")
+                .join(format!("backup-{sid}.jsonl")),
+            "",
+        )
+        .unwrap();
+        let cold_again =
+            SessionStore::new(tmp.path().to_path_buf(), "autonomous", None).with_dated_files(4);
+        assert_eq!(
+            cold_again.absolute_path_for(&sid).unwrap(),
+            path,
+            "the 10-character-date requirement must pick the dated file"
+        );
+    }
+
+    /// A plain store must not change: its filename is still exactly
+    /// `{session_id}.jsonl`, and a dated-looking neighbour does not resolve.
+    ///
+    /// The collision check goes through a fresh store, because the one
+    /// that created the session answers from `path_cache` and would not
+    /// notice if the exact-name match had been replaced by the Dated
+    /// suffix match.
+    #[test]
+    fn a_plain_store_still_matches_its_filename_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
+        let sid = store
+            .create_session(&("room".to_string(), None), "matrix", "default")
+            .unwrap();
+
+        let path = store.absolute_path_for(&sid).unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            format!("{sid}.jsonl")
+        );
+
+        // Same id, a dated filename: must not be picked up by the exact match.
+        let ns = tmp.path().join("default").join("channel");
+        std::fs::write(ns.join(format!("2026-09-12-{sid}.jsonl")), "").unwrap();
+        assert_eq!(
+            store
+                .resolve_path_for_test(&sid)
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            std::ffi::OsStr::new(&format!("{sid}.jsonl"))
+        );
+
+        // Cold cache: the exact-name branch of `resolve_path` is what
+        // decides here, and it must ignore the dated neighbour.
+        let cold = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
+        assert_eq!(
+            cold.absolute_path_for(&sid).unwrap().file_name().unwrap(),
+            std::ffi::OsStr::new(&format!("{sid}.jsonl"))
         );
     }
 }
