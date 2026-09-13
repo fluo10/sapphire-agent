@@ -519,7 +519,19 @@ mod tests {
             other => panic!("expected text, got {other:?}"),
         };
         assert!(first.starts_with("[Autonomous: journal]\n"));
-        assert!(first.contains("Session: sessions/default/autonomous/"));
+        // The second line is the session's own path, workspace-relative and
+        // dated — derived from the store, so this asserts exactly what
+        // `absolute_path_for` resolves to, prefix and file name together.
+        let path_line = store_path(&state, &sid);
+        assert!(
+            first.contains(&format!("Session: {path_line}")),
+            "first: {first:?}"
+        );
+        assert!(
+            path_line.starts_with("sessions/default/autonomous/")
+                && path_line.ends_with(&format!("-{sid}.jsonl")),
+            "path should be dated and workspace-relative: {path_line}"
+        );
         assert!(first.ends_with("Summarise the day.\n"));
 
         // The status file says what happened, and names the task.
@@ -527,6 +539,58 @@ mod tests {
         let st: AutonomousState = serde_json::from_str(&raw).unwrap();
         assert!(st.reason.contains("journal"), "reason was {:?}", st.reason);
         assert!(st.status == "idle" || st.status == "running");
+    }
+
+    /// The workspace-relative path the loop should name in its first
+    /// message — computed from the store, not from a format template.
+    fn store_path(state: &crate::serve::ServeState, sid: &str) -> String {
+        state
+            .autonomous_session_store
+            .absolute_path_for(sid)
+            .and_then(|p| {
+                p.strip_prefix(state.workspace.dir())
+                    .ok()
+                    .map(std::path::PathBuf::from)
+            })
+            .map(|p| p.display().to_string())
+            .unwrap()
+    }
+
+    /// The protocol the loop exists for, pinned: the second message of a
+    /// task that is not finished is the marker plus `CONTINUE_PROMPT`, and
+    /// a turn that replies exactly `DONE` closes the session *before* its
+    /// `max_turns` cap is reached.
+    #[tokio::test]
+    async fn a_done_reply_closes_early_and_the_second_turn_continues() {
+        let state = crate::serve::ServeState::for_test_scripted(
+            false,
+            vec![response("working"), response("DONE")],
+        );
+        let ws = state.workspace.dir().to_path_buf();
+        std::fs::create_dir_all(ws.join("autonomous")).unwrap();
+        std::fs::write(
+            ws.join("autonomous/journal.md"),
+            "---\nmax_turns: 3\n---\nKeep going.\n",
+        )
+        .unwrap();
+
+        let mut lp = AutonomousLoop::new(Arc::clone(&state), None);
+        lp.run_cycle().await.unwrap();
+
+        let rows = state.autonomous_session_store.session_rows();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].is_closed,
+            "a DONE reply must close the session before the cap"
+        );
+        let sid = rows[0].meta.session_id.clone();
+        let history = state.autonomous_session_store.load_session(&sid).unwrap();
+        assert_eq!(history.len(), 4, "two turns: user + assistant each");
+        let second = match &history[2].parts[0] {
+            crate::provider::ContentPart::Text(t) => t.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert_eq!(second, format!("[Autonomous: journal]\n{CONTINUE_PROMPT}"));
     }
 
     /// A cycle for a task inside its cooldown: nothing is created, and the

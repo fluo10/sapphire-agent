@@ -869,6 +869,21 @@ async fn main() -> Result<()> {
             // timers can push fire messages back to their satellite.
             timer_manager.set_serve_state(Arc::downgrade(&serve_state));
 
+            // ── Autonomous sessions (off unless configured) ─────────────────
+            // Spawned outside the channel block on purpose: this loop needs
+            // `ServeState` and nothing else, so an ACP-only or voice-only
+            // deployment gets the feature too. `enabled = false` (the
+            // default) means no loop, no status file, no directory.
+            if config.autonomous.enabled {
+                autonomous::AutonomousLoop::new(
+                    Arc::clone(&serve_state),
+                    Some(Arc::clone(&channel_session_store)),
+                )
+                .spawn();
+            } else {
+                tracing::info!("Autonomous sessions disabled by config");
+            }
+
             // ── Session tools ───────────────────────────────────────────────
             // Registered here rather than in `default_tool_set` because
             // they read the session stores, which are built after it.

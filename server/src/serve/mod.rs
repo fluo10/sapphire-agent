@@ -3699,8 +3699,13 @@ rooms    = []
                 "device-default",
                 None,
             )),
+            // Same layout production builds (`<sessions_base>/<ns>/autonomous/`,
+            // here under the workspace dir) so a test asserting the
+            // workspace-relative path a loop run writes actually exercises
+            // the derived path, not a fallback string.
             autonomous_session_store: Arc::new(
-                SessionStore::new(base.join("autonomous"), "autonomous", None).with_dated_files(4),
+                SessionStore::new(base.join("workspace").join("sessions"), "autonomous", None)
+                    .with_dated_files(4),
             ),
             mcp_session_store: Arc::new(SessionStore::new(base.join("mcp"), "mcp", None)),
             mcp_project_index: Default::default(),
