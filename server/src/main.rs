@@ -7,6 +7,7 @@ mod acp_session;
 mod agent;
 mod agents;
 mod ambient;
+mod autonomous_config;
 mod channel;
 mod cli_device;
 mod cli_init;
