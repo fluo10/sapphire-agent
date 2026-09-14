@@ -798,6 +798,84 @@ reason (`task: journal, turn 2/3`) so you can tell what the agent is doing
 without reading the session. Task definitions are re-read every cycle, so
 editing one takes effect without a restart.
 
+## Editing the agent's own definitions
+
+The files an operator hand-edits to describe the work the agent does on its
+own — `<workspace>/heartbeat/*.md`, `<workspace>/autonomous/*.md` and
+`<workspace>/agents/*.md` — are readable and writable from a chat room too,
+through four tools:
+
+| Tool | Actions | Definitions |
+|---|---|---|
+| `heartbeat_config` | `list` · `read` · `write` · `set_enabled` | `<workspace>/heartbeat/*.md` |
+| `autonomous_config` | `list` · `read` · `write` · `set_enabled` | `<workspace>/autonomous/*.md` |
+| `agent_config` | `list` · `read` · `write` | `<workspace>/agents/*.md` |
+| `task_test` | `kind` = `heartbeat` or `autonomous`, plus `name` | runs one definition once |
+
+- `list` reports each definition and whether it is effectively enabled;
+  `read` returns one exactly as it is on disk; `write` creates or replaces
+  one, refusing content the agent's own loader would drop — a definition that
+  would never fire is not something you should be able to write and then
+  puzzle over.
+- `set_enabled` changes **only the `enabled:` line**. Comments, other keys and
+  the body are left byte-for-byte as they were. That is the whole point: these
+  are files people hand-edit, and the `schedule:` line usually has a comment
+  above it saying why — a `write` to flip one switch would take it with it.
+  A definition with no `enabled:` line at all is enabled by default. Both
+  task loaders re-read their directory every cycle, so the flag takes effect
+  without a restart.
+- `agent_config` has no `set_enabled`, because a subagent definition has no
+  `enabled:` flag to flip: it runs when it is *called*. Whether to delegate at
+  all is a decision the parent model makes per call, not a switch on the file.
+  A definition written with `agent_config` is offered for delegation
+  immediately, without restarting the agent; one you hand-edit under
+  `agents/` still needs a restart, as [Subagents](#subagents) describes.
+
+**A room has to be named, in the host config.** The tools are registered only
+when `[tools.admin].rooms` lists at least one room, and every action —
+including the read-only `list` — is refused everywhere else:
+
+```toml
+# host-local config, never the workspace's
+[tools.admin]
+rooms = ["!ops:example.com", "123456789012345678"]   # Matrix room / Discord channel
+```
+
+With `rooms` absent or empty the four tools are **not registered at all** —
+the model is never told they exist. A tool that is offered and then always
+refuses is the worse answer: it invites a retry loop against a wall.
+
+`[tools]` is deliberately outside the workspace layer's allowlist, so a
+synced workspace `config.toml` cannot grant itself this — a `[tools.admin]`
+written there is dropped and named in a startup warning, the same as any
+other key that layer may not set. Who may run these tools is the same kind of
+host-local decision as the API key or the bind address, and it has to be: a
+room on this list can rewrite, through the agent, what runs unattended. **Pair
+it with that room's own `allowed_users`**, or everyone who can post in the
+room can author code-adjacent work that runs with nobody watching. The
+transports with no room of their own — `/rpc`, `/acp`, voice — are never on
+the list, so the tools are refused there even when a room is configured.
+
+**Trying a task before enabling it.** `task_test` runs one heartbeat or
+autonomous definition once, in a throwaway session, so a task can be
+exercised while it is still `enabled: false` — the case it exists for. The
+run is production's in every respect that matters: the same model, the same
+prompt assembly, the same permission row (`[autonomous] origin`). Three
+things differ:
+
+- It stops after **3 turns** at most. A heartbeat task is one prompt and is
+  always exactly one turn; a definition's own `max_turns` can only lower the
+  autonomous cap, never raise it. A tool for checking that a task does not eat
+  tokens must not eat tokens itself.
+- Its session is named `test:<kind>:<name>`, **not** after the task, so the
+  task's cooldown is untouched. Testing a task does not postpone it.
+- **Delivery is not verified.** A heartbeat task's `room_id:` / `voice:`
+  targets are ignored: what is checked is the prompt and how the run ends, not
+  where a result would go.
+
+The report names the session it created, so the transcript can be read
+afterwards with `session_read`.
+
 ## Skills
 
 A skill is a written procedure for a kind of work — planning, TDD,
