@@ -862,7 +862,18 @@ impl Tool for TaskTestTool {
         match kind {
             "heartbeat" => self.run_heartbeat(name).await,
             "autonomous" => {
-                let requested = input["max_turns"].as_u64().map(|n| n as usize);
+                // Presence and type are different questions: a `max_turns`
+                // that is there but not a non-negative integer is refused
+                // rather than read as "omitted", because the caller asked
+                // for a cap and would otherwise silently get the
+                // definition's own.
+                let requested = match input.get("max_turns") {
+                    None => None,
+                    Some(v) if v.is_null() => None,
+                    Some(v) => Some(v.as_u64().with_context(|| {
+                        format!("'max_turns' must be a non-negative integer, got {v}")
+                    })? as usize),
+                };
                 self.run_autonomous(name, requested).await
             }
             other => anyhow::bail!(
@@ -1307,5 +1318,20 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("heartbeat"), "{err}");
+
+        // A `max_turns` that is present but not a non-negative integer is
+        // refused, not read as "omitted" — a caller that asked for a cap
+        // must not silently get the definition's own.
+        for bad in [json!(-1), json!("5"), json!(3.5)] {
+            let err = in_room(
+                "!ops:x",
+                tool.execute(&json!({"kind": "autonomous", "name": "journal", "max_turns": bad})),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("max_turns"), "{bad}: {err}");
+            assert!(err.contains("non-negative integer"), "{bad}: {err}");
+        }
     }
 }
