@@ -424,8 +424,6 @@ impl SubagentTool {
     ///
     /// Not `async`: it never waits, only writes. The lock is `std`'s,
     /// see the field's doc.
-    // Consumed by the config tools once they land (#265).
-    #[allow(dead_code)]
     pub fn set_agents(&self, agents: Vec<AgentDef>) {
         *self.agents.write().unwrap() = agents;
     }
@@ -439,8 +437,6 @@ impl SubagentTool {
     /// the caller that is about to store it (`ToolSet::replace_spec`)
     /// and wants the description the model is offered to list exactly
     /// the agents a dispatch would accept.
-    // Consumed by the config tools once they land (#265).
-    #[allow(dead_code)]
     pub fn live_spec(&self) -> ToolSpec {
         build_spec(&self.agents())
     }

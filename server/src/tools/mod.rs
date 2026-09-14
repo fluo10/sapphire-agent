@@ -3,6 +3,7 @@ pub mod ambient_tools;
 pub mod builtin_tools;
 pub mod client_exec;
 pub mod client_tools;
+pub mod config_tools;
 pub mod policy;
 pub mod session_tools;
 pub mod skill_tools;
@@ -284,8 +285,6 @@ impl ToolSet {
     /// matched and drops its read guard before calling into that tool,
     /// so this write does not queue behind a guard the caller itself
     /// still holds.
-    // Consumed by the config tools once they land (#265).
-    #[allow(dead_code)]
     pub async fn replace_spec(&self, name: &str, spec: ToolSpec) {
         let mut inner = self.inner.write().await;
         match inner.specs.iter_mut().find(|s| s.name == name) {

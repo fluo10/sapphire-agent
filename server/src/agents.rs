@@ -103,8 +103,6 @@ fn parse_agent(name: String, raw: &str) -> Option<AgentDef> {
 /// *about to write* the file has the opposite need: it must refuse what
 /// the loader would silently drop, or the model writes an agent that is
 /// never offered for delegation and cannot tell why.
-// Consumed by the config tools once they land (#265).
-#[allow(dead_code)]
 pub fn parse_definition(name: &str, raw: &str) -> Result<AgentDef, String> {
     // `split` only for the message: no frontmatter at all is the one case
     // worth naming precisely, since that is what a model gets wrong when

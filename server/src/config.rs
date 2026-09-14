@@ -1670,8 +1670,6 @@ api_key = "test"
     /// endpoint a client reaches first, before any room is named, is the
     /// one that can author unattended work. Voice is the same: the caller
     /// is a device, not a room.
-    // Consumed by the config tools once they land (#265).
-    #[allow(dead_code)]
     pub fn config_tools_allowed_in(&self, room_id: Option<&str>) -> bool {
         match room_id {
             Some(r) => self.tools.admin.rooms.iter().any(|allowed| allowed == r),
@@ -1681,7 +1679,7 @@ api_key = "test"
 
     /// True when `[tools.admin].rooms` names at least one room, i.e. the
     /// config-file management tools are registered at all.
-    // Consumed by the config tools once they land (#265).
+    // Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
     #[allow(dead_code)]
     pub fn config_tools_enabled(&self) -> bool {
         !self.tools.admin.rooms.is_empty()

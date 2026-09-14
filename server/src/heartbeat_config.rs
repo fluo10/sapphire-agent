@@ -170,8 +170,6 @@ fn parse_task(name: String, raw: &str) -> Option<HeartbeatTask> {
 /// A task whose `schedule:` does not parse is *not* refused here: the
 /// loader keeps it and `next_due` skips it, which is a different
 /// failure. `ConfigTool::validate` adds that check where it matters.
-// Consumed by the config tools once they land (#265).
-#[allow(dead_code)]
 pub fn parse_definition(name: &str, raw: &str) -> Result<HeartbeatTask, String> {
     // `split` only for the message: no frontmatter at all is the one case
     // worth naming precisely, since that is what a model gets wrong when
