@@ -353,6 +353,21 @@ system_prompt = "You are a helpful personal assistant."
 #     `mcp__<name>__<tool_name>`. Distinct from the inbound MCP
 #     server block above: that lets external AIs call sapphire-agent;
 #     this lets sapphire-agent call external MCP servers.
+#   - `[tools.admin].rooms` — the rooms whose calls may use the
+#     config-file management tools (`heartbeat`, `autonomous`,
+#     `agents`), which add and edit the definitions under the
+#     workspace that the unattended loops later run. Empty (the
+#     default) leaves all of them unregistered, the same shape as
+#     `[tools.host_access]`. Host-layer only: `[tools]` is outside the
+#     workspace-layer allowlist, so a synced workspace config cannot
+#     grant itself this.
+#
+#     Who can post in a room listed here can therefore rewrite, through
+#     the agent, what runs unattended — a heartbeat task, an autonomous
+#     loop's prompt, an agent definition. Say it once more loudly: pair
+#     this with the room's own `allowed_users`, or anyone who can reach
+#     the room can author code-adjacent work that runs with nobody
+#     watching.
 #
 # Each `[[tools.mcp_servers]]` entry has a `name` (used as the tool
 # prefix) and a `type` selecting one of two transports:
@@ -404,6 +419,11 @@ system_prompt = "You are a helpful personal assistant."
 #
 # [tools.subagent]
 # turn_timeout_secs = 3600                  # 0 = no limit
+#
+# # Example: let one ops room manage the heartbeat/autonomous/agents
+# # definitions. Empty by default (all four tools unregistered).
+# [tools.admin]
+# rooms = ["!ops:example.com"]
 #
 # # Example: HTTP transport to a remote MCP server.
 # [[tools.mcp_servers]]

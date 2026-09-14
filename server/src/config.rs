@@ -772,6 +772,29 @@ fn default_serve_port() -> u16 {
     3170
 }
 
+/// The config-file management tools (`heartbeat`, `autonomous`, `agents`),
+/// bound to the rooms that may use them.
+///
+/// Empty means all four tools are unregistered — the same shape as
+/// `[tools] host_access`, where the switch itself is the opt-in. The tools
+/// write the files under the workspace (`heartbeats/`, `autonomous/`,
+/// `agents/`) that the *unattended* loops then execute, so a room's
+/// presence here is a grant to author unattended work, not merely to read
+/// config.
+///
+/// `rooms` is the same room-id namespace as `room_profile.<n>.rooms`
+/// (Matrix room ids, Discord channel ids, and the synthetic ids those fold
+/// to) — the same string that `Config::room_profile_for` resolves, so an
+/// operator writing both tables does not have to translate between them.
+///
+/// Host-layer only: `[tools]` is outside the workspace-layer allowlist, so
+/// a synced workspace config cannot hand itself this grant.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct AdminToolsConfig {
+    #[serde(default)]
+    pub rooms: Vec<String>,
+}
+
 /// Configuration for built-in tools.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ToolsConfig {
@@ -790,6 +813,10 @@ pub struct ToolsConfig {
     /// Limits on a delegated subagent's turn. See [`SubagentConfig`].
     #[serde(default)]
     pub subagent: SubagentConfig,
+    /// The config-file management tools and the rooms allowed to call
+    /// them. See [`AdminToolsConfig`].
+    #[serde(default)]
+    pub admin: AdminToolsConfig,
 }
 
 /// Limits on one delegated subagent turn, as a whole.
@@ -1633,6 +1660,29 @@ api_key = "test"
         errors
     }
 
+    /// True when `room_id` is one of the rooms declared in
+    /// `[tools.admin].rooms`.
+    ///
+    /// `None` is always `false`, deliberately. Both `/rpc` and `/acp` have
+    /// no room of their own and synthesise a `room_id` out of the session
+    /// id, so a `None` here is not "the operator's own session" — it is a
+    /// session nobody declared. Treating it as trusted would mean the
+    /// endpoint a client reaches first, before any room is named, is the
+    /// one that can author unattended work. Voice is the same: the caller
+    /// is a device, not a room.
+    pub fn config_tools_allowed_in(&self, room_id: Option<&str>) -> bool {
+        match room_id {
+            Some(r) => self.tools.admin.rooms.iter().any(|allowed| allowed == r),
+            None => false,
+        }
+    }
+
+    /// True when `[tools.admin].rooms` names at least one room, i.e. the
+    /// config-file management tools are registered at all.
+    pub fn config_tools_enabled(&self) -> bool {
+        !self.tools.admin.rooms.is_empty()
+    }
+
     /// True if `name` is either the implicit `"default"` namespace or has a
     /// `[memory_namespace.<name>]` block.
     fn namespace_is_defined(&self, name: &str) -> bool {
@@ -2027,6 +2077,23 @@ mod tests {
 
     fn parse(s: &str) -> Config {
         Config::parse_for_test(s)
+    }
+
+    #[test]
+    fn config_tools_are_off_until_a_room_is_named() {
+        let cfg = parse("[anthropic]\napi_key = \"test\"\n");
+        assert!(!cfg.config_tools_enabled());
+        assert!(!cfg.config_tools_allowed_in(Some("!ops:x")));
+        assert!(!cfg.config_tools_allowed_in(None));
+    }
+
+    #[test]
+    fn config_tools_are_allowed_in_a_named_room_and_nowhere_else() {
+        let cfg = parse("[anthropic]\napi_key = \"test\"\n\n[tools.admin]\nrooms = [\"!ops:x\", \"!dev:y\"]\n");
+        assert!(cfg.config_tools_enabled());
+        assert!(cfg.config_tools_allowed_in(Some("!ops:x")));
+        assert!(!cfg.config_tools_allowed_in(Some("!random:z")));
+        assert!(!cfg.config_tools_allowed_in(None));   // /rpc, /acp, voice: never
     }
 
     /// The default is off. An agent that starts working on its own
