@@ -86,7 +86,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// One ACP session, mapped onto an agent session.
 struct AcpSession {
@@ -825,6 +825,13 @@ pub async fn handle_acp_ws(
     ws.on_upgrade(move |socket| serve_connection(socket, state, profile_name, keepalive))
 }
 
+/// Prefix of a JSON-RPC error response whose `id` is `null` — the shape the
+/// spec reserves for "a response to a request whose id could not be
+/// determined" (a peer answering something it could not parse enough of to
+/// correlate). See [`lines_transport`] for why this text is matched and
+/// dropped before it ever reaches the SDK's transport.
+const NULL_ID_ERROR_RESPONSE_PREFIX: &str = r#"{"jsonrpc":"2.0","id":null,"error"#;
+
 /// Wrap the socket as the SDK's line transport.
 ///
 /// Per the ACP transport RFD one JSON-RPC message rides in one text frame,
@@ -836,6 +843,15 @@ pub async fn handle_acp_ws(
 /// frames carry no ACP meaning, axum answers incoming pings itself, and a
 /// close frame is followed by the end of the stream, which is what actually
 /// ends the connection.
+///
+/// A text frame shaped like [`NULL_ID_ERROR_RESPONSE_PREFIX`] is dropped the
+/// same way. That shape is a JSON-RPC response, not a request — the SDK has
+/// no request of its own with a `null` id to match it against, so it can
+/// only log the response as unroutable and move on. Answering it anyway
+/// would itself be a response to a response, and a peer that treats *that*
+/// as needing an answer in turn echoes forever: the two sides trade the same
+/// error back and forth with no request underneath either send, which is
+/// the frame storm this branch exists to stop before it starts.
 ///
 /// `connection_cancel` is cancelled when this socket stops delivering
 /// frames — see [`cancel_when_exhausted`].
@@ -880,6 +896,13 @@ fn lines_transport(
 
     let frames = rx.filter_map(|frame| async move {
         match frame {
+            Ok(Message::Text(text)) if text.starts_with(NULL_ID_ERROR_RESPONSE_PREFIX) => {
+                debug!(
+                    "ACP: dropping a null-id error response instead of relaying it, to avoid \
+                     an echo storm"
+                );
+                None
+            }
             Ok(Message::Text(text)) => Some(Ok(text.to_string())),
             // Not ACP: no reply, and the connection carries on.
             Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_)) => None,
@@ -2035,6 +2058,47 @@ mod tests {
                         assert_eq!(v["result"]["protocolVersion"], 1);
                         return;
                     }
+                }
+                Message::Ping(_) | Message::Pong(_) => continue,
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+    }
+
+    /// A null-id error response — the shape a peer sends back for a frame it
+    /// could not correlate to a request of its own — must never get a reply.
+    /// Answering one is itself a response to a response, which is exactly
+    /// the shape of an echo storm: a peer that also auto-replies to anything
+    /// resembling a response would receive that reply and send back another
+    /// null-id error of its own, forever. This asserts the connection stays
+    /// open and quiet through one, and still answers ordinary requests
+    /// afterward.
+    #[tokio::test]
+    async fn null_id_error_response_is_dropped_without_a_reply() {
+        let addr = spawn(ServeState::for_test(true)).await;
+        let mut ws = connect(&addr).await;
+
+        ws.send(Message::Text(
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        // Nothing answers the dropped frame; the next thing on the wire is
+        // the reply to a request sent right after it.
+        ws.send(Message::Text(initialize_request(1).to_string().into()))
+            .await
+            .unwrap();
+        loop {
+            match next_frame(&mut ws).await {
+                Message::Text(t) => {
+                    let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                    assert_eq!(
+                        v["id"], 1,
+                        "the dropped frame must not have produced a reply"
+                    );
+                    assert_eq!(v["result"]["protocolVersion"], 1);
+                    return;
                 }
                 Message::Ping(_) | Message::Pong(_) => continue,
                 other => panic!("unexpected frame: {other:?}"),
