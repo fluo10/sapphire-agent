@@ -122,9 +122,35 @@ fn parse_task(name: String, raw: &str) -> Option<AutonomousTask> {
     })
 }
 
+/// Parse one definition the way the loader does, but hand the failure
+/// back instead of skipping the file.
+///
+/// `load_autonomous_dir` swallows a broken file on purpose — one typo
+/// must not take the other tasks down with it — but a caller that is
+/// *about to write* the file has the opposite need: it must refuse what
+/// the loader would silently drop, or the model writes a task that never
+/// fires and cannot tell why.
+pub fn parse_definition(name: &str, raw: &str) -> Result<AutonomousTask, String> {
+    // `split` only for the message: no frontmatter at all is the one case
+    // worth naming precisely, since that is what a model gets wrong when
+    // it writes a bare markdown file.
+    crate::frontmatter::split(raw)
+        .ok_or_else(|| "no YAML frontmatter: the file must start with a `---` line".to_string())?;
+    parse_task(name.to_string(), raw).ok_or_else(|| {
+        "cannot be parsed as an autonomous task: check the frontmatter YAML and that the body is not empty"
+            .to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_definition_reports_what_the_loader_would_skip() {
+        assert!(parse_definition("journal", "---\npriority: 50\n---\nWrite it.\n").is_ok());
+        assert!(parse_definition("journal", "---\npriority: 50\n---\n\n").is_err());   // empty body
+    }
 
     fn write(dir: &Path, name: &str, raw: &str) {
         std::fs::write(dir.join(name), raw).unwrap();

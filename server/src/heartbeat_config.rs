@@ -158,6 +158,30 @@ fn parse_task(name: String, raw: &str) -> Option<HeartbeatTask> {
     })
 }
 
+/// Parse one definition the way the loader does, but hand the failure
+/// back instead of skipping the file.
+///
+/// `load_heartbeat_dir` swallows a broken file on purpose — one typo
+/// must not take the other tasks down with it — but a caller that is
+/// *about to write* the file has the opposite need: it must refuse what
+/// the loader would silently drop, or the model writes a task that never
+/// fires and cannot tell why.
+///
+/// A task whose `schedule:` does not parse is *not* refused here: the
+/// loader keeps it and `next_due` skips it, which is a different
+/// failure. `ConfigTool::validate` adds that check where it matters.
+pub fn parse_definition(name: &str, raw: &str) -> Result<HeartbeatTask, String> {
+    // `split` only for the message: no frontmatter at all is the one case
+    // worth naming precisely, since that is what a model gets wrong when
+    // it writes a bare markdown file.
+    crate::frontmatter::split(raw)
+        .ok_or_else(|| "no YAML frontmatter: the file must start with a `---` line".to_string())?;
+    parse_task(name.to_string(), raw).ok_or_else(|| {
+        "cannot be parsed as a task: check the frontmatter YAML and that the body is not empty"
+            .to_string()
+    })
+}
+
 /// From a list of tasks, find the next due time and the tasks scheduled for it.
 /// Tasks scheduled within a 1-second window are batched together.
 pub fn next_due(
@@ -187,6 +211,14 @@ pub fn next_due(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_definition_reports_what_the_loader_would_skip() {
+        assert!(parse_definition("morning", "---\nschedule: \"0 8 * * *\"\n---\nHi\n").is_ok());
+        let err = parse_definition("broken", "# no frontmatter\n").unwrap_err();
+        assert!(err.contains("frontmatter"), "{err}");
+        assert!(parse_definition("broken", "---\nschedule: [oops\n---\nHi\n").is_err());
+    }
 
     #[test]
     fn parse_basic() {
