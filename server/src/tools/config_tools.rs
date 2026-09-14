@@ -91,7 +91,14 @@ impl ConfigDir {
 /// what makes it so. Anything that could name a *different* file — a
 /// separator, a leading dot, a `..` — is refused rather than normalised.
 pub(crate) fn definition_path(workspace_root: &Path, dir: &str, name: &str) -> Result<PathBuf> {
-    let stem = name.strip_suffix(".md").unwrap_or(name);
+    // `.md` in any case names the same file on a case-insensitive
+    // filesystem, so `Foo.MD` must not become `Foo.MD.md`.
+    let bytes = name.as_bytes();
+    let stem = if name.len() >= 3 && bytes[name.len() - 3..].eq_ignore_ascii_case(b".md") {
+        &name[..name.len() - 3]
+    } else {
+        name
+    };
     if stem.is_empty()
         || stem.starts_with('.')
         || stem.contains('/')
@@ -116,6 +123,12 @@ pub(crate) fn definition_path(workspace_root: &Path, dir: &str, name: &str) -> R
 /// refusal. That is the point rather than an oversight: the allow-list
 /// names places the operator knows who can write in, and those are not
 /// such places.
+///
+/// One consequence worth naming: an unattended heartbeat task that fires
+/// *into* a listed room is scoped to that room too, so it can call these
+/// tools with nobody present. That is intended — the grant is the room,
+/// not the caller — and is why a listed room should not also be a
+/// task's delivery target.
 pub(crate) fn current_call_room() -> Option<String> {
     match crate::timer::current_origin() {
         Some(crate::timer::TimerOrigin::Chat { room_id }) => Some(room_id),
@@ -145,10 +158,12 @@ pub(crate) fn declared_enabled(raw: &str) -> Option<bool> {
         let trimmed = line.trim_end_matches(['\n', '\r']);
         if let Some(value) = trimmed.strip_prefix("enabled:") {
             let value = value.trim();
-            // `unwrap_or(true)` mirrors the loaders' default: a value
-            // serde would reject leaves the file skipped by the loader,
-            // where this is only a display hint.
-            return Some(value.parse::<bool>().unwrap_or(true));
+            // A value serde would reject leaves the file *skipped* by the
+            // loader, so there is no effective state to claim: `None`,
+            // the same answer as a missing frontmatter block. The
+            // loaders' `default_true` applies only when the key is
+            // ABSENT, which the `Some(true)` at the end covers.
+            return value.parse::<bool>().ok();
         }
     }
     Some(true)
@@ -272,9 +287,15 @@ impl ConfigTool {
 
     /// A workspace-relative path for `WorkspaceState::write_file`.
     ///
-    /// The path is built from a fixed directory name and a validated stem
-    /// and so is always inside the workspace; this is the check that says
-    /// so rather than an expectation that it could fail.
+    /// The path is built from a fixed directory name and a validated stem,
+    /// so it is inside the workspace — *assuming no symlink is pre-placed
+    /// in the definition directory*. `main` builds the `AppContext` with
+    /// `.allow_external_paths()`, so a pre-placed symlink resolving out of
+    /// the tree is followed rather than refused: the write lands at the
+    /// symlink's target. That is accepted defense-in-depth, not the
+    /// invariant this check provides — what it catches is a path that is
+    /// outside the workspace *before* any filesystem resolution, which is
+    /// the only case the stem validation leaves open.
     fn rel(&self, abs: &Path) -> Result<PathBuf> {
         abs.strip_prefix(&self.workspace_root)
             .map(Path::to_path_buf)
@@ -360,8 +381,11 @@ impl ConfigTool {
         let abs = definition_path(&self.workspace_root, self.dir.dir_name(), name)?;
         // Verbatim, not through `serde`: a definition is a file people
         // hand-edit, and the model has to see the comments that say why.
-        std::fs::read_to_string(&abs)
-            .with_context(|| format!("failed to read {}", self.rel(&abs).unwrap_or(abs).display()))
+        // Propagated, not swallowed: a path that is not in the workspace
+        // is exactly the case worth reporting, and the `?` names it
+        // rather than falling back to the absolute path.
+        let rel = self.rel(&abs)?;
+        std::fs::read_to_string(&abs).with_context(|| format!("failed to read {}", rel.display()))
     }
 
     async fn write(&self, input: &serde_json::Value) -> Result<String> {
@@ -585,6 +609,13 @@ fn describe_stop(stop: &TurnStop) -> &'static str {
 ///
 /// `enabled: false` is not an obstacle: it is the case this exists for.
 pub struct TaskTestTool {
+    /// A strong `Arc<ServeState>`, so this tool and the state it runs on
+    /// form a process-lifetime cycle (`ServeState` -> `ToolSet` ->
+    /// `TaskTestTool` -> `ServeState`). Intentional and terminal: both
+    /// live for the whole process, exactly as the timer wiring's
+    /// `Weak<ServeState>` precedent exists to avoid *for a task that can
+    /// outlive the state*. Nothing here does, so a `Weak` would only add
+    /// an upgrade-or-refuse path with no reachable case.
     state: Arc<ServeState>,
     workspace_root: PathBuf,
     spec: ToolSpec,
@@ -661,6 +692,12 @@ impl TaskTestTool {
     }
 
     /// A workspace-relative path, for an error message or a report.
+    ///
+    /// Display only, so it degrades rather than failing: a path this
+    /// cannot strip shows up absolute instead of turning the message
+    /// *about* a failure into a second failure. Same symlink caveat as
+    /// [`ConfigTool::rel`] — it reports on the path it was handed, and
+    /// `write_file` is where external resolution would happen.
     fn rel_display(&self, abs: &Path) -> String {
         abs.strip_prefix(&self.workspace_root)
             .unwrap_or(abs)
@@ -872,7 +909,7 @@ impl Tool for TaskTestTool {
 /// of the same grant, for the transports that have no room of their own.
 ///
 /// Called once `serve_state` exists, since `task_test` needs it.
-pub async fn register_admin_tools(
+pub(crate) async fn register_admin_tools(
     tool_set: &Arc<ToolSet>,
     workspace_root: &Path,
     config: Config,
@@ -1420,5 +1457,104 @@ mod tests {
             kinds.iter().all(|(_, kind)| *kind == ToolKind::Edit),
             "every admin tool is an edit: {kinds:?}"
         );
+    }
+
+    /// The seam the whole-branch review found untested: `after_write`
+    /// refreshes both halves — `set_agents` (what `execute` dispatches
+    /// from) and `replace_spec` (what the model is *offered*) — so a
+    /// definition written while the agent runs is immediately
+    /// advertised and callable, not one of the two. Asserted end to end:
+    /// one `ToolSet`, one `Arc<SubagentTool>` in it, one `ConfigTool`
+    /// wired to both by `Weak` exactly as `main` wires them.
+    #[tokio::test]
+    async fn a_written_agent_definition_is_offered_and_callable() {
+        let (_dir, root, ws) = test_workspace();
+        let subagent = Arc::new(SubagentTool::new(Vec::new()));
+        let set = Arc::new(ToolSet::new(
+            vec![Box::new(Arc::clone(&subagent)) as Box<dyn Tool>],
+            Vec::new(),
+        ));
+        let mut config = Config::for_test();
+        config.tools.admin.rooms = vec!["!ops:x".to_string()];
+        let tool = ConfigTool::new(
+            ConfigDir::Agents,
+            root.clone(),
+            config,
+            ws,
+            Some(Arc::downgrade(&subagent)),
+            Arc::downgrade(&set),
+        );
+
+        // Nothing is advertised before the write: the set was built
+        // around an empty definition list.
+        let before = set
+            .specs_filtered(|n| n == crate::tools::subagent::SUBAGENT_TOOL_NAME)
+            .await;
+        assert!(
+            !before[0].description.contains("reviewer"),
+            "{}",
+            before[0].description
+        );
+
+        call(
+            &tool,
+            json!({
+                "action": "write",
+                "name": "reviewer",
+                "content": "---
+description: Reviews a diff.
+---
+You are a reviewer.
+"
+            }),
+        )
+        .await
+        .unwrap();
+
+        // (a) Offered: the spec the model is handed now lists it — this
+        // is `replace_spec` having been reached, since `specs_filtered`
+        // reads `ToolSet`'s own copy.
+        let after = set
+            .specs_filtered(|n| n == crate::tools::subagent::SUBAGENT_TOOL_NAME)
+            .await;
+        assert_eq!(after.len(), 1, "replace, not append");
+        assert!(
+            after[0].description.contains("reviewer"),
+            "{}",
+            after[0].description
+        );
+        assert!(
+            after[0].description.contains("Reviews a diff."),
+            "{}",
+            after[0].description
+        );
+
+        // (b) Callable: a dispatch by that name resolves in the live
+        // list and runs a real nested turn — this is `set_agents` having
+        // been reached. A `TurnContext` is scoped by hand, the pattern
+        // the subagent tests use, since `execute` only ever reads it
+        // through `current_turn_context()`.
+        let provider: Arc<dyn crate::provider::Provider> = Arc::new(
+            crate::serve::StubProvider::new(vec![test_response("reviewed")]),
+        );
+        let state = ServeState::for_test_scripted(false, vec![test_response("unused")]);
+        let ctx = Arc::new(crate::serve::TurnContext {
+            state,
+            provider: Arc::clone(&provider),
+            progress: Arc::new(crate::serve::NullProgress),
+            visible_specs: set.specs_filtered(|_| true).await.into(),
+            timer_origin: None,
+            session_id: None,
+        });
+        let out = crate::serve::scope_turn_context(
+            ctx,
+            in_room(
+                "!ops:x",
+                subagent.execute(&json!({"agent": "reviewer", "prompt": "Review this."})),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("reviewed"), "{out}");
     }
 }

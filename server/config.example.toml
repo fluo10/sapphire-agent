@@ -367,7 +367,10 @@ system_prompt = "You are a helpful personal assistant."
 #     loop's prompt, an agent definition. Say it once more loudly: pair
 #     this with the room's own `allowed_users`, or anyone who can reach
 #     the room can author code-adjacent work that runs with nobody
-#     watching.
+#     watching. An unattended task -- heartbeat or autonomous -- that
+#     fires *into* a listed room is scoped to that room too, so it can
+#     call these tools with no human present; a listed room should
+#     therefore not also be a task's delivery target.
 #
 # Each `[[tools.mcp_servers]]` entry has a `name` (used as the tool
 # prefix) and a `type` selecting one of two transports:
