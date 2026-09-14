@@ -399,6 +399,8 @@ mod tests {
     fn host_only_tables_are_not_allowed() {
         assert!(!path_allowed(&["tools", "tavily_api_key"]));
         assert!(!path_allowed(&["tools", "mcp_servers"]));
+        assert!(!path_allowed(&["tools", "admin"]));
+        assert!(!path_allowed(&["tools", "admin", "rooms"]));
         assert!(!path_allowed(&["matrix", "access_token"]));
         assert!(!path_allowed(&["serve", "port"]));
         assert!(!path_allowed(&["workspace_dir"]));

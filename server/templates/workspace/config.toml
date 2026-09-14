@@ -41,6 +41,12 @@ heartbeat_enabled = false
 # poll_seconds = 60
 # origin = "trusted"   # "trusted" (everything, needs [tools] host_access) | "channel" (no shell)
 
+# The config tools (`heartbeat_config`, `autonomous_config`, `agent_config`,
+# `task_test`) are not configured here: who may run them is the same
+# host-local decision as the API key or the bind address, so `[tools.admin]`
+# belongs in the host config. Written here it is outside this layer's
+# allowlist and is dropped with a warning at startup.
+
 # The agent's model and framing. The API key itself is host-local.
 # [anthropic]
 # model = "claude-sonnet-5"

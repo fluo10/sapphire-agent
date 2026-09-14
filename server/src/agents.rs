@@ -95,9 +95,40 @@ fn parse_agent(name: String, raw: &str) -> Option<AgentDef> {
     })
 }
 
+/// Parse one definition the way the loader does, but hand the failure
+/// back instead of skipping the file.
+///
+/// `load_agents_dir` swallows a broken file on purpose — one typo must
+/// not take the other definitions down with it — but a caller that is
+/// *about to write* the file has the opposite need: it must refuse what
+/// the loader would silently drop, or the model writes an agent that is
+/// never offered for delegation and cannot tell why.
+pub fn parse_definition(name: &str, raw: &str) -> Result<AgentDef, String> {
+    // `split` only for the message: no frontmatter at all is the one case
+    // worth naming precisely, since that is what a model gets wrong when
+    // it writes a bare markdown file.
+    crate::frontmatter::split(raw)
+        .ok_or_else(|| "no YAML frontmatter: the file must start with a `---` line".to_string())?;
+    parse_agent(name.to_string(), raw).ok_or_else(|| {
+        "cannot be parsed as an agent definition: `description` is required and the frontmatter must be valid YAML"
+            .to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_definition_reports_what_the_loader_would_skip() {
+        assert!(parse_definition("reviewer", "---\ntools: []\n---\nReview.\n").is_err()); // no description
+        let def =
+            parse_definition("reviewer", "---\ndescription: Reviews.\n---\nReview.\n").unwrap();
+        assert_eq!(
+            (def.name.as_str(), def.prompt.as_str()),
+            ("reviewer", "Review.\n")
+        );
+    }
 
     fn write(dir: &std::path::Path, name: &str, body: &str) {
         std::fs::write(dir.join(name), body).unwrap();

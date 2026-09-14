@@ -124,6 +124,10 @@ where
 /// closed session is the common case — `max_turns` closes one — and
 /// exactly the case a cooldown has to remember, because the file is still
 /// there to be found (design decision 5).
+///
+/// A session whose `room_id` is `task.name` is the only thing counted,
+/// which is also why a test run must **not** reuse that name: the
+/// `task_test` tool creates its sessions under `test:<kind>:<name>`.
 fn is_due(
     task: &AutonomousTask,
     rows: &[SessionRow],

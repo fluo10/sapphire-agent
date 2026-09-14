@@ -3,6 +3,7 @@ pub mod ambient_tools;
 pub mod builtin_tools;
 pub mod client_exec;
 pub mod client_tools;
+pub mod config_tools;
 pub mod policy;
 pub mod session_tools;
 pub mod skill_tools;
@@ -256,6 +257,40 @@ impl ToolSet {
         let mut inner = self.inner.write().await;
         inner.specs.push(tool.spec().clone());
         inner.tools.push(Arc::from(tool));
+    }
+
+    /// Swap, in place, the spec discovery hands the model for a tool
+    /// that is already registered.
+    ///
+    /// This exists because `Tool::spec` returns a borrow: a tool whose
+    /// description depends on state it can change has no way to publish
+    /// that state through its own `spec()` — there is nowhere for the
+    /// borrow to come from that outlives the lock guarding the state.
+    /// So the spec the model is offered is kept here instead, as the
+    /// authoritative copy, and whatever changes the state updates this
+    /// copy too: `subagent`'s definition list is the first such state
+    /// (#265), swapped with `SubagentTool::set_agents` and rendered by
+    /// `SubagentTool::live_spec`.
+    ///
+    /// Replace only. An unregistered `name` is a `warn!` and nothing
+    /// else, on purpose: pushing the spec anyway would leave the set
+    /// offering a name `execute` cannot dispatch, which is worse than
+    /// not offering it at all — the model would call it, spend a round
+    /// trip, and get `Unknown tool` back for something it was just told
+    /// exists. Adding a tool is `register_tool`, which carries the tool
+    /// itself.
+    ///
+    /// Callable from inside `Tool::execute`, which is how the config
+    /// tools will reach it: `execute` clones the `Arc<dyn Tool>` it
+    /// matched and drops its read guard before calling into that tool,
+    /// so this write does not queue behind a guard the caller itself
+    /// still holds.
+    pub async fn replace_spec(&self, name: &str, spec: ToolSpec) {
+        let mut inner = self.inner.write().await;
+        match inner.specs.iter_mut().find(|s| s.name == name) {
+            Some(existing) => *existing = spec,
+            None => warn!("replace_spec: no registered tool named '{name}'"),
+        }
     }
 }
 
@@ -564,6 +599,41 @@ mod tests {
             .map(|s| s.name.to_string())
             .collect();
         assert_eq!(names, vec!["keep_me".to_string()]);
+    }
+
+    /// `replace_spec` swaps the spec the model is offered — same
+    /// count, new description — rather than appending a second entry
+    /// for a name that is already registered.
+    #[tokio::test]
+    async fn replace_spec_swaps_what_the_model_is_offered() {
+        let set = ToolSet::new(
+            vec![Box::new(crate::tools::subagent::SubagentTool::new(Vec::new())) as Box<dyn Tool>],
+            Vec::new(),
+        );
+        let mut swapped = set.specs_filtered(|_| true).await[0].clone();
+        swapped.description = "swapped".into();
+        set.replace_spec("subagent", swapped).await;
+        let after = set.specs_filtered(|_| true).await;
+        assert_eq!(after.len(), 1, "replace, not append");
+        assert_eq!(after[0].description, "swapped");
+    }
+
+    /// Naming something unregistered must not *add* it: a spec without
+    /// a tool behind it is a call the model can make and cannot
+    /// complete.
+    #[tokio::test]
+    async fn replace_spec_does_not_add_an_unknown_name() {
+        let set = ToolSet::new(Vec::new(), Vec::new());
+        set.replace_spec(
+            "nope",
+            crate::provider::ToolSpec {
+                name: "nope".into(),
+                description: "x".into(),
+                input_schema: serde_json::json!({}),
+            },
+        )
+        .await;
+        assert!(set.specs_filtered(|_| true).await.is_empty());
     }
 
     /// Regression test for the Critical deadlock fixed in `execute`'s doc
