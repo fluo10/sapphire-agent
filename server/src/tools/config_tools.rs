@@ -38,16 +38,12 @@ use tracing::warn;
 
 /// Which of the three definition directories a [`ConfigTool`] speaks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-// Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
 pub enum ConfigDir {
     Heartbeat,
     Autonomous,
     Agents,
 }
 
-#[allow(dead_code)]
-// Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
 impl ConfigDir {
     /// Every directory, in the order the tool names sort. Task 7 walks
     /// this to register one tool per entry.
@@ -94,8 +90,6 @@ impl ConfigDir {
 /// from the call, and `name` being one word of a file in one directory is
 /// what makes it so. Anything that could name a *different* file — a
 /// separator, a leading dot, a `..` — is refused rather than normalised.
-#[allow(dead_code)]
-// Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
 pub(crate) fn definition_path(workspace_root: &Path, dir: &str, name: &str) -> Result<PathBuf> {
     let stem = name.strip_suffix(".md").unwrap_or(name);
     if stem.is_empty()
@@ -122,8 +116,6 @@ pub(crate) fn definition_path(workspace_root: &Path, dir: &str, name: &str) -> R
 /// refusal. That is the point rather than an oversight: the allow-list
 /// names places the operator knows who can write in, and those are not
 /// such places.
-#[allow(dead_code)]
-// Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
 pub(crate) fn current_call_room() -> Option<String> {
     match crate::timer::current_origin() {
         Some(crate::timer::TimerOrigin::Chat { room_id }) => Some(room_id),
@@ -138,8 +130,6 @@ pub(crate) fn current_call_room() -> Option<String> {
 /// has no other way to find out, and an operator being told by the agent
 /// *which* setting to change is the whole reason the refusal is not just
 /// "denied".
-#[allow(dead_code)]
-// Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
 pub(crate) const ROOM_REFUSAL: &str = "Permission denied: the config tools are not available in this room. An operator can allow them with `[tools.admin].rooms` in the host config.";
 
 /// The *effective* `enabled` value of a definition, as the loaders read
@@ -149,8 +139,6 @@ pub(crate) const ROOM_REFUSAL: &str = "Permission denied: the config tools are n
 ///
 /// Only a top-level `enabled:` counts, matching `frontmatter::set_enabled`
 /// — an indented one belongs to a nested mapping such as `voice:`.
-#[allow(dead_code)]
-// Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
 pub(crate) fn declared_enabled(raw: &str) -> Option<bool> {
     let (fm, _) = crate::frontmatter::split(raw)?;
     for line in fm.split_inclusive('\n') {
@@ -166,8 +154,6 @@ pub(crate) fn declared_enabled(raw: &str) -> Option<bool> {
     Some(true)
 }
 
-#[allow(dead_code)]
-// Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
 fn lock(state: &Mutex<WorkspaceState>) -> std::sync::MutexGuard<'_, WorkspaceState> {
     state.lock().expect("WorkspaceState mutex poisoned")
 }
@@ -175,8 +161,6 @@ fn lock(state: &Mutex<WorkspaceState>) -> std::sync::MutexGuard<'_, WorkspaceSta
 /// `list` / `read` / `write` / `set_enabled` over one definition
 /// directory, gated on the calling room and on content the loaders can
 /// actually use.
-#[allow(dead_code)]
-// Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
 pub struct ConfigTool {
     dir: ConfigDir,
     workspace_root: PathBuf,
@@ -198,8 +182,6 @@ pub struct ConfigTool {
     spec: ToolSpec,
 }
 
-#[allow(dead_code)]
-// Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
 impl ConfigTool {
     pub fn new(
         dir: ConfigDir,
@@ -602,16 +584,12 @@ fn describe_stop(stop: &TurnStop) -> &'static str {
 /// with looser permissions than production would prove nothing.
 ///
 /// `enabled: false` is not an obstacle: it is the case this exists for.
-#[allow(dead_code)]
-// Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
 pub struct TaskTestTool {
     state: Arc<ServeState>,
     workspace_root: PathBuf,
     spec: ToolSpec,
 }
 
-#[allow(dead_code)]
-// Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
 impl TaskTestTool {
     pub fn new(state: Arc<ServeState>) -> Self {
         // Derived rather than passed: the workspace root is already in the
@@ -881,6 +859,54 @@ impl Tool for TaskTestTool {
             ),
         }
     }
+}
+
+/// Register the four admin tools when the deployment has named a room.
+///
+/// Extracted from `main.rs` so the condition is testable, because the
+/// condition *is* the grant: with `[tools.admin].rooms` empty, `main`
+/// must register nothing at all — four tools that always refuse would
+/// still tell the model they exist, and "exists but never works" is a
+/// worse answer than "does not exist". The run-time gate in
+/// [`ConfigTool::gate`] and [`TaskTestTool::execute`] is the second half
+/// of the same grant, for the transports that have no room of their own.
+///
+/// Called once `serve_state` exists, since `task_test` needs it.
+pub async fn register_admin_tools(
+    tool_set: &Arc<ToolSet>,
+    workspace_root: &Path,
+    config: Config,
+    ws: Arc<Mutex<WorkspaceState>>,
+    subagent: Option<&Arc<SubagentTool>>,
+    serve_state: Arc<ServeState>,
+) {
+    if !config.config_tools_enabled() {
+        return;
+    }
+    // `agent_config` refreshes the spec `ToolSet::specs` advertises, and
+    // `ToolSet` owns those specs — so it holds a `Weak` to the very set
+    // it is registered into. Same shape `RefreshSystemPromptTool` uses
+    // for `Agent`, and the same reason: a strong ref would be a cycle.
+    let tool_set_weak = Arc::downgrade(tool_set);
+    for dir in ConfigDir::ALL {
+        tool_set
+            .register_tool(Box::new(ConfigTool::new(
+                dir,
+                workspace_root.to_path_buf(),
+                config.clone(),
+                Arc::clone(&ws),
+                if dir == ConfigDir::Agents {
+                    subagent.map(Arc::downgrade)
+                } else {
+                    None
+                },
+                tool_set_weak.clone(),
+            )))
+            .await;
+    }
+    tool_set
+        .register_tool(Box::new(TaskTestTool::new(serve_state)))
+        .await;
 }
 
 #[cfg(test)]
@@ -1333,5 +1359,66 @@ mod tests {
             assert!(err.contains("max_turns"), "{bad}: {err}");
             assert!(err.contains("non-negative integer"), "{bad}: {err}");
         }
+    }
+    /// A `rooms` that names nobody registers nothing — not four tools that
+    /// always refuse. The difference matters: the model cannot ask for a
+    /// tool it was never offered, and a refusal it can discover still tells
+    /// it that this surface exists.
+    #[tokio::test]
+    async fn no_room_means_no_registration() {
+        let (_dir, root, ws) = test_workspace();
+        let serve_state = test_state(vec![test_response("ok")]);
+        let set = Arc::new(ToolSet::new(Vec::new(), Vec::new()));
+        let mut config = Config::for_test();
+        config.tools.admin.rooms = Vec::new();
+        assert!(!config.config_tools_enabled());
+
+        register_admin_tools(&set, &root, config, ws, None, serve_state).await;
+
+        assert!(
+            set.specs_filtered(|_| true).await.is_empty(),
+            "no room names one: none of the admin tools may be registered"
+        );
+        assert!(set.kinds().await.is_empty());
+    }
+
+    /// One room is all it takes, and it registers exactly four tools: the
+    /// three `ConfigTool`s (`ConfigDir::ALL`) plus `task_test`. `kinds()`
+    /// is checked for length as well as the specs are for their names, so a
+    /// directory registered twice — or a spec pushed without its tool —
+    /// fails here rather than at the first call.
+    #[tokio::test]
+    async fn one_room_registers_all_four() {
+        let (_dir, root, ws) = test_workspace();
+        let serve_state = test_state(vec![test_response("ok")]);
+        let set = Arc::new(ToolSet::new(Vec::new(), Vec::new()));
+        let mut config = Config::for_test();
+        config.tools.admin.rooms = vec!["!ops:x".to_string()];
+
+        register_admin_tools(&set, &root, config, ws, None, serve_state).await;
+
+        let mut names: Vec<String> = set
+            .specs_filtered(|_| true)
+            .await
+            .into_iter()
+            .map(|s| s.name.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "agent_config",
+                "autonomous_config",
+                "heartbeat_config",
+                "task_test",
+            ]
+        );
+
+        let kinds = set.kinds().await;
+        assert_eq!(kinds.len(), 4, "each name registered once: {kinds:?}");
+        assert!(
+            kinds.iter().all(|(_, kind)| *kind == ToolKind::Edit),
+            "every admin tool is an edit: {kinds:?}"
+        );
     }
 }

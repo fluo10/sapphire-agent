@@ -1679,8 +1679,6 @@ api_key = "test"
 
     /// True when `[tools.admin].rooms` names at least one room, i.e. the
     /// config-file management tools are registered at all.
-    // Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
-    #[allow(dead_code)]
     pub fn config_tools_enabled(&self) -> bool {
         !self.tools.admin.rooms.is_empty()
     }

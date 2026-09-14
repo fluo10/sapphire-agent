@@ -82,6 +82,7 @@ use crate::tools::{Tool, ToolKind};
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::Arc;
 use tracing::warn;
 
 pub(crate) const SUBAGENT_TOOL_NAME: &str = "subagent";
@@ -510,6 +511,26 @@ impl Tool for SubagentTool {
             (Some(name), None) => self.dispatch(name, prompt).await,
             (None, Some(handle)) => self.resume(handle, prompt).await,
         }
+    }
+}
+
+/// Lets one `Arc<SubagentTool>` back both the `subagent` slot in `ToolSet`
+/// *and* the `Weak` `ConfigTool` holds in its `agent_config`
+/// instance — the same shape `SkillTool` uses for its four slots. Without
+/// it the tool would have to be owned by the set alone, and a definition
+/// written at run time would have nowhere to be swapped into (#265).
+#[async_trait]
+impl Tool for Arc<SubagentTool> {
+    fn kind(&self) -> ToolKind {
+        (**self).kind()
+    }
+
+    fn spec(&self) -> &ToolSpec {
+        (**self).spec()
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> anyhow::Result<String> {
+        (**self).execute(input).await
     }
 }
 

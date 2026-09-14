@@ -511,10 +511,15 @@ async fn main() -> Result<()> {
             // `<workspace>/heartbeat/*.md`. Registered outside
             // `default_tool_set` (rather than inside it) so that
             // function's existing call sites, including the test in
-            // `src/agent.rs`, stay untouched by this feature. Only
-            // registered when at least one definition loaded: a tool
-            // with nobody to delegate to has no reason to be offered.
+            // `src/agent.rs`, stay untouched by this feature. Registered
+            // when at least one definition loaded — a tool with nobody to
+            // delegate to has no reason to be offered — and also when
+            // `[tools.admin].rooms` is set, since `agent_config` can
+            // create a definition while the process is running.
             let agent_defs = agents::load_agents_dir(&workspace_dir.join("agents"));
+            // Taken before `new` moves the list: an empty list is not an
+            // error, it is the state `agent_config` exists to change.
+            let no_agent_defs = agent_defs.is_empty();
             let profile_errors = config.validate_subagent_profiles(&agent_defs);
             if !profile_errors.is_empty() {
                 anyhow::bail!(
@@ -522,9 +527,15 @@ async fn main() -> Result<()> {
                     profile_errors.join("\n  - ")
                 );
             }
-            if !agent_defs.is_empty() {
+            // Registered when there is something to delegate to, and also
+            // when `[tools.admin].rooms` is set: `agent_config` can create
+            // a definition while the process is running. `Arc` rather than
+            // a bare `Box` because `agent_config` holds a `Weak` to it —
+            // same shape `SkillTool` uses.
+            let subagent = Arc::new(tools::subagent::SubagentTool::new(agent_defs));
+            if !no_agent_defs || config.config_tools_enabled() {
                 tool_set
-                    .register_tool(Box::new(tools::subagent::SubagentTool::new(agent_defs)))
+                    .register_tool(Box::new(Arc::clone(&subagent)))
                     .await;
             }
 
@@ -911,6 +922,24 @@ async fn main() -> Result<()> {
                     )))
                     .await;
             }
+
+            // ── Config tools ────────────────────────────────────────────────
+            // The agent's own heartbeat / autonomous / subagent definitions,
+            // editable from a chat room an operator names in
+            // `[tools.admin].rooms`. Registered here rather than in
+            // `default_tool_set` because `task_test` needs `serve_state`,
+            // which is built above, and because a `rooms` that names nobody
+            // must register none of the four at all — see
+            // `register_admin_tools`.
+            tools::config_tools::register_admin_tools(
+                &tool_set,
+                &workspace_dir,
+                config.clone(),
+                Arc::clone(&ws_state),
+                Some(&subagent),
+                Arc::clone(&serve_state),
+            )
+            .await;
 
             // Captured below so main can await the agent's graceful
             // shutdown before returning. Without this, the tokio runtime
