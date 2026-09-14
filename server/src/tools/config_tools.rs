@@ -21,8 +21,11 @@
 //!   definition that would never fire cannot be written and then puzzled
 //!   over.
 
-use crate::config::Config;
+use crate::autonomous::{CONTINUE_PROMPT, marker};
+use crate::config::{Config, DEFAULT_NAMESPACE_NAME};
+use crate::provider::ChatMessage;
 use crate::provider::ToolSpec;
+use crate::serve::{AutonomousHost, LlmTurnOutcome, ServeState, TurnStop};
 use crate::tools::subagent::SubagentTool;
 use crate::tools::{Tool, ToolKind, ToolSet};
 use anyhow::{Context, Result, anyhow};
@@ -31,6 +34,7 @@ use sapphire_framework::workspace::WorkspaceState;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
+use tracing::warn;
 
 /// Which of the three definition directories a [`ConfigTool`] speaks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -544,9 +548,334 @@ impl Tool for ConfigTool {
     }
 }
 
+/// The most turns a `task_test` run may spend.
+///
+/// A tool whose job is to check that a task does not eat tokens must not
+/// eat tokens itself, so the cap is a constant rather than a knob: a
+/// definition's own `max_turns` can only ever lower it (see
+/// [`capped_test_turns`]).
+const MAX_TEST_TURNS: usize = 3;
+
+/// The `room_id` a test session is created under.
+///
+/// **Deliberately not the task's name.** `autonomous::is_due` anchors a
+/// task's cooldown on the latest session whose `room_id == task.name`, so
+/// a test that claimed that name would reset the real task's cooldown —
+/// merely testing a task would postpone it. The `test:` prefix keeps every
+/// test session out of that query.
+fn test_room_id(kind: &str, name: &str) -> String {
+    format!("test:{kind}:{name}")
+}
+
+/// How many turns a requested `max_turns` means for a test run.
+///
+/// `Some(0)` is one turn — a zero-turn run would test nothing — and every
+/// other request is capped at [`MAX_TEST_TURNS`]. `None` means "use the
+/// definition's own `max_turns`"; that is signalled as `0` rather than an
+/// `Option` so the caller has one number to resolve.
+fn capped_test_turns(requested: Option<usize>) -> usize {
+    match requested {
+        Some(0) => 1,
+        Some(n) => n.min(MAX_TEST_TURNS),
+        None => 0,
+    }
+}
+
+/// One line for why a test run ended.
+///
+/// `TurnStop`'s `Debug` prints `BudgetExhausted { partial_text: "..." }`,
+/// which is not a sentence an operator can read in a report.
+fn describe_stop(stop: &TurnStop) -> &'static str {
+    match stop {
+        TurnStop::Replied => "replied",
+        TurnStop::ProviderError => "provider error",
+        TurnStop::BudgetExhausted { .. } => "tool-round budget exhausted",
+    }
+}
+
+/// Run one of the agent's own task definitions once, before it is enabled.
+///
+/// The run is production's in every respect but two: the session it lands
+/// in is named `test:<kind>:<name>` rather than after the task, and it
+/// stops after [`MAX_TEST_TURNS`]. Same `serve::run_llm_turn`, same prompt
+/// assembly, same permission row (`[autonomous] origin`) — a test that ran
+/// with looser permissions than production would prove nothing.
+///
+/// `enabled: false` is not an obstacle: it is the case this exists for.
+#[allow(dead_code)]
+// Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
+pub struct TaskTestTool {
+    state: Arc<ServeState>,
+    workspace_root: PathBuf,
+    spec: ToolSpec,
+}
+
+#[allow(dead_code)]
+// Consumed by `register_admin_tools` once `main` wires it up (#265, Task 7).
+impl TaskTestTool {
+    pub fn new(state: Arc<ServeState>) -> Self {
+        // Derived rather than passed: the workspace root is already in the
+        // state, and a second copy could disagree with it.
+        let workspace_root = state.workspace.dir().to_path_buf();
+        let spec = ToolSpec {
+            name: "task_test".into(),
+            description: "Run one of the agent's own task definitions once, in a throwaway \
+                 session, to see what it does before enabling it. The task runs even while \
+                 `enabled: false` — that is the point: try it first, then turn it on with \
+                 `heartbeat_config` / `autonomous_config` and `set_enabled`. The run uses the \
+                 same model, the same prompt assembly and the same permission row as the real \
+                 thing, but its session is named `test:<kind>:<name>` instead of after the \
+                 task, so it touches neither the `enabled:` flag nor the task's cooldown. \
+                 `max_turns` caps an autonomous test at 3 turns; a heartbeat task is one \
+                 prompt and is always exactly one turn. Delivery is not verified: a heartbeat \
+                 task's `room_id:` / `voice:` targets are ignored, because what this tool \
+                 checks is the prompt and how the task ends, not where a result would go. \
+                 These tools are available only in the rooms an operator listed in \
+                 `[tools.admin].rooms`."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["heartbeat", "autonomous"],
+                        "description": "Which definition directory the task lives in.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "The definition's file stem — one word, no \
+                            directory and no extension (e.g. \"journal\").",
+                    },
+                    "max_turns": {
+                        "type": "integer",
+                        "description": "For `autonomous`: how many turns the test may \
+                            spend, at most 3. Omit to use the definition's own \
+                            `max_turns`. Ignored for `heartbeat`, which is one prompt.",
+                    },
+                },
+                "required": ["kind", "name"],
+            }),
+        };
+        Self {
+            state,
+            workspace_root,
+            spec,
+        }
+    }
+
+    /// The permission row this run's turns are judged by — production's
+    /// own, from `[autonomous] origin`.
+    fn origin(&self) -> crate::tools::policy::Origin {
+        match self.state.config.autonomous.origin {
+            crate::config::AutonomousOrigin::Channel => crate::tools::policy::Origin::Channel,
+            crate::config::AutonomousOrigin::Trusted => crate::tools::policy::Origin::Trusted,
+        }
+    }
+
+    /// The namespace the test session lands in: the calling room's, so the
+    /// report is readable where the operator already is. `None` only
+    /// happens on a path the gate has already refused.
+    fn namespace(&self) -> &str {
+        match current_call_room() {
+            Some(room) => self.state.config.namespace_for_room(&room),
+            None => DEFAULT_NAMESPACE_NAME,
+        }
+    }
+
+    /// A workspace-relative path, for an error message or a report.
+    fn rel_display(&self, abs: &Path) -> String {
+        abs.strip_prefix(&self.workspace_root)
+            .unwrap_or(abs)
+            .display()
+            .to_string()
+    }
+
+    /// The session's own path, workspace-relative — the report's `Session:`
+    /// line. Derived from the store rather than assembled from a template,
+    /// so it cannot drift from the real file name.
+    fn session_rel(&self, session_id: &str) -> String {
+        let ns = self.namespace();
+        self.state
+            .autonomous_session_store
+            .absolute_path_for(session_id)
+            .map(|p| self.rel_display(&p))
+            .unwrap_or_else(|| format!("sessions/{ns}/autonomous/{session_id}.jsonl"))
+    }
+
+    fn load_heartbeat(&self, name: &str) -> Result<crate::heartbeat_config::HeartbeatTask> {
+        let abs = definition_path(&self.workspace_root, "heartbeat", name)?;
+        let raw = std::fs::read_to_string(&abs)
+            .with_context(|| format!("failed to read {}", self.rel_display(&abs)))?;
+        crate::heartbeat_config::parse_definition(name, &raw)
+            .map_err(|e| anyhow!("cannot test {name}: {e}"))
+    }
+
+    fn load_autonomous(&self, name: &str) -> Result<crate::autonomous_config::AutonomousTask> {
+        let abs = definition_path(&self.workspace_root, "autonomous", name)?;
+        let raw = std::fs::read_to_string(&abs)
+            .with_context(|| format!("failed to read {}", self.rel_display(&abs)))?;
+        crate::autonomous_config::parse_definition(name, &raw)
+            .map_err(|e| anyhow!("cannot test {name}: {e}"))
+    }
+
+    /// One turn, run exactly as production runs it.
+    async fn turn(&self, session_id: &str, text: String) -> LlmTurnOutcome {
+        crate::serve::run_llm_turn(
+            Arc::clone(&self.state),
+            session_id.to_string(),
+            ChatMessage::user(text),
+            Arc::new(AutonomousHost {
+                origin: self.origin(),
+            }),
+            None,
+        )
+        .await
+    }
+
+    /// Create the test session, under the `test:` name and the caller's
+    /// namespace.
+    fn open_session(&self, kind: &str, name: &str) -> Result<String> {
+        self.state
+            .autonomous_session_store
+            .create_autonomous_session(&test_room_id(kind, name), self.namespace())
+            .with_context(|| format!("failed to create a test session for {name}"))
+    }
+
+    /// Close the session, then answer with what happened.
+    ///
+    /// Closed *before* the report is built, and closed even when the run
+    /// failed: a session left open is the one state a later `session_list`
+    /// would read wrongly, as a test still in progress.
+    fn finish(
+        &self,
+        kind: &str,
+        name: &str,
+        session_id: &str,
+        turns: usize,
+        stop: &TurnStop,
+        answer: Option<String>,
+    ) -> Result<String> {
+        if let Err(e) = self
+            .state
+            .autonomous_session_store
+            .close_session(session_id)
+        {
+            warn!("task_test: cannot close the test session for {name}: {e}");
+        }
+        let answer = answer.unwrap_or_else(|| "(no answer)".to_string());
+        Ok(format!(
+            "{kind} task '{name}' ran {turns} turn(s) ({}).\nSession: {}\nResult: {answer}",
+            describe_stop(stop),
+            self.session_rel(session_id),
+        ))
+    }
+
+    /// A heartbeat task is one prompt, so its test is exactly one turn —
+    /// a heartbeat definition has no `max_turns` to honour anyway.
+    async fn run_heartbeat(&self, name: &str) -> Result<String> {
+        let task = self.load_heartbeat(name)?;
+        let session_id = self.open_session("heartbeat", name)?;
+        // The same prefix `Heartbeat::fire_task` puts in front of the body.
+        let text = format!("[Heartbeat: {name}]\n\n{}", task.body);
+        let outcome = self.turn(&session_id, text).await;
+        self.finish(
+            "heartbeat",
+            name,
+            &session_id,
+            1,
+            &outcome.stop,
+            outcome.text,
+        )
+    }
+
+    /// The autonomous test: production's own turn-1 assembly, then
+    /// `CONTINUE_PROMPT` — so a run that works here works there.
+    async fn run_autonomous(&self, name: &str, requested: Option<usize>) -> Result<String> {
+        let task = self.load_autonomous(name)?;
+        // `0` is the "not requested" sentinel; the definition's own cap is
+        // still bounded, so a task declaring 50 turns cannot turn a test
+        // into a long run.
+        let cap = match capped_test_turns(requested) {
+            0 => task.max_turns.min(MAX_TEST_TURNS),
+            n => n,
+        };
+        let session_id = self.open_session("autonomous", name)?;
+        let session_rel = self.session_rel(&session_id);
+
+        let mut turns = 0;
+        let mut last: Option<String> = None;
+        // Overwritten by the first turn, which always runs: a parsed task's
+        // `max_turns` is at least one and `cap` is therefore at least one.
+        let mut stop = TurnStop::Replied;
+        while turns < cap {
+            let text = if turns == 0 {
+                format!("{}\nSession: {session_rel}\n\n{}", marker(name), task.body)
+            } else {
+                format!("{}\n{CONTINUE_PROMPT}", marker(name))
+            };
+            let outcome = self.turn(&session_id, text).await;
+            turns += 1;
+            stop = outcome.stop;
+            // Kept even when this turn produced no answer, so a run whose
+            // final turn broke the provider still reports what the model
+            // last said.
+            match outcome.text {
+                Some(text) => last = Some(text),
+                None => break,
+            }
+            if last.as_deref().is_some_and(|t| t.trim() == "DONE") {
+                break;
+            }
+        }
+
+        self.finish("autonomous", name, &session_id, turns, &stop, last)
+    }
+}
+
+#[async_trait]
+impl Tool for TaskTestTool {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Edit
+    }
+
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // Before the arguments are even read: the room gate every config
+        // tool shares. A run is the most powerful thing on this surface —
+        // it drives a whole turn — so it is refused as firmly as a write.
+        if !self
+            .state
+            .config
+            .config_tools_allowed_in(current_call_room().as_deref())
+        {
+            anyhow::bail!(ROOM_REFUSAL);
+        }
+        let kind = input["kind"]
+            .as_str()
+            .context("missing 'kind' (\"heartbeat\" or \"autonomous\")")?;
+        let name = input["name"]
+            .as_str()
+            .context("missing 'name' (the definition's file stem)")?;
+        match kind {
+            "heartbeat" => self.run_heartbeat(name).await,
+            "autonomous" => {
+                let requested = input["max_turns"].as_u64().map(|n| n as usize);
+                self.run_autonomous(name, requested).await
+            }
+            other => anyhow::bail!(
+                "task_test: unknown kind {other:?}. `kind` is \"heartbeat\" or \"autonomous\"."
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ChatResponse;
     use crate::timer::{TimerOrigin, scope_timer_origin};
     use sapphire_framework::workspace::{AppContext, Workspace, WorkspaceState};
     use serde_json::json;
@@ -808,5 +1137,175 @@ mod tests {
             ConfigDir::ALL.map(|d| d.tool_name()),
             ["agent_config", "autonomous_config", "heartbeat_config"]
         );
+    }
+
+    /// The same shape `autonomous.rs`'s `mod tests` builds: one final
+    /// answer, no tool calls.
+    fn test_response(text: &str) -> ChatResponse {
+        ChatResponse {
+            prompt_usage: None,
+            text: Some(text.to_string()),
+            tool_calls: Vec::new(),
+            stop_reason: None,
+        }
+    }
+
+    /// A `ServeState` whose scripted provider answers with `responses`,
+    /// with `!ops:x` allow-listed so the tool's room gate is passable.
+    fn test_state(responses: Vec<ChatResponse>) -> Arc<ServeState> {
+        let mut state = ServeState::for_test_scripted(false, responses);
+        Arc::get_mut(&mut state)
+            .expect("uniquely owned immediately after construction")
+            .config
+            .tools
+            .admin
+            .rooms = vec!["!ops:x".to_string()];
+        state
+    }
+
+    fn test_tool(responses: Vec<ChatResponse>) -> (Arc<ServeState>, TaskTestTool) {
+        let state = test_state(responses);
+        let tool = TaskTestTool::new(Arc::clone(&state));
+        (state, tool)
+    }
+
+    /// The invariant the whole design hangs on: `autonomous::is_due`
+    /// anchors a task's cooldown on the latest session whose `room_id` is
+    /// the task's name, so a test session must never claim that name.
+    #[test]
+    fn a_test_session_does_not_claim_the_task_name() {
+        assert_eq!(
+            test_room_id("autonomous", "journal"),
+            "test:autonomous:journal"
+        );
+        assert_ne!(test_room_id("autonomous", "journal"), "journal");
+        assert_eq!(
+            test_room_id("heartbeat", "morning"),
+            "test:heartbeat:morning"
+        );
+    }
+
+    /// `enabled: false` is the case this tool exists for: the task runs
+    /// anyway, on the production prompt assembly, and the session it used
+    /// is closed so a later `session_list` does not show a running test.
+    #[tokio::test]
+    async fn a_disabled_task_can_be_tested_and_the_session_is_closed() {
+        let (state, tool) = test_tool(vec![test_response("working"), test_response("DONE")]);
+        let ws = state.workspace.dir().to_path_buf();
+        std::fs::create_dir_all(ws.join("autonomous")).unwrap();
+        std::fs::write(
+            ws.join("autonomous/journal.md"),
+            "---\nenabled: false\n---\nWrite the journal.\n",
+        )
+        .unwrap();
+
+        let out = in_room(
+            "!ops:x",
+            tool.execute(&json!({"kind": "autonomous", "name": "journal"})),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            out.contains("autonomous task 'journal' ran 2 turn(s) (replied)"),
+            "{out}"
+        );
+        // The model's own answer is what is reported — proving the turn
+        // really ran rather than merely created a session.
+        assert!(out.contains("Result: DONE"), "{out}");
+        assert!(
+            out.contains("Session: sessions/default/autonomous/"),
+            "the report should name the session, workspace-relative: {out}"
+        );
+
+        let rows = state.autonomous_session_store.session_rows();
+        assert_eq!(rows.len(), 1, "one test, one session");
+        assert_eq!(rows[0].meta.room_id, "test:autonomous:journal");
+        assert!(rows[0].is_closed, "a finished test must not look running");
+
+        // The definition's body went into the first user message exactly
+        // as production assembles it.
+        let history = state
+            .autonomous_session_store
+            .load_session(&rows[0].meta.session_id)
+            .unwrap();
+        let first = match &history[0].parts[0] {
+            crate::provider::ContentPart::Text(t) => t.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert!(first.starts_with("[Autonomous: journal]\n"), "{first}");
+        assert!(first.ends_with("Write the journal.\n"), "{first}");
+    }
+
+    /// A test must never be a long run: the cap is what makes it a check
+    /// on token appetite rather than a source of one.
+    #[test]
+    fn max_turns_is_capped_for_a_test() {
+        assert_eq!(capped_test_turns(Some(50)), MAX_TEST_TURNS);
+        assert_eq!(capped_test_turns(Some(MAX_TEST_TURNS)), MAX_TEST_TURNS);
+        assert_eq!(capped_test_turns(Some(2)), 2);
+        assert_eq!(capped_test_turns(Some(0)), 1, "zero would test nothing");
+        assert_eq!(
+            capped_test_turns(None),
+            0,
+            "`0` is the sentinel for \"use the definition's own max_turns\""
+        );
+    }
+
+    /// Two answers are scripted; a one-turn run consumes only the first,
+    /// which is what `Result: first` pins.
+    #[tokio::test]
+    async fn a_heartbeat_test_runs_exactly_one_turn() {
+        let (state, tool) = test_tool(vec![test_response("first"), test_response("second")]);
+        let ws = state.workspace.dir().to_path_buf();
+        std::fs::create_dir_all(ws.join("heartbeat")).unwrap();
+        std::fs::write(
+            ws.join("heartbeat/morning.md"),
+            "---\nschedule: \"0 8 * * *\"\n---\nWake up.\n",
+        )
+        .unwrap();
+
+        let out = in_room(
+            "!ops:x",
+            tool.execute(&json!({"kind": "heartbeat", "name": "morning"})),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("1 turn(s) (replied)"), "{out}");
+        assert!(out.contains("Result: first"), "{out}");
+        assert!(!out.contains("second"), "a second turn was run: {out}");
+
+        let rows = state.autonomous_session_store.session_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].meta.room_id, "test:heartbeat:morning");
+        assert!(rows[0].is_closed);
+    }
+
+    /// The room gate comes first — before `kind` or `name` are read — and
+    /// an unknown `kind` names one of two directories or is refused.
+    #[tokio::test]
+    async fn task_test_is_refused_without_a_chat_room() {
+        let (_state, tool) = test_tool(vec![test_response("ok")]);
+
+        // No `TimerOrigin::Chat` scope at all is `/rpc`, `/acp` and voice.
+        let err = tool
+            .execute(&json!({"kind": "autonomous", "name": "journal"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Permission denied"), "{err}");
+
+        // A room is not the only thing that can be wrong: `kind` names one
+        // of two definition directories, and anything else is refused
+        // before a file is read.
+        let err = in_room(
+            "!ops:x",
+            tool.execute(&json!({"kind": "agents", "name": "reviewer"})),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("heartbeat"), "{err}");
     }
 }
