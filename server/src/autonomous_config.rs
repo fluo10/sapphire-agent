@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn parse_definition_reports_what_the_loader_would_skip() {
         assert!(parse_definition("journal", "---\npriority: 50\n---\nWrite it.\n").is_ok());
-        assert!(parse_definition("journal", "---\npriority: 50\n---\n\n").is_err());   // empty body
+        assert!(parse_definition("journal", "---\npriority: 50\n---\n\n").is_err()); // empty body
     }
 
     fn write(dir: &Path, name: &str, raw: &str) {

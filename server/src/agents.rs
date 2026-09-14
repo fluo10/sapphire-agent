@@ -123,9 +123,13 @@ mod tests {
 
     #[test]
     fn parse_definition_reports_what_the_loader_would_skip() {
-        assert!(parse_definition("reviewer", "---\ntools: []\n---\nReview.\n").is_err());  // no description
-        let def = parse_definition("reviewer", "---\ndescription: Reviews.\n---\nReview.\n").unwrap();
-        assert_eq!((def.name.as_str(), def.prompt.as_str()), ("reviewer", "Review.\n"));
+        assert!(parse_definition("reviewer", "---\ntools: []\n---\nReview.\n").is_err()); // no description
+        let def =
+            parse_definition("reviewer", "---\ndescription: Reviews.\n---\nReview.\n").unwrap();
+        assert_eq!(
+            (def.name.as_str(), def.prompt.as_str()),
+            ("reviewer", "Review.\n")
+        );
     }
 
     fn write(dir: &std::path::Path, name: &str, body: &str) {

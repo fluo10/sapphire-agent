@@ -37,8 +37,8 @@ pub fn split(raw: &str) -> Option<(&str, &str)> {
 /// switch would rewrite a human's file. A definition is a file people
 /// hand-edit — the `schedule` line usually has a comment above it saying
 /// why — and the tool's job is one line, not the document.
-    // Consumed by the config tools once they land (#265).
-    #[allow(dead_code)]
+// Consumed by the config tools once they land (#265).
+#[allow(dead_code)]
 pub fn set_enabled(raw: &str, enabled: bool) -> Option<String> {
     let (fm, _) = split(raw)?;
     // Which delimiter the file already uses. Rewriting a CRLF file as LF

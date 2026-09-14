@@ -2093,11 +2093,13 @@ mod tests {
 
     #[test]
     fn config_tools_are_allowed_in_a_named_room_and_nowhere_else() {
-        let cfg = parse("[anthropic]\napi_key = \"test\"\n\n[tools.admin]\nrooms = [\"!ops:x\", \"!dev:y\"]\n");
+        let cfg = parse(
+            "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\nrooms = [\"!ops:x\", \"!dev:y\"]\n",
+        );
         assert!(cfg.config_tools_enabled());
         assert!(cfg.config_tools_allowed_in(Some("!ops:x")));
         assert!(!cfg.config_tools_allowed_in(Some("!random:z")));
-        assert!(!cfg.config_tools_allowed_in(None));   // /rpc, /acp, voice: never
+        assert!(!cfg.config_tools_allowed_in(None)); // /rpc, /acp, voice: never
     }
 
     /// The default is off. An agent that starts working on its own
