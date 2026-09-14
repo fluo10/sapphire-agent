@@ -189,6 +189,14 @@ fn build_spec(agents: &[AgentDef]) -> ToolSpec {
     for agent in agents {
         description.push_str(&format!("- {}: {}\n", agent.name, agent.description));
     }
+    if agents.is_empty() {
+        // The heading is printed either way, so an empty list has to
+        // say so in words — left as a dangling "Available agents:" it
+        // reads as a rendering bug rather than as "none are configured
+        // yet". Names the tool that fixes it, since the likeliest
+        // reader is the model that is allowed to write one.
+        description.push_str("(none yet \u{2014} create one with `agent_config` action `write`)\n");
+    }
 
     ToolSpec {
         name: SUBAGENT_TOOL_NAME.into(),
@@ -346,7 +354,20 @@ impl crate::serve::TurnHost for SubagentHost {
 /// answer. See the module docs for the three properties this exists to
 /// establish.
 pub struct SubagentTool {
-    agents: Vec<AgentDef>,
+    /// The definitions currently offered, swappable at run time (#265)
+    /// so a config-tool write takes effect without a restart. Swappable
+    /// *through* the lock, not by constructing a new tool: the
+    /// `ToolSet` already holds this one behind an `Arc<dyn Tool>`, and
+    /// a second `SubagentTool::new` would be a tool nothing dispatches
+    /// to.
+    ///
+    /// `std::sync::RwLock` rather than `tokio::sync::RwLock`: every
+    /// reader clones what it needs and drops the guard before any
+    /// `.await`, so no guard is ever held across a suspension point and
+    /// there is nothing an async lock would buy. It is also the lock
+    /// that *works* here — [`Self::live_spec`] calls `build_spec`
+    /// synchronously, with no runtime guaranteed to await on.
+    agents: std::sync::RwLock<Vec<AgentDef>>,
     spec: ToolSpec,
     /// `(agent name, tool name)` pairs already warned about by
     /// [`Self::newly_unknown_tools`], so a typo in one definition's
@@ -368,11 +389,60 @@ impl SubagentTool {
     pub fn new(agents: Vec<AgentDef>) -> Self {
         let spec = build_spec(&agents);
         Self {
-            agents,
+            agents: std::sync::RwLock::new(agents),
             spec,
             warned_unknown_tools: std::sync::Mutex::new(std::collections::HashSet::new()),
             busy_handles: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// The definitions this tool currently offers.
+    ///
+    /// An owned clone, not a guard: every caller wants to `.await` or
+    /// to build a string out of the list, and a guard held across an
+    /// `.await` is precisely the coupling `ToolSet::execute`'s doc
+    /// describes having removed. Cloning also means a concurrent
+    /// [`Self::set_agents`] can never be observed half-applied — a
+    /// caller sees the whole old list or the whole new one.
+    fn agents(&self) -> Vec<AgentDef> {
+        // Bound to its own name so the read guard's lifetime is this
+        // statement and no longer: it is released before the clone is
+        // even returned, let alone awaited on.
+        let agents = self.agents.read().unwrap();
+        agents.clone()
+    }
+
+    /// Swap the definition list — the write side of a hot reload, for
+    /// the caller that has just rewritten a definition file (#265).
+    ///
+    /// `spec` is deliberately left alone: it stays the
+    /// registration-time value it has always been (see
+    /// [`Tool::spec`]). The list the model is *offered* is `ToolSet`'s
+    /// copy of that spec, which the caller updates with
+    /// `ToolSet::replace_spec` — pairing the two is what makes a written
+    /// definition both offered and callable, rather than one of the two.
+    ///
+    /// Not `async`: it never waits, only writes. The lock is `std`'s,
+    /// see the field's doc.
+    // Consumed by the config tools once they land (#265).
+    #[allow(dead_code)]
+    pub fn set_agents(&self, agents: Vec<AgentDef>) {
+        *self.agents.write().unwrap() = agents;
+    }
+
+    /// The spec for the definitions as they are *right now*, rather
+    /// than [`Tool::spec`]'s construction-time one.
+    ///
+    /// `Tool::spec` hands back a borrow, so it cannot build this on
+    /// demand from behind a lock — the guard would not outlive the
+    /// call. This is that same `build_spec` made callable any time, for
+    /// the caller that is about to store it (`ToolSet::replace_spec`)
+    /// and wants the description the model is offered to list exactly
+    /// the agents a dispatch would accept.
+    // Consumed by the config tools once they land (#265).
+    #[allow(dead_code)]
+    pub fn live_spec(&self) -> ToolSpec {
+        build_spec(&self.agents())
     }
 
     /// Which of `def.tools`' names resolve to nothing the parent can
@@ -451,10 +521,11 @@ impl SubagentTool {
     /// Start a fresh child conversation with `def`, run it to
     /// completion, and store it under a freshly generated handle.
     async fn dispatch(&self, name: &str, prompt: &str) -> anyhow::Result<String> {
-        let Some(def) = self.agents.iter().find(|a| a.name == name) else {
+        let agents = self.agents();
+        let Some(def) = agents.iter().find(|a| a.name == name) else {
             // Recoverable: the parent picked a name that does not
             // exist, and can pick again if it is told what does.
-            let known: Vec<&str> = self.agents.iter().map(|a| a.name.as_str()).collect();
+            let known: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
             anyhow::bail!("no agent named '{name}'. Available: {}", known.join(", "));
         };
 
@@ -530,7 +601,8 @@ impl SubagentTool {
             );
         };
 
-        let Some(def) = self.agents.iter().find(|a| a.name == stored.agent) else {
+        let agents = self.agents();
+        let Some(def) = agents.iter().find(|a| a.name == stored.agent) else {
             // The definition this handle belongs to does not currently
             // resolve — a rename, a deletion, or simply a `.md` that
             // failed to parse this time around. That last case is not
@@ -887,6 +959,14 @@ mod tests {
         }]
     }
 
+    /// The definitions moved behind a lock in #265, so a test that wants
+    /// one out of the tool clones it — the same thing every reader in
+    /// this module does. The list is still `new`'s, unchanged, so this
+    /// is the registration-time definition; only the access changed.
+    fn agent(tool: &SubagentTool, index: usize) -> crate::agents::AgentDef {
+        tool.agents()[index].clone()
+    }
+
     /// The description is the parent model's only basis for choosing,
     /// so every agent's own description has to reach it.
     #[test]
@@ -907,6 +987,35 @@ mod tests {
     #[test]
     fn the_kind_is_other() {
         assert_eq!(SubagentTool::new(defs()).kind(), ToolKind::Other);
+    }
+
+    /// A definition written after the tool was constructed is callable
+    /// and offered without a restart — the whole point of holding the
+    /// list behind a lock.
+    ///
+    /// `spec()` deliberately stays put: it is the registration-time
+    /// value, and `Tool::spec` cannot return a borrow of anything
+    /// rebuilt on demand. What the model is offered is `ToolSet`'s copy
+    /// of the spec, updated via `replace_spec` — so `live_spec` is the
+    /// one that has to track `set_agents`.
+    #[tokio::test]
+    async fn set_agents_makes_a_new_definition_callable() {
+        let tool = SubagentTool::new(Vec::new());
+        assert!(tool.live_spec().description.contains("none yet"));
+        tool.set_agents(vec![crate::agents::AgentDef {
+            name: "reviewer".into(),
+            description: "Reviews things.".into(),
+            tools: None,
+            prompt: "Review.".into(),
+            profile: None,
+        }]);
+        assert!(
+            tool.live_spec()
+                .description
+                .contains("- reviewer: Reviews things.")
+        );
+        // The tool's own `spec()` is the registration-time value and stays put.
+        assert!(!tool.spec().description.contains("reviewer"));
     }
 
     /// A name the operator never defined is a mistake the parent can
@@ -1028,7 +1137,7 @@ mod tests {
     #[test]
     fn an_unknown_tool_name_is_reported_once() {
         let tool = SubagentTool::new(defs());
-        let def = &tool.agents[0]; // tools: Some(["client_file_read"])
+        let def = agent(&tool, 0); // tools: Some(["client_file_read"])
         let parent_visible = [spec_named("client_file_read")];
 
         let unknown = crate::agents::AgentDef {
@@ -1057,8 +1166,8 @@ mod tests {
             profile: None,
             ..defs()[0].clone()
         }]);
-        let def = &tool.agents[0];
-        assert!(tool.newly_unknown_tools(def, &[]).is_empty());
+        let def = agent(&tool, 0);
+        assert!(tool.newly_unknown_tools(&def, &[]).is_empty());
     }
 
     /// An unrestricted definition (`tools: None`) has nothing to check
@@ -1071,8 +1180,8 @@ mod tests {
             profile: None,
             ..defs()[0].clone()
         }]);
-        let def = &tool.agents[0];
-        assert!(tool.newly_unknown_tools(def, &[]).is_empty());
+        let def = agent(&tool, 0);
+        assert!(tool.newly_unknown_tools(&def, &[]).is_empty());
     }
 
     /// A minimal `TurnHost` that records every call it receives, so a
