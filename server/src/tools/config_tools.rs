@@ -148,7 +148,9 @@ pub(crate) const ROOM_REFUSAL: &str = "Permission denied: the config tools are n
 /// The *effective* `enabled` value of a definition, as the loaders read
 /// it: `enabled:` when present, `true` when absent (both loaders declare
 /// `#[serde(default = "default_true")]`, so an unmentioned definition is
-/// an enabled one), and `None` when there is no frontmatter at all.
+/// an enabled one), and `None` when there is no frontmatter at all or the
+/// `enabled:` value itself is unparseable (the loader skips such a file,
+/// so there is no effective state to claim).
 ///
 /// Only a top-level `enabled:` counts, matching `frontmatter::set_enabled`
 /// — an indented one belongs to a nested mapping such as `voice:`.
@@ -1040,6 +1042,11 @@ mod tests {
             Some(false)
         );
         assert_eq!(declared_enabled("# no frontmatter\n"), None);
+        assert_eq!(
+            declared_enabled("---\nenabled: yes please\n---\nBody\n"),
+            None,
+            "an unparseable value means the loader skips the file"
+        );
     }
 
     #[tokio::test]
