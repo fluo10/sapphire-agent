@@ -1552,6 +1552,7 @@ You are a reviewer.
             visible_specs: set.specs_filtered(|_| true).await.into(),
             timer_origin: None,
             session_id: None,
+            subagent_depth: 0,
         });
         let out = crate::serve::scope_turn_context(
             ctx,

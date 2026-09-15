@@ -347,7 +347,12 @@ system_prompt = "You are a helpful personal assistant."
 #     tool error, with its conversation so far saved under a handle the
 #     parent can `resume`. It is a backstop for hangs a round cap cannot
 #     see — a tool call that never returns — not a budget, so keep it well
-#     above how long real delegated work takes.
+#     above how long real delegated work takes. `max_depth` is the
+#     nesting cap, default 2: main(0) delegating to a planning agent(1)
+#     that delegates to an explorer(2) fits, nothing deeper does. `0`
+#     forbids delegation outright — the `subagent` tool is not offered to
+#     any turn, the main agent's included — and `1` is the old
+#     "never nest" behaviour.
 #   - `[[tools.mcp_servers]]` — outbound MCP client. Connects to
 #     external MCP servers and exposes their tools to the agent as
 #     `mcp__<name>__<tool_name>`. Distinct from the inbound MCP
@@ -422,6 +427,8 @@ system_prompt = "You are a helpful personal assistant."
 #
 # [tools.subagent]
 # turn_timeout_secs = 3600                  # 0 = no limit
+# max_depth = 2                             # nesting cap; 0 = no
+#                                           # delegation, 1 = never nest
 #
 # # Example: let one ops room manage the heartbeat/autonomous/agents
 # # definitions. Empty by default (all four tools unregistered).

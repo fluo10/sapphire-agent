@@ -17,6 +17,8 @@ struct AgentMeta {
     description: String,
     #[serde(default)]
     tools: Option<Vec<String>>,
+    #[serde(default)]
+    subagents: Option<Vec<String>>,
     /// Name of the `[profiles.<name>]` entry this agent runs on. `None`
     /// means "the parent turn's provider, unchanged" — the default and
     /// the pre-feature behaviour.
@@ -32,6 +34,10 @@ pub struct AgentDef {
     /// `None` means "whatever the parent can see". `Some(vec![])` means
     /// no tools at all, which is a legitimate definition.
     pub tools: Option<Vec<String>>,
+    /// `None` means "inherit whatever the delegating turn can see".
+    /// `Some(vec![])` means never delegate further, which is a
+    /// legitimate definition.
+    pub subagents: Option<Vec<String>>,
     /// The body, which becomes the whole system prompt.
     pub prompt: String,
     /// The name in `[profiles.<n>]` this agent runs on, or `None` for
@@ -90,6 +96,7 @@ fn parse_agent(name: String, raw: &str) -> Option<AgentDef> {
         name,
         description: meta.description,
         tools: meta.tools,
+        subagents: meta.subagents,
         prompt: body.trim_start_matches(['\n', '\r']).to_string(),
         profile: meta.profile,
     })
@@ -183,6 +190,33 @@ mod tests {
 
         let agents = load_agents_dir(d.path());
         assert_eq!(agents[0].tools.as_deref(), Some([].as_slice()));
+    }
+
+    /// `subagents` behaves like `tools`: absent means `None` (inherit
+    /// whatever the delegating turn can see), and an empty list means
+    /// `Some(empty)` (never delegate further).
+    #[test]
+    fn subagents_field_parses_like_tools_does() {
+        let d = tempfile::tempdir().unwrap();
+        write(
+            d.path(),
+            "plain.md",
+            "---\ndescription: Thinks.\n---\nThink.\n",
+        );
+        write(
+            d.path(),
+            "limited.md",
+            "---\ndescription: Plans.\nsubagents: [explorer]\n---\nPlan.\n",
+        );
+
+        let agents = load_agents_dir(d.path());
+        let plain = agents.iter().find(|a| a.name == "plain").unwrap();
+        let limited = agents.iter().find(|a| a.name == "limited").unwrap();
+        assert_eq!(plain.subagents, None);
+        assert_eq!(
+            limited.subagents.as_deref(),
+            Some(["explorer".to_string()].as_slice())
+        );
     }
 
     /// One broken file must not take the others with it — the same

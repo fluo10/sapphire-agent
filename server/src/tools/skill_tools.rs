@@ -1864,6 +1864,7 @@ mod tests {
             visible_specs: Arc::from(Vec::<ToolSpec>::new()),
             timer_origin: None,
             session_id: Some(session_id.to_string()),
+            subagent_depth: 0,
         })
     }
 
