@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-server-v0.8.0...sapphire-agent-server-v0.8.1) - 2026-09-15
+
+### Added
+
+- *(workspace)* Pin system-prompt file reads until an explicit clear
+- *(agent)* Invalidate_system_prompts also clears the pinned file cache
+- *(tools)* Add refresh_system_prompt tool + document pinned prompt
+- *(serve)* Inject ACP session cwd into the system prompt
+- *(agents)* Parse an optional `profile:` onto agent definitions
+- *(config)* Reject agent definitions naming an unknown profile at startup
+- *(subagent)* Run profiled definitions on their profile's provider
+- *(sessions)* Dated file naming and autonomous session creation
+- *(sessions)* Load autonomous task files from autonomous/*.md
+- *(config)* Add the [autonomous] table, off by default
+- *(serve)* Add the autonomous session store and turn host
+- *(autonomous)* Add the idle loop driving autonomous sessions
+- *(autonomous)* Wire the idle loop into startup
+- *(session-tools)* Let session_list read the autonomous store
+- *(frontmatter)* Add a line-level set_enabled for definition files
+- *(config)* Add [tools.admin].rooms for the admin tool surface
+- *(config)* Expose the definition parsers for the write side
+- *(subagent)* Make the definition list swappable at run time
+- *(tools)* ConfigTool over the three definition directories
+- *(tools)* Add task_test to try a task without enabling it
+- *(main)* Register the admin tools when a room is allow-listed
+- *(agents)* Parse the subagents: allowlist on definitions
+- *(config)* Add [tools.subagent] max_depth (nesting cap, default 2); thread subagents field through test literals
+- *(subagent)* Allow nesting up to max_depth, with per-definition subagents allowlists
+
+### Changed
+
+- Rustfmt the profile-parsing test added in the profile feature
+- Keep the new pub items clippy-clean until their consumers land
+- Rustfmt the new config-tools code
+
+### Documentation
+
+- *(workspace)* Restore render_room_info doc comment placement
+- *(autonomous)* Ship an example task and document the loop
+- Document the admin tools and why they are room-scoped
+- *(tools)* Re-review nits - declared_enabled doc covers the unparseable-value case (with a test assertion), em-dash consistency in config.example.toml
+
+### Fixed
+
+- Time out stalled provider streams and hung subagent turns ([#258](https://github.com/fluo10/sapphire-agent/pull/258))
+- *(config)* Make the autonomous origin default the safe channel row
+- *(tools)* Refuse a non-integer max_turns in task_test
+- *(tools)* Final-review fixes for the config tools
+
+### Testing
+
+- *(sessions)* Exercise the dated path resolution through a cold cache
+
+
+
 ## [0.8.0](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.7.2...sapphire-agent-server-v0.8.0) - 2026-09-07
 
 ### Changed
