@@ -971,6 +971,7 @@ mod tests {
             name: "reviewer".to_string(),
             description: "Reviews a diff.".to_string(),
             tools: Some(vec!["client_file_read".to_string()]),
+            subagents: None,
             prompt: "You are a reviewer.".to_string(),
             profile: None,
         }]
@@ -1023,6 +1024,7 @@ mod tests {
             name: "reviewer".into(),
             description: "Reviews things.".into(),
             tools: None,
+            subagents: None,
             prompt: "Review.".into(),
             profile: None,
         }]);
@@ -1332,6 +1334,7 @@ mod tests {
                 "client_file_read".to_string(),
                 "client_shell".to_string(),
             ]),
+            subagents: None,
             prompt: "You are impl.".to_string(),
             profile: None,
         }]
@@ -1747,6 +1750,7 @@ mod tests {
             name: "impl".to_string(),
             description: "Implements a task.".to_string(),
             tools: None,
+            subagents: None,
             prompt: "You are impl.".to_string(),
             profile: None,
         }]);
@@ -1994,6 +1998,7 @@ mod tests {
             name: "impl".to_string(),
             description: "Implements a task.".to_string(),
             tools: Some(vec![]),
+            subagents: None,
             prompt: "You are impl.".to_string(),
             profile: Some("dev".to_string()),
         }]);
@@ -2067,6 +2072,7 @@ mod tests {
             name: "impl".to_string(),
             description: "Implements a task.".to_string(),
             tools: Some(vec![]),
+            subagents: None,
             prompt: "You are impl.".to_string(),
             profile: None,
         };
@@ -2154,6 +2160,7 @@ mod tests {
             name: "worker".to_string(),
             description: "Works.".to_string(),
             tools: None,
+            subagents: None,
             prompt: "You are a worker.".to_string(),
             profile: None,
         }]);

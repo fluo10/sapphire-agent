@@ -845,11 +845,20 @@ pub struct SubagentConfig {
     /// real work to a guard meant only for hangs.
     #[serde(default = "SubagentConfig::default_turn_timeout_secs")]
     pub turn_timeout_secs: u64,
+    /// Nesting-depth cap for subagent recursion. main(0) -> plan(1) ->
+    /// explorer(2) fits under 2. `0` forbids delegation entirely; `1`
+    /// is the old "never nest" behaviour.
+    #[serde(default = "SubagentConfig::default_max_depth")]
+    pub max_depth: u32,
 }
 
 impl SubagentConfig {
     fn default_turn_timeout_secs() -> u64 {
         3600
+    }
+
+    fn default_max_depth() -> u32 {
+        2
     }
 
     /// The deadline, or `None` when it is disabled.
@@ -863,6 +872,7 @@ impl Default for SubagentConfig {
     fn default() -> Self {
         Self {
             turn_timeout_secs: Self::default_turn_timeout_secs(),
+            max_depth: Self::default_max_depth(),
         }
     }
 }
@@ -2374,6 +2384,7 @@ provider = "anthropic"
                 name: "reviewer".into(),
                 description: "Reviews.".into(),
                 tools: None,
+                subagents: None,
                 prompt: "Review.".into(),
                 profile: Some("dev".into()),
             },
@@ -2381,6 +2392,7 @@ provider = "anthropic"
                 name: "impl".into(),
                 description: "Implements.".into(),
                 tools: None,
+                subagents: None,
                 prompt: "Implement.".into(),
                 profile: Some("missing".into()),
             },
@@ -2388,6 +2400,7 @@ provider = "anthropic"
                 name: "helper".into(),
                 description: "Thinks.".into(),
                 tools: None,
+                subagents: None,
                 prompt: "Think.".into(),
                 profile: None,
             },
@@ -2415,6 +2428,7 @@ provider = "anthropic"
             name: "reviewer".into(),
             description: "Reviews.".into(),
             tools: None,
+            subagents: None,
             prompt: "Review.".into(),
             profile: Some("dev".into()),
         }];
@@ -3441,5 +3455,22 @@ model = "m"
         let tools: crate::config::ToolsConfig =
             toml::from_str("[subagent]\nturn_timeout_secs = 0").unwrap();
         assert_eq!(tools.subagent.turn_timeout(), None);
+    }
+
+    /// The nesting-depth cap defaults to 2: main(0) -> plan(1) ->
+    /// explorer(2) fits under it, and nothing deeper is delegated.
+    #[test]
+    fn subagent_max_depth_defaults_to_two() {
+        let tools: crate::config::ToolsConfig = toml::from_str("[subagent]").unwrap();
+        assert_eq!(tools.subagent.max_depth, 2);
+    }
+
+    /// A written value is read back as-is, `0` — delegation forbidden
+    /// outright — included.
+    #[test]
+    fn subagent_max_depth_reads_from_toml() {
+        let tools: crate::config::ToolsConfig =
+            toml::from_str("[subagent]\nmax_depth = 0").unwrap();
+        assert_eq!(tools.subagent.max_depth, 0);
     }
 }
