@@ -2310,6 +2310,13 @@ pub(crate) struct TurnContext {
     /// through `ServeState`, so without a session key two different
     /// editors' `skill()` calls would collide on one cache entry.
     pub session_id: Option<String>,
+    /// This turn's own subagent nesting depth. A main turn is `0`; a
+    /// nested subagent turn is its delegator's depth + 1 (set by
+    /// `SubagentTool::run_and_store`, which builds the nested `TurnLoop`
+    /// with `subagent_depth: ctx.subagent_depth + 1`). Paired with
+    /// `tools.subagent.max_depth`, this is what `subagent_tool_specs`
+    /// uses to decide whether this turn may delegate further.
+    pub subagent_depth: u32,
 }
 
 tokio::task_local! {
@@ -2355,6 +2362,11 @@ pub(crate) struct TurnLoop<'a> {
     pub timer_origin: Option<crate::timer::TimerOrigin>,
     pub namespace: String,
     pub persistence: Option<&'a TurnPersistence>,
+    /// This loop's own nesting depth, copied straight into each round's
+    /// `TurnContext` (see `TurnContext::subagent_depth`). A main turn
+    /// builds its `TurnLoop` with `0`; a nested subagent turn with its
+    /// delegator's depth + 1.
+    pub subagent_depth: u32,
 }
 
 impl TurnLoop<'_> {
@@ -2628,6 +2640,7 @@ impl TurnLoop<'_> {
                         visible_specs: Arc::clone(&visible_specs),
                         timer_origin: timer_origin.clone(),
                         session_id: self.persistence.map(|p| p.session_id.clone()),
+                        subagent_depth: self.subagent_depth,
                     });
                     let mut results: Vec<(String, crate::tools::ToolOutput)> =
                         futures_util::future::join_all(permitted.into_iter().map(|c| {
@@ -2942,6 +2955,7 @@ pub(crate) async fn run_llm_turn(
         timer_origin,
         namespace: namespace.clone(),
         persistence: Some(&persistence),
+        subagent_depth: 0,
     }
     .run(&mut history)
     .await;
@@ -4008,16 +4022,19 @@ mod tests {
         );
     }
 
-    /// The depth cap `subagent_tool_specs` gives by removing `subagent`
-    /// from a nested turn's own list is a promise about what is
-    /// *offered* — `ToolSet::execute` dispatches on name across every
+    /// The depth cap is enforced by the *gate*, not just by the list.
+    /// With `max_depth = 1` — the pre-recursion default, one delegation
+    /// deep, no further — the nested turn's own `tool_specs` carries no
+    /// `subagent`, and `ToolSet::execute` dispatches by name across every
     /// tool the shared `ToolSet` has registered, `subagent` included, so
-    /// without a gate that actually checks the round's own `tool_specs`,
-    /// a subagent could still call `subagent` by name and recurse
-    /// without bound. This asserts the gate, not just the list.
+    /// it is the gate (which refuses any call outside the round's own
+    /// `tool_specs`) that actually stops the nested turn from calling
+    /// `subagent` by name and recursing anyway. This asserts the gate,
+    /// not just the list. See `a_subagent_can_nest_up_to_max_depth_two`
+    /// for the same script where the cap permits one more level.
     #[tokio::test]
-    async fn a_subagent_cannot_invoke_subagent_by_name() {
-        let (state, chat_log) = ServeState::for_test_scripted_with_log(
+    async fn a_subagent_cannot_nest_past_max_depth_one() {
+        let (mut state, chat_log) = ServeState::for_test_scripted_with_log(
             true,
             vec![
                 // Parent round 1: delegate.
@@ -4032,8 +4049,9 @@ mod tests {
                     stop_reason: None,
                 },
                 // Subagent round 1: try to recurse by naming `subagent`
-                // itself — never in this round's own `tool_specs`, but
-                // still a name the shared `ToolSet` has registered.
+                // itself — never in this round's own `tool_specs` (the
+                // cap is 1 here), but still a name the shared `ToolSet`
+                // has registered.
                 crate::provider::ChatResponse {
                     prompt_usage: None,
                     text: None,
@@ -4060,6 +4078,16 @@ mod tests {
                 },
             ],
         );
+
+        // Pin the cap to 1 (one level only) rather than rely on the
+        // shipped default of 2 — this test is specifically about the
+        // no-nesting boundary.
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .tools
+            .subagent
+            .max_depth = 1;
 
         state
             .tools
@@ -4097,6 +4125,99 @@ mod tests {
             "exactly parent-round-1, subagent-round-1, subagent-round-2, \
              parent-round-2 — a 5th call would mean the self-recursion \
              attempt actually ran"
+        );
+    }
+
+    /// The counterpart of `a_subagent_cannot_nest_past_max_depth_one`:
+    /// the same script, the same single `delegator` definition, but the
+    /// shipped default cap (`max_depth = 2`). Now the nested turn *is*
+    /// offered `subagent`, its recursive call runs, and the turn needs a
+    /// fifth `chat()` call — depth-2's answer, then depth-1's, then the
+    /// parent's. If the cap were misread as "levels below the delegator
+    /// minus one", this script would exhaust at four calls and the fifth
+    /// would error instead of completing.
+    #[tokio::test]
+    async fn a_subagent_can_nest_up_to_max_depth_two() {
+        let (state, chat_log) = ServeState::for_test_scripted_with_log(
+            true,
+            vec![
+                // Parent round 1: delegate to the depth-1 agent.
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "delegator", "prompt": "go"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Depth-1 round 1: recurse — now offered, at depth 1 with
+                // the default cap of 2.
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "sub-call-1".to_string(),
+                        name: "subagent".to_string(),
+                        input: json!({"agent": "delegator", "prompt": "recurse"}),
+                    }],
+                    stop_reason: None,
+                },
+                // Depth-2 round 1: at the cap — no further delegation,
+                // answers straight away.
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: Some("leaf answer".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+                // Depth-1 round 2: receives the leaf's answer, answers.
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: Some("delegator done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+                // Parent round 2: receives it, finishes the turn.
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
+                crate::agents::AgentDef {
+                    name: "delegator".to_string(),
+                    description: "Delegates.".to_string(),
+                    tools: None,
+                    subagents: None,
+                    prompt: "You are a delegator.".to_string(),
+                    profile: None,
+                },
+            ])))
+            .await;
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-subagent-nesting".to_string(),
+            ChatMessage::user("delegate it"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert_eq!(
+            chat_log.calls().len(),
+            5,
+            "the recursion actually ran: parent(2) + depth-1(2) + depth-2(1) \
+             = 5 calls; four would mean the nested call was still refused"
         );
     }
 
@@ -4465,10 +4586,10 @@ mod tests {
             );
             assert_eq!(
                 tools,
-                &vec!["echo".to_string()],
+                &vec!["echo".to_string(), "subagent".to_string()],
                 "the subagent's round {i} must see exactly its \
-                 definition's own tool list, `subagent` included nowhere \
-                 in it"
+                 definition's own tool list plus the `subagent` tool (the \
+                 default cap of 2 offers it at depth 1), nothing else"
             );
         }
 

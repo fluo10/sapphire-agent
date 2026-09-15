@@ -17,18 +17,22 @@
 //! 2. **The system prompt is the definition and nothing else.** See
 //!    [`subagent_system_prompt`].
 //! 3. **The tool list actually offered is enforced, not just built
-//!    restricted.** `subagent_tool_specs` removes `subagent` from a
-//!    nested turn's own list, but that alone is a hint to the model, not
-//!    a bound: `ToolSet::execute` dispatches by name across every tool
-//!    the shared `ToolSet` has registered, `subagent` included, so
-//!    nothing here would stop a nested turn from calling `subagent` by
-//!    name even though its own list never offered it. What actually
-//!    closes recursion — and a definition's `tools:` restriction, and
-//!    the same hallucinated-name gap on the parent's own turn — is
-//!    `TurnLoop::run`'s permission gate refusing any call whose name is
-//!    not in *that round's own* `tool_specs`, checked ahead of
-//!    everything else including the host-access gate. See
-//!    `Refusal::NotOffered` in `crate::tools::policy`.
+//!    restricted.** `subagent_tool_specs` builds each turn's list under
+//!    the depth cap — past `tools.subagent.max_depth` it omits `subagent`
+//!    entirely, so a turn at the cap is never *offered* delegation — but
+//!    the list alone is a hint to the model, not a bound:
+//!    `ToolSet::execute` dispatches by name across every tool the shared
+//!    `ToolSet` has registered, `subagent` included, so nothing here
+//!    would stop a turn from calling `subagent` by name even though its
+//!    own list never offered it. What actually enforces the cap — and a
+//!    definition's `tools:` restriction, and the same hallucinated-name
+//!    gap on the parent's own turn — is `TurnLoop::run`'s permission gate
+//!    refusing any call whose name is not in *that round's own*
+//!    `tool_specs`, checked ahead of everything else including the
+//!    host-access gate. The list this function builds and the gate's
+//!    membership check are two halves of the one mechanism: only a spec
+//!    this function *did* append is a `subagent` call the gate lets
+//!    through. See `Refusal::NotOffered` in `crate::tools::policy`.
 //!
 //! `Tool::execute` receives only its JSON input — no session, no host,
 //! no model. What a subagent needs to run is threaded through instead
@@ -138,25 +142,46 @@ pub(crate) fn subagent_system_prompt(def: &AgentDef) -> String {
     def.prompt.clone()
 }
 
-/// The tools a subagent may use.
+/// The tools a subagent may use, and the `subagent` tool its own
+/// delegations would show — see this module doc's third property for
+/// what actually enforces the cap (the gate, not this list).
 ///
-/// `None` in the definition inherits the parent's visible set; a list
-/// selects from it. Either way `subagent` itself is removed from the
-/// list this function returns — but that is a hint to the model about
-/// what to call, not the thing that actually caps delegation depth.
-/// `ToolSet::execute` dispatches by name across every tool the shared
-/// `ToolSet` has registered, `subagent` included, so a nested turn could
-/// still call `subagent` by name even with it missing from this list.
-/// What actually enforces the cap is `TurnLoop::run`'s permission gate,
-/// which refuses any call whose name is not in that round's own
-/// `tool_specs` — i.e. not in what this function returned. See
-/// `Refusal::NotOffered` in `crate::tools::policy`.
+/// `def.tools` filters the inherited set exactly as before: `None` inherits
+/// the parent's visible set, a list selects from it. The difference from
+/// the pre-recursion behaviour is the `subagent` tool itself. It is still
+/// stripped from the inherited list, but when the nested turn this list is
+/// *for* is itself allowed to delegate — its own depth is `depth + 1`
+/// (`depth` is the delegating turn's depth, main turn = 0) and it can
+/// delegate exactly when that is still under the cap, `depth + 1 <
+/// max_depth` — a *fresh* `subagent` spec is appended, carrying the agent
+/// list the nested turn may itself delegate to.
+/// When the depth cap forbids delegation, or `def.subagents` is `Some(
+/// vec![])`, no `subagent` spec is appended, so the gate's membership check
+/// refuses any `subagent` call and the turn cannot delegate.
 ///
-/// `ToolSpec.name` is `Cow<'static, str>`, so every comparison below
-/// goes through `.as_ref()` rather than relying on a direct `Cow` vs
-/// `&str` comparison.
-pub(crate) fn subagent_tool_specs(def: &AgentDef, parent_visible: &[ToolSpec]) -> Vec<ToolSpec> {
-    parent_visible
+/// The appended spec's agent list is derived the same way this function was
+/// originally invoked on the delegator: `def.subagents == Some(list)`
+/// rebuilds it narrowed to those names against `all_agents` (the currently
+/// registered definitions); `None` inherits the delegator's own view verbatim
+/// — the `subagent` spec already embedded in `parent_visible`, whose
+/// description carries exactly the set that turn can see, is cloned
+/// straight through. A delegator with no `subagent` spec in its own view can
+/// only arise one level below the depth cap, already excluded by the
+/// `depth + 1 < max_depth` check above, so there is no "no source spec to
+/// clone" case to handle.
+///
+/// `ToolSpec.name` is `Cow<'static, str>`, so every comparison below goes
+/// through `.as_ref()` rather than relying on a direct `Cow` vs `&str`
+/// comparison.
+pub(crate) fn subagent_tool_specs(
+    def: &AgentDef,
+    parent_visible: &[ToolSpec],
+    all_agents: &[AgentDef],
+    depth: u32,
+    max_depth: u32,
+) -> Vec<ToolSpec> {
+    let nested_allowed = depth + 1 < max_depth && def.subagents != Some(vec![]);
+    let mut specs: Vec<ToolSpec> = parent_visible
         .iter()
         .filter(|s| s.name.as_ref() != SUBAGENT_TOOL_NAME)
         .filter(|s| match &def.tools {
@@ -164,7 +189,29 @@ pub(crate) fn subagent_tool_specs(def: &AgentDef, parent_visible: &[ToolSpec]) -
             None => true,
         })
         .cloned()
-        .collect()
+        .collect();
+    if nested_allowed {
+        let nested = match &def.subagents {
+            // `None`: inherit the delegating turn's own view verbatim — the
+            // spec already embedded there carries exactly the set it can see.
+            None => parent_visible
+                .iter()
+                .find(|s| s.name.as_ref() == SUBAGENT_TOOL_NAME)
+                .cloned(),
+            // `Some(list)`: rebuild the spec narrowed to the listed names,
+            // against the full registered list.
+            Some(allowed) => {
+                let visible: Vec<AgentDef> = all_agents
+                    .iter()
+                    .filter(|a| allowed.contains(&a.name))
+                    .cloned()
+                    .collect();
+                Some(build_spec(&visible))
+            }
+        };
+        specs.extend(nested);
+    }
+    specs
 }
 
 /// Build the tool's spec: a fixed preamble plus one line per agent, so
@@ -704,7 +751,13 @@ impl SubagentTool {
         }
 
         let system = subagent_system_prompt(def);
-        let specs = subagent_tool_specs(def, &ctx.visible_specs);
+        let specs = subagent_tool_specs(
+            def,
+            &ctx.visible_specs,
+            &self.agents(),
+            ctx.subagent_depth,
+            ctx.state.config.tools.subagent.max_depth,
+        );
 
         // The subagent's own memory-tool calls (if it has any) write
         // under the same namespace the delegating conversation is in —
@@ -746,6 +799,13 @@ impl SubagentTool {
             progress: &progress,
             timer_origin: ctx.timer_origin.clone(),
             namespace,
+            // This nested turn sits one level below whoever delegated to
+            // it, so it can delegate further exactly when
+            // `subagent_depth + 1` is still under the cap.
+            // `subagent_tool_specs` reads the same `ctx.subagent_depth`
+            // this is derived from to decide whether to offer `subagent`
+            // at all.
+            subagent_depth: ctx.subagent_depth + 1,
             // No session behind it. The conversation exists for the
             // length of this call and is then dropped — that is what
             // "context isolation" means here. Resumability is a
@@ -1084,34 +1144,119 @@ mod tests {
         }
     }
 
-    /// `subagent_tool_specs` never lists `subagent` — the parent
-    /// model's basis for choosing what to call — but the list alone is
-    /// only a hint. What actually caps delegation depth is
-    /// `TurnLoop::run`'s permission gate refusing any call outside a
-    /// round's own `tool_specs`; see
-    /// `a_subagent_cannot_invoke_subagent_by_name` in `src/serve/mod.rs`
-    /// for the test that pins the gate itself, not just the list this
-    /// function builds.
+    /// The depth cap bites where it was always going to bite: the list
+    /// a turn is actually *offered*. A turn at or past
+    /// `tools.subagent.max_depth` gets no `subagent` spec in its own
+    /// list at all — and the list is what the gate enforces (see the
+    /// module doc's third property and
+    /// `a_subagent_cannot_nest_past_max_depth_one` in `src/serve/mod.rs`),
+    /// so a call naming it anyway is refused as not offered. Below the
+    /// cap, an unrestricted definition inherits the delegator's own
+    /// `subagent` spec verbatim.
     #[test]
-    fn a_subagents_tool_list_never_contains_subagent() {
+    fn the_subagent_tool_is_offered_only_below_the_depth_cap() {
         let parent_visible = [
             spec_named("client_file_read"),
             spec_named(SUBAGENT_TOOL_NAME),
         ];
-        let inherited = subagent_tool_specs(&defs()[0], &parent_visible);
+        let all = defs();
+
+        // At the cap: under `max_depth = 1` only the main turn (depth 0)
+        // delegates — a list built for the depth-1 turn it produced, and
+        // anything deeper, carries no `subagent` — restricted definition
+        // and unrestricted definition both.
+        let inherited = subagent_tool_specs(&all[0], &parent_visible, &all, 1, 1);
         assert!(!inherited.iter().any(|s| s.name == SUBAGENT_TOOL_NAME));
 
         let unrestricted = crate::agents::AgentDef {
             tools: None,
-            profile: None,
-            ..defs()[0].clone()
+            ..all[0].clone()
         };
-        let inherited = subagent_tool_specs(&unrestricted, &parent_visible);
+        let inherited = subagent_tool_specs(&unrestricted, &parent_visible, &all, 1, 1);
         assert!(!inherited.iter().any(|s| s.name == SUBAGENT_TOOL_NAME));
         assert!(inherited.iter().any(|s| s.name == "client_file_read"));
+
+        // The shipped default (`max_depth = 2`): the list built at
+        // depth 1 — for the turn a depth-1 agent would produce — carries
+        // no `subagent`: main(0) may delegate to plan(1), and plan(1)
+        // itself still holds the tool, but what plan(1) produces sits at
+        // the cap and cannot delegate further.
+        let inherited = subagent_tool_specs(&unrestricted, &parent_visible, &all, 1, 2);
+        assert!(!inherited.iter().any(|s| s.name == SUBAGENT_TOOL_NAME));
+
+        // Below the cap — a main turn (depth 0, default cap 2) — an
+        // unrestricted definition inherits the delegator's own spec
+        // verbatim: same description, same list it carries.
+        let inherited = subagent_tool_specs(&unrestricted, &parent_visible, &all, 0, 2);
+        let offered = inherited
+            .iter()
+            .find(|s| s.name == SUBAGENT_TOOL_NAME)
+            .expect("a delegator below the cap is offered `subagent`");
+        assert_eq!(offered.description, parent_visible[1].description);
     }
 
-    /// Even when the definition asks for it by name.
+    /// `subagents:` narrows, it does not grant. The spec offered to a
+    /// delegating agent carries only the names its definition allows —
+    /// the full registered list the delegator itself sees is not what the
+    /// nested turn gets.
+    #[test]
+    fn a_subagents_allowlist_narrows_the_offered_spec() {
+        let all = vec![
+            crate::agents::AgentDef {
+                name: "explorer".to_string(),
+                description: "Explores.".to_string(),
+                tools: None,
+                subagents: None,
+                prompt: "You explore.".to_string(),
+                profile: None,
+            },
+            crate::agents::AgentDef {
+                name: "other-agent".to_string(),
+                description: "Does other things.".to_string(),
+                tools: None,
+                subagents: None,
+                prompt: "You do other things.".to_string(),
+                profile: None,
+            },
+        ];
+        let delegator = crate::agents::AgentDef {
+            tools: None,
+            subagents: Some(vec!["explorer".to_string()]),
+            ..all[0].clone()
+        };
+        // The delegator itself sees both agents; its nested turn must see
+        // only the one its allowlist names.
+        let parent_visible = [spec_named(SUBAGENT_TOOL_NAME)];
+        let inherited = subagent_tool_specs(&delegator, &parent_visible, &all, 0, 2);
+        assert_eq!(inherited.len(), 1, "{inherited:?}");
+        let desc = inherited[0].description.as_ref();
+        assert!(desc.contains("explorer: "), "{desc}");
+        assert!(
+            !desc.contains("other-agent:"),
+            "narrowed spec leaked a non-allowlisted agent: {desc}"
+        );
+    }
+
+    /// `subagents: []` is an explicit refusal, not an omission: even a
+    /// turn comfortably below the cap gets no `subagent` at all.
+    #[test]
+    fn an_empty_subagents_list_forbids_delegation_at_any_depth() {
+        let def = crate::agents::AgentDef {
+            tools: None,
+            subagents: Some(vec![]),
+            ..defs()[0].clone()
+        };
+        let parent_visible = [spec_named(SUBAGENT_TOOL_NAME)];
+        assert!(subagent_tool_specs(&def, &parent_visible, &defs(), 0, 2).is_empty());
+    }
+
+    /// `subagent` named in a definition's own `tools:` is not a typo and
+    /// is not a grant: the filter never passes it through as an inherited
+    /// tool. (Below the depth cap the tool can still reach the nested
+    /// turn — re-appended by the depth machinery, not by this list; see
+    /// `the_subagent_tool_is_offered_only_below_the_depth_cap`. At
+    /// `max_depth = 0` no delegation is possible at any depth, so the
+    /// filter's verdict here is the whole story.)
     #[test]
     fn a_definition_cannot_grant_itself_subagent() {
         let greedy = crate::agents::AgentDef {
@@ -1126,7 +1271,7 @@ mod tests {
             spec_named("client_file_read"),
             spec_named(SUBAGENT_TOOL_NAME),
         ];
-        let inherited = subagent_tool_specs(&greedy, &parent_visible);
+        let inherited = subagent_tool_specs(&greedy, &parent_visible, &defs(), 0, 0);
         assert!(!inherited.iter().any(|s| s.name == SUBAGENT_TOOL_NAME));
     }
 
@@ -1139,7 +1284,7 @@ mod tests {
             ..defs()[0].clone()
         };
         let parent_visible = [spec_named("client_file_read")];
-        assert!(subagent_tool_specs(&toolless, &parent_visible).is_empty());
+        assert!(subagent_tool_specs(&toolless, &parent_visible, &defs(), 0, 2).is_empty());
     }
 
     fn spec_named(name: &str) -> crate::provider::ToolSpec {
@@ -1475,6 +1620,7 @@ mod tests {
             // added later should fail loudly on `None`, not silently
             // pass because a test handed it a `Some`.
             session_id: None,
+            subagent_depth: 0,
         })
     }
 
@@ -1518,6 +1664,7 @@ mod tests {
                 visible_specs: Vec::<ToolSpec>::new().into(),
                 timer_origin: None,
                 session_id: Some("parent-session".to_string()),
+                subagent_depth: 0,
             })
         };
 
@@ -1577,7 +1724,17 @@ mod tests {
     #[tokio::test]
     async fn resume_recomputes_the_tool_list_so_the_depth_cap_still_holds() {
         let tool = SubagentTool::new(resumable_defs());
-        let state = crate::serve::ServeState::for_test(false);
+        let mut state = crate::serve::ServeState::for_test(false);
+        // Pin the cap to 1 (the pre-recursion "never nest" behaviour) so
+        // the recomputed list has no `subagent` in it and any widening at
+        // all fails the strict equality below.
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .tools
+            .subagent
+            .max_depth = 1;
+        let state = state;
 
         // Wider than `resumable_defs`' own `tools:` list, and including
         // `subagent` itself, so a resumed list that was merely *not
