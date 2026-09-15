@@ -21,7 +21,7 @@ A personal AI assistant agent that lives in a [`sapphire-framework`](https://git
 - **Ambient audio ingest**: optional always-on capture from a wearable/pendant device — `POST /audio/ingest` takes raw audio (metadata in query params, no JSON/base64 framing) from a bearer-authenticated device, re-gates it, transcribes it, attributes it to a speaker against reference audio curated in the workspace, and stores the transcript outside the workspace. Records without answering: nothing in this path starts an LLM turn. `transcript_read`, `speaker_candidates` and `speaker_promote` expose the result as agent tools. Disabled by default — enable via `[ambient].enabled = true`; see `config.example.toml`.
 - **Agent-to-agent**: `/a2a` endpoint speaks the v1 A2A protocol (JSON-RPC `SendMessage`, AgentCard) with per-device bearer-token auth — enable via `[a2a].enabled = true`.
 - **External AI integration**: `/mcp` endpoint publishes `write_report` and `recall_memory` tools so Claude Code (and other MCP clients) can share project context with the agent — see [docs/mcp-integration.md](docs/mcp-integration.md).
-- **Subagents**: `<workspace>/agents/<name>.md` definitions the main agent can delegate a task to via the `subagent` tool — its own system prompt, its own tool loop, only the final answer comes back, and it can be resumed by handle for a later round. See [Subagents](#subagents) below.
+- **Subagents**: `<workspace>/agents/<name>.md` definitions the main agent can delegate a task to via the `subagent` tool — its own system prompt, its own tool loop, only the final answer comes back, it can be resumed by handle for a later round, and a delegated agent can itself delegate up to `[tools.subagent] max_depth` deep. See [Subagents](#subagents) below.
 - **Skills**: written procedures (planning, TDD, debugging, code review, …) loaded on request from a checkout on the *editor's* machine, over ACP. Requires an ACP client that declared terminal support — off entirely for Matrix, Discord and voice. See [Skills](#skills) below.
 - **Editor integration**: `/acp` endpoint speaks the Agent Client Protocol over WebSocket, so Zed can drive the running agent — enable via `[acp].enabled = true`; see [Zed / ACP](#zed--acp) below.
 - **Commands**:
@@ -141,6 +141,13 @@ You are a reviewer. Read the diff, report problems, and stop there.
   config's `[profiles]` does not define fails startup outright — a
   typo'd profile name should not silently run the agent on a different
   model.
+- **`subagents`** is optional, and mirrors `tools` one level up: it
+  restricts *which agents this one may delegate to*. Omit it and the
+  agent inherits whichever agents the delegating turn could already
+  delegate to; give it `[]` and this agent never delegates further,
+  whatever depth cap is configured; give it a list and only those agent
+  names are offered. Same shape, same semantics, different namespace —
+  agent names here, tool names in `tools:`.
 - **The body** is the subagent's entire system prompt. That is genuinely
   all of it — see below.
 
@@ -202,12 +209,32 @@ go. If a subagent's own tool list includes `recall_image`, calling it
 produces nothing the parent (or the model) can see — the image bytes are
 simply dropped rather than attached to anything.
 
-**Delegation is depth 1.** A subagent's own tool list never contains
-`subagent`, regardless of what its definition's `tools:` says — and, per
-the enforcement above, this isn't just an omission from the list a
-subagent is offered: a call literally naming `subagent` is refused the
-same way any other out-of-list name is, so a subagent cannot recurse by
-guessing.
+**Delegation nests, up to `[tools.subagent] max_depth`** — 2 by default.
+The main agent runs at depth 0, a subagent it dispatches at depth 1, and a
+subagent that one dispatches at depth 2; a planner can therefore hand a
+focused search to an explorer, but nothing runs three levels down. Set
+`max_depth = 1` for the old "delegation is always exactly one level"
+behaviour, or `0` to forbid delegation outright — the `subagent` tool is
+then not offered to any turn, the main agent's included. Enforcement is
+exactly the tool-list check described above: once a turn sits at the cap,
+its offered list simply omits `subagent`, and a call naming it anyway is
+refused the same way any other out-of-list name is, so a subagent cannot
+recurse by guessing — nor can a definition widen its own reach by naming
+`subagent` in `tools:`.
+
+**The allowlist narrows at every level.** A definition's `subagents:` is
+the same shape as `tools:`, applied to agent names instead of tool names:
+omit it and the child can delegate to whatever the delegating turn could,
+write `[]` and it never delegates further regardless of the depth cap, and
+write a list and only those names are offered. A nested subagent is thus
+governed by both the depth cap and every allowlist on the chain above it —
+each level decides locally, rather than the whole chain being computed up
+front.
+
+**`[tools.subagent] turn_timeout_secs` applies per level, not per chain.**
+Each nested subagent turn gets its own deadline, so a child that hangs is
+stopped and reported to its own parent as a tool error, and that parent
+carries on.
 
 **Permission requests work normally.** A subagent's tool calls are judged
 by the parent's own `Origin`, through the parent's own `TurnHost` — the
