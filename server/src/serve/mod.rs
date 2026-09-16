@@ -2763,15 +2763,19 @@ impl TurnLoop<'_> {
 ///
 /// - The user message and any compaction summary are already on disk — they
 ///   are appended to JSONL as they happen (steps 4 and 5). The `state.sessions`
-///   write-back at the end never runs. So a cancelled prompt is invisible to
-///   the next turn's in-memory model context, yet present in `list_sessions`
-///   and after a restart; a compaction summary can be persisted and then
-///   thrown away, and will be produced again next turn. For an ACP session,
-///   the same is true of `tool_use` and `tool_result`: each is appended as
+///   write-back at the end never runs, but step 1 no longer minds: it
+///   re-reads storage every turn rather than trusting a cache that this
+///   drop just left behind stale, so a cancelled prompt's already-saved
+///   progress is what the *next* turn hydrates from, not the previous
+///   completed turn's write-back. A compaction summary can still be
+///   persisted and then thrown away by the drop, and will be produced
+///   again next turn — that part is unchanged, it is simply not lost
+///   information, only repeated work. For an ACP session, the same
+///   re-read applies to `tool_use` and `tool_result`: each is appended as
 ///   it happens, so a drop between the two leaves exactly the gap
-///   `AcpSessionStore::history`'s positional repair exists to close on the
-///   next read — an orphaned `tool_use` gets a synthesised placeholder
-///   result spliced in right after it.
+///   `AcpSessionStore::history`'s positional repair exists to close, and
+///   step 1 hits that repair on every turn now, not only after a process
+///   restart.
 /// - Tool futures in flight are dropped too. `ShellTool` therefore sets
 ///   `kill_on_drop(true)` (`src/tools/builtin_tools.rs`) — without it a
 ///   cancelled turn left a shell command running against the workspace.
@@ -2803,22 +2807,44 @@ pub(crate) async fn run_llm_turn(
     let store = Arc::clone(state.store_for_session(&session_id));
     let is_acp = state.is_acp(&session_id).await;
 
-    // 1. Load or lazy-hydrate in-memory history
+    // 1. Hydrate history fresh from storage every turn, rather than only
+    //    the first time this process touches the session.
+    //
+    //    This function's own doc (above) already names the reason: a
+    //    dropped turn — `session/cancel`, ACP's "stop and immediately
+    //    send the next message" interrupt pattern chief among them —
+    //    never reaches step 8's `state.sessions` write-back, but the user
+    //    message and any completed `tool_use`/`tool_result` pairs from
+    //    that same turn are already on disk (steps 4/5, appended as they
+    //    happen). With `HashMap::entry(...).or_insert_with(...)`, once
+    //    *any* turn had populated this session's entry — including an
+    //    empty one inserted by a first turn that then got cancelled
+    //    before writing anything back — every later turn cloned that
+    //    stale in-memory copy and never looked at storage again: the
+    //    interrupted turn's own progress, though durably saved, became
+    //    invisible to the very next turn for the rest of the process's
+    //    life. Loading fresh here costs a JSONL parse every turn instead
+    //    of once per session, but keeps this cache honest against a drop
+    //    landing anywhere in the turn above it. `history_for_model`/
+    //    `load_session` also run `repair_tool_pairing`, so an orphaned
+    //    `tool_use` left by a mid-round cancellation gets its synthesised
+    //    placeholder result spliced back in here rather than staying a
+    //    gap only a fresh process restart used to close.
     let mut history: Vec<ChatMessage> = {
-        let mut sessions = state.sessions.lock().await;
-        sessions
-            .entry(session_id.clone())
-            .or_insert_with(|| {
-                if is_acp {
-                    state
-                        .acp_session_store
-                        .history_for_model(&session_id)
-                        .unwrap_or_default()
-                } else {
-                    store.load_session(&session_id).unwrap_or_default()
-                }
-            })
-            .clone()
+        let loaded = if is_acp {
+            state
+                .acp_session_store
+                .history_for_model(&session_id)
+                .unwrap_or_default()
+        } else {
+            store.load_session(&session_id).unwrap_or_default()
+        };
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), loaded.clone());
+        loaded
     };
     let was_first_turn = history.is_empty();
 
@@ -4887,6 +4913,76 @@ mod tests {
             hanging.dropped.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "expected the in-flight chat() future's drop guard to fire on abort"
+        );
+    }
+
+    /// Regression test for `run_llm_turn`'s step 1: a turn must hydrate
+    /// from storage every time, not only the first time this process
+    /// touches the session — see that function's own doc for why.
+    ///
+    /// This reproduces the *result* of a `session/cancel`-then-reprompt
+    /// without needing to actually abort a real turn: it seeds
+    /// `state.sessions` with exactly what the old `entry().or_insert_with(
+    /// ...)` hydration would have left behind after a first turn was
+    /// dropped before its write-back ever ran — an empty cached entry —
+    /// while the ACP session store (what step 4 durably appends the user
+    /// message to, *before* the turn can even reach a provider call that
+    /// might hang or be cancelled) already has real content. A second
+    /// turn on the same session must not come back having "forgotten"
+    /// that content.
+    #[tokio::test]
+    async fn a_stale_in_memory_cache_does_not_hide_a_sessions_persisted_progress() {
+        let state = ServeState::for_test(true);
+        let sid = "acp-interrupt-then-reprompt".to_string();
+        state.acp_sessions.lock().await.insert(sid.clone());
+        state
+            .acp_session_store
+            .create(&sid, "default", "/work")
+            .unwrap();
+        state
+            .acp_session_store
+            .append_message(&sid, &ChatMessage::user("FIRST_TURN_MARKER"))
+            .unwrap();
+        // What the pre-fix hydration left behind: an empty entry, inserted
+        // by the cancelled first turn's own hydration and never
+        // overwritten because that turn's future was dropped before
+        // reaching its `state.sessions` write-back.
+        state.sessions.lock().await.insert(sid.clone(), Vec::new());
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("SECOND_TURN_MARKER"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("ok"));
+        assert!(
+            !outcome.was_first_turn,
+            "storage was not empty, so this must not be reported as the \
+             session's first turn"
+        );
+
+        let history = state.sessions.lock().await;
+        let messages = history.get(&sid).expect("the session exists");
+        let texts: Vec<&str> = messages
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("FIRST_TURN_MARKER")),
+            "the interrupted turn's own already-persisted progress must \
+             survive into the next turn's history: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("SECOND_TURN_MARKER")),
+            "and the new turn's own message must still be there too: {texts:?}"
         );
     }
 
