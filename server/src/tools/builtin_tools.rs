@@ -77,6 +77,15 @@ impl Tool for FileReadTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // Which machine this call reaches is decided once, here: a client
+        // scoped to this turn means the *editor's* filesystem, and no client
+        // means this agent's own — the pre-#270 behaviour, kept for every
+        // non-ACP transport. There is no fallback in either direction; see
+        // `client_tools`' module doc.
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            return crate::tools::client_tools::client_read(&client, input).await;
+        }
+
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = input["limit"].as_u64().unwrap_or(500).min(2000) as usize;
@@ -509,6 +518,12 @@ impl Tool for FileWriteTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // The editor's machine when a client is scoped, this one otherwise —
+        // see `FileReadTool::execute` and `client_tools`' module doc.
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            return crate::tools::client_tools::client_write(&client, input).await;
+        }
+
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
 
@@ -587,6 +602,12 @@ impl Tool for FileDeleteTool {
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let path_str = input["path"].as_str().context("missing 'path'")?;
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            // ACP has no delete, so the client's side is `rm` over the
+            // terminal — see `client_tools::client_delete`.
+            return crate::tools::client_tools::client_delete(&client, input).await;
+        }
+
         let path = expand_path(path_str);
 
         let workspace_root = self
@@ -662,6 +683,13 @@ impl Tool for FileAppendTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // `client_append` is read -> concatenate -> write on the editor's
+        // side, since ACP has no append — see its doc for what that costs
+        // (two crossings of the whole file, and no atomicity).
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            return crate::tools::client_tools::client_append(&client, input).await;
+        }
+
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
 
@@ -974,6 +1002,45 @@ impl Tool for ShellTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // The editor's machine when a client is scoped to this turn, this
+        // one otherwise. Same one-shot contract either way: wait up to
+        // `timeout`, and on timeout hand back a *running* handle rather than
+        // killing the command — see `client_tools::format_timed_out`.
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            let command = input["command"].as_str().context("missing 'command'")?;
+            let timeout = crate::tools::client_tools::clamp_timeout(input["timeout"].as_u64());
+            // `workdir` names a directory on the *client's* machine, so it is
+            // passed through as written: expanding a `~` here would expand
+            // this agent's home instead. `None` lets the client default to
+            // the session's own cwd.
+            let cwd = input["workdir"].as_str();
+            // ACP's `terminal/create` takes a command plus an argv, not a
+            // shell string, while this tool's `command` parameter *is* one —
+            // so the shell is spelled out here, the same way the agent-side
+            // body below runs the line under `$SHELL -c`.
+            let args = vec!["-c".to_string(), command.to_string()];
+
+            let run =
+                crate::tools::client_exec::run_client_command(&client, "sh", &args, cwd, timeout)
+                    .await?;
+            return match run.timed_out_handle {
+                Some(handle) => Ok(crate::tools::client_tools::format_timed_out(
+                    &handle, timeout,
+                )),
+                None => {
+                    let status = run.status.expect(
+                        "run_client_command always sets `status` when it does not time out",
+                    );
+                    let mut out = crate::tools::client_tools::format_finished(&run.output, &status);
+                    if let Some(warning) = run.release_warning {
+                        out.push('\n');
+                        out.push_str(&warning);
+                    }
+                    Ok(out)
+                }
+            };
+        }
+
         use std::time::Duration;
         use tokio::process::Command;
 
@@ -2157,5 +2224,266 @@ mod refresh_system_prompt_tests {
         let tool = RefreshSystemPromptTool::new(Weak::new());
         let err = tool.execute(&json!({})).await.unwrap_err();
         assert_eq!(format!("{err:#}"), "agent unavailable");
+    }
+}
+
+#[cfg(test)]
+mod session_routing_tests {
+    use super::*;
+    use crate::tools::acp_client::{AcpClient, scope_acp_client, tests::FakeClient};
+    use sapphire_framework::workspace::{AppContext, Workspace};
+    use std::sync::Mutex;
+
+    static TEST_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
+
+    /// A fresh workspace in a temp dir. Same shape as `tools::tests`'
+    /// helper of the same name, duplicated rather than shared because the
+    /// intervening `mod tests` is private and this module is not its
+    /// descendant.
+    fn test_workspace() -> Arc<Mutex<WorkspaceState>> {
+        // `AppContext` panics on any `cache_dir()` access until
+        // `set_cache_dir` has been called once, and `Workspace::from_root`
+        // reads it to compute the workspace's cache path. First writer
+        // wins and later calls are ignored, so calling it here every time
+        // is safe.
+        TEST_CTX
+            .set_cache_dir(std::env::temp_dir().join("sapphire-agent-builtin-tools-test-cache"));
+        // Leaked on purpose: this is a test binary and the OS reclaims the
+        // directory when it exits.
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        std::fs::create_dir_all(dir.path().join(".sapphire-agent")).unwrap();
+        let ws = Workspace::from_root(&TEST_CTX, dir.path()).unwrap();
+        Arc::new(Mutex::new(WorkspaceState::open(ws).unwrap()))
+    }
+
+    fn file_read_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, FileReadTool) {
+        let state = test_workspace();
+        (Arc::clone(&state), FileReadTool::new(state))
+    }
+
+    fn file_write_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, FileWriteTool) {
+        let state = test_workspace();
+        (Arc::clone(&state), FileWriteTool::new(state))
+    }
+
+    fn file_append_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, FileAppendTool) {
+        let state = test_workspace();
+        (Arc::clone(&state), FileAppendTool::new(state))
+    }
+
+    fn file_delete_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, FileDeleteTool) {
+        let state = test_workspace();
+        (Arc::clone(&state), FileDeleteTool::new(state))
+    }
+
+    /// `ShellTool` takes the workspace root rather than the state: its own
+    /// default working directory *is* that root.
+    fn shell_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, ShellTool) {
+        let state = test_workspace();
+        let root = state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .clone();
+        (Arc::clone(&state), ShellTool::new(root))
+    }
+
+    /// Put `content` in the *agent's* copy of `name` — the machine the
+    /// routing tests below must not touch.
+    fn write_workspace_file(state: &Arc<Mutex<WorkspaceState>>, name: &str, content: &str) {
+        state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .write_file(Path::new(name), content)
+            .unwrap();
+    }
+
+    fn read_workspace_file(state: &Arc<Mutex<WorkspaceState>>, name: &str) -> Option<String> {
+        state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .read_file(Path::new(name))
+            .ok()
+    }
+
+    /// The point of the unification: with an ACP client scoped, `file_read`
+    /// reads the *editor's* machine. The workspace and the fake client are
+    /// given deliberately different contents so the assertion cannot pass by
+    /// accident.
+    #[tokio::test]
+    async fn file_read_reads_the_clients_machine_inside_an_acp_session() {
+        let (state, tool) = file_read_tool_for_test();
+        // The agent's own file, which must NOT be what comes back.
+        write_workspace_file(&state, "note.txt", "agent side\n");
+
+        let client = Arc::new(FakeClient::default());
+        client.queue_read_result("client side\n");
+        let out = scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"path": "note.txt"})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "client side\n");
+        assert!(
+            client.read_paths().contains(&"note.txt".to_string()),
+            "the read must have gone to the client, got {:?}",
+            client.read_paths()
+        );
+    }
+
+    /// Without a client scoped, the same tool reads the agent's own machine —
+    /// unchanged behaviour for every non-ACP transport.
+    #[tokio::test]
+    async fn file_read_reads_the_agents_machine_outside_an_acp_session() {
+        let (state, tool) = file_read_tool_for_test();
+        write_workspace_file(&state, "note.txt", "agent side\n");
+        let out = tool.execute(&json!({"path": "note.txt"})).await.unwrap();
+        assert!(out.contains("agent side"), "got: {out}");
+    }
+
+    /// The write direction of the same routing: an ACP turn's `file_write`
+    /// lands on the editor's machine and the agent's own copy of that path is
+    /// left exactly as it was.
+    #[tokio::test]
+    async fn file_write_writes_the_clients_machine_inside_an_acp_session() {
+        let (state, tool) = file_write_tool_for_test();
+        write_workspace_file(&state, "note.txt", "agent side\n");
+
+        let client = Arc::new(FakeClient::default());
+        scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"path": "note.txt", "content": "client side\n"})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            client.writes.lock().unwrap().as_slice(),
+            &[("note.txt".to_string(), "client side\n".to_string())]
+        );
+        assert_eq!(
+            read_workspace_file(&state, "note.txt").as_deref(),
+            Some("agent side\n"),
+            "the agent's own file must be untouched: the write went to the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_writes_the_agents_machine_outside_an_acp_session() {
+        let (state, tool) = file_write_tool_for_test();
+        tool.execute(&json!({"path": "note.txt", "content": "agent side\n"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_workspace_file(&state, "note.txt").as_deref(),
+            Some("agent side\n")
+        );
+    }
+
+    /// `file_append` is not an ACP request at all: the client's file is read
+    /// whole, the addition concatenated, and the result written back. The
+    /// agent's own copy is the "before" in that pair and must stay it.
+    #[tokio::test]
+    async fn file_append_concatenates_on_the_clients_machine_inside_an_acp_session() {
+        let (state, tool) = file_append_tool_for_test();
+        write_workspace_file(&state, "note.txt", "agent side\n");
+
+        let client = Arc::new(FakeClient::default());
+        client.queue_read_result("client side\n");
+        let out = scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"path": "note.txt", "content": "more\n"})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "Appended: note.txt (+5 bytes)");
+        assert_eq!(
+            client.writes.lock().unwrap().as_slice(),
+            &[("note.txt".to_string(), "client side\nmore\n".to_string())],
+            "the client's existing content must be the prefix, not the agent's"
+        );
+        assert_eq!(
+            read_workspace_file(&state, "note.txt").as_deref(),
+            Some("agent side\n"),
+            "the agent's own file must be untouched"
+        );
+    }
+
+    /// `file_delete` on the client is `rm` over the terminal, since ACP has
+    /// no delete. The argv assertion is what pins the shape of that call —
+    /// the path travels as a positional argument, never interpolated into
+    /// the script — and the agent's own file is what proves the call went to
+    /// the other machine.
+    #[tokio::test]
+    async fn file_delete_deletes_on_the_clients_machine_inside_an_acp_session() {
+        let (state, tool) = file_delete_tool_for_test();
+        write_workspace_file(&state, "note.txt", "agent side\n");
+
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout("");
+        let out = scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"path": "note.txt"})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "Deleted: note.txt");
+        assert_eq!(
+            read_workspace_file(&state, "note.txt").as_deref(),
+            Some("agent side\n"),
+            "the agent's own file must be untouched: the delete ran on the client"
+        );
+        let creates = client.creates.lock().unwrap();
+        assert_eq!(creates[0].0, "bash");
+        assert_eq!(creates[0].1[0], "-c");
+        assert_eq!(
+            creates[0].1[2], "note.txt",
+            "the path must be a positional argument, not interpolated into the script"
+        );
+    }
+
+    /// ACP's `terminal/create` takes a command plus an argv, not a shell
+    /// string, while this tool's own `command` parameter *is* a shell string.
+    /// So the ACP path has to spell `sh -c` out itself, and `workdir` maps
+    /// onto the client call's `cwd`.
+    #[tokio::test]
+    async fn shell_runs_the_command_line_through_sh_c_on_the_client() {
+        let (_state, tool) = shell_tool_for_test();
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout("hi\n");
+
+        let out = scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"command": "echo hi", "workdir": "/z"})),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("hi"), "got: {out}");
+        let creates = client.creates.lock().unwrap();
+        assert_eq!(creates[0].0, "sh");
+        assert_eq!(creates[0].1, vec!["-c".to_string(), "echo hi".to_string()]);
+        assert_eq!(
+            creates[0].2.as_deref(),
+            Some("/z"),
+            "`workdir` is the client call's `cwd`"
+        );
+    }
+
+    /// Outside an ACP session the same tool still runs on this machine — the
+    /// agent-side body, untouched.
+    #[tokio::test]
+    async fn shell_runs_on_the_agents_machine_outside_an_acp_session() {
+        let (_state, tool) = shell_tool_for_test();
+        let out = tool
+            .execute(&json!({"command": "echo agent side"}))
+            .await
+            .unwrap();
+        assert!(out.contains("agent side"), "got: {out}");
     }
 }

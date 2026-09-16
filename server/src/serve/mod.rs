@@ -1956,8 +1956,8 @@ pub(crate) trait TurnHost: Send + Sync {
     /// `(read, write)`. A client can implement `fs/read_text_file`
     /// without `fs/write_text_file` or vice versa, so the two are read
     /// independently rather than folded into one "fs" bit — see
-    /// `visible_tool_predicate` and `client_tools::ClientFileRead`/
-    /// `ClientFileWrite`.
+    /// `visible_tool_predicate`, which gates the shared `file_read`/
+    /// `file_write`/`file_append` names on them inside an ACP turn.
     ///
     /// `(false, false)` by default: every host with no editor on the
     /// other end (`/rpc`, `/a2a`, Matrix, Discord, voice) has nothing
@@ -1967,8 +1967,8 @@ pub(crate) trait TurnHost: Send + Sync {
     }
 
     /// Whether this turn's editor implements `terminal/*` — the
-    /// capability `client_shell` (`src/tools/client_tools.rs`) needs to
-    /// be worth offering at all. Same convention as `client_fs_caps`:
+    /// capability the shell and delete names need to be worth offering at
+    /// all. Same convention as `client_fs_caps`:
     /// read off `AcpSession::client_capabilities` and exposed here so
     /// `visible_tool_predicate` doesn't reach into ACP-specific state.
     ///
@@ -2173,10 +2173,12 @@ pub(crate) struct LlmTurnOutcome {
 /// client on that path, so the client-side tools must never appear
 /// there either.
 ///
-/// `client_file_read`/`client_file_write` are named directly rather
-/// than matched by prefix or `ToolKind`: a client can implement
-/// `fs/read_text_file` without `fs/write_text_file` (or vice versa),
-/// and this is where that independence has to be honored, or the
+/// Every name is matched directly rather than by prefix or `ToolKind`,
+/// because after #270 the names are shared: `file_read` on an ACP turn and
+/// `file_read` on a Matrix turn are the same registered tool, and only the
+/// session decides which machine it reaches (see `builtin_tools`). A client
+/// can implement `fs/read_text_file` without `fs/write_text_file` (or vice
+/// versa), so those two flags are still read independently, or the
 /// capability this turn's editor recorded (`AcpSession::client_capabilities`,
 /// `src/serve/acp.rs`) was recorded for nothing.
 pub(crate) fn visible_tool_predicate(
@@ -2187,15 +2189,33 @@ pub(crate) fn visible_tool_predicate(
     client_terminal: bool,
 ) -> impl Fn(&str) -> bool {
     move |name: &str| {
-        if crate::tools::policy::host_tool_denied(name, host_access_enabled) {
+        // With a client on the other end these names reach the *editor's*
+        // machine, so this deployment's `host_access` switch has no business
+        // speaking for them — the capability flags below are the whole rule
+        // there. Without one they reach the agent's own machine and the
+        // gate is exactly what it always was. (`host_access` still governs
+        // the non-ACP side in full; #270 lands this split inside
+        // `host_tool_denied` as an explicit `routed_to_client` argument.)
+        if !has_client && crate::tools::policy::host_tool_denied(name, host_access_enabled) {
             return false;
         }
         match name {
-            "client_file_read" => has_client && client_fs_read,
-            "client_file_write" => has_client && client_fs_write,
-            "client_shell" | "client_shell_start" | "client_shell_output" | "client_shell_kill" => {
-                has_client && client_terminal
-            }
+            // The unified set: one name each, whose *machine* this turn
+            // decides (see `builtin_tools`).
+            "file_read" => client_fs_read,
+            "file_write" => client_fs_write,
+            // Append is a read and a write on the client's side (read ->
+            // concatenate -> write), so it needs both halves.
+            "file_append" => client_fs_read && client_fs_write,
+            // No ACP request exists for delete, so it is spelled as a
+            // command on the terminal.
+            "file_delete" | "shell" => client_terminal,
+            // Listing and walking were client-only tools before #270 and
+            // keep their own names and arm; unifying them is a later task.
+            "dir_list" | "dir_walk" => has_client && client_terminal,
+            // The three lifecycle tools have no agent-side body at all, so
+            // their names are unchanged from before #270.
+            "client_shell_start" | "client_shell_output" | "client_shell_kill" => client_terminal,
             // The skills directory lives on the editor's machine and is
             // located by running a script there, so every skill tool
             // needs both a client and its terminal. Listing a directory
@@ -2775,7 +2795,7 @@ impl TurnLoop<'_> {
 /// - Tool futures in flight are dropped too. `ShellTool` therefore sets
 ///   `kill_on_drop(true)` (`src/tools/builtin_tools.rs`) — without it a
 ///   cancelled turn left a shell command running against the workspace.
-///   `ClientShell` and `ClientShellStart` (`src/tools/client_tools.rs`)
+///   the client halves of `ShellTool` and `ClientShellStart`
 ///   own a process on a different machine, which a drop cannot kill for
 ///   them the way `kill_on_drop` kills a local child — so they are made
 ///   drop-safe the other way: the terminal handle is written into
@@ -4319,24 +4339,24 @@ mod tests {
     /// permission gate, which checks `offered` first, ahead of the
     /// host-machine gate and `decide` both.
     ///
-    /// `client_shell` is the tool named: it isn't in `HOST_TOOLS`, so
-    /// `host_tool_denied` — the *other* thing that could explain a
+    /// `client_shell_start` is the tool named: it isn't in `HOST_TOOLS`, so
+    /// the host-machine gate — the *other* thing that could explain a
     /// refusal here — never fires for it, and `NullProgress`'s default
     /// `origin()` is `Origin::Trusted`, which `decide` allows
     /// unconditionally for every kind. The only thing left standing
     /// between the call and `ran` flipping `true` is the offered check
-    /// itself: `visible_tool_predicate` excludes `client_shell` from
+    /// itself: `visible_tool_predicate` excludes `client_shell_start` from
     /// this round's own `tool_specs` because `NullProgress` reports no
     /// ACP client (`has_client` is `false`), even though the tool stays
     /// registered and visible to `state.tools.kinds()`.
     #[tokio::test]
     async fn a_registered_but_unoffered_tool_is_refused_on_an_ordinary_turn() {
-        struct FakeClientShell {
+        struct FakeClientShellStart {
             spec: crate::provider::ToolSpec,
             ran: Arc<std::sync::atomic::AtomicBool>,
         }
         #[async_trait::async_trait]
-        impl crate::tools::Tool for FakeClientShell {
+        impl crate::tools::Tool for FakeClientShellStart {
             fn spec(&self) -> &crate::provider::ToolSpec {
                 &self.spec
             }
@@ -4360,7 +4380,7 @@ mod tests {
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
-                        name: "client_shell".to_string(),
+                        name: "client_shell_start".to_string(),
                         input: json!({"command": "echo hi"}),
                     }],
                     stop_reason: None,
@@ -4378,9 +4398,9 @@ mod tests {
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         state
             .tools
-            .register_tool(Box::new(FakeClientShell {
+            .register_tool(Box::new(FakeClientShellStart {
                 spec: crate::provider::ToolSpec {
-                    name: "client_shell".into(),
+                    name: "client_shell_start".into(),
                     description: "Pretend to run a command on the client.".into(),
                     input_schema: json!({ "type": "object", "properties": {} }),
                 },
@@ -4400,8 +4420,8 @@ mod tests {
         assert_eq!(outcome.text.as_deref(), Some("done"));
         assert!(
             !ran.load(std::sync::atomic::Ordering::SeqCst),
-            "`client_shell` is registered, isn't a `HOST_TOOLS` name (so \
-             `host_tool_denied` never fires), and `Origin::Trusted` \
+            "`client_shell_start` is registered, isn't a `HOST_TOOLS` name (so the \
+             host gate never fires), and `Origin::Trusted` \
              allows every kind unconditionally — only the offered check \
              itself explains a refusal here"
         );
@@ -5439,18 +5459,39 @@ mod tests {
         terminal: bool,
     }
 
-    /// A `ToolSet` carrying a stand-in for every host tool plus the
-    /// real client-side file and shell tools, so "not offered" in the
-    /// assertions below means the predicate hid the name — not that it
-    /// was never registered in the first place.
+    /// A `ToolSet` carrying a stand-in for every name the predicate has an
+    /// opinion about, so "not offered" in the assertions below means the
+    /// predicate hid the name — not that it was never registered in the
+    /// first place.
+    ///
+    /// Stand-ins rather than the real tools for the file and shell names:
+    /// after #270 those names are *one* set of tools whose machine the turn
+    /// decides (`file_read` is the agent's or the editor's depending on the
+    /// session), and `visible_tool_predicate` is a pure function of the name
+    /// and the five flags. Which machine a name reaches is `builtin_tools`'
+    /// business and is tested there; this fixture is about the predicate's
+    /// own table. The three `shell_*` lifecycle tools are real, since they
+    /// have no agent-side body at all.
     fn client_filtering_test_set() -> ToolSet {
-        let mut tools: Vec<Box<dyn crate::tools::Tool>> = crate::tools::policy::HOST_TOOLS
+        let names = [
+            // The unified set: one name each, routed by session type.
+            "file_read",
+            "file_write",
+            "file_append",
+            "file_delete",
+            "dir_list",
+            "dir_walk",
+            "shell",
+            // Skill tools, gated on the same terminal capability.
+            "skill",
+            "skill_install",
+            "skill_update",
+            "skill_uninstall",
+        ];
+        let mut tools: Vec<Box<dyn crate::tools::Tool>> = names
             .iter()
             .map(|name| Box::new(NamedStubTool::new(name)) as Box<dyn crate::tools::Tool>)
             .collect();
-        tools.push(Box::new(crate::tools::client_tools::ClientFileRead::new()));
-        tools.push(Box::new(crate::tools::client_tools::ClientFileWrite::new()));
-        tools.push(Box::new(crate::tools::client_tools::ClientShell::new()));
         tools.push(Box::new(crate::tools::client_tools::ClientShellStart::new()));
         tools.push(Box::new(
             crate::tools::client_tools::ClientShellOutput::new(),
@@ -5500,8 +5541,10 @@ mod tests {
             terminal: false,
         })
         .await;
-        assert!(names.contains(&"client_file_read".to_string()));
-        assert!(!names.contains(&"client_file_write".to_string()));
+        assert!(names.contains(&"file_read".to_string()));
+        assert!(!names.contains(&"file_write".to_string()));
+        // `append` needs both halves: it is a read and a write.
+        assert!(!names.contains(&"file_append".to_string()));
 
         let names = tool_names_for_turn(TestCaps {
             fs_read: false,
@@ -5509,18 +5552,30 @@ mod tests {
             terminal: false,
         })
         .await;
-        assert!(!names.contains(&"client_file_read".to_string()));
-        assert!(names.contains(&"client_file_write".to_string()));
+        assert!(!names.contains(&"file_read".to_string()));
+        assert!(names.contains(&"file_write".to_string()));
+        // Still not: it would have to read the file back first.
+        assert!(!names.contains(&"file_append".to_string()));
     }
 
-    /// `client_shell` is offered only when the editor declared
-    /// `terminal/*` support — the same independence the two file tools
-    /// get, just with one flag instead of two since ACP's `terminal`
-    /// capability isn't split into finer-grained bits.
+    /// Every name that reaches the editor's shell is offered only when the
+    /// editor declared `terminal/*` support — the same independence the two
+    /// file tools get, just with one flag instead of two since ACP's
+    /// `terminal` capability isn't split into finer-grained bits. ACP has no
+    /// request for delete, listing or walking, so those three name commands
+    /// on that terminal and ride the same flag.
     #[tokio::test]
     async fn the_terminal_tool_follows_its_own_capability_flag() {
         let terminal_tools = [
-            "client_shell",
+            // The unified name that reaches the editor's shell...
+            "shell",
+            "file_delete",
+            // ...plus the client-only tools that were already gated on this
+            // flag before #270...
+            "dir_list",
+            "dir_walk",
+            // ...and the three with no agent-side body at all, which keep
+            // their original `client_shell_*` names.
             "client_shell_start",
             "client_shell_output",
             "client_shell_kill",
@@ -5557,12 +5612,18 @@ mod tests {
     /// tool that can only fail wastes a round trip and invites the model
     /// to pick the wrong machine.
     #[tokio::test]
-    async fn a_non_acp_turn_is_offered_no_client_tools() {
+    async fn a_non_acp_turn_is_offered_no_lifecycle_tools() {
         let names = tool_names_for_turn_without_a_client().await;
-        assert!(
-            !names.iter().any(|n| n.starts_with("client_")),
-            "got: {names:?}"
-        );
+        for name in [
+            "client_shell_start",
+            "client_shell_output",
+            "client_shell_kill",
+        ] {
+            assert!(
+                !names.contains(&name.to_string()),
+                "{name} has no agent-side body, got: {names:?}"
+            );
+        }
     }
 
     /// The host switch is off by default, so its seven tools are absent

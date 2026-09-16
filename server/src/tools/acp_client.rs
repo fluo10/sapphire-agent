@@ -317,7 +317,7 @@ pub(crate) mod tests {
         pub killed: Mutex<Vec<TerminalHandle>>,
         /// Set by [`FakeClient::make_exit_never_return`]. When true,
         /// `wait_for_terminal_exit` blocks forever instead of resolving
-        /// — the only way to make `ClientShell`'s
+        /// — the only way to make the one-shot `shell` tool's
         /// `tokio::time::timeout` race actually win on the timeout arm
         /// without a test sleeping out a real wall-clock timeout.
         exit_never_returns: Mutex<bool>,
@@ -459,6 +459,27 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap()
                 .push_back((text.to_string(), exit_code));
+        }
+
+        /// Queue `text` as the answer to the next `read_text_file`,
+        /// which reports it with a successful status. Without this the
+        /// fake answers with an empty string, which is indistinguishable
+        /// from a real client's empty file — so a test asserting on what
+        /// the *client's* copy holds needs this to say so.
+        pub(crate) fn queue_read_result(&self, text: &str) {
+            *self.read_answer.lock().unwrap() = Some(Ok(text.to_string()));
+        }
+
+        /// The paths this client has been asked to read, in call order —
+        /// how a routing test proves that a read went to the editor's
+        /// machine rather than the agent's own.
+        pub(crate) fn read_paths(&self) -> Vec<String> {
+            self.reads
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(path, _, _)| path.clone())
+                .collect()
         }
 
         /// How many terminals this client has been asked to create —

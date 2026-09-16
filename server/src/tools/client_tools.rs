@@ -1,199 +1,218 @@
-//! Tools that reach the editor's machine over ACP, rather than this
-//! agent's own filesystem.
+//! The ACP side of the shell and file tools: what the same tool names do
+//! when the turn's machine is the *editor's*, not this agent's own.
 //!
-//! `file_read`/`file_write` (`src/tools/builtin_tools.rs`) touch the
-//! machine this agent runs on. These two touch the machine the *editor*
-//! runs on, via `fs/read_text_file` and `fs/write_text_file` — see
-//! `crate::tools::acp_client`. Both sets can be offered in the same
-//! turn's tool list at once — with host access on, an ACP turn sees
-//! both `file_read` and `client_file_read`, both `shell` and
-//! `client_shell` — the tool descriptions are what disambiguate which
-//! machine each one reaches. Outside an ACP session there is no client
-//! to ask, so the client-side tools refuse rather than silently doing
-//! nothing.
+//! `file_read`/`file_write`/`file_append`/`file_delete`/`shell`
+//! (`src/tools/builtin_tools.rs`) each read
+//! `crate::tools::acp_client::current_acp_client()` at the top of their
+//! `execute` and hand over to a `client_*` function here when a client is
+//! scoped to the turn. That scoping *is* the routing decision (#270): one
+//! tool name reaches one machine or the other, and the tool description
+//! says which, because a name that meant a fixed machine would be wrong in
+//! one of the two cases every time.
+//!
+//! Everything that knows ACP's wire surface lives here for that reason.
+//! Two of the `client_*` functions are not ACP requests at all: ACP has no
+//! delete and no append, so `client_append` is read → concatenate → write
+//! and `client_delete` is `rm` over the terminal.
+//!
+//! The three tools with no agent-side body (`ClientShellStart` /
+//! `ClientShellOutput` / `ClientShellKill`) are ordinary `Tool`s and still
+//! live at the bottom of this file.
 
 use crate::provider::ToolSpec;
-use crate::tools::acp_client::{ExitStatus, TerminalHandle, TerminalOutput, current_acp_client};
+use crate::tools::acp_client::{
+    AcpClient, ExitStatus, TerminalHandle, TerminalOutput, current_acp_client,
+};
+use crate::tools::builtin_tools::ShellTool;
+use crate::tools::client_exec::run_client_command;
 use crate::tools::{OUTPUT_CAP_BYTES, Tool, ToolKind};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::json;
 
-/// The editor is not reachable: no ACP client is scoped to this call.
+/// The refusal for the three tools that have no agent-side body.
 ///
-/// Shared by both tools below so the wording — and the substring the
-/// tests and the model both key on — cannot drift between them.
-fn no_editor_error() -> anyhow::Error {
-    anyhow::anyhow!("no editor is connected to this session; this tool only works over ACP")
-}
-
-// ---------------------------------------------------------------------------
-// client_file_read
-// ---------------------------------------------------------------------------
-
-/// Read a file on the machine the editor is running on.
+/// `ClientShellStart`/`ClientShellOutput`/`ClientShellKill` exist only
+/// against a client, so with none scoped there is nothing to route to and
+/// the call is refused.
 ///
-/// Distinct from `file_read`, which reads the machine the *agent* runs
-/// on. With host access on, an ACP turn may be offered both; the tool
-/// descriptions are what tell the model which machine each one reaches.
-pub struct ClientFileRead {
-    spec: ToolSpec,
-}
-
-impl ClientFileRead {
-    pub fn new() -> Self {
-        Self {
-            spec: ToolSpec {
-                name: "client_file_read".into(),
-                description: "Read a file on the machine the connected editor is \
-                    running on — NOT this agent's own machine. Use `file_read` \
-                    instead for files on the agent's machine. \
-                    Only available inside an ACP session whose editor supports \
-                    `fs/read_text_file`; refuses otherwise. \
-                    For large files, pass `line` and `limit` to read a range \
-                    instead of the whole file: ACP sends the requested content \
-                    over the wire in full, so reading an entire large file at \
-                    once is expensive."
-                    .into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Absolute path on the editor's machine."
-                        },
-                        "line": {
-                            "type": "integer",
-                            "description": "1-indexed line number to start reading from. \
-                                Pair with `limit` to read a large file in pieces.",
-                            "minimum": 1
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of lines to read starting at `line`.",
-                            "minimum": 1
-                        }
-                    },
-                    "required": ["path"]
-                }),
-            },
-        }
-    }
-}
-
-impl Default for ClientFileRead {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Tool for ClientFileRead {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
-    }
-
-    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
-        let path = input["path"].as_str().context("missing 'path'")?;
-        let line = input["line"].as_u64().map(|v| v as u32);
-        let limit = input["limit"].as_u64().map(|v| v as u32);
-
-        let client = current_acp_client().ok_or_else(no_editor_error)?;
-        client.read_text_file(path, line, limit).await
-    }
-}
-
-// ---------------------------------------------------------------------------
-// client_file_write
-// ---------------------------------------------------------------------------
-
-/// Write a file on the machine the editor is running on.
+/// The unified `file_read`/`file_write`/`file_append`/`file_delete`/
+/// `shell` tools do **not** refuse this way any more: "no editor" now means
+/// the agent's own machine, which is a route rather than an error, so those
+/// tools have no such message to give (#270).
 ///
-/// Distinct from `file_write`, which writes the machine the *agent*
-/// runs on. With host access on, an ACP turn may be offered both; the
-/// tool descriptions are what tell the model which machine each one
-/// reaches.
-pub struct ClientFileWrite {
-    spec: ToolSpec,
+/// One constant rather than a literal per tool, so the wording — and the
+/// substring the tests key on — cannot drift between them. `skill_tools`
+/// keeps its own copy of the same sentence; see the note there.
+const NO_EDITOR: &str = "no editor is connected to this session; this tool only works over ACP";
+
+// ---------------------------------------------------------------------------
+// ACP-side implementations for the unified tools
+// ---------------------------------------------------------------------------
+//
+// These are not tools any more: `builtin_tools.rs` picks between them and
+// its own bodies by reading `current_acp_client()`, so nothing here
+// advertises itself to the model.
+
+/// `file_read` against the editor's machine. The tool's own `offset`/
+/// `limit` map onto ACP's `line`/`limit`, which exist for exactly this
+/// reason: the full file does not have to cross the wire to read a range.
+///
+/// Note what does *not* happen here: the agent-side body's line-number
+/// prefixing and `/dev/`+`/proc/` guard are about how a file is read off
+/// *this* machine, so the client's answer is passed through as the client
+/// wrote it rather than being reformatted into the host's shape.
+pub(crate) async fn client_read(
+    client: &std::sync::Arc<dyn AcpClient>,
+    input: &serde_json::Value,
+) -> Result<String> {
+    let path = input["path"].as_str().context("missing 'path'")?;
+    let line = input["offset"].as_u64().map(|v| v as u32);
+    let limit = input["limit"].as_u64().map(|v| v as u32);
+    client.read_text_file(path, line, limit).await
 }
 
-impl ClientFileWrite {
-    pub fn new() -> Self {
-        Self {
-            spec: ToolSpec {
-                name: "client_file_write".into(),
-                description: "Write content to a file on the machine the connected \
-                    editor is running on — NOT this agent's own machine. Use \
-                    `file_write` instead for files on the agent's machine. \
-                    Completely replaces the file's existing content. \
-                    Only available inside an ACP session whose editor supports \
-                    `fs/write_text_file`; refuses otherwise."
-                    .into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Absolute path on the editor's machine."
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Complete content to write to the file (overwrites entirely)."
-                        }
-                    },
-                    "required": ["path", "content"]
-                }),
-            },
-        }
-    }
+/// `file_write` against the editor's machine.
+pub(crate) async fn client_write(
+    client: &std::sync::Arc<dyn AcpClient>,
+    input: &serde_json::Value,
+) -> Result<String> {
+    let path = input["path"].as_str().context("missing 'path'")?;
+    let content = input["content"].as_str().context("missing 'content'")?;
+    client.write_text_file(path, content).await?;
+    Ok(format!("Written: {path} ({} bytes)", content.len()))
 }
 
-impl Default for ClientFileWrite {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Tool for ClientFileWrite {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
-    }
-
-    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
-        let path = input["path"].as_str().context("missing 'path'")?;
-        let content = input["content"].as_str().context("missing 'content'")?;
-
-        let client = current_acp_client().ok_or_else(no_editor_error)?;
-        client.write_text_file(path, content).await?;
-        Ok(format!("Written: {path} ({} bytes)", content.len()))
-    }
+/// `file_append` against the editor's machine.
+///
+/// ACP has no append, so this is read → concatenate → write. Two
+/// consequences the tool description has to carry, because a model that
+/// does not know them will use this where it should use a shell: the whole
+/// file crosses the wire twice, and the pair is not atomic — a write by
+/// another process between the read and the write is lost. A missing parent
+/// directory is a `fs/write_text_file` error, not a silent `mkdir`.
+pub(crate) async fn client_append(
+    client: &std::sync::Arc<dyn AcpClient>,
+    input: &serde_json::Value,
+) -> Result<String> {
+    let path = input["path"].as_str().context("missing 'path'")?;
+    let content = input["content"].as_str().context("missing 'content'")?;
+    let existing = match client.read_text_file(path, None, None).await {
+        Ok(existing) => existing,
+        // A missing file is the ordinary "create it" case, not an error —
+        // `file_append`'s agent-side contract says it creates the file.
+        // Every other read failure is reported as-is.
+        Err(_) => String::new(),
+    };
+    let mut merged = existing;
+    merged.push_str(content);
+    client.write_text_file(path, &merged).await?;
+    Ok(format!("Appended: {path} (+{} bytes)", content.len()))
 }
 
 // ---------------------------------------------------------------------------
-// client_shell
+// The ACP surface ACP does not have, spelled as a command
 // ---------------------------------------------------------------------------
 
-/// The cap on how long the one-shot form waits. Past this the command
-/// keeps running and the caller gets its handle back instead of a
-/// result — see [`ClientShell`]'s doc for why releasing (which the ACP
+/// The waiting budget for the short, local commands the unified tools run on
+/// the client (`rm` today, `find` for a client-side `dir_list`/`dir_walk`).
+/// Same value as `skill_tools`' `LOCAL_TIMEOUT`: these cost about as little
+/// as reading a file.
+pub(crate) const CLIENT_LOCAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run one `bash -c <script> <argv0> <args...>` on the client and require it
+/// to have finished with exit code 0, returning its stdout.
+///
+/// Paths travel as **positional arguments**, never interpolated into the
+/// script: `terminal/create` takes a command and an argv separately, so
+/// there is no shell quoting to get wrong and a path with spaces or a quote
+/// in it is safe by construction.
+///
+/// A timeout is reported as an error naming the terminal handle rather than
+/// swallowing it: a handle left tracked counts against the session's
+/// 8-terminal cap (`MAX_TERMINALS_PER_SESSION`), so the model has to be told
+/// which one to free.
+///
+/// `bash` rather than `sh`, and rather than whatever the client happens to
+/// ship as `/bin/sh`: the scripts here use nothing beyond POSIX, but naming
+/// the interpreter keeps the same script from meaning two things depending
+/// on where it lands.
+pub(crate) async fn run_client_bash(
+    client: &std::sync::Arc<dyn AcpClient>,
+    script: &str,
+    argv0: &str,
+    args: &[String],
+) -> Result<String> {
+    let mut bash_args = vec!["-c".to_string(), script.to_string()];
+    bash_args.push(argv0.to_string());
+    bash_args.extend(args.iter().cloned());
+
+    let run = run_client_command(client, "bash", &bash_args, None, CLIENT_LOCAL_TIMEOUT).await?;
+    if let Some(handle) = run.timed_out_handle {
+        anyhow::bail!(
+            "timed out after {}s on the editor's machine; the command is still \
+             running as terminal {handle}. Use shell_output to check on it, or \
+             shell_kill to stop it.",
+            CLIENT_LOCAL_TIMEOUT.as_secs()
+        );
+    }
+    let status = run
+        .status
+        .expect("run_client_command always sets `status` when it does not time out");
+    if status.signal.is_some() || status.exit_code != Some(0) {
+        anyhow::bail!(
+            "the command failed on the editor's machine: {}",
+            format_exit_status(&status).trim()
+        );
+    }
+    Ok(run.output.output)
+}
+
+/// `file_delete` against the editor's machine: `rm`, since ACP has no
+/// delete.
+///
+/// The `-d` check is what keeps a recursive flag from being needed at all:
+/// the agent-side contract is "files, never directories", so a directory is
+/// refused here rather than removed. The wording the model sees for those
+/// two cases is the script's own, on stderr.
+const DELETE_SH: &str = r#"
+if [ -d "$1" ]; then
+  echo "is a directory" >&2
+  exit 1
+fi
+if [ ! -e "$1" ]; then
+  echo "no such file" >&2
+  exit 1
+fi
+rm -- "$1"
+"#;
+
+/// `file_delete` against the editor's machine.
+pub(crate) async fn client_delete(
+    client: &std::sync::Arc<dyn AcpClient>,
+    input: &serde_json::Value,
+) -> Result<String> {
+    let path = input["path"].as_str().context("missing 'path'")?;
+    run_client_bash(client, DELETE_SH, path, &[]).await?;
+    Ok(format!("Deleted: {path}"))
+}
+
+// ---------------------------------------------------------------------------
+// The one-shot command: formatting, and the timeout policy
+// ---------------------------------------------------------------------------
+
+/// The cap on how long the one-shot `shell` waits on the client. Past this
+/// the command keeps running and the caller gets its handle back instead of
+/// a result — see [`format_timed_out`] for why releasing (which the ACP
 /// schema defines as killing) is wrong here.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
 
 /// Clamp a requested timeout (seconds) to `(0, MAX_TIMEOUT_SECS]`,
-/// defaulting to `DEFAULT_TIMEOUT_SECS` when the caller didn't ask for
-/// one. Pulled out of `execute` so the cap can be tested directly
+/// defaulting to `DEFAULT_TIMEOUT_SECS` when the caller didn't ask for one.
+/// Pulled out of `ShellTool::execute` so the cap can be tested directly
 /// instead of a test waiting out a real timeout.
-fn clamp_timeout(requested: Option<u64>) -> std::time::Duration {
+pub(crate) fn clamp_timeout(requested: Option<u64>) -> std::time::Duration {
     std::time::Duration::from_secs(
         requested
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
@@ -203,10 +222,10 @@ fn clamp_timeout(requested: Option<u64>) -> std::time::Duration {
 
 /// Render an exit status the same way regardless of caller —
 /// `format_finished` (the one-shot path) and `ClientShellOutput` (the
-/// long-running path) both need this tail, and duplicating the
-/// three-way match would let the two drift apart. `pub(crate)` so
-/// `skill_tools`'s terminal-fallback and index-resolver failures are
-/// worded the same way rather than inventing a second phrasing.
+/// long-running path) both need this tail, and duplicating the three-way
+/// match would let the two drift apart. `pub(crate)` so `skill_tools`'s
+/// terminal-fallback and index-resolver failures are worded the same way
+/// rather than inventing a second phrasing.
 pub(crate) fn format_exit_status(status: &ExitStatus) -> String {
     match (&status.exit_code, &status.signal) {
         (Some(code), _) => format!("\n[exit code: {code}]"),
@@ -217,7 +236,7 @@ pub(crate) fn format_exit_status(status: &ExitStatus) -> String {
 
 /// Render a finished command's output for the model: the (possibly
 /// truncated) text plus how it ended.
-fn format_finished(output: &TerminalOutput, status: &ExitStatus) -> String {
+pub(crate) fn format_finished(output: &TerminalOutput, status: &ExitStatus) -> String {
     let mut out = output.output.clone();
     if output.truncated {
         out.push_str("\n[output truncated]");
@@ -226,162 +245,45 @@ fn format_finished(output: &TerminalOutput, status: &ExitStatus) -> String {
     out
 }
 
-/// Render the message for a one-shot command that outlived its
-/// timeout: the terminal was left running rather than killed, and the
-/// model must not re-run the command because of this call alone. See
-/// [`ClientShell`]'s doc for why releasing on timeout would be wrong.
-fn format_timed_out(handle: &TerminalHandle, timeout: std::time::Duration) -> String {
+/// Render the message for a one-shot command that outlived its timeout: the
+/// terminal was left running rather than killed, and the model must not
+/// re-run the command because of this call alone.
+///
+/// # Why a timed-out client command is not killed
+///
+/// ACP's `terminal/release` kills the command it releases — the schema says
+/// so explicitly, the same way `terminal/kill` does. Releasing on timeout
+/// would therefore throw away a build that has already run for however long
+/// the timeout allowed, and for a non-idempotent command (`git push`, a
+/// migration, a script that writes files) a retry after that would run it a
+/// second time.
+///
+/// So on timeout `ShellTool::execute`'s ACP branch releases nothing. The
+/// terminal keeps running and the handle is handed back in the result text
+/// — and tracked in `ServeState.acp_terminals`, the same registry
+/// `ClientShellStart` uses, so it counts against the session's cap and shows
+/// up if the model has to list what it is holding — so the model can poll it
+/// with `shell_output` or stop it with `shell_kill`. The decision to kill is
+/// left to the model or the human, never made here on their behalf. This is
+/// a deliberate departure from what the protocol's own `terminal/kill` doc
+/// suggests (kill on timeout and collect the output).
+///
+/// The one new risk this creates is the model reading a timeout as a failure
+/// and re-running the command — which for a non-idempotent command is
+/// exactly the outcome not-releasing was meant to avoid. The result text is
+/// worded so that misreading is not possible, and ends with an explicit
+/// instruction not to re-run.
+///
+/// `pub(crate)` because the formatting lives here while the branch that
+/// calls it lives in `ShellTool::execute`, so that a `shell` and a
+/// `shell_start` timeout read the same way.
+pub(crate) fn format_timed_out(handle: &TerminalHandle, timeout: std::time::Duration) -> String {
     format!(
         "[timed out after {}s — the command is still running as terminal {handle}. \
-         It was not killed. Use client_shell_output to check on it, or \
-         client_shell_kill to stop it. Do not re-run the command.]",
+         It was not killed. Use shell_output to check on it, or shell_kill to stop it. \
+         Do not re-run the command.]",
         timeout.as_secs()
     )
-}
-
-/// Run a command on the machine the editor is running on, and wait for
-/// it to finish — up to a timeout.
-///
-/// # A timed-out command is not killed
-///
-/// ACP's `terminal/release` kills the command it releases — the schema
-/// says so explicitly, the same way `terminal/kill` does. Releasing on
-/// timeout would therefore throw away a build that has already run for
-/// however long the timeout allowed, and for a non-idempotent command
-/// (`git push`, a migration, a script that writes files) a retry after
-/// that would run it a second time.
-///
-/// So on timeout this tool releases nothing. The terminal keeps
-/// running and the handle is handed back in the result text — and
-/// tracked in `ServeState.acp_terminals`, the same registry
-/// `ClientShellStart` uses, so it counts against the session's cap and
-/// shows up if the model has to list what it is holding — so the
-/// model can poll it with `client_shell_output` or stop it with
-/// `client_shell_kill`. The decision to kill is left to the model or
-/// the human, never made here on their behalf. This is a deliberate
-/// departure from what the protocol's own `terminal/kill` doc suggests
-/// (kill on timeout and collect the output).
-///
-/// The one new risk this creates is the model reading a timeout as a
-/// failure and re-running the command — which for a non-idempotent
-/// command is exactly the outcome not-releasing was meant to avoid.
-/// The result text is worded so that misreading is not possible, and
-/// ends with an explicit instruction not to re-run.
-///
-/// # Also subject to the session's terminal cap
-///
-/// A timed-out call leaves a handle tracked (see above), so without a
-/// cap check here a model could loop `client_shell` with a short
-/// `timeout_secs` and accumulate unbounded live processes on the
-/// user's machine — exactly what `MAX_TERMINALS_PER_SESSION` exists to
-/// prevent. So `execute` checks the same cap `ClientShellStart` does,
-/// before calling `create_terminal`, and refuses the same way.
-pub struct ClientShell {
-    spec: ToolSpec,
-}
-
-impl ClientShell {
-    pub fn new() -> Self {
-        Self {
-            spec: ToolSpec {
-                name: "client_shell".into(),
-                description: format!(
-                    "Run a command on the machine the connected editor is \
-                    running on — NOT this agent's own machine. Use `shell` instead \
-                    for commands on the agent's machine. \
-                    Waits up to `timeout_secs` (default 120, max 600) for the \
-                    command to finish. If it finishes in time, returns its output, \
-                    exit status, and whether the output was truncated. If it does \
-                    NOT finish in time, the command is left running rather than \
-                    killed — the result names the terminal handle so it can be \
-                    checked or stopped later; do not re-run the command just \
-                    because this call timed out. A session may hold at most \
-                    {MAX_TERMINALS_PER_SESSION} terminals at once, counting both \
-                    this tool's timed-out handles and client_shell_start's; \
-                    starting one past that is refused. \
-                    Only available inside an ACP session whose editor supports \
-                    `terminal/*`; refuses otherwise."
-                )
-                .into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The command to run (not a shell string — no pipes or redirection)."
-                        },
-                        "args": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Arguments to pass to the command."
-                        },
-                        "cwd": {
-                            "type": "string",
-                            "description": "Working directory on the editor's machine. Defaults to the session's cwd."
-                        },
-                        "timeout_secs": {
-                            "type": "integer",
-                            "description": "Max seconds to wait for the command to finish before handing back a running handle instead (default: 120, max: 600).",
-                            "minimum": 1,
-                            "maximum": 600
-                        }
-                    },
-                    "required": ["command"]
-                }),
-            },
-        }
-    }
-}
-
-impl Default for ClientShell {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Tool for ClientShell {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Execute
-    }
-
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
-    }
-
-    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
-        let command = input["command"].as_str().context("missing 'command'")?;
-        let args: Vec<String> = input["args"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let cwd = input["cwd"].as_str();
-        let timeout = clamp_timeout(input["timeout_secs"].as_u64());
-
-        let client = current_acp_client().ok_or_else(no_editor_error)?;
-
-        let run =
-            crate::tools::client_exec::run_client_command(&client, command, &args, cwd, timeout)
-                .await?;
-        match run.timed_out_handle {
-            Some(h) => Ok(format_timed_out(&h, timeout)),
-            None => {
-                let status = run
-                    .status
-                    .expect("run_client_command always sets `status` when it does not time out");
-                let mut out = format_finished(&run.output, &status);
-                if let Some(warning) = run.release_warning {
-                    out.push('\n');
-                    out.push_str(&warning);
-                }
-                Ok(out)
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -516,7 +418,7 @@ impl Tool for ClientShellStart {
             .unwrap_or_default();
         let cwd = input["cwd"].as_str();
 
-        let client = current_acp_client().ok_or_else(no_editor_error)?;
+        let client = current_acp_client().ok_or_else(|| anyhow::anyhow!(NO_EDITOR))?;
 
         // Reserve-then-create, not read-then-write: see
         // `AcpClient::try_reserve_terminal_slot`'s doc. `run_llm_turn`
@@ -530,7 +432,7 @@ impl Tool for ClientShellStart {
             .await
             .map_err(|held| cap_error(&held))?;
 
-        // As in `ClientShell`: if `create_terminal` errors or this call
+        // As in the one-shot path: if `create_terminal` errors or this call
         // is cancelled before it returns, `reservation` is dropped
         // without reaching `track_terminal`, and its `Drop` frees the
         // slot on its own.
@@ -617,7 +519,7 @@ impl Tool for ClientShellOutput {
         let terminal = input["terminal"].as_str().context("missing 'terminal'")?;
         let handle = TerminalHandle(terminal.to_string());
 
-        let client = current_acp_client().ok_or_else(no_editor_error)?;
+        let client = current_acp_client().ok_or_else(|| anyhow::anyhow!(NO_EDITOR))?;
         // Deliberately does NOT untrack on error — see this tool's doc.
         // An error here could be transient rather than "this handle is
         // truly gone," and untracking a terminal that is still running
@@ -712,7 +614,7 @@ impl Tool for ClientShellKill {
         let terminal = input["terminal"].as_str().context("missing 'terminal'")?;
         let handle = TerminalHandle(terminal.to_string());
 
-        let client = current_acp_client().ok_or_else(no_editor_error)?;
+        let client = current_acp_client().ok_or_else(|| anyhow::anyhow!(NO_EDITOR))?;
 
         // Both attempted before either `?` — see this tool's doc for
         // why: a kill failure must not skip the release attempt, and
@@ -774,186 +676,6 @@ mod tests {
     /// `line` and `limit` exist in ACP because a coding agent reads big
     /// files in pieces. Passing them through is the reason to prefer
     /// this over shelling out to `sed`.
-    #[tokio::test]
-    async fn read_passes_line_and_limit_through() {
-        let fake = Arc::new(FakeClient::default());
-        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
-        scope_acp_client(client, async {
-            ClientFileRead::new()
-                .execute(&json!({"path": "/p/a.rs", "line": 10, "limit": 40}))
-                .await
-                .unwrap();
-        })
-        .await;
-        assert_eq!(
-            fake.reads.lock().unwrap().as_slice(),
-            &[("/p/a.rs".to_string(), Some(10), Some(40))]
-        );
-    }
-
-    /// Outside an ACP turn there is no editor. Refusing here is what
-    /// keeps a Discord message from reaching a tool that would have
-    /// nowhere to go.
-    #[tokio::test]
-    async fn a_client_tool_refuses_without_a_client() {
-        let err = ClientFileRead::new()
-            .execute(&json!({"path": "/p/a.rs"}))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("no editor"),
-            "the message should say why, got: {err}"
-        );
-    }
-
-    /// The editor's refusal is information, not a failure to swallow:
-    /// the model can read it and try something else.
-    #[tokio::test]
-    async fn the_clients_error_reaches_the_model() {
-        let fake = Arc::new(FakeClient::default());
-        *fake.read_answer.lock().unwrap() = Some(Err("permission denied".to_string()));
-        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
-        scope_acp_client(client, async {
-            let err = ClientFileRead::new()
-                .execute(&json!({"path": "/p/secret"}))
-                .await
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("permission denied"), "got: {err}");
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn write_sends_the_path_and_content() {
-        let fake = Arc::new(FakeClient::default());
-        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
-        scope_acp_client(client, async {
-            ClientFileWrite::new()
-                .execute(&json!({"path": "/p/b.rs", "content": "fn main() {}"}))
-                .await
-                .unwrap();
-        })
-        .await;
-        assert_eq!(
-            fake.writes.lock().unwrap().as_slice(),
-            &[("/p/b.rs".to_string(), "fn main() {}".to_string())]
-        );
-    }
-
-    #[test]
-    fn the_kinds_match_what_the_permission_table_expects() {
-        assert_eq!(ClientFileRead::new().kind(), ToolKind::Read);
-        assert_eq!(ClientFileWrite::new().kind(), ToolKind::Edit);
-        assert_eq!(ClientShell::new().kind(), ToolKind::Execute);
-        assert_eq!(ClientShellStart::new().kind(), ToolKind::Execute);
-        assert_eq!(ClientShellOutput::new().kind(), ToolKind::Read);
-        assert_eq!(ClientShellKill::new().kind(), ToolKind::Execute);
-    }
-
-    /// Outside an ACP turn there is no editor to run a command on,
-    /// exactly as for the two file tools.
-    #[tokio::test]
-    async fn client_shell_refuses_without_a_client() {
-        let err = ClientShell::new()
-            .execute(&json!({"command": "ls", "args": []}))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("no editor"),
-            "the message should say why, got: {err}"
-        );
-    }
-
-    /// The whole point of the timeout: a build that outruns it keeps
-    /// running, and the model is handed the handle instead of a
-    /// corpse. Killing here would throw away the work and, for a
-    /// non-idempotent command, run it twice.
-    #[tokio::test]
-    async fn a_timed_out_command_is_not_killed_and_hands_back_its_handle() {
-        let fake = Arc::new(FakeClient::default());
-        fake.make_exit_never_return();
-        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
-
-        let out = scope_acp_client(client, async {
-            ClientShell::new()
-                .execute(&json!({"command": "cargo", "args": ["test"], "timeout_secs": 1}))
-                .await
-                .unwrap()
-        })
-        .await;
-
-        assert!(out.contains("still running"), "got: {out}");
-        assert!(
-            out.contains("t1"),
-            "the handle must be in the result: {out}"
-        );
-        assert!(
-            fake.released.lock().unwrap().is_empty(),
-            "release kills the command — it must not be called on a timeout"
-        );
-        assert!(fake.killed.lock().unwrap().is_empty(), "nor kill");
-    }
-
-    #[tokio::test]
-    async fn a_command_that_finishes_in_time_is_released() {
-        let fake = Arc::new(FakeClient::default());
-        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
-        scope_acp_client(client, async {
-            ClientShell::new()
-                .execute(&json!({"command": "ls", "args": []}))
-                .await
-                .unwrap();
-        })
-        .await;
-        assert_eq!(
-            fake.released.lock().unwrap().len(),
-            1,
-            "the handle is freed"
-        );
-    }
-
-    /// The cap is handed to the client so the output is cut at the
-    /// source rather than shipped across the wire and cut here.
-    #[tokio::test]
-    async fn the_output_cap_is_passed_to_the_client() {
-        let fake = Arc::new(FakeClient::default());
-        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
-        scope_acp_client(client, async {
-            ClientShell::new()
-                .execute(&json!({"command": "ls", "args": []}))
-                .await
-                .unwrap();
-        })
-        .await;
-        let (_, _, _, limit) = fake.creates.lock().unwrap()[0].clone();
-        assert_eq!(limit, Some(crate::tools::OUTPUT_CAP_BYTES as u64));
-    }
-
-    /// `clamp_timeout` is what `execute` calls to turn a requested
-    /// timeout into the duration it actually waits — testing it
-    /// directly avoids a test that waits out a real 600s timeout.
-    #[test]
-    fn the_timeout_is_capped_at_ten_minutes() {
-        assert_eq!(
-            clamp_timeout(Some(9999)),
-            std::time::Duration::from_secs(MAX_TIMEOUT_SECS)
-        );
-        assert_eq!(
-            clamp_timeout(None),
-            std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS)
-        );
-        assert_eq!(clamp_timeout(Some(30)), std::time::Duration::from_secs(30));
-    }
-
-    // -----------------------------------------------------------------
-    // client_shell_start / client_shell_output / client_shell_kill
-    // -----------------------------------------------------------------
-
-    /// Outside an ACP turn there is no editor, exactly as for the
-    /// other client-side tools.
     #[tokio::test]
     async fn the_long_running_tools_refuse_without_a_client() {
         assert!(
@@ -1204,69 +926,13 @@ mod tests {
     /// escapes both the cap and the "what is holding this session"
     /// listing, and the model is told to clean up while the very thing
     /// it needs to clean up stays invisible.
-    #[tokio::test]
-    async fn a_timed_out_one_shot_is_tracked_against_the_session() {
-        let (state, fake) = shell_test_state().await;
-        fake.make_exit_never_return();
-        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
-
-        scope_acp_client(client, async {
-            ClientShell::new()
-                .execute(&json!({"command": "cargo", "args": ["test"], "timeout_secs": 1}))
-                .await
-                .unwrap();
-        })
-        .await;
-
-        assert_eq!(
-            state
-                .acp_terminals
-                .lock()
-                .unwrap()
-                .get(TEST_SESSION_ID)
-                .map(Vec::len),
-            Some(1),
-            "a timed-out one-shot's handle must be tracked, or it escapes the cap and \
-             the model can never see it to clean it up"
-        );
-    }
-
     /// Review round 1, Finding 1: the one-shot path must respect the
-    /// same cap `client_shell_start` does. `ClientShell`'s timeout
+    /// same cap `shell_start` does. `shell`'s timeout
     /// branch tracks a handle (previous test), so without a cap check
     /// on this path too, a model looping `client_shell` with a short
     /// `timeout_secs` could accumulate live processes past the cap the
     /// same way looping `client_shell_start` would — exactly what
     /// `MAX_TERMINALS_PER_SESSION` exists to prevent.
-    #[tokio::test]
-    async fn the_one_shot_path_is_also_capped() {
-        let (_state, fake) = shell_test_state().await;
-        fake.hand_out_distinct_handles();
-        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
-
-        let refusal = scope_acp_client(client, async {
-            for _ in 0..MAX_TERMINALS_PER_SESSION {
-                ClientShellStart::new()
-                    .execute(&json!({"command": "sleep", "args": ["999"]}))
-                    .await
-                    .unwrap();
-            }
-            ClientShell::new()
-                .execute(&json!({"command": "one", "args": ["too", "many"]}))
-                .await
-                .unwrap_err()
-                .to_string()
-        })
-        .await;
-
-        assert!(refusal.contains("t1"), "names a held handle: {refusal}");
-        assert_eq!(
-            fake.creates.lock().unwrap().len(),
-            MAX_TERMINALS_PER_SESSION,
-            "the refused one-shot call must not have reached the client either"
-        );
-    }
-
     // -----------------------------------------------------------------
     // Final review, Fix 1 & Fix 2
     // -----------------------------------------------------------------
@@ -1277,83 +943,11 @@ mod tests {
     /// must stay tracked so the model can still poll or kill it later;
     /// losing it here is exactly the "under-counting loses a live
     /// process" outcome the design rules out.
-    #[tokio::test]
-    async fn a_wait_for_exit_error_leaves_the_handle_tracked() {
-        let (state, fake) = shell_test_state().await;
-        fake.make_wait_fail_with("connection reset");
-        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
-
-        let err = scope_acp_client(client, async {
-            ClientShell::new()
-                .execute(&json!({"command": "cargo", "args": ["build"]}))
-                .await
-                .unwrap_err()
-                .to_string()
-        })
-        .await;
-
-        assert!(err.contains("connection reset"), "got: {err}");
-        assert_eq!(
-            state
-                .acp_terminals
-                .lock()
-                .unwrap()
-                .get(TEST_SESSION_ID)
-                .map(Vec::len),
-            Some(1),
-            "a wait-for-exit error must not drop tracking — the command may still be running"
-        );
-    }
-
     /// Fix 1, item 3: a `release_terminal` failure must not discard
     /// output that was already collected successfully. A finished
     /// build's output is real work; throwing it away because the
     /// unrelated release call that follows failed would be worse than
     /// reporting both.
-    #[tokio::test]
-    async fn a_release_error_still_returns_the_output_and_leaves_the_handle_tracked() {
-        let (state, fake) = shell_test_state().await;
-        // Also fails `kill_terminal`, but this path never calls it.
-        fake.make_kill_fail_with("no such terminal");
-        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
-
-        let out = scope_acp_client(client, async {
-            ClientShell::new()
-                .execute(&json!({"command": "cargo", "args": ["build"]}))
-                .await
-                .unwrap()
-        })
-        .await;
-
-        assert!(
-            out.contains("[exit status unknown]"),
-            "the finished command's output must still be reported: {out}"
-        );
-        assert!(
-            out.contains("no such terminal"),
-            "the release failure must be surfaced too, not swallowed: {out}"
-        );
-        // Order, not just presence: `.contains(...)` alone would not
-        // have caught a regression that put the release warning first —
-        // exactly what Fix 1's first round did, and had to be repaired.
-        // The finished command's own output and exit status must read
-        // before the unrelated warning about releasing its terminal.
-        assert!(
-            out.find("[exit status unknown]").unwrap() < out.find("[warning:").unwrap(),
-            "the exit status must be rendered before the release warning: {out}"
-        );
-        assert_eq!(
-            state
-                .acp_terminals
-                .lock()
-                .unwrap()
-                .get(TEST_SESSION_ID)
-                .map(Vec::len),
-            Some(1),
-            "the handle stays tracked — a release failure is not proof it actually freed"
-        );
-    }
-
     /// Fix 2: `run_llm_turn` executes a turn's permitted tool calls
     /// concurrently (`futures_util::future::join_all`, `src/serve/mod.rs`),
     /// so one assistant message containing several `client_shell_start`
@@ -1621,5 +1215,231 @@ mod tests {
             h.abort();
             let _ = h.await;
         }
+    }
+
+    // -----------------------------------------------------------------
+    // The ACP half of the one-shot `shell` tool
+    // -----------------------------------------------------------------
+    //
+    // `shell` is no longer a pair of tools: `ShellTool::execute` dispatches
+    // into `client_exec` when a client is scoped. The timeout policy and the
+    // tracking rules that used to belong to the old `ClientShell` tool therefore have to
+    // be verified where they now run.
+
+    /// Enough of a `ShellTool` to exercise the ACP branch: the workspace
+    /// root is never read on that path (the client call's `cwd` comes from
+    /// `workdir`), so any directory will do.
+    fn shell_tool() -> ShellTool {
+        ShellTool::new(std::env::temp_dir())
+    }
+
+    /// The whole point of the timeout: a build that outruns it keeps
+    /// running, and the model is handed the handle instead of a corpse.
+    /// Killing here would throw away the work and, for a non-idempotent
+    /// command, run it twice.
+    #[tokio::test]
+    async fn a_timed_out_command_is_not_killed_and_hands_back_its_handle() {
+        let fake = Arc::new(FakeClient::default());
+        fake.make_exit_never_return();
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+
+        let out = scope_acp_client(client, async {
+            shell_tool()
+                .execute(&json!({"command": "cargo test", "timeout": 1}))
+                .await
+                .unwrap()
+        })
+        .await;
+
+        assert!(out.contains("still running"), "got: {out}");
+        assert!(
+            out.contains("t1"),
+            "the handle must be in the result: {out}"
+        );
+        assert!(
+            fake.released.lock().unwrap().is_empty(),
+            "release kills the command — it must not be called on a timeout"
+        );
+        assert!(fake.killed.lock().unwrap().is_empty(), "nor kill");
+    }
+
+    #[tokio::test]
+    async fn a_command_that_finishes_in_time_is_released() {
+        let fake = Arc::new(FakeClient::default());
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+        scope_acp_client(client, async {
+            shell_tool()
+                .execute(&json!({"command": "ls"}))
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(
+            fake.released.lock().unwrap().len(),
+            1,
+            "the handle is freed"
+        );
+    }
+
+    /// The cap is handed to the client so the output is cut at the source
+    /// rather than shipped across the wire and cut here.
+    #[tokio::test]
+    async fn the_output_cap_is_passed_to_the_client() {
+        let fake = Arc::new(FakeClient::default());
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+        scope_acp_client(client, async {
+            shell_tool()
+                .execute(&json!({"command": "ls"}))
+                .await
+                .unwrap();
+        })
+        .await;
+        let (_, _, _, limit) = fake.creates.lock().unwrap()[0].clone();
+        assert_eq!(limit, Some(crate::tools::OUTPUT_CAP_BYTES as u64));
+    }
+
+    /// A `shell` call that outruns its timeout must be tracked too — the
+    /// command is still running, so it has to count against the session's
+    /// cap and be listable for cleanup.
+    #[tokio::test]
+    async fn a_timed_out_one_shot_is_tracked_against_the_session() {
+        let (state, fake) = shell_test_state().await;
+        fake.make_exit_never_return();
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+
+        scope_acp_client(client, async {
+            shell_tool()
+                .execute(&json!({"command": "cargo test", "timeout": 1}))
+                .await
+                .unwrap();
+        })
+        .await;
+
+        assert_eq!(
+            state
+                .acp_terminals
+                .lock()
+                .unwrap()
+                .get(TEST_SESSION_ID)
+                .map(Vec::len),
+            Some(1),
+            "a timed-out one-shot's handle must be tracked, or it escapes the cap and \
+             the model can never see it to clean it up"
+        );
+    }
+
+    /// The one-shot path must respect the same cap `shell_start` does. Its
+    /// timeout branch tracks a handle (previous test), so without a cap
+    /// check here a model looping `shell` with a short `timeout` could
+    /// accumulate live processes past the cap the same way looping
+    /// `shell_start` would — exactly what `MAX_TERMINALS_PER_SESSION`
+    /// exists to prevent.
+    #[tokio::test]
+    async fn the_one_shot_path_is_also_capped() {
+        let (_state, fake) = shell_test_state().await;
+        fake.hand_out_distinct_handles();
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+
+        let refusal = scope_acp_client(client, async {
+            for _ in 0..MAX_TERMINALS_PER_SESSION {
+                ClientShellStart::new()
+                    .execute(&json!({"command": "sleep 999"}))
+                    .await
+                    .unwrap();
+            }
+            shell_tool()
+                .execute(&json!({"command": "one too many"}))
+                .await
+                .unwrap_err()
+                .to_string()
+        })
+        .await;
+
+        assert!(refusal.contains("t1"), "names a held handle: {refusal}");
+        assert_eq!(
+            fake.creates.lock().unwrap().len(),
+            MAX_TERMINALS_PER_SESSION,
+            "the refused one-shot call must not have reached the client either"
+        );
+    }
+
+    /// A `wait_for_terminal_exit` error (the client mid-reconnect, an RPC
+    /// timeout) is not proof the command has stopped — it is still running
+    /// on the user's machine. The handle must stay tracked so the model can
+    /// still poll or kill it later; losing it here is exactly the
+    /// "under-counting loses a live process" outcome the design rules out.
+    #[tokio::test]
+    async fn a_wait_for_exit_error_leaves_the_handle_tracked() {
+        let (state, fake) = shell_test_state().await;
+        fake.make_wait_fail_with("connection reset");
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+
+        let err = scope_acp_client(client, async {
+            shell_tool()
+                .execute(&json!({"command": "cargo build"}))
+                .await
+                .unwrap_err()
+                .to_string()
+        })
+        .await;
+
+        assert!(err.contains("connection reset"), "got: {err}");
+        assert_eq!(
+            state
+                .acp_terminals
+                .lock()
+                .unwrap()
+                .get(TEST_SESSION_ID)
+                .map(Vec::len),
+            Some(1),
+            "a wait-for-exit error must not drop tracking — the command may still be running"
+        );
+    }
+
+    /// A `release_terminal` failure must not discard output that was
+    /// already collected successfully. A finished build's output is real
+    /// work; throwing it away because the unrelated release call that
+    /// follows failed would be worse than reporting both.
+    #[tokio::test]
+    async fn a_release_error_still_returns_the_output_and_leaves_the_handle_tracked() {
+        let (state, fake) = shell_test_state().await;
+        // Also fails `kill_terminal`, but this path never calls it.
+        fake.make_kill_fail_with("no such terminal");
+        let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+
+        let out = scope_acp_client(client, async {
+            shell_tool()
+                .execute(&json!({"command": "cargo build"}))
+                .await
+                .unwrap()
+        })
+        .await;
+
+        assert!(
+            out.contains("[exit status unknown]"),
+            "the finished command's output must still be reported: {out}"
+        );
+        assert!(
+            out.contains("no such terminal"),
+            "the release failure must be surfaced too, not swallowed: {out}"
+        );
+        // Order, not just presence: `.contains(...)` alone would not have
+        // caught a regression that put the release warning first. The
+        // finished command's own output and exit status must read before
+        // the unrelated warning about releasing its terminal.
+        assert!(
+            out.find("[exit status unknown]").unwrap() < out.find("[warning:").unwrap(),
+            "the exit status must be rendered before the release warning: {out}"
+        );
+        assert_eq!(
+            state
+                .acp_terminals
+                .lock()
+                .unwrap()
+                .get(TEST_SESSION_ID)
+                .map(Vec::len),
+            Some(1),
+            "the handle stays tracked — a release failure is not proof it actually freed"
+        );
     }
 }

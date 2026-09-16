@@ -115,7 +115,7 @@ struct AcpSession {
     ///
     /// Read at `session/prompt` time and copied onto the turn's
     /// [`AcpProgress`] the same way `client_capabilities` is, so
-    /// `ClientShell` (`src/tools/client_tools.rs`) can default a
+    /// the client shell path (`src/tools/client_tools.rs`) can default a
     /// `terminal/create` call's working directory to it when the model
     /// doesn't pass one.
     cwd: PathBuf,
@@ -210,7 +210,7 @@ struct AcpProgress {
     /// This turn's session's recorded [`AcpSession::cwd`], copied in at
     /// construction time the same way `client_capabilities` is. Two uses:
     /// handed to `AcpClientHandle` by `acp_client()` below, which is what
-    /// lets `ClientShell` default a terminal's working directory to the
+    /// lets the client shell path default a terminal's working directory to the
     /// session's; and exposed to `run_llm_turn` through the `TurnHost::cwd`
     /// override below, which injects it into the session's system prompt.
     cwd: PathBuf,
@@ -250,9 +250,12 @@ fn terminal_cap_from(caps: &ClientCapabilities) -> bool {
 
 /// The capability line logged when a client initializes.
 ///
-/// These three flags decide which client-side tools the model is offered
-/// at all — the two `client_file_*` tools, the four `client_shell*` ones
-/// and, through the terminal flag, all four skill tools
+/// These three flags decide which tools the model is offered at all, and
+/// after #270 that is still the whole story for an ACP turn: the shared
+/// `file_read` / `file_write` / `file_append` names need their flag, the
+/// names that reach the editor's shell — `shell`, `file_delete`,
+/// `dir_list`, `dir_walk` and the three `client_shell_*` lifecycle tools —
+/// need the terminal one, and through it come all four skill tools
 /// (`visible_tool_predicate`, `src/serve/mod.rs`). When a tool is missing
 /// there are exactly two possible reasons, and this was the invisible
 /// one: the namespace's `skills` flag is in a file the operator can read,

@@ -341,9 +341,6 @@ pub async fn default_tool_set(
         Box::new(DirListTool::new(Arc::clone(&state))),
         Box::new(DirWalkTool::new(Arc::clone(&state))),
         Box::new(ShellTool::new(workspace_root.clone())),
-        Box::new(ClientFileRead::new()),
-        Box::new(ClientFileWrite::new()),
-        Box::new(ClientShell::new()),
         Box::new(ClientShellStart::new()),
         Box::new(ClientShellOutput::new()),
         Box::new(ClientShellKill::new()),
@@ -481,9 +478,6 @@ mod tests {
         let got_refs: Vec<(&str, ToolKind)> = got.iter().map(|(n, k)| (n.as_str(), *k)).collect();
 
         let want: Vec<(&str, ToolKind)> = vec![
-            ("client_file_read", ToolKind::Read),
-            ("client_file_write", ToolKind::Edit),
-            ("client_shell", ToolKind::Execute),
             ("client_shell_kill", ToolKind::Execute),
             ("client_shell_output", ToolKind::Read),
             ("client_shell_start", ToolKind::Execute),
