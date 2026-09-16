@@ -13,6 +13,14 @@ use std::sync::{Arc, Mutex, Weak};
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+// The one sentence every session-routed shell/file tool's description opens
+// with. Which machine a call reaches is a property of the *session*, not of
+// the tool: an ACP session reaches the connected editor's machine, every
+// other session this agent's own. Naming a fixed machine would be wrong in
+// one of the two cases every time, so the sentence lives here once rather
+// than in seven drifting copies.
+pub(crate) const REACHES_SENTENCE: &str = "Reaches whichever machine this     conversation is about: inside an ACP session, the machine the connected     editor is running on; otherwise this agent's own machine. ";
+
 fn expand_path(path_str: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path_str).as_ref())
 }
@@ -32,13 +40,15 @@ impl FileReadTool {
             state,
             spec: ToolSpec {
                 name: "file_read".into(),
-                description: "Read a file with optional line-based pagination. \
+                description: format!(
+                    "{REACHES_SENTENCE}Read a file with optional line-based pagination. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
                     (resolved against the workspace root). \
                     Returns lines prefixed with their 1-indexed line number in 'N|content' format. \
                     Use offset and limit for large files. \
-                    Cannot read binary files or device paths (/dev/, /proc/)."
-                    .into(),
+                    Cannot read binary files or device paths (/dev/, /proc/).",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -479,15 +489,16 @@ impl FileWriteTool {
             state,
             spec: ToolSpec {
                 name: "file_write".into(),
-                description: "Write content to a file, completely replacing its existing content. \
+                description: format!("{REACHES_SENTENCE}Write content to a file, completely replacing its existing content. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
                     (resolved against the workspace root). \
                     Creates the file and any missing parent directories automatically. \
                     When the target file is inside the workspace, the search index \
                     is updated automatically. \
                     Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.) \
-                    and to this agent's own config.toml and acp-permissions.json."
-                    .into(),
+                    and to this agent's own config.toml and acp-permissions.json.",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -566,15 +577,16 @@ impl FileDeleteTool {
             state,
             spec: ToolSpec {
                 name: "file_delete".into(),
-                description: "Delete a file from the filesystem. \
+                description: format!("{REACHES_SENTENCE}In an ACP session the delete runs a `rm` on the editor's machine over `terminal/*`. Delete a file from the filesystem. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
                     (resolved against the workspace root). \
                     When the file is inside the workspace, it is also removed from the search index \
                     automatically. \
                     Refuses deletes of sensitive system paths (/etc, /boot, /bin, etc.) \
                     and of this agent's own config.toml and acp-permissions.json. \
-                    Cannot delete directories."
-                    .into(),
+                    Cannot delete directories.",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -644,15 +656,16 @@ impl FileAppendTool {
             state,
             spec: ToolSpec {
                 name: "file_append".into(),
-                description: "Append content to the end of a file, creating it if missing. \
+                description: format!("{REACHES_SENTENCE}Append content to the end of a file, creating it if missing. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
                     (resolved against the workspace root). \
                     Creates any missing parent directories automatically. \
                     When the target file is inside the workspace, the search index \
                     is updated automatically. \
                     Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.) \
-                    and to this agent's own config.toml and acp-permissions.json."
-                    .into(),
+                    and to this agent's own config.toml and acp-permissions.json.",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -732,11 +745,12 @@ impl DirListTool {
             state,
             spec: ToolSpec {
                 name: "dir_list".into(),
-                description: "List the direct children of a directory (non-recursive). \
+                description: format!("{REACHES_SENTENCE}In an ACP session the listing runs a `find` on the editor's machine over `terminal/*`. List the direct children of a directory (non-recursive). \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths. \
                     Entries are sorted alphabetically. Directories are shown with a \
-                    trailing slash. For deeper exploration, use dir_walk."
-                    .into(),
+                    trailing slash. For deeper exploration, use dir_walk.",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -824,12 +838,13 @@ impl DirWalkTool {
             state,
             spec: ToolSpec {
                 name: "dir_walk".into(),
-                description: "Recursively list all files and directories under a path. \
+                description: format!("{REACHES_SENTENCE}In an ACP session the walk runs a `find` on the editor's machine over `terminal/*`. Recursively list all files and directories under a path. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths. \
                     Output is a sorted flat list; directories carry a trailing slash. \
                     Bounded by max_depth (default 5) and max_entries (default 500) to \
-                    avoid runaway walks into large trees."
-                    .into(),
+                    avoid runaway walks into large trees.",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -974,7 +989,8 @@ impl ShellTool {
             workspace_root,
             spec: ToolSpec {
                 name: "shell".into(),
-                description: "Execute a shell command and return its output. \
+                description: format!(
+                    "{REACHES_SENTENCE}Execute a shell command and return its output. \
                     Returns stdout, stderr, and exit code. \
                     The default working directory is the workspace root. \
                     By default the command runs under the shell named by the \
@@ -982,8 +998,9 @@ impl ShellTool {
                     override per call with the `shell` parameter (e.g. `bash`, \
                     `zsh`, `fish`, or an absolute path). \
                     Use the timeout parameter for long-running commands (default 60 s, max 600 s). \
-                    Not suitable for interactive commands or persistent daemons."
-                    .into(),
+                    Not suitable for interactive commands or persistent daemons.",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

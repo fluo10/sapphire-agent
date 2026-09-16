@@ -644,9 +644,7 @@ impl ClientShellStart {
                     Check on it with shell_output and stop it with shell_kill. \
                     A session may hold at most {MAX_TERMINALS_PER_SESSION} terminals at \
                     once; starting one more than that is refused, naming the handles \
-                    already held, until one is freed. \
-                    Only available inside an ACP session whose editor supports \
-                    `terminal/*`; refuses otherwise."
+                    already held, until one is freed. "
                 )
                 .into(),
                 input_schema: json!({
@@ -763,8 +761,7 @@ impl ClientShellOutput {
                 description: "Check on a command started with shell_start (or left \
                     running by a shell call that timed out): its output so far, \
                     whether it has finished, and its exit status if it has. Does not stop \
-                    the command. Only available inside an ACP session whose editor supports \
-                    `terminal/*`; refuses otherwise."
+                    the command."
                     .into(),
                 input_schema: json!({
                     "type": "object",
@@ -857,9 +854,7 @@ impl ClientShellKill {
                     "Stop a command started with shell_start (or left \
                     running by a shell call that timed out) and free its terminal \
                     handle. Use this to make room under the {MAX_TERMINALS_PER_SESSION}-\
-                    terminal cap, or to give up on a command that is no longer needed. \
-                    Only available inside an ACP session whose editor supports \
-                    `terminal/*`; refuses otherwise."
+                    terminal cap, or to give up on a command that is no longer needed. "
                 )
                 .into(),
                 input_schema: json!({
