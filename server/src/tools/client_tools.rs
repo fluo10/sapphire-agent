@@ -24,7 +24,11 @@ use crate::provider::ToolSpec;
 use crate::tools::acp_client::{
     AcpClient, ExitStatus, TerminalHandle, TerminalOutput, current_acp_client,
 };
-use crate::tools::builtin_tools::{ShellTool, truncation_marker};
+use crate::tools::builtin_tools::truncation_marker;
+// `ShellTool::execute` now dispatches the ACP branch itself (see the `shell`
+// tools); this module only constructs one inside its test module.
+#[cfg(test)]
+use crate::tools::builtin_tools::ShellTool;
 use crate::tools::client_exec::run_client_command;
 use crate::tools::{OUTPUT_CAP_BYTES, Tool, ToolKind};
 use anyhow::{Context, Result};
@@ -98,13 +102,13 @@ pub(crate) async fn client_append(
 ) -> Result<String> {
     let path = input["path"].as_str().context("missing 'path'")?;
     let content = input["content"].as_str().context("missing 'content'")?;
-    let existing = match client.read_text_file(path, None, None).await {
-        Ok(existing) => existing,
-        // A missing file is the ordinary "create it" case, not an error —
-        // `file_append`'s agent-side contract says it creates the file.
-        // Every other read failure is reported as-is.
-        Err(_) => String::new(),
-    };
+    // A missing file is the ordinary "create it" case, not an error —
+    // `file_append`'s agent-side contract says it creates the file. Every
+    // other read failure is reported as-is by the `?` on `write_text_file`.
+    let existing = client
+        .read_text_file(path, None, None)
+        .await
+        .unwrap_or_default();
     let mut merged = existing;
     merged.push_str(content);
     client.write_text_file(path, &merged).await?;
