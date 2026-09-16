@@ -2189,14 +2189,15 @@ pub(crate) fn visible_tool_predicate(
     client_terminal: bool,
 ) -> impl Fn(&str) -> bool {
     move |name: &str| {
-        // With a client on the other end these names reach the *editor's*
-        // machine, so this deployment's `host_access` switch has no business
-        // speaking for them — the capability flags below are the whole rule
-        // there. Without one they reach the agent's own machine and the
-        // gate is exactly what it always was. (`host_access` still governs
-        // the non-ACP side in full; #270 lands this split inside
-        // `host_tool_denied` as an explicit `routed_to_client` argument.)
-        if !has_client && crate::tools::policy::host_tool_denied(name, host_access_enabled) {
+        // The host gate is checked for every name, client or not, and must
+        // stay that way until Task 3: the execution gate
+        // (`run_llm_turn`'s `host_tool_denied(&call.name, host_access_enabled)`)
+        // does not know about the client yet, so advertising a client-routed
+        // name on a deployment with `host_access` off would only produce a
+        // tool that is offered and then refused on every call. Task 3 adds
+        // the `routed_to_client` argument there and this check moves inside,
+        // scoped to the names that stay on this machine.
+        if crate::tools::policy::host_tool_denied(name, host_access_enabled) {
             return false;
         }
         match name {
@@ -5453,6 +5454,14 @@ mod tests {
     /// fills `AcpSession::client_capabilities` in from `initialize` —
     /// that plumbing has no test-visible seam of its own (see the
     /// comment at the end of `src/serve/acp.rs`'s test module).
+    ///
+    /// `tool_names_for_turn` passes `host_access` **on**, because this is
+    /// an ACP turn and the unified names (`file_read`, `file_write`, ...)
+    /// are `HOST_TOOLS`: the host gate is checked first and would hide
+    /// every one of them at the off-by-default setting, leaving nothing
+    /// for the capability flags to be asserted against. That the gate
+    /// really does hide them is `host_tools_are_absent_when_host_access_is_off`
+    /// below. Task 3 folds the two together — see `visible_tool_predicate`.
     struct TestCaps {
         fs_read: bool,
         fs_write: bool,
@@ -5506,7 +5515,7 @@ mod tests {
     async fn tool_names_for_turn(caps: TestCaps) -> Vec<String> {
         client_filtering_test_set()
             .specs_filtered(visible_tool_predicate(
-                false,
+                true,
                 true,
                 caps.fs_read,
                 caps.fs_write,
@@ -5520,7 +5529,8 @@ mod tests {
 
     /// The tool names a turn with no editor on the other end (`/rpc`,
     /// Matrix, Discord, voice) would see, with host access left at its
-    /// off-by-default setting.
+    /// off-by-default setting — which, for the names in `HOST_TOOLS`, is
+    /// the whole rule there.
     async fn tool_names_for_turn_without_a_client() -> Vec<String> {
         client_filtering_test_set()
             .specs_filtered(visible_tool_predicate(false, false, false, false, false))
@@ -5533,6 +5543,9 @@ mod tests {
     /// A client that says it can read but not write gets exactly one of
     /// the two file tools. Clients implement these independently, so
     /// the two flags are read separately rather than as one "fs" bit.
+    ///
+    /// `host_access` is on in the helper: without it the host gate hides
+    /// all five unified names before any capability flag is consulted.
     #[tokio::test]
     async fn the_two_fs_tools_follow_their_own_capability_flags() {
         let names = tool_names_for_turn(TestCaps {
@@ -5562,8 +5575,8 @@ mod tests {
     /// editor declared `terminal/*` support — the same independence the two
     /// file tools get, just with one flag instead of two since ACP's
     /// `terminal` capability isn't split into finer-grained bits. ACP has no
-    /// request for delete, listing or walking, so those three name commands
-    /// on that terminal and ride the same flag.
+    /// request for delete, so it names `rm` on that terminal and rides the
+    /// same flag, as do the client-only `dir_list`/`dir_walk`.
     #[tokio::test]
     async fn the_terminal_tool_follows_its_own_capability_flag() {
         let terminal_tools = [
@@ -5628,6 +5641,14 @@ mod tests {
 
     /// The host switch is off by default, so its seven tools are absent
     /// from an ordinary turn's list entirely — not offered and refused.
+    ///
+    /// This is also the live-consistency guarantee for #270 Tasks 1-2: the
+    /// five unified names are host-gated exactly as before, and
+    /// `visible_tool_predicate` must not advertise one on an ACP turn while
+    /// the execution gate
+    /// (`run_llm_turn`'s `host_tool_denied(&call.name, host_access_enabled)`)
+    /// still refuses it. The two move together in Task 3, which gives
+    /// `host_tool_denied` a `routed_to_client` argument.
     #[tokio::test]
     async fn host_tools_are_absent_when_host_access_is_off() {
         let names = tool_names_for_turn_without_a_client().await;

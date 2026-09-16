@@ -151,8 +151,8 @@ pub(crate) async fn run_client_bash(
     if let Some(handle) = run.timed_out_handle {
         anyhow::bail!(
             "timed out after {}s on the editor's machine; the command is still \
-             running as terminal {handle}. Use shell_output to check on it, or \
-             shell_kill to stop it.",
+             running as terminal {handle}. Use client_shell_output to check on \
+             it, or client_shell_kill to stop it.",
             CLIENT_LOCAL_TIMEOUT.as_secs()
         );
     }
@@ -175,7 +175,12 @@ pub(crate) async fn run_client_bash(
 /// the agent-side contract is "files, never directories", so a directory is
 /// refused here rather than removed. The wording the model sees for those
 /// two cases is the script's own, on stderr.
-const DELETE_SH: &str = r#"
+/// The path arrives as `$1`, not `$0`: `bash -c <script> <argv0> [args...]`
+/// puts the first word *after* the script in `$0`, so a placeholder `$0`
+/// plus `rm -- "$1"` is what makes the path the first real argument. Passing
+/// the path as `argv0` instead would silently delete whatever `$0` happened
+/// to name — here, nothing, and every delete would fail with "no such file".
+pub(crate) const DELETE_SH: &str = r#"
 if [ -d "$1" ]; then
   echo "is a directory" >&2
   exit 1
@@ -187,13 +192,18 @@ fi
 rm -- "$1"
 "#;
 
+/// The `$0` placeholder [`DELETE_SH`] expects. Bash's `-c` has no other way
+/// to place a value in `$1`: the name is required syntactically, but nothing
+/// reads it.
+const DELETE_ARGV0: &str = "client_delete";
+
 /// `file_delete` against the editor's machine.
 pub(crate) async fn client_delete(
     client: &std::sync::Arc<dyn AcpClient>,
     input: &serde_json::Value,
 ) -> Result<String> {
     let path = input["path"].as_str().context("missing 'path'")?;
-    run_client_bash(client, DELETE_SH, path, &[]).await?;
+    run_client_bash(client, DELETE_SH, DELETE_ARGV0, &[path.to_string()]).await?;
     Ok(format!("Deleted: {path}"))
 }
 
@@ -263,7 +273,8 @@ pub(crate) fn format_finished(output: &TerminalOutput, status: &ExitStatus) -> S
 /// — and tracked in `ServeState.acp_terminals`, the same registry
 /// `ClientShellStart` uses, so it counts against the session's cap and shows
 /// up if the model has to list what it is holding — so the model can poll it
-/// with `shell_output` or stop it with `shell_kill`. The decision to kill is
+/// with `client_shell_output` or stop it with `client_shell_kill`. The
+/// decision to kill is
 /// left to the model or the human, never made here on their behalf. This is
 /// a deliberate departure from what the protocol's own `terminal/kill` doc
 /// suggests (kill on timeout and collect the output).
@@ -276,11 +287,12 @@ pub(crate) fn format_finished(output: &TerminalOutput, status: &ExitStatus) -> S
 ///
 /// `pub(crate)` because the formatting lives here while the branch that
 /// calls it lives in `ShellTool::execute`, so that a `shell` and a
-/// `shell_start` timeout read the same way.
+/// `client_shell_start` timeout read the same way.
 pub(crate) fn format_timed_out(handle: &TerminalHandle, timeout: std::time::Duration) -> String {
     format!(
         "[timed out after {}s — the command is still running as terminal {handle}. \
-         It was not killed. Use shell_output to check on it, or shell_kill to stop it. \
+         It was not killed. Use client_shell_output to check on it, or \
+         client_shell_kill to stop it. \
          Do not re-run the command.]",
         timeout.as_secs()
     )
@@ -927,7 +939,7 @@ mod tests {
     /// listing, and the model is told to clean up while the very thing
     /// it needs to clean up stays invisible.
     /// Review round 1, Finding 1: the one-shot path must respect the
-    /// same cap `shell_start` does. `shell`'s timeout
+    /// same cap `client_shell_start` does. `shell`'s timeout
     /// branch tracks a handle (previous test), so without a cap check
     /// on this path too, a model looping `client_shell` with a short
     /// `timeout_secs` could accumulate live processes past the cap the
@@ -1328,11 +1340,11 @@ mod tests {
         );
     }
 
-    /// The one-shot path must respect the same cap `shell_start` does. Its
+    /// The one-shot path must respect the same cap `client_shell_start` does. Its
     /// timeout branch tracks a handle (previous test), so without a cap
     /// check here a model looping `shell` with a short `timeout` could
     /// accumulate live processes past the cap the same way looping
-    /// `shell_start` would — exactly what `MAX_TERMINALS_PER_SESSION`
+    /// `client_shell_start` would — exactly what `MAX_TERMINALS_PER_SESSION`
     /// exists to prevent.
     #[tokio::test]
     async fn the_one_shot_path_is_also_capped() {

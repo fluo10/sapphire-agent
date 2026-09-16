@@ -2438,13 +2438,29 @@ mod session_routing_tests {
             Some("agent side\n"),
             "the agent's own file must be untouched: the delete ran on the client"
         );
+        // Positional-argument placement is the whole contract here, and
+        // `$0` is the trap: `bash -c <script> <argv0> [args...]` puts the
+        // first word *after* the script in `$0`, so a path passed as
+        // `argv0` would land where no script reads it and every delete
+        // would fail. Assert every slot, not just "somewhere in the argv".
         let creates = client.creates.lock().unwrap();
         assert_eq!(creates[0].0, "bash");
-        assert_eq!(creates[0].1[0], "-c");
+        let argv = &creates[0].1;
+        assert_eq!(argv[0], "-c");
         assert_eq!(
-            creates[0].1[2], "note.txt",
-            "the path must be a positional argument, not interpolated into the script"
+            argv[1],
+            crate::tools::client_tools::DELETE_SH,
+            "the script is the `-c` operand"
         );
+        assert_eq!(
+            argv[2], "client_delete",
+            "argv0 is a placeholder; the path must not sit in `$0`, which no script reads"
+        );
+        assert_eq!(
+            argv[3], "note.txt",
+            "the path is `$1` — the first real argument — not interpolated into the script"
+        );
+        assert_eq!(argv.len(), 4, "no extra arguments: {argv:?}");
     }
 
     /// ACP's `terminal/create` takes a command plus an argv, not a shell
