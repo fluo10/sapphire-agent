@@ -1,5 +1,5 @@
 //! The one-shot "run a command on the editor's machine and wait for it"
-//! mechanism shared by `client_shell` and the tools that reuse the same
+//! mechanism shared by `shell` and the tools that reuse the same
 //! run-and-collect dance.
 //!
 //! Formatting the result for the model — `format_finished`, the timeout
@@ -35,12 +35,12 @@ pub(crate) async fn run_client_command(
 ) -> anyhow::Result<ClientRun> {
     // Same cap, same check, as `ClientShellStart`: a timed-out call
     // below leaves a handle tracked, so without this a model
-    // looping `client_shell` with a short `timeout_secs` could
+    // looping `shell` with a short `timeout_secs` could
     // accumulate unbounded live processes — see this tool's doc.
     //
     // Reserve-then-create, not read-then-write: `run_llm_turn` runs
     // a turn's permitted calls concurrently, so one assistant
-    // message with several `client_shell`/`client_shell_start`
+    // message with several `shell`/`shell_start`
     // calls must not let them all read the count before any of
     // them wrote it back. `try_reserve_terminal_slot` does the
     // check and the reservation in one lock span so that cannot
@@ -95,7 +95,7 @@ pub(crate) async fn run_client_command(
                     // that follows failed. The handle is left
                     // tracked (over-counting is recoverable; losing
                     // a finished build's output is not), so the
-                    // model can retry `client_shell_kill` to free it.
+                    // model can retry `shell_kill` to free it.
                     Ok(ClientRun {
                         output,
                         status: Some(status),
@@ -103,7 +103,7 @@ pub(crate) async fn run_client_command(
                         release_warning: Some(format!(
                             "[warning: the command finished, but releasing terminal \
                              {handle} failed: {e}. It may still be tracked; use \
-                             client_shell_kill to free it.]"
+                             shell_kill to free it.]"
                         )),
                     })
                 }
@@ -112,7 +112,7 @@ pub(crate) async fn run_client_command(
         Err(_elapsed) => {
             // Already tracked above — the handle escapes this call
             // still running, so it has to stay in the same
-            // session-keyed tracking `client_shell_start` uses,
+            // session-keyed tracking `shell_start` uses,
             // otherwise it would count against nothing, the cap
             // would never see it, and the model would have no way
             // to list it in order to clean it up.

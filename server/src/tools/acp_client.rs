@@ -122,7 +122,7 @@ pub trait AcpClient: Send + Sync {
     /// [`create_terminal`](AcpClient::create_terminal) based on what it
     /// saw: `run_llm_turn` executes a turn's permitted tool calls
     /// concurrently (`futures_util::future::join_all`), so one
-    /// assistant message with N `client_shell_start` (or `client_shell`)
+    /// assistant message with N `shell_start` (or `shell`)
     /// calls had all N read the count before any of them wrote it back
     /// — the cap was bypassable within a single turn. Reserving
     /// atomically here closes that gap.

@@ -2220,9 +2220,9 @@ pub(crate) fn visible_tool_predicate(
         // needs that terminal.
         if matches!(
             name,
-            "client_shell_start"
-                | "client_shell_output"
-                | "client_shell_kill"
+            "shell_start"
+                | "shell_output"
+                | "shell_kill"
                 | "skill"
                 | "skill_install"
                 | "skill_update"
@@ -4392,13 +4392,13 @@ mod tests {
     /// permission gate, which checks `offered` first, ahead of the
     /// host-machine gate and `decide` both.
     ///
-    /// `client_shell_start` is the tool named: it isn't in `HOST_TOOLS`, so
+    /// `shell_start` is the tool named: it isn't in `HOST_TOOLS`, so
     /// the host-machine gate — the *other* thing that could explain a
     /// refusal here — never fires for it, and `NullProgress`'s default
     /// `origin()` is `Origin::Trusted`, which `decide` allows
     /// unconditionally for every kind. The only thing left standing
     /// between the call and `ran` flipping `true` is the offered check
-    /// itself: `visible_tool_predicate` excludes `client_shell_start` from
+    /// itself: `visible_tool_predicate` excludes `shell_start` from
     /// this round's own `tool_specs` because `NullProgress` reports no
     /// ACP client (`has_client` is `false`), even though the tool stays
     /// registered and visible to `state.tools.kinds()`.
@@ -4433,7 +4433,7 @@ mod tests {
                     text: None,
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "call-1".to_string(),
-                        name: "client_shell_start".to_string(),
+                        name: "shell_start".to_string(),
                         input: json!({"command": "echo hi"}),
                     }],
                     stop_reason: None,
@@ -4453,7 +4453,7 @@ mod tests {
             .tools
             .register_tool(Box::new(FakeClientShellStart {
                 spec: crate::provider::ToolSpec {
-                    name: "client_shell_start".into(),
+                    name: "shell_start".into(),
                     description: "Pretend to run a command on the client.".into(),
                     input_schema: json!({ "type": "object", "properties": {} }),
                 },
@@ -4473,7 +4473,7 @@ mod tests {
         assert_eq!(outcome.text.as_deref(), Some("done"));
         assert!(
             !ran.load(std::sync::atomic::Ordering::SeqCst),
-            "`client_shell_start` is registered, isn't a `HOST_TOOLS` name (so the \
+            "`shell_start` is registered, isn't a `HOST_TOOLS` name (so the \
              host gate never fires), and `Origin::Trusted` \
              allows every kind unconditionally — only the offered check \
              itself explains a refusal here"
@@ -5525,7 +5525,7 @@ mod tests {
     /// business and is tested there; this fixture is about the predicate's
     /// own table. The three lifecycle tools are the real ones, since they
     /// have no agent-side body at all — still under their pre-#270
-    /// `client_shell_*` names, which Task 4 renames.
+    /// `shell_*` names, which Task 4 renames.
     fn client_filtering_test_set() -> ToolSet {
         let names = [
             // The unified set: one name each, routed by session type.
@@ -5651,10 +5651,10 @@ mod tests {
             "dir_list",
             "dir_walk",
             // ...plus the three with no agent-side body at all, which keep
-            // their original `client_shell_*` names until Task 4.
-            "client_shell_start",
-            "client_shell_output",
-            "client_shell_kill",
+            // their original `shell_*` names until Task 4.
+            "shell_start",
+            "shell_output",
+            "shell_kill",
         ];
 
         let names = tool_names_for_turn(
@@ -5757,11 +5757,7 @@ mod tests {
             assert!(on.contains(&n.to_string()), "{n} should be present");
         }
 
-        for n in [
-            "client_shell_start",
-            "client_shell_output",
-            "client_shell_kill",
-        ] {
+        for n in ["shell_start", "shell_output", "shell_kill"] {
             assert!(!on.contains(&n.to_string()), "{n} has no agent-side body");
             assert!(!off.contains(&n.to_string()), "{n} has no agent-side body");
         }
@@ -5774,11 +5770,7 @@ mod tests {
     async fn a_non_acp_turn_is_offered_no_lifecycle_tools() {
         for host_access in [false, true] {
             let names = tool_names_for_turn_without_a_client(host_access).await;
-            for name in [
-                "client_shell_start",
-                "client_shell_output",
-                "client_shell_kill",
-            ] {
+            for name in ["shell_start", "shell_output", "shell_kill"] {
                 assert!(
                     !names.contains(&name.to_string()),
                     "{name} has no agent-side body, got: {names:?}"

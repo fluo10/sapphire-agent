@@ -152,8 +152,8 @@ pub(crate) async fn run_client_bash(
     if let Some(handle) = run.timed_out_handle {
         anyhow::bail!(
             "timed out after {}s on the editor's machine; the command is still \
-             running as terminal {handle}. Use client_shell_output to check on \
-             it, or client_shell_kill to stop it.",
+             running as terminal {handle}. Use shell_output to check on \
+             it, or shell_kill to stop it.",
             CLIENT_LOCAL_TIMEOUT.as_secs()
         );
     }
@@ -544,7 +544,7 @@ pub(crate) fn format_finished(output: &TerminalOutput, status: &ExitStatus) -> S
 /// — and tracked in `ServeState.acp_terminals`, the same registry
 /// `ClientShellStart` uses, so it counts against the session's cap and shows
 /// up if the model has to list what it is holding — so the model can poll it
-/// with `client_shell_output` or stop it with `client_shell_kill`. The
+/// with `shell_output` or stop it with `shell_kill`. The
 /// decision to kill is
 /// left to the model or the human, never made here on their behalf. This is
 /// a deliberate departure from what the protocol's own `terminal/kill` doc
@@ -558,19 +558,19 @@ pub(crate) fn format_finished(output: &TerminalOutput, status: &ExitStatus) -> S
 ///
 /// `pub(crate)` because the formatting lives here while the branch that
 /// calls it lives in `ShellTool::execute`, so that a `shell` and a
-/// `client_shell_start` timeout read the same way.
+/// `shell_start` timeout read the same way.
 pub(crate) fn format_timed_out(handle: &TerminalHandle, timeout: std::time::Duration) -> String {
     format!(
         "[timed out after {}s — the command is still running as terminal {handle}. \
-         It was not killed. Use client_shell_output to check on it, or \
-         client_shell_kill to stop it. \
+         It was not killed. Use shell_output to check on it, or \
+         shell_kill to stop it. \
          Do not re-run the command.]",
         timeout.as_secs()
     )
 }
 
 // ---------------------------------------------------------------------------
-// client_shell_start / client_shell_output / client_shell_kill
+// shell_start / shell_output / shell_kill
 // ---------------------------------------------------------------------------
 
 /// How many terminals one session may hold at once.
@@ -607,18 +607,18 @@ pub(crate) fn cap_error(held: &crate::tools::acp_client::CapHeld) -> anyhow::Err
     }
     anyhow::anyhow!(
         "already holding the maximum of {MAX_TERMINALS_PER_SESSION} terminals for this \
-         session: {}. Use client_shell_kill to free one before starting another.",
+         session: {}. Use shell_kill to free one before starting another.",
         parts.join(", ")
     )
 }
 
 /// Start a long-running command on the editor's machine and return
 /// immediately with a terminal handle, rather than waiting for it to
-/// finish the way `client_shell` does.
+/// finish the way `shell` does.
 ///
 /// The handle is tracked against the session
 /// (`ServeState.acp_terminals`) the moment the client hands it back —
-/// before that, `client_shell_output`/`client_shell_kill` would have
+/// before that, `shell_output`/`shell_kill` would have
 /// nothing to check the model's handle against, and the cap below
 /// would never see it.
 ///
@@ -634,14 +634,14 @@ impl ClientShellStart {
     pub fn new() -> Self {
         Self {
             spec: ToolSpec {
-                name: "client_shell_start".into(),
+                name: "shell_start".into(),
                 description: format!(
                     "Start a long-running command on the machine the connected \
                     editor is running on — NOT this agent's own machine — and return \
                     immediately with a terminal handle instead of waiting for it to finish. \
-                    Prefer this over `client_shell` for a command expected to keep running \
+                    Prefer this over `shell` for a command expected to keep running \
                     (a dev server, a watch task) or that may outlast a reasonable wait. \
-                    Check on it with client_shell_output and stop it with client_shell_kill. \
+                    Check on it with shell_output and stop it with shell_kill. \
                     A session may hold at most {MAX_TERMINALS_PER_SESSION} terminals at \
                     once; starting one more than that is refused, naming the handles \
                     already held, until one is freed. \
@@ -706,7 +706,7 @@ impl Tool for ClientShellStart {
         // Reserve-then-create, not read-then-write: see
         // `AcpClient::try_reserve_terminal_slot`'s doc. `run_llm_turn`
         // runs a turn's permitted calls concurrently, so one assistant
-        // message containing several `client_shell_start` blocks must
+        // message containing several `shell_start` blocks must
         // not let them all read the count before any of them wrote it
         // back — a real, reachable way to bypass the cap within one
         // turn, not just across concurrent prompts.
@@ -724,14 +724,14 @@ impl Tool for ClientShellStart {
             .await?;
         client.track_terminal(reservation, handle.clone()).await;
         Ok(format!(
-            "Started terminal {handle}. Use client_shell_output to check on it, or \
-             client_shell_kill to stop it."
+            "Started terminal {handle}. Use shell_output to check on it, or \
+             shell_kill to stop it."
         ))
     }
 }
 
-/// Check on a command started by `client_shell_start` (or left running
-/// by a `client_shell` timeout): its output so far, whether it has
+/// Check on a command started by `shell_start` (or left running
+/// by a `shell` timeout): its output so far, whether it has
 /// finished, and its exit status if it has.
 ///
 /// # An output error does NOT untrack the handle
@@ -748,7 +748,7 @@ impl Tool for ClientShellStart {
 ///
 /// So this tool leaves the handle tracked on any error and just
 /// reports the client's message. Over-counting is the recoverable
-/// direction — `client_shell_kill` untracks unconditionally (see its
+/// direction — `shell_kill` untracks unconditionally (see its
 /// doc), so the model can always clear a handle it no longer needs by
 /// killing it, even if this tool keeps failing on it.
 pub struct ClientShellOutput {
@@ -759,9 +759,9 @@ impl ClientShellOutput {
     pub fn new() -> Self {
         Self {
             spec: ToolSpec {
-                name: "client_shell_output".into(),
-                description: "Check on a command started with client_shell_start (or left \
-                    running by a client_shell call that timed out): its output so far, \
+                name: "shell_output".into(),
+                description: "Check on a command started with shell_start (or left \
+                    running by a shell call that timed out): its output so far, \
                     whether it has finished, and its exit status if it has. Does not stop \
                     the command. Only available inside an ACP session whose editor supports \
                     `terminal/*`; refuses otherwise."
@@ -771,8 +771,8 @@ impl ClientShellOutput {
                     "properties": {
                         "terminal": {
                             "type": "string",
-                            "description": "The terminal handle returned by client_shell_start \
-                                (or by a client_shell call that timed out)."
+                            "description": "The terminal handle returned by shell_start \
+                                (or by a shell call that timed out)."
                         }
                     },
                     "required": ["terminal"]
@@ -821,8 +821,8 @@ impl Tool for ClientShellOutput {
     }
 }
 
-/// Stop a command started by `client_shell_start` (or left running by
-/// a `client_shell` timeout) and free its terminal handle.
+/// Stop a command started by `shell_start` (or left running by
+/// a `shell` timeout) and free its terminal handle.
 ///
 /// Kills, then releases: ACP's `terminal/kill` alone leaves the handle
 /// valid, so a caller that stopped there would leak it against the cap
@@ -842,7 +842,7 @@ impl Tool for ClientShellOutput {
 /// dropped from tracking regardless of whether either succeeded; only
 /// then does a real error from either call propagate to the model.
 /// Over-counting from here is recoverable (the model can call this
-/// tool again, or check with `client_shell_output`); a permanently
+/// tool again, or check with `shell_output`); a permanently
 /// stuck slot is not.
 pub struct ClientShellKill {
     spec: ToolSpec,
@@ -852,10 +852,10 @@ impl ClientShellKill {
     pub fn new() -> Self {
         Self {
             spec: ToolSpec {
-                name: "client_shell_kill".into(),
+                name: "shell_kill".into(),
                 description: format!(
-                    "Stop a command started with client_shell_start (or left \
-                    running by a client_shell call that timed out) and free its terminal \
+                    "Stop a command started with shell_start (or left \
+                    running by a shell call that timed out) and free its terminal \
                     handle. Use this to make room under the {MAX_TERMINALS_PER_SESSION}-\
                     terminal cap, or to give up on a command that is no longer needed. \
                     Only available inside an ACP session whose editor supports \
@@ -1083,7 +1083,7 @@ mod tests {
     /// Review round 1, Finding 2: an output error alone is not proof the
     /// client has forgotten the handle — it could be transient (a
     /// reconnect, a timed-out request) — so it must not untrack a
-    /// terminal that might still be running. Only `client_shell_kill`
+    /// terminal that might still be running. Only `shell_kill`
     /// untracks unconditionally, because a handle the model explicitly
     /// asked to kill is exactly the case the cap's refusal message
     /// points the model at. This is a stronger pair than "an unknown
@@ -1204,17 +1204,17 @@ mod tests {
     }
 
     /// Task 6's ruling that the plan itself does not state: a one-shot
-    /// `client_shell` call that outruns its timeout must be tracked too
+    /// `shell` call that outruns its timeout must be tracked too
     /// — not just handed back in the result text. Otherwise the handle
     /// escapes both the cap and the "what is holding this session"
     /// listing, and the model is told to clean up while the very thing
     /// it needs to clean up stays invisible.
     /// Review round 1, Finding 1: the one-shot path must respect the
-    /// same cap `client_shell_start` does. `shell`'s timeout
+    /// same cap `shell_start` does. `shell`'s timeout
     /// branch tracks a handle (previous test), so without a cap check
-    /// on this path too, a model looping `client_shell` with a short
+    /// on this path too, a model looping `shell` with a short
     /// `timeout_secs` could accumulate live processes past the cap the
-    /// same way looping `client_shell_start` would — exactly what
+    /// same way looping `shell_start` would — exactly what
     /// `MAX_TERMINALS_PER_SESSION` exists to prevent.
     // -----------------------------------------------------------------
     // Final review, Fix 1 & Fix 2
@@ -1233,7 +1233,7 @@ mod tests {
     /// reporting both.
     /// Fix 2: `run_llm_turn` executes a turn's permitted tool calls
     /// concurrently (`futures_util::future::join_all`, `src/serve/mod.rs`),
-    /// so one assistant message containing several `client_shell_start`
+    /// so one assistant message containing several `shell_start`
     /// blocks runs them all at once against the same session. The old
     /// code read `tracked_terminals()` and wrote `track_terminal()` as
     /// two separate steps, so every concurrent call could read the
@@ -1267,7 +1267,7 @@ mod tests {
         let succeeded = outcomes.iter().filter(|r| r.is_ok()).count();
         assert_eq!(
             succeeded, MAX_TERMINALS_PER_SESSION,
-            "one turn's concurrent client_shell_start calls must not exceed the cap: {outcomes:?}"
+            "one turn's concurrent shell_start calls must not exceed the cap: {outcomes:?}"
         );
         assert_eq!(
             state
@@ -1433,7 +1433,7 @@ mod tests {
     }
 
     /// End-to-end version of the same fix: eight concurrent
-    /// `client_shell_start` calls that are all still mid-`create_terminal`
+    /// `shell_start` calls that are all still mid-`create_terminal`
     /// (parked, so none of them has resolved into a real handle yet)
     /// must still be reflected in the refusal a ninth concurrent call
     /// gets — as a count, since none of the eight has a handle for the
@@ -1611,11 +1611,11 @@ mod tests {
         );
     }
 
-    /// The one-shot path must respect the same cap `client_shell_start` does. Its
+    /// The one-shot path must respect the same cap `shell_start` does. Its
     /// timeout branch tracks a handle (previous test), so without a cap
     /// check here a model looping `shell` with a short `timeout` could
     /// accumulate live processes past the cap the same way looping
-    /// `client_shell_start` would — exactly what `MAX_TERMINALS_PER_SESSION`
+    /// `shell_start` would — exactly what `MAX_TERMINALS_PER_SESSION`
     /// exists to prevent.
     #[tokio::test]
     async fn the_one_shot_path_is_also_capped() {

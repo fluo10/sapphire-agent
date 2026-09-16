@@ -254,7 +254,7 @@ fn terminal_cap_from(caps: &ClientCapabilities) -> bool {
 /// after #270 that is still the whole story for an ACP turn: the shared
 /// `file_read` / `file_write` / `file_append` names need their flag, the
 /// names that reach the editor's shell — `shell`, `file_delete`,
-/// `dir_list`, `dir_walk` and the three `client_shell_*` lifecycle tools —
+/// `dir_list`, `dir_walk` and the three `shell_*` lifecycle tools —
 /// need the terminal one, and through it come all four skill tools
 /// (`visible_tool_predicate`, `src/serve/mod.rs`). When a tool is missing
 /// there are exactly two possible reasons, and this was the invisible
