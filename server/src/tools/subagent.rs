@@ -301,17 +301,18 @@ fn build_spec(agents: &[AgentDef]) -> ToolSpec {
 /// records a message, read back solely when the *parent's* own turn
 /// ends with no reply) but still wrong: a subagent's failure has no
 /// business overwriting what the parent's own failure, if any, would
-/// have said. Swallowing it here keeps a subagent's provider failure off
-/// that channel — but it does not surface the cause anywhere the model
-/// can read. `TurnStop::ProviderError` yields `text: None`, so
-/// `SubagentTool::execute`'s match on `stop` falls through to a generic
-/// `"[the subagent produced no answer]"` result (`src/tools/subagent.rs`,
-/// below) — the parent model sees only that, never the specific error.
-/// The cause is not lost operationally: `run_llm_turn`
-/// (`src/serve/mod.rs`) logs it (`error!("Provider error: {e:#}")`)
-/// before calling `turn_error`, so it is visible there. Whether it
-/// should also reach the parent model is a separate design question,
-/// not settled by this wrapper.
+/// have said. Swallowing it here only keeps a subagent's provider failure
+/// off *that* channel — it does not, on its own, keep the cause from the
+/// model: `TurnStop::ProviderError` carries its own `message` now (the
+/// same text `run_llm_turn`, `src/serve/mod.rs`, logs via
+/// `error!("Provider error: {e:#}")` and hands to `turn_error` before this
+/// wrapper swallows it), and `run_and_store` (below) reads it off the
+/// variant and returns [`provider_error`]'s `Err` instead of ever calling
+/// `answer_text`. So a subagent's own provider failure — an upstream rate
+/// limit, insufficient API credit, a network error — reaches the parent
+/// model as the `subagent` tool call's own error, distinguishable from a
+/// subagent that simply produced no answer, even though it never reaches
+/// the parent's own terminal-response channel.
 ///
 /// Every other method is forwarded completely unchanged: `origin()`,
 /// `approve()`, `acp_client()`, `client_fs_caps()`,
@@ -836,6 +837,22 @@ impl SubagentTool {
             },
         };
 
+        // A provider failure (rate limit, insufficient credit, a network
+        // error) is not an answer to prefix and return `Ok` with — see
+        // `provider_error`'s doc for what that used to look like from the
+        // parent's side.
+        if let crate::serve::TurnStop::ProviderError { message } = &stop {
+            return Err(provider_error(
+                ctx,
+                def,
+                handle,
+                created_at,
+                history,
+                over_cap_reason,
+                message,
+            ));
+        }
+
         let answer = answer_text(text, stop);
         let history = std::mem::take(history);
         let resumability = persist(
@@ -907,6 +924,64 @@ fn timed_out(
     )
 }
 
+/// Wind up a subagent turn that ended because its own `Provider::chat`
+/// call errored (a rate limit, insufficient API credit, a network
+/// failure, ...): save what it had, and build the error the parent model
+/// reads in place of an answer.
+///
+/// Before this existed, `TurnStop::ProviderError` carried no message and
+/// `answer_text`'s fallback arm turned every such failure into the same
+/// generic `"[the subagent produced no answer]"` text — handed back as a
+/// *successful* tool result, indistinguishable from a subagent that simply
+/// gave up. The actual cause reached only the `error!("Provider error:
+/// {e:#}")` log line in `run_llm_turn` (`src/serve/mod.rs`), never the
+/// parent model, which would go on to quietly redo the delegated work
+/// itself with no idea the subagent's provider — not the task — was what
+/// failed. `TurnStop::ProviderError { message }` is what closes that: the
+/// same text logged there now travels with the outcome, and this function
+/// is what turns it into the tool's own `Err` rather than folding it into
+/// `answer_text`'s generic case.
+///
+/// Unlike [`timed_out`], `history` needs no `repair_tool_pairing`: the
+/// failing `provider.chat` call is the first thing each round does, ahead
+/// of any history mutation for that round (`TurnLoop::run`,
+/// `src/serve/mod.rs`), so whatever is here is exactly what the last
+/// *successful* round left — already correctly paired, never mid-`tool_use`.
+fn provider_error(
+    ctx: &crate::serve::TurnContext,
+    def: &AgentDef,
+    handle: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+    history: &mut Vec<ChatMessage>,
+    over_cap_reason: &'static str,
+    message: &str,
+) -> anyhow::Error {
+    warn!(
+        "subagent '{}' (handle {handle})'s provider call failed: {message}; \
+         reporting the error to the parent instead of a placeholder answer",
+        def.name
+    );
+    let history = std::mem::take(history);
+    let resumability = persist(
+        ctx.state.subagent_cache.as_deref(),
+        handle,
+        &def.name,
+        history,
+        created_at,
+        over_cap_reason,
+    );
+    let saved = match resumability {
+        Resumability::Resumable(handle) => format!(
+            "Its conversation so far was saved: pass handle {handle} as `resume` \
+             to continue it, once the underlying problem is resolved."
+        ),
+        Resumability::NotResumable(reason) => {
+            format!("Its conversation so far is not resumable: {reason}.")
+        }
+    };
+    anyhow::anyhow!("subagent '{}' failed: {message}. {saved}", def.name)
+}
+
 /// How a dispatched or resumed child's answer should describe its own
 /// resumability to the model — see [`prefixed`].
 enum Resumability {
@@ -970,6 +1045,15 @@ fn prefixed(agent_name: &str, resumability: Resumability, answer: &str) -> Strin
 }
 
 /// What the parent model is told for a nested turn's own outcome.
+///
+/// `TurnStop::ProviderError` never reaches here: `run_and_store` matches it
+/// out beforehand and returns [`provider_error`]'s `Err` instead, since a
+/// failed provider call is not an answer to fold into a successful tool
+/// result. Only `Replied` (`text` always `Some`) and `BudgetExhausted`
+/// reach this function in practice; the fallback arm stays as a defensive
+/// default for a future `TurnStop` variant this function was not updated
+/// for, rather than an `unreachable!` that would turn that omission into a
+/// panic.
 fn answer_text(text: Option<String>, stop: crate::serve::TurnStop) -> String {
     match stop {
         crate::serve::TurnStop::BudgetExhausted { partial_text } => {
@@ -2391,6 +2475,96 @@ mod tests {
                     )
                 })),
             "the interrupted tool_use must be answered by the next message: {messages:?}"
+        );
+    }
+
+    /// A provider that always fails with a fixed message — what proves a
+    /// subagent's own provider failure (a rate limit, insufficient API
+    /// credit, a network error) reaches the parent as the `subagent`
+    /// call's own error text, not folded into a generic answer.
+    struct FailingProvider {
+        message: &'static str,
+    }
+
+    #[async_trait]
+    impl crate::provider::Provider for FailingProvider {
+        fn name(&self) -> &str {
+            "failing"
+        }
+
+        async fn chat(
+            &self,
+            _system: Option<&str>,
+            _messages: &[ChatMessage],
+            _tools: Option<&[ToolSpec]>,
+        ) -> anyhow::Result<crate::provider::ChatResponse> {
+            anyhow::bail!("{}", self.message)
+        }
+    }
+
+    /// A subagent's own provider failure must reach the parent as the
+    /// `subagent` call's own error, carrying the provider's actual message
+    /// — not `answer_text`'s generic `"[the subagent produced no answer]"`,
+    /// which was indistinguishable from a subagent that simply gave up.
+    /// Regression test for `TurnStop::ProviderError` gaining its own
+    /// `message` and `run_and_store` routing it through `provider_error`
+    /// instead of `answer_text`.
+    #[tokio::test]
+    async fn a_providers_error_reaches_the_parent_as_a_tool_error_and_stays_resumable() {
+        let state = crate::serve::ServeState::for_test(false);
+        let tool = SubagentTool::new(defs());
+        let provider = std::sync::Arc::new(FailingProvider {
+            message: "insufficient credits",
+        });
+
+        let err = crate::serve::scope_turn_context(
+            turn_context(
+                std::sync::Arc::clone(&state),
+                provider as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+            ),
+            tool.execute(&serde_json::json!({"agent": "reviewer", "prompt": "go"})),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("insufficient credits"),
+            "the parent must see the provider's own error: {err}"
+        );
+        let handle = err
+            .split("pass handle ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_else(|| panic!("the error must carry a resumable handle: {err}"))
+            .to_string();
+
+        // The failed dispatch is not a dead end: resuming it with a
+        // provider that actually answers picks up right where it left off.
+        let resume_provider = ScriptedProvider::new(vec![text_response("recovered")]);
+        let resumed = crate::serve::scope_turn_context(
+            turn_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&resume_provider)
+                    as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+            ),
+            tool.execute(&serde_json::json!({"resume": handle, "prompt": "try again"})),
+        )
+        .await
+        .unwrap();
+        assert!(resumed.contains("recovered"), "got: {resumed}");
+
+        let texts: Vec<String> = resume_provider
+            .last_messages()
+            .iter()
+            .filter_map(|m| m.text())
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("go")),
+            "the resumed call must still see the original dispatch prompt, \
+             unlost by the failed first attempt: {texts:?}"
         );
     }
 }
