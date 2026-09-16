@@ -2176,11 +2176,20 @@ pub(crate) struct LlmTurnOutcome {
 /// Every name is matched directly rather than by prefix or `ToolKind`,
 /// because after #270 the names are shared: `file_read` on an ACP turn and
 /// `file_read` on a Matrix turn are the same registered tool, and only the
-/// session decides which machine it reaches (see `builtin_tools`). A client
-/// can implement `fs/read_text_file` without `fs/write_text_file` (or vice
-/// versa), so those two flags are still read independently, or the
-/// capability this turn's editor recorded (`AcpSession::client_capabilities`,
-/// `src/serve/acp.rs`) was recorded for nothing.
+/// session decides which machine it reaches (see `builtin_tools`). The
+/// three client flags apply only to the routed turn, where they are the
+/// capabilities this turn's editor recorded at `initialize`
+/// (`AcpSession::client_capabilities`, `src/serve/acp.rs`); a client can
+/// implement `fs/read_text_file` without `fs/write_text_file` (or vice
+/// versa), so those two are read independently.
+///
+/// The one gate that is not about capabilities is
+/// `policy::host_tool_denied`, and #270 is what moved it inside: it now
+/// receives `has_client` as its `routed_to_client`, so on an ACP turn the
+/// seven unified names are decided by capability alone — the same seven
+/// names on a non-ACP turn are decided by `host_access` alone, which is
+/// the deployment switch's entire domain. `Agent::handle_message` calls
+/// this with every client flag false for exactly that reason.
 pub(crate) fn visible_tool_predicate(
     host_access_enabled: bool,
     has_client: bool,
@@ -2189,17 +2198,58 @@ pub(crate) fn visible_tool_predicate(
     client_terminal: bool,
 ) -> impl Fn(&str) -> bool {
     move |name: &str| {
-        // The host gate is checked for every name, client or not, and must
-        // stay that way until Task 3: the execution gate
-        // (`run_llm_turn`'s `host_tool_denied(&call.name, host_access_enabled)`)
-        // does not know about the client yet, so advertising a client-routed
-        // name on a deployment with `host_access` off would only produce a
-        // tool that is offered and then refused on every call. Task 3 adds
-        // the `routed_to_client` argument there and this check moves inside,
-        // scoped to the names that stay on this machine.
-        if crate::tools::policy::host_tool_denied(name, host_access_enabled) {
+        // The host gate, and the one place #270 changed its meaning:
+        // `has_client` is the `routed_to_client` argument. On an ACP turn
+        // these calls are going to the *editor's* machine, which this
+        // deployment's `[tools.host_access]` switch has no business
+        // speaking for, so the gate declines to fire and the list below
+        // is the whole answer. On a turn with no client (Matrix, Discord,
+        // `/rpc`, voice, the heartbeat) the gate is exactly the old rule
+        // and every name it lets through is the agent's own.
+        if crate::tools::policy::host_tool_denied(name, host_access_enabled, has_client) {
             return false;
         }
+
+        // The names with no agent-side body at all, which are therefore
+        // never offered without a client no matter what the host switch
+        // says: there is nothing on this machine for them to mean. The
+        // three lifecycle tools have no agent-side handle store (see
+        // `client_tools`), and every skill tool resolves its directory by
+        // running a script on the editor (`src/tools/skill_tools.rs`) —
+        // ACP has no list, glob or stat, so even the read-only `skill`
+        // needs that terminal.
+        if matches!(
+            name,
+            "client_shell_start"
+                | "client_shell_output"
+                | "client_shell_kill"
+                | "skill"
+                | "skill_install"
+                | "skill_update"
+                | "skill_uninstall"
+        ) {
+            return has_client && client_terminal;
+        }
+
+        // Everything else survived the gate. With no client that is the
+        // whole rule — `host_access` is the only gate there is, and the
+        // seven unified names it let through (`file_read`, `file_write`,
+        // `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`)
+        // are the agent's own tools here; `dir_list`/`dir_walk` included,
+        // since #270 gave them an agent-side body rather than leaving them
+        // client-only.
+        if !has_client {
+            return true;
+        }
+
+        // With a client, one more narrowing: the same seven names reach
+        // the editor, so a routable name may still be unusable — and the
+        // editor said at `initialize` which of these it implements. A
+        // client can declare `fs/read_text_file` without
+        // `fs/write_text_file` (or vice versa), so those two flags are
+        // read independently rather than folded into one "fs" bit.
+        // Nothing falls back to the agent's own disk when a capability is
+        // missing; the name is simply absent from this round's list.
         match name {
             // The unified set: one name each, whose *machine* this turn
             // decides (see `builtin_tools`).
@@ -2208,23 +2258,9 @@ pub(crate) fn visible_tool_predicate(
             // Append is a read and a write on the client's side (read ->
             // concatenate -> write), so it needs both halves.
             "file_append" => client_fs_read && client_fs_write,
-            // No ACP request exists for delete, so it is spelled as a
-            // command on the terminal.
             // No ACP request exists for delete, list or walk, so all three
-            // are spelled as a command on the terminal.
+            // — and `shell` — are spelled as a command on the terminal.
             "file_delete" | "dir_list" | "dir_walk" | "shell" => client_terminal,
-            // The three lifecycle tools have no agent-side body at all, so
-            // their names are unchanged from before #270.
-            "client_shell_start" | "client_shell_output" | "client_shell_kill" => client_terminal,
-            // The skills directory lives on the editor's machine and is
-            // located by running a script there, so every skill tool
-            // needs both a client and its terminal. Listing a directory
-            // is not expressible in ACP at all — there is no list, glob
-            // or stat in the agent→client surface — which is why even
-            // the read-only `skill` depends on the terminal.
-            "skill" | "skill_install" | "skill_update" | "skill_uninstall" => {
-                has_client && client_terminal
-            }
             _ => true,
         }
     }
@@ -2404,6 +2440,15 @@ impl TurnLoop<'_> {
         // is what keeps the client-side tools refusing there rather
         // than reaching for a connection that does not exist.
         let host_access_enabled = state.config.tools.host_access.enabled;
+        // Read once per turn, beside the switch and for the same reason it
+        // is: this is what decides whether that switch speaks for this
+        // turn at all. #270's core meaning change — an ACP turn's calls go
+        // to the editor's machine, so the host gate must not fire for
+        // them; a turn with no client gets exactly the old behaviour.
+        // `visible_tool_predicate` applies the same rule to the *offered*
+        // list, and the two must move together or a name is advertised and
+        // then refused on every call.
+        let routed_to_client = progress.acp_client().is_some();
         let compression_config = &state.config.compression;
         let mut accumulated_text: Vec<String> = Vec::new();
         // Built once per turn, not once per round: `tool_specs` is fixed
@@ -2594,10 +2639,18 @@ impl TurnLoop<'_> {
                         // this agent touch its own disk at all"), not a
                         // row in the origin/kind policy table — so it is
                         // checked, and can refuse, before `decide` is even
-                        // consulted.
+                        // consulted. `routed_to_client` is what scopes that
+                        // fact to the machine it is about: on this turn an
+                        // ACP client means the call lands elsewhere, and
+                        // the editor's own `session/request_permission`
+                        // answer is what governs it instead.
                         let refusal = if !offered.contains(call.name.as_str()) {
                             Some(refusal_message(&call.name, Refusal::NotOffered))
-                        } else if host_tool_denied(&call.name, host_access_enabled) {
+                        } else if host_tool_denied(
+                            &call.name,
+                            host_access_enabled,
+                            routed_to_client,
+                        ) {
                             Some(refusal_message(&call.name, Refusal::Unavailable))
                         } else {
                             let kind = kind_of(&call.name, &kinds);
@@ -5453,14 +5506,6 @@ mod tests {
     /// fills `AcpSession::client_capabilities` in from `initialize` —
     /// that plumbing has no test-visible seam of its own (see the
     /// comment at the end of `src/serve/acp.rs`'s test module).
-    ///
-    /// `tool_names_for_turn` passes `host_access` **on**, because this is
-    /// an ACP turn and the unified names (`file_read`, `file_write`, ...)
-    /// are `HOST_TOOLS`: the host gate is checked first and would hide
-    /// every one of them at the off-by-default setting, leaving nothing
-    /// for the capability flags to be asserted against. That the gate
-    /// really does hide them is `host_tools_are_absent_when_host_access_is_off`
-    /// below. Task 3 folds the two together — see `visible_tool_predicate`.
     struct TestCaps {
         fs_read: bool,
         fs_write: bool,
@@ -5478,8 +5523,9 @@ mod tests {
     /// session), and `visible_tool_predicate` is a pure function of the name
     /// and the five flags. Which machine a name reaches is `builtin_tools`'
     /// business and is tested there; this fixture is about the predicate's
-    /// own table. The three `shell_*` lifecycle tools are real, since they
-    /// have no agent-side body at all.
+    /// own table. The three lifecycle tools are the real ones, since they
+    /// have no agent-side body at all — still under their pre-#270
+    /// `client_shell_*` names, which Task 4 renames.
     fn client_filtering_test_set() -> ToolSet {
         let names = [
             // The unified set: one name each, routed by session type.
@@ -5509,12 +5555,18 @@ mod tests {
     }
 
     /// The tool names an ACP turn with an editor declaring `caps` would
-    /// see. Host access stays off (the deployment default) — these
-    /// tests are about the client-side flags, not the host gate.
-    async fn tool_names_for_turn(caps: TestCaps) -> Vec<String> {
+    /// see, at the `host_access` setting given.
+    ///
+    /// `host_access` is a parameter rather than the `true` this helper
+    /// used to hard-code: on an ACP turn it must make no difference at
+    /// all, since the unified names reach the editor's machine and the
+    /// switch speaks for the agent's own. Every ACP test below passes
+    /// `false` — the shipped default, and the value that used to hide all
+    /// seven — so "still offered" is the sharper statement.
+    async fn tool_names_for_turn(caps: TestCaps, host_access: bool) -> Vec<String> {
         client_filtering_test_set()
             .specs_filtered(visible_tool_predicate(
-                true,
+                host_access,
                 true,
                 caps.fs_read,
                 caps.fs_write,
@@ -5527,12 +5579,18 @@ mod tests {
     }
 
     /// The tool names a turn with no editor on the other end (`/rpc`,
-    /// Matrix, Discord, voice) would see, with host access left at its
-    /// off-by-default setting — which, for the names in `HOST_TOOLS`, is
-    /// the whole rule there.
-    async fn tool_names_for_turn_without_a_client() -> Vec<String> {
+    /// Matrix, Discord, voice) would see: every client-capability flag
+    /// `false`, exactly as `Agent::handle_message` passes them, with
+    /// `host_access` varied.
+    async fn tool_names_for_turn_without_a_client(host_access: bool) -> Vec<String> {
         client_filtering_test_set()
-            .specs_filtered(visible_tool_predicate(false, false, false, false, false))
+            .specs_filtered(visible_tool_predicate(
+                host_access,
+                false,
+                false,
+                false,
+                false,
+            ))
             .await
             .into_iter()
             .map(|s| s.name.to_string())
@@ -5543,26 +5601,34 @@ mod tests {
     /// the two file tools. Clients implement these independently, so
     /// the two flags are read separately rather than as one "fs" bit.
     ///
-    /// `host_access` is on in the helper: without it the host gate hides
-    /// all five unified names before any capability flag is consulted.
+    /// `host_access` is off in the helper: the seven names are
+    /// `HOST_TOOLS`, and an ACP turn must offer them regardless — that
+    /// the deployment-wide switch has no say here is the change #270
+    /// makes.
     #[tokio::test]
     async fn the_two_fs_tools_follow_their_own_capability_flags() {
-        let names = tool_names_for_turn(TestCaps {
-            fs_read: true,
-            fs_write: false,
-            terminal: false,
-        })
+        let names = tool_names_for_turn(
+            TestCaps {
+                fs_read: true,
+                fs_write: false,
+                terminal: false,
+            },
+            false,
+        )
         .await;
         assert!(names.contains(&"file_read".to_string()));
         assert!(!names.contains(&"file_write".to_string()));
         // `append` needs both halves: it is a read and a write.
         assert!(!names.contains(&"file_append".to_string()));
 
-        let names = tool_names_for_turn(TestCaps {
-            fs_read: false,
-            fs_write: true,
-            terminal: false,
-        })
+        let names = tool_names_for_turn(
+            TestCaps {
+                fs_read: false,
+                fs_write: true,
+                terminal: false,
+            },
+            false,
+        )
         .await;
         assert!(!names.contains(&"file_read".to_string()));
         assert!(names.contains(&"file_write".to_string()));
@@ -5575,29 +5641,30 @@ mod tests {
     /// file tools get, just with one flag instead of two since ACP's
     /// `terminal` capability isn't split into finer-grained bits. ACP has no
     /// request for delete, so it names `rm` on that terminal and rides the
-    /// same flag, as do the client-only `dir_list`/`dir_walk`.
+    /// same flag, as do `dir_list`/`dir_walk`.
     #[tokio::test]
     async fn the_terminal_tool_follows_its_own_capability_flag() {
         let terminal_tools = [
-            // The unified name that reaches the editor's shell...
+            // The unified names that reach the editor's shell...
             "shell",
             "file_delete",
-            // ...plus the client-only tools that were already gated on this
-            // flag before #270...
             "dir_list",
             "dir_walk",
-            // ...and the three with no agent-side body at all, which keep
-            // their original `client_shell_*` names.
+            // ...plus the three with no agent-side body at all, which keep
+            // their original `client_shell_*` names until Task 4.
             "client_shell_start",
             "client_shell_output",
             "client_shell_kill",
         ];
 
-        let names = tool_names_for_turn(TestCaps {
-            fs_read: false,
-            fs_write: false,
-            terminal: true,
-        })
+        let names = tool_names_for_turn(
+            TestCaps {
+                fs_read: false,
+                fs_write: false,
+                terminal: true,
+            },
+            false,
+        )
         .await;
         for tool in terminal_tools {
             assert!(
@@ -5606,11 +5673,14 @@ mod tests {
             );
         }
 
-        let names = tool_names_for_turn(TestCaps {
-            fs_read: false,
-            fs_write: false,
-            terminal: false,
-        })
+        let names = tool_names_for_turn(
+            TestCaps {
+                fs_read: false,
+                fs_write: false,
+                terminal: false,
+            },
+            false,
+        )
         .await;
         for tool in terminal_tools {
             assert!(
@@ -5620,55 +5690,121 @@ mod tests {
         }
     }
 
+    /// Inside an ACP session the seven names are gated on capabilities
+    /// alone — `host_access` is not consulted at all, because every one of
+    /// them reaches the editor. Here it is left at its off-by-default
+    /// setting, which before #270 hid all seven.
+    #[tokio::test]
+    async fn an_acp_turn_sees_the_seven_names_by_capability_only() {
+        let names = tool_names_for_turn(
+            TestCaps {
+                fs_read: true,
+                fs_write: true,
+                terminal: true,
+            },
+            false,
+        )
+        .await;
+        for n in crate::tools::policy::HOST_TOOLS {
+            assert!(names.contains(&n.to_string()), "missing {n}: {names:?}");
+        }
+
+        // `fs.read` only: the read half survives, the write half and the
+        // terminal-dependent names do not. No fallback to the agent's
+        // disk — that is the point of the capability gate, and `dir_list`
+        // /`dir_walk` ride the terminal flag rather than being exempt.
+        let names = tool_names_for_turn(
+            TestCaps {
+                fs_read: true,
+                fs_write: false,
+                terminal: false,
+            },
+            false,
+        )
+        .await;
+        assert!(names.contains(&"file_read".to_string()));
+        for n in [
+            "file_write",
+            "file_append",
+            "file_delete",
+            "dir_list",
+            "dir_walk",
+            "shell",
+        ] {
+            assert!(!names.contains(&n.to_string()), "unexpected {n}: {names:?}");
+        }
+    }
+
+    /// Outside an ACP session the same seven names answer to the
+    /// deployment switch and nothing else.
+    ///
+    /// `dir_list` and `dir_walk` are pinned on their own here because
+    /// they were client-only before #270 and are now ordinary
+    /// `HOST_TOOLS` with an agent-side body: a Matrix/Discord or `/rpc`
+    /// turn must see them exactly when host access is on, and never on a
+    /// capability flag it does not have. The three lifecycle tools go the
+    /// other way — no agent-side body exists, so they are absent at both
+    /// settings.
+    #[tokio::test]
+    async fn a_non_acp_turn_is_governed_by_host_access_alone() {
+        let off = tool_names_for_turn_without_a_client(false).await;
+        for n in crate::tools::policy::HOST_TOOLS {
+            assert!(!off.contains(&n.to_string()), "{n} should be hidden");
+        }
+
+        let on = tool_names_for_turn_without_a_client(true).await;
+        for n in crate::tools::policy::HOST_TOOLS {
+            assert!(on.contains(&n.to_string()), "{n} should be present");
+        }
+
+        for n in [
+            "client_shell_start",
+            "client_shell_output",
+            "client_shell_kill",
+        ] {
+            assert!(!on.contains(&n.to_string()), "{n} has no agent-side body");
+            assert!(!off.contains(&n.to_string()), "{n} has no agent-side body");
+        }
+    }
+
     /// Matrix, Discord, `/rpc` and voice have no editor. Offering them a
     /// tool that can only fail wastes a round trip and invites the model
     /// to pick the wrong machine.
     #[tokio::test]
     async fn a_non_acp_turn_is_offered_no_lifecycle_tools() {
-        let names = tool_names_for_turn_without_a_client().await;
-        for name in [
-            "client_shell_start",
-            "client_shell_output",
-            "client_shell_kill",
-        ] {
-            assert!(
-                !names.contains(&name.to_string()),
-                "{name} has no agent-side body, got: {names:?}"
-            );
-        }
-    }
-
-    /// The host switch is off by default, so its seven tools are absent
-    /// from an ordinary turn's list entirely — not offered and refused.
-    ///
-    /// This is also the live-consistency guarantee for #270 Tasks 1-2: the
-    /// five unified names are host-gated exactly as before, and
-    /// `visible_tool_predicate` must not advertise one on an ACP turn while
-    /// the execution gate
-    /// (`run_llm_turn`'s `host_tool_denied(&call.name, host_access_enabled)`)
-    /// still refuses it. The two move together in Task 3, which gives
-    /// `host_tool_denied` a `routed_to_client` argument.
-    #[tokio::test]
-    async fn host_tools_are_absent_when_host_access_is_off() {
-        let names = tool_names_for_turn_without_a_client().await;
-        for name in crate::tools::policy::HOST_TOOLS {
-            assert!(
-                !names.contains(&name.to_string()),
-                "{name} should be hidden"
-            );
+        for host_access in [false, true] {
+            let names = tool_names_for_turn_without_a_client(host_access).await;
+            for name in [
+                "client_shell_start",
+                "client_shell_output",
+                "client_shell_kill",
+            ] {
+                assert!(
+                    !names.contains(&name.to_string()),
+                    "{name} has no agent-side body, got: {names:?}"
+                );
+            }
         }
     }
 
     /// Channels reach `visible_tool_predicate` with every client flag
     /// false (see `src/agent.rs`), so gating on the terminal capability
-    /// is also what keeps skills off Matrix and Discord — without
-    /// changing this function's signature, which `src/agent.rs` calls
-    /// and which this branch may not edit.
+    /// is also what keeps skills off Matrix and Discord — the same rule
+    /// as before #270, and it has to stay true now that the seven unified
+    /// names *are* offered there when host access is on. A skill tool has
+    /// no agent-side body either: it resolves a directory on the editor's
+    /// machine.
     #[test]
     fn skill_tools_need_a_client_with_a_terminal() {
         let none = visible_tool_predicate(false, false, false, false, false);
         for t in ["skill", "skill_install", "skill_update", "skill_uninstall"] {
             assert!(!none(t), "{t} offered with no client");
+        }
+        // And the host switch does not change that: it speaks for the
+        // agent's own disk, which is not where these run.
+        let none_host_on = visible_tool_predicate(true, false, false, false, false);
+        for t in ["skill", "skill_install", "skill_update", "skill_uninstall"] {
+            assert!(!none_host_on(t), "{t} offered with no client");
         }
         let full = visible_tool_predicate(false, true, true, true, true);
         for t in ["skill", "skill_install", "skill_update", "skill_uninstall"] {
@@ -5676,6 +5812,185 @@ mod tests {
         }
         let no_term = visible_tool_predicate(false, true, true, true, false);
         assert!(!no_term("skill"), "skill offered without a terminal");
+    }
+
+    /// A turn with an editor on the other end, for the two tests below.
+    /// `origin` is `Acp(Default)` — where an `Execute` name would be asked
+    /// about, but a `Read` one is allowed outright — and `fs_read` is the
+    /// only capability declared, so `file_read` is the one unified name
+    /// this turn advertises.
+    struct AcpHostForGateTests {
+        client: Option<Arc<dyn crate::tools::acp_client::AcpClient>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnHost for AcpHostForGateTests {
+        async fn tool_start(&self, _id: &str, _name: &str) {}
+        async fn tool_end(&self, _id: &str, _name: &str) {}
+        async fn turn_error(&self, _message: &str) {}
+        fn origin(&self) -> crate::tools::policy::Origin {
+            crate::tools::policy::Origin::Acp(crate::tools::policy::SessionMode::Default)
+        }
+        fn acp_client(&self) -> Option<Arc<dyn crate::tools::acp_client::AcpClient>> {
+            self.client.clone()
+        }
+        fn client_fs_caps(&self) -> (bool, bool) {
+            (true, false)
+        }
+    }
+
+    /// A registered `file_read` that records having run, so a turn can be
+    /// judged on whether the call reached execution rather than only on
+    /// what the model was told.
+    struct FakeFileRead {
+        spec: crate::provider::ToolSpec,
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FakeFileRead {
+        fn new(ran: Arc<std::sync::atomic::AtomicBool>) -> Self {
+            Self {
+                spec: crate::provider::ToolSpec {
+                    name: "file_read".into(),
+                    description: "Pretend to read a file.".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                },
+                ran,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for FakeFileRead {
+        fn spec(&self) -> &crate::provider::ToolSpec {
+            &self.spec
+        }
+        fn kind(&self) -> crate::tools::ToolKind {
+            crate::tools::ToolKind::Read
+        }
+        async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
+            self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("ran".to_string())
+        }
+    }
+
+    /// The gate's meaning change, where the gate is actually consulted:
+    /// an ACP turn on a deployment with `host_access` off — the shipped
+    /// default, and the case that switch was protecting — runs a call
+    /// named `file_read` anyway, because that call is going to the
+    /// editor's machine. Before Task 3 this refused it: the gate had no
+    /// `routed_to_client` to tell the two apart, so a deployment-wide
+    /// switch would have been deciding for a machine it does not own.
+    #[tokio::test]
+    async fn an_acp_turn_runs_a_host_named_tool_with_host_access_off() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "file_read".to_string(),
+                        input: json!({"path": "note.txt"}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        assert!(
+            !state.config.tools.host_access.enabled,
+            "the shipped default is the case under test"
+        );
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state
+            .tools
+            .register_tool(Box::new(FakeFileRead::new(Arc::clone(&ran))))
+            .await;
+
+        let client: Arc<dyn crate::tools::acp_client::AcpClient> =
+            Arc::new(crate::tools::acp_client::tests::FakeClient::default());
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-acp-host-gate".to_string(),
+            ChatMessage::user("read it"),
+            Arc::new(AcpHostForGateTests {
+                client: Some(client),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "an ACP turn reaches the editor's machine, so the deployment's \
+             host_access switch has nothing to refuse here"
+        );
+    }
+
+    /// The other side of the same gate, with one variable changed — the
+    /// client's presence. With no editor, a name the gate hides is not
+    /// merely refused at execution: it is never offered, so the model
+    /// cannot name its way past the switch. `/rpc`, voice, the heartbeat
+    /// and the autonomous loops take this path.
+    #[tokio::test]
+    async fn a_non_acp_turn_never_offers_a_host_tool_to_begin_with() {
+        let (state, log) = ServeState::for_test_scripted_with_log(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "file_read".to_string(),
+                        input: json!({"path": "note.txt"}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state
+            .tools
+            .register_tool(Box::new(FakeFileRead::new(Arc::clone(&ran))))
+            .await;
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            "s-nonacp-host-gate".to_string(),
+            ChatMessage::user("read it"),
+            Arc::new(AcpHostForGateTests { client: None }),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "host access is off in this deployment, so a host-named call must \
+             not reach execution on a turn with no client"
+        );
+        let offered = &log.calls()[0].1;
+        assert!(
+            !offered.contains(&"file_read".to_string()),
+            "the name was never advertised to the model: {offered:?}"
+        );
     }
 
     /// The bug this pins: `round` used to be counted over the whole

@@ -205,8 +205,20 @@ pub const HOST_TOOLS: &[&str] = &[
 /// a pure function of origin and kind, and this is a fact about the
 /// deployment. Keeping them apart means the permission table still
 /// reads as one thing.
-pub fn host_tool_denied(name: &str, host_access_enabled: bool) -> bool {
-    !host_access_enabled && HOST_TOOLS.contains(&name)
+///
+/// `routed_to_client` is what #270 added, and it is what changed this
+/// gate's meaning. The seven names below are "the agent's own filesystem
+/// and shell" *only when that is where the call is going*: inside an ACP
+/// session the same names reach the editor's machine, which this
+/// deployment's `[tools.host_access]` switch has no business speaking
+/// for — that turn's list is set by the capabilities its editor declared
+/// (`serve::visible_tool_predicate`) and each call is answered by the
+/// editor itself through `session/request_permission`. A caller that
+/// knows this turn has an ACP client passes `true` and the gate declines
+/// to fire; a caller that does not (every non-ACP transport, whose turns
+/// never have one) passes `false` and gets exactly the old behaviour.
+pub fn host_tool_denied(name: &str, host_access_enabled: bool, routed_to_client: bool) -> bool {
+    !host_access_enabled && !routed_to_client && HOST_TOOLS.contains(&name)
 }
 
 /// The whole policy. The table in the design spec is this function.
@@ -257,23 +269,32 @@ pub fn decide(origin: Origin, kind: ToolKind) -> Decision {
 /// it — but a later policy change that did must not silently open the
 /// channel path, so the unreachable case fails closed.
 ///
-/// `host_access_enabled` is checked before `decide` for the same reason
-/// it is in `run_llm_turn`'s permission loop: it is a fact about the
-/// deployment, not a row in the origin/kind table, so a host tool never
-/// even reaches `decide` while it is off — including for a channel
-/// message, which has nobody to ask and would otherwise reach `Edit`/
-/// `Delete` tools like `file_write`/`file_delete` unasked.
+/// `host_access_enabled` and `routed_to_client` are checked before
+/// `decide` for the same reason they are in `run_llm_turn`'s permission
+/// loop: they are facts about the deployment and the turn, not rows in
+/// the origin/kind table, so a host tool never even reaches `decide`
+/// while the gate refuses it — including for a channel message, which has
+/// nobody to ask and would otherwise reach `Edit`/`Delete` tools like
+/// `file_write`/`file_delete` unasked.
+///
+/// `routed_to_client` goes straight through to `host_tool_denied` and is
+/// `false` at every call site of this function today: the channel path
+/// (`src/agent.rs`) is the only one, and a Matrix/Discord turn never has
+/// an ACP client. It is a parameter rather than a constant so the two
+/// gates cannot drift apart if a routed origin ever reaches here — and so
+/// that this path states that it is unrouted rather than assuming it.
 pub fn partition_without_asking(
     origin: Origin,
     calls: &[crate::provider::ToolCall],
     kinds: &[(String, ToolKind)],
     host_access_enabled: bool,
+    routed_to_client: bool,
 ) -> (Vec<crate::provider::ToolCall>, Vec<(String, String)>) {
     let mut permitted = Vec::with_capacity(calls.len());
     let mut refused = Vec::new();
 
     for call in calls {
-        if host_tool_denied(&call.name, host_access_enabled) {
+        if host_tool_denied(&call.name, host_access_enabled, routed_to_client) {
             refused.push((
                 call.id.clone(),
                 refusal_message(&call.name, Refusal::Unavailable),
@@ -493,7 +514,8 @@ mod tests {
             call("c3", "mcp__x__y"),
         ];
 
-        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds, true);
+        let (permitted, refused) =
+            partition_without_asking(Origin::Channel, &calls, &kinds, true, false);
 
         let kept: Vec<&str> = permitted.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(kept, vec!["c1"]);
@@ -512,7 +534,8 @@ mod tests {
         let kinds = vec![("file_delete".to_string(), ToolKind::Delete)];
         let calls = vec![call("c1", "file_delete")];
 
-        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds, false);
+        let (permitted, refused) =
+            partition_without_asking(Origin::Channel, &calls, &kinds, false, false);
 
         assert!(permitted.is_empty(), "host access is off by default");
         assert_eq!(refused.len(), 1);
@@ -524,7 +547,8 @@ mod tests {
         let kinds = vec![("file_delete".to_string(), ToolKind::Delete)];
         let calls = vec![call("c1", "file_delete")];
 
-        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds, true);
+        let (permitted, refused) =
+            partition_without_asking(Origin::Channel, &calls, &kinds, true, false);
 
         assert_eq!(permitted.len(), 1);
         assert!(refused.is_empty());
@@ -537,7 +561,7 @@ mod tests {
     fn host_tools_are_denied_when_host_access_is_off() {
         for name in HOST_TOOLS {
             assert!(
-                host_tool_denied(name, false),
+                host_tool_denied(name, false, false),
                 "{name} must be denied with host access off"
             );
         }
@@ -547,7 +571,7 @@ mod tests {
     fn host_tools_are_allowed_through_when_host_access_is_on() {
         for name in HOST_TOOLS {
             assert!(
-                !host_tool_denied(name, true),
+                !host_tool_denied(name, true, false),
                 "{name} must fall through to the policy table when enabled"
             );
         }
@@ -558,7 +582,10 @@ mod tests {
     #[test]
     fn workspace_tools_are_not_host_tools() {
         for name in ["memory_add", "workspace_search", "timer_set", "web_search"] {
-            assert!(!host_tool_denied(name, false), "{name} is not a host tool");
+            assert!(
+                !host_tool_denied(name, false, false),
+                "{name} is not a host tool"
+            );
         }
     }
 
@@ -573,7 +600,7 @@ mod tests {
             "the policy table alone still allows it — which is the point"
         );
         assert!(
-            host_tool_denied("file_delete", false),
+            host_tool_denied("file_delete", false, false),
             "the host gate is what stops it"
         );
     }
@@ -584,7 +611,8 @@ mod tests {
         let kinds = vec![("shell".to_string(), ToolKind::Execute)];
         let calls = vec![call("c1", "shell")];
 
-        let (permitted, refused) = partition_without_asking(Origin::Trusted, &calls, &kinds, true);
+        let (permitted, refused) =
+            partition_without_asking(Origin::Trusted, &calls, &kinds, true, false);
 
         assert_eq!(permitted.len(), 1);
         assert!(refused.is_empty());
@@ -599,10 +627,56 @@ mod tests {
         let kinds = vec![("shell".to_string(), ToolKind::Execute)];
         let calls = vec![call("c1", "shell")];
 
-        let (permitted, refused) =
-            partition_without_asking(Origin::Acp(SessionMode::Default), &calls, &kinds, true);
+        let (permitted, refused) = partition_without_asking(
+            Origin::Acp(SessionMode::Default),
+            &calls,
+            &kinds,
+            true,
+            false,
+        );
 
         assert!(permitted.is_empty(), "an Ask must not be treated as Allow");
         assert_eq!(refused.len(), 1);
+    }
+
+    /// The meaning change #270 makes: with host access off, a call routed
+    /// to the editor is not this deployment's own disk and has nothing to
+    /// do with this gate. What that turn may see is decided by the
+    /// capabilities the editor declared (`serve::visible_tool_predicate`)
+    /// and by the editor's own answer to `session/request_permission`.
+    #[test]
+    fn a_call_routed_to_the_client_is_never_denied_by_the_host_gate() {
+        for name in HOST_TOOLS {
+            assert!(!host_tool_denied(name, false, true), "{name}");
+        }
+    }
+
+    /// Unchanged: with no client on the other end the gate behaves exactly
+    /// as it did, for every origin.
+    #[test]
+    fn a_call_routed_to_the_agent_is_still_denied_with_host_access_off() {
+        for name in HOST_TOOLS {
+            assert!(host_tool_denied(name, false, false), "{name}");
+            assert!(!host_tool_denied(name, true, false), "{name}");
+        }
+    }
+
+    /// `partition_without_asking` threads the flag into the gate rather
+    /// than assuming one answer somewhere along the way. Every call site of
+    /// this function passes `false` today (the channel path is the only
+    /// one), so this pins the other direction — a routed call survives a
+    /// deployment with host access off — which is what would otherwise
+    /// fail silently if the parameter stopped being forwarded.
+    #[test]
+    fn partition_without_asking_honours_routed_to_client() {
+        let kinds = vec![("file_read".to_string(), ToolKind::Read)];
+        let calls = vec![call("c1", "file_read")];
+
+        let (permitted, refused) =
+            partition_without_asking(Origin::Channel, &calls, &kinds, false, true);
+
+        let kept: Vec<&str> = permitted.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(kept, vec!["c1"], "a routed call is not this machine's call");
+        assert!(refused.is_empty());
     }
 }
