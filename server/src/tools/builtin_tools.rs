@@ -798,6 +798,17 @@ impl Tool for DirListTool {
     }
 }
 
+/// The one sentence a truncated `dir_walk` reports, shared with the client.
+///
+/// The wording used to sit, verbatim, in both `DirWalkTool::execute` here and
+/// `client_tools::client_dir_walk` -- which is exactly the drift the
+/// unification exists to avoid: a model that learned "there was more" on one
+/// machine must not meet a differently worded cap on the other. The agent side
+/// owns the sentence; the client path calls this.
+pub(crate) fn truncation_marker(max_entries: usize) -> String {
+    format!("[truncated — more than {max_entries} entries; raise max_entries or narrow path]")
+}
+
 // ---------------------------------------------------------------------------
 // dir_walk
 // ---------------------------------------------------------------------------
@@ -939,9 +950,7 @@ impl Tool for DirWalkTool {
             })
             .collect();
         if truncated {
-            out.push(format!(
-                "[truncated — more than {max_entries} entries; raise max_entries or narrow path]"
-            ));
+            out.push(truncation_marker(max_entries));
         }
         Ok(out.join("\n"))
     }
@@ -2473,7 +2482,7 @@ mod session_routing_tests {
         assert_eq!(argv[0], "-c");
         assert_eq!(
             argv[1],
-            crate::tools::client_tools::DELETE_SH,
+            crate::tools::client_tools::delete_script(),
             "the script is the `-c` operand"
         );
         assert_eq!(
@@ -2530,11 +2539,16 @@ mod session_routing_tests {
     /// `dir_list` on an ACP turn runs on the editor's machine. The path is
     /// outside this workspace on purpose (`/z`): the agent-side body would
     /// refuse it, so a listing can only have come from the client.
+    ///
+    /// The queued stdout is what the script actually emits, in the script's own
+    /// order (agent-side pre-order DFS, `E` announcement first), because the
+    /// client passes that order through: a fixture in some other order would
+    /// only be testing the fixture.
     #[tokio::test]
     async fn dir_list_lists_the_clients_machine_inside_an_acp_session() {
         let (_state, tool) = dir_list_tool_for_test();
         let client = Arc::new(FakeClient::default());
-        client.queue_terminal_stdout("F\t/z/b.txt\nD\t/z/sub\nF\t/z/a.txt\n");
+        client.queue_terminal_stdout("E\t/z\nF\t/z/a.txt\nF\t/z/b.txt\nD\t/z/sub\n");
 
         let out = scope_acp_client(
             Arc::clone(&client) as Arc<dyn AcpClient>,
@@ -2580,8 +2594,13 @@ mod session_routing_tests {
         assert_eq!(argv[4], "3", "max_entries + 1, got: {argv:?}");
     }
 
-    /// Outside an ACP session both tools are the agent's own bodies,
-    /// untouched: sorted, directories with a trailing slash.
+    /// Outside an ACP session both tools are the agent's own bodies, untouched:
+    /// sorted, directories with a trailing slash.
+    ///
+    /// The order is a **pre-order DFS**, which is what the client's script has
+    /// to reproduce: `sub` comes before the sibling file `sub.txt`, and
+    /// everything under `sub` is emitted right after `sub`. A flat sort of the
+    /// whole listing would put `sub.txt` first, because `/` sorts above `.`.
     #[tokio::test]
     async fn dir_list_still_lists_the_agents_machine_outside_an_acp_session() {
         let (state, tool) = dir_list_tool_for_test();
@@ -2591,25 +2610,33 @@ mod session_routing_tests {
             .workspace
             .root
             .clone();
-        std::fs::create_dir_all(root.join("sub")).unwrap();
         write_workspace_file(&state, "a.txt", "a\n");
         write_workspace_file(&state, "b.txt", "b\n");
+        write_workspace_file(&state, "sub/inner.txt", "inner\n");
+        write_workspace_file(&state, "sub.txt", "sub\n");
 
         let out = tool
             .execute(&json!({"path": root.to_str().unwrap()}))
             .await
             .unwrap();
 
-        assert!(out.contains("sub/"), "a directory keeps its slash: {out}");
-        let a = out.find("a.txt").expect("a.txt is listed");
-        let b = out.find("b.txt").expect("b.txt is listed");
-        assert!(a < b, "entries are sorted: {out}");
+        // Sliced rather than compared whole: the workspace root carries the
+        // framework's own `.sapphire-agent` directory, which sorts before
+        // `a.txt` and is not what this test is about.
+        let lines: Vec<&str> = out.lines().collect();
+        let a = lines.iter().position(|l| *l == "a.txt").expect("a.txt");
+        assert_eq!(
+            &lines[a..a + 4],
+            ["a.txt", "b.txt", "sub/", "sub.txt"],
+            "one level, sorted, directories with a slash: {out}"
+        );
     }
 
-    /// The truncation sentence is the same one `client_tools` adds, so a
-    /// model that learned it on this machine reads the client's answer the
-    /// same way -- neither machine's walk reports "there was more" in its
-    /// own words.
+    /// The truncation sentence is the same one `client_tools` adds, so a model
+    /// that learned it on this machine reads the client's answer the same way
+    /// -- neither machine's walk reports "there was more" in its own words.
+    /// Read from the shared function, so a reworded marker is reworded on both
+    /// sides or on neither.
     #[tokio::test]
     async fn dir_walk_truncates_on_the_agents_machine_with_the_same_marker() {
         let (state, tool) = dir_walk_tool_for_test();
@@ -2629,11 +2656,203 @@ mod session_routing_tests {
             .unwrap();
 
         assert!(out.contains("a.txt"), "got: {out}");
-        assert!(
-            out.contains(
-                "[truncated \u{2014} more than 1 entries; raise max_entries or narrow path]"
-            ),
-            "got: {out}"
+        assert!(out.contains(&truncation_marker(1)), "got: {out}");
+    }
+
+    /// A shell to run the client's own scripts with, or `None` where neither is
+    /// on `PATH` -- the same guard `skills`' script tests use. The scripts are
+    /// shell running on someone else's machine, so a Rust-side assertion that
+    /// never evaluates them would prove nothing about the order the two
+    /// machines produce.
+    fn shell_for_scripts() -> Option<&'static str> {
+        ["bash", "sh"].into_iter().find(|c| {
+            std::process::Command::new(c)
+                .arg("-c")
+                .arg("exit 0")
+                .status()
+                .is_ok()
+        })
+    }
+
+    /// Run one of the client's scripts the way `run_client_bash` does --
+    /// `<shell> -c <script> <argv0> <args...>` -- against a real directory.
+    fn run_client_script(
+        shell: &str,
+        script: &str,
+        argv0: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> std::process::Output {
+        let mut cmd = std::process::Command::new(shell);
+        cmd.arg("-c").arg(script).arg(argv0).args(args);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("the shell runs")
+    }
+
+    /// The review's finding, pinned against the real thing: the client's `find`
+    /// script must produce the **agent's own pre-order DFS** -- `sub`, the
+    /// entries under `sub`, then the sibling file `sub.txt` -- and not a flat
+    /// sort of the whole listing, which a byte comparison puts the other way
+    /// round (`/` is 0x2F, above `.`).
+    ///
+    /// Both machines are run against one real tree, so this is the comparison
+    /// the two fake-driven tests can only approximate: the agent's own tools on
+    /// this side, and the client's script through a real shell on the other.
+    #[tokio::test]
+    async fn the_client_scripts_keep_the_agents_own_dfs_order() {
+        let Some(shell) = shell_for_scripts() else {
+            return;
+        };
+        let (state, walk) = dir_walk_tool_for_test();
+        let list = DirListTool::new(Arc::clone(&state));
+        let root = state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .clone();
+        write_workspace_file(&state, "a.txt", "a\n");
+        write_workspace_file(&state, "b.txt", "b\n");
+        write_workspace_file(&state, "sub/inner.txt", "inner\n");
+        write_workspace_file(&state, "sub.txt", "sub\n");
+        let root = root.to_str().unwrap().to_string();
+
+        // The agent's own tools, on this machine.
+        let agent_list = list.execute(&json!({"path": root})).await.unwrap();
+        let agent_walk = walk.execute(&json!({"path": root})).await.unwrap();
+
+        // The client's scripts, through a real shell, over the same tree.
+        let client_list = run_client_script(
+            shell,
+            &crate::tools::client_tools::list_script(),
+            "client_dir_list",
+            &[&root],
+            &[],
         );
+        let client_walk = run_client_script(
+            shell,
+            &crate::tools::client_tools::walk_script(),
+            "client_dir_walk",
+            &[&root, "6", "1001"],
+            &[],
+        );
+        assert!(client_list.status.success(), "list script: {client_list:?}");
+        assert!(client_walk.status.success(), "walk script: {client_walk:?}");
+
+        // The agent's listing is relative to the workspace root (both tools
+        // treat it as internal), the script's is absolute: strip the shared
+        // prefix so the two are compared as one list of names, in one order.
+        let prefix = format!("{}/", root.trim_end_matches('/'));
+        let shape = |out: &std::process::Output| {
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let (entries, _) = crate::tools::client_tools::shape_entries(&stdout, &root, 1000);
+            entries
+                .into_iter()
+                .map(|entry| {
+                    entry
+                        .strip_prefix(&prefix)
+                        .expect("every entry is under the root")
+                        .to_string()
+                })
+                .collect::<Vec<String>>()
+        };
+
+        assert_eq!(shape(&client_list), agent_list.lines().collect::<Vec<_>>());
+        assert_eq!(shape(&client_walk), agent_walk.lines().collect::<Vec<_>>());
+
+        // The fixture's own sanity: the pair this task is about, in the order
+        // the agent emits it -- `sub` and its contents before the sibling file
+        // `sub.txt`.
+        let lines: Vec<&str> = agent_walk.lines().collect();
+        let sub = lines.iter().position(|l| *l == "sub/").expect("sub/");
+        assert_eq!(
+            &lines[sub..sub + 3],
+            ["sub/", "sub/inner.txt", "sub.txt"],
+            "the agent's DFS, which the client's script has to match: {agent_walk}"
+        );
+    }
+
+    /// The review's finding 2, pinned against the real thing: `find` prints
+    /// nothing on stdout when it cannot read the directory, so a script that
+    /// only reported what came back would let `(empty) <path>` stand in for a
+    /// path that is not there. The script refuses instead, before `find` runs,
+    /// and `run_client_bash` turns a non-zero exit into an error.
+    #[test]
+    fn the_client_script_refuses_a_missing_directory() {
+        let Some(shell) = shell_for_scripts() else {
+            return;
+        };
+        let missing = "/nonexistent-sapphire-agent-test-dir";
+        assert!(!std::path::Path::new(missing).exists());
+
+        for script in [
+            crate::tools::client_tools::list_script(),
+            crate::tools::client_tools::walk_script(),
+        ] {
+            let out =
+                run_client_script(shell, &script, "client_dir_list", &[missing, "3", "3"], &[]);
+            assert!(
+                !out.status.success(),
+                "a missing directory must not exit 0: {out:?}"
+            );
+            assert!(
+                out.stdout.is_empty(),
+                "nothing may reach stdout that could be shaped into a listing: {out:?}"
+            );
+        }
+    }
+
+    /// The review's other half of finding 2: `~/...` is quoted on its way into
+    /// `find`, and quoting is exactly what stops a tilde from expanding -- so
+    /// the path that every one of these tools advertises failed on the client.
+    /// The scripts now expand it against the **client's** `$HOME`, which is the
+    /// only `$HOME` that can answer for the client's machine; `file_delete`
+    /// carries the same resolution, since its `rm` was reachable the same way.
+    #[test]
+    fn the_client_scripts_resolve_a_tilde_against_the_clients_home() {
+        let Some(shell) = shell_for_scripts() else {
+            return;
+        };
+        let home =
+            std::env::temp_dir().join(format!("sapphire-agent-tilde-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("x")).unwrap();
+        std::fs::write(home.join("x/f.txt"), "f\n").unwrap();
+        let home = home.to_str().unwrap().to_string();
+        let env = [("HOME", home.as_str())];
+
+        let list = run_client_script(
+            shell,
+            &crate::tools::client_tools::list_script(),
+            "client_dir_list",
+            &["~/x"],
+            &env,
+        );
+        assert!(list.status.success(), "{list:?}");
+        let stdout = String::from_utf8_lossy(&list.stdout).into_owned();
+        assert!(
+            stdout.contains(&format!("E\t{home}/x\n")),
+            "the announcement names the client's resolved path: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("F\t{home}/x/f.txt\n")),
+            "`~` resolved against the client's own $HOME: {stdout}"
+        );
+
+        let delete = run_client_script(
+            shell,
+            &crate::tools::client_tools::delete_script(),
+            "client_delete",
+            &["~/x/f.txt"],
+            &env,
+        );
+        assert!(delete.status.success(), "{delete:?}");
+        assert!(
+            !std::path::Path::new(&home).join("x/f.txt").exists(),
+            "the tilde path must have deleted the client's file, not failed on it"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }
