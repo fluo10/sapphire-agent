@@ -763,6 +763,13 @@ impl Tool for DirListTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // ACP has no list/stat, so the editor's listing is one `find` over
+        // the terminal -- see `client_tools::client_dir_list`. Outside an
+        // ACP session this is the agent's own workspace, below.
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            return crate::tools::client_tools::client_dir_list(&client, input).await;
+        }
+
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let path = expand_path(path_str);
 
@@ -889,6 +896,13 @@ impl Tool for DirWalkTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // Same routing as `dir_list`: `find` on the editor's side, with the
+        // same sorting, trailing slashes and truncation marker produced
+        // here (see `client_tools::client_dir_walk`).
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            return crate::tools::client_tools::client_dir_walk(&client, input).await;
+        }
+
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let max_depth = input["max_depth"].as_u64().unwrap_or(5).min(20) as usize;
         let max_entries = input["max_entries"].as_u64().unwrap_or(500).clamp(1, 5000) as usize;
@@ -2276,6 +2290,16 @@ mod session_routing_tests {
         (Arc::clone(&state), FileDeleteTool::new(state))
     }
 
+    fn dir_list_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, DirListTool) {
+        let state = test_workspace();
+        (Arc::clone(&state), DirListTool::new(state))
+    }
+
+    fn dir_walk_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, DirWalkTool) {
+        let state = test_workspace();
+        (Arc::clone(&state), DirWalkTool::new(state))
+    }
+
     /// `ShellTool` takes the workspace root rather than the state: its own
     /// default working directory *is* that root.
     fn shell_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, ShellTool) {
@@ -2501,5 +2525,115 @@ mod session_routing_tests {
             .await
             .unwrap();
         assert!(out.contains("agent side"), "got: {out}");
+    }
+
+    /// `dir_list` on an ACP turn runs on the editor's machine. The path is
+    /// outside this workspace on purpose (`/z`): the agent-side body would
+    /// refuse it, so a listing can only have come from the client.
+    #[tokio::test]
+    async fn dir_list_lists_the_clients_machine_inside_an_acp_session() {
+        let (_state, tool) = dir_list_tool_for_test();
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout("F\t/z/b.txt\nD\t/z/sub\nF\t/z/a.txt\n");
+
+        let out = scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"path": "/z"})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "/z/a.txt\n/z/b.txt\n/z/sub/");
+        let creates = client.creates.lock().unwrap();
+        assert_eq!(creates.len(), 1, "exactly one terminal, on the client");
+        assert_eq!(
+            creates[0].0, "bash",
+            "the listing is a command on the client"
+        );
+    }
+
+    /// The same routing for `dir_walk`, whose two bounds are positional
+    /// arguments: `max_depth + 1` for `find` (it counts the starting point
+    /// as depth 0) and `max_entries + 1` so truncation is decidable without
+    /// a second round trip.
+    #[tokio::test]
+    async fn dir_walk_walks_the_clients_machine_inside_an_acp_session() {
+        let (_state, tool) = dir_walk_tool_for_test();
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout("F\t/z/f0\nF\t/z/f1\nF\t/z/f2\n");
+
+        let out = scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"path": "/z", "max_depth": 2, "max_entries": 2})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            out,
+            "/z/f0\n/z/f1\n[truncated \u{2014} more than 2 entries; \
+             raise max_entries or narrow path]"
+        );
+        let creates = client.creates.lock().unwrap();
+        let argv = &creates[0].1;
+        assert_eq!(argv[3], "3", "max_depth + 1, got: {argv:?}");
+        assert_eq!(argv[4], "3", "max_entries + 1, got: {argv:?}");
+    }
+
+    /// Outside an ACP session both tools are the agent's own bodies,
+    /// untouched: sorted, directories with a trailing slash.
+    #[tokio::test]
+    async fn dir_list_still_lists_the_agents_machine_outside_an_acp_session() {
+        let (state, tool) = dir_list_tool_for_test();
+        let root = state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .clone();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        write_workspace_file(&state, "a.txt", "a\n");
+        write_workspace_file(&state, "b.txt", "b\n");
+
+        let out = tool
+            .execute(&json!({"path": root.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        assert!(out.contains("sub/"), "a directory keeps its slash: {out}");
+        let a = out.find("a.txt").expect("a.txt is listed");
+        let b = out.find("b.txt").expect("b.txt is listed");
+        assert!(a < b, "entries are sorted: {out}");
+    }
+
+    /// The truncation sentence is the same one `client_tools` adds, so a
+    /// model that learned it on this machine reads the client's answer the
+    /// same way -- neither machine's walk reports "there was more" in its
+    /// own words.
+    #[tokio::test]
+    async fn dir_walk_truncates_on_the_agents_machine_with_the_same_marker() {
+        let (state, tool) = dir_walk_tool_for_test();
+        let dir = state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .join("d");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_workspace_file(&state, "d/a.txt", "a\n");
+        write_workspace_file(&state, "d/b.txt", "b\n");
+
+        let out = tool
+            .execute(&json!({"path": dir.to_str().unwrap(), "max_entries": 1}))
+            .await
+            .unwrap();
+
+        assert!(out.contains("a.txt"), "got: {out}");
+        assert!(
+            out.contains(
+                "[truncated \u{2014} more than 1 entries; raise max_entries or narrow path]"
+            ),
+            "got: {out}"
+        );
     }
 }

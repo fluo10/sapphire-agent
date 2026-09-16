@@ -489,6 +489,20 @@ pub(crate) mod tests {
         pub(crate) fn terminal_count(&self) -> usize {
             self.creates.lock().unwrap().len()
         }
+
+        /// The command and argv of the most recent `terminal/create`, or
+        /// `None` if there has not been one. Used by `client_tools`'s
+        /// terminal-routed tests, which assert on the *shape* of the
+        /// command (script, positional arguments, argv0 placeholder)
+        /// rather than only on what came back from it.
+        pub(crate) fn last_terminal_command(&self) -> Option<Vec<String>> {
+            let creates = self.creates.lock().unwrap();
+            let (command, args, _, _) = creates.last()?;
+            let mut argv = Vec::with_capacity(args.len() + 1);
+            argv.push(command.clone());
+            argv.extend(args.iter().cloned());
+            Some(argv)
+        }
     }
 
     #[async_trait::async_trait]

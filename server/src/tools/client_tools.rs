@@ -11,9 +11,10 @@
 //! one of the two cases every time.
 //!
 //! Everything that knows ACP's wire surface lives here for that reason.
-//! Two of the `client_*` functions are not ACP requests at all: ACP has no
-//! delete and no append, so `client_append` is read → concatenate → write
-//! and `client_delete` is `rm` over the terminal.
+//! Four of the `client_*` functions are not ACP requests at all: ACP has no
+//! append, delete, list or stat, so `client_append` is read → concatenate
+//! → write, and `client_delete` / `client_dir_list` / `client_dir_walk`
+//! are `rm` and `find` over the terminal.
 //!
 //! The three tools with no agent-side body (`ClientShellStart` /
 //! `ClientShellOutput` / `ClientShellKill`) are ordinary `Tool`s and still
@@ -205,6 +206,172 @@ pub(crate) async fn client_delete(
     let path = input["path"].as_str().context("missing 'path'")?;
     run_client_bash(client, DELETE_SH, DELETE_ARGV0, &[path.to_string()]).await?;
     Ok(format!("Deleted: {path}"))
+}
+
+// ---------------------------------------------------------------------------
+// Listing and walking: `find` over the same terminal
+// ---------------------------------------------------------------------------
+//
+// ACP has no list, glob or stat either, so both tools run one `find` on the
+// client and the *shape* the model sees is built here. That is the point of
+// #262 travelling this road: two machines, one output format, so a
+// `dir_list` result reads identically whichever side it came from.
+
+/// Print one `D<TAB>path` / `F<TAB>path` line per entry.
+///
+/// `LC_ALL=C` is not cosmetic: the agent-side tools sort with Rust's
+/// `PathBuf` ordering, and a locale-aware `sort` would disagree with it on
+/// names containing case or punctuation -- two machines, two orders, one
+/// tool. `-print0`/`-0` is deliberately not used: it would buy
+/// newline-in-filename support at the cost of assuming `sort -z`, which BSD
+/// and GNU spell the same way but fewer clients ship.
+///
+/// `find -mindepth` / `-maxdepth` as the first pipe stage is what unions the
+/// two tools into one script: `dir_list` passes `1` for both (the starting
+/// point itself is not an entry), `dir_walk` passes `"$2"`.
+const CLASSIFY_LINE: &str = r#"
+while IFS= read -r p; do
+  if [ -d "$p" ]; then printf 'D\t%s\n' "$p"; else printf 'F\t%s\n' "$p"; fi
+done
+"#;
+
+/// `dir_list` on the client: the direct children of `$1`, one level only.
+///
+/// The script emits the raw entries and nothing else -- no sort, no
+/// trailing-slash decoration, no `(empty)` marker. All three are
+/// `shape_entries`' job on this side, so the client never gets to decide
+/// what a listing looks like.
+pub(crate) const LIST_SH: &str = r#"
+set -e
+find "$1" -mindepth 1 -maxdepth 1 | LC_ALL=C sort | {
+
+"#;
+
+/// `dir_walk` on the client: every entry below `$1`, deepest `$2`.
+///
+/// `$2` is already `max_depth + 1` (see [`client_dir_walk`]): `find` counts
+/// the starting point as depth 0 while the tool's own `max_depth` counts
+/// entries below it. `head -n "$3"` caps the traversal at `max_entries + 1`,
+/// which is one more than the caller will show -- and therefore enough for
+/// [`shape_entries`] to tell "there was more" without a second round trip.
+/// `head` rather than `find -quit` because it stops the *traversal*, where
+/// `find` would keep descending a huge tree it is about to discard.
+pub(crate) const WALK_SH: &str = r#"
+set -e
+find "$1" -mindepth 1 -maxdepth "$2" | LC_ALL=C sort | head -n "$3" | {
+
+"#;
+
+/// The `$0` placeholder the scripts above expect. Bash's `-c` has no other
+/// way to place a value in `$1`: the name is required syntactically, but
+/// nothing reads it. Distinct per tool so a failure message naming the
+/// command says which one it was.
+const LIST_ARGV0: &str = "client_dir_list";
+const WALK_ARGV0: &str = "client_dir_walk";
+
+/// Build `LIST_SH`/`WALK_SH`: the common `find` pipeline, the classifier,
+/// and the closing brace.
+fn find_script(prefix: &str) -> String {
+    format!("{prefix}{CLASSIFY_LINE}}}")
+}
+
+/// Turn the script's `D`/`F` lines into what `dir_list`/`dir_walk` return on
+/// the agent's own machine: sorted, directories with a trailing slash, and
+/// `(empty) <path>` when there is nothing.
+///
+/// `limit` is `max_entries + 1` (or `usize::MAX` for a listing that cannot
+/// truncate): one more than the caller will show, so "there was more" is
+/// decidable without a second round trip. The second half of the return is
+/// whether the script's own output exceeded it.
+///
+/// The sort key is the **`find`-reported path**, not the shown string: the
+/// agent-side walk sorts `(PathBuf, is_dir)` pairs, so `sub.txt` precedes
+/// `sub/` while the shown names (`sub.txt` vs `sub/`) would sort the other
+/// way round. Decorating first and sorting after would silently disagree
+/// with the other machine for every directory whose name is a prefix of a
+/// sibling file's.
+///
+/// A line without the `D<TAB>`/`F<TAB>` shape is dropped rather than shown.
+/// The script is the only writer on the happy path, but a filename
+/// containing a newline arrives as a line of its own (see the module docs'
+/// note on that limitation) and a stray diagnostic on stdout must not
+/// become an entry.
+fn shape_entries(stdout: &str, path: &str, limit: usize) -> (Vec<String>, bool) {
+    let mut entries: Vec<(String, String)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let (kind, name) = line.split_once('\t')?;
+            if kind != "D" && kind != "F" {
+                return None;
+            }
+            let shown = if kind == "D" {
+                format!("{name}/")
+            } else {
+                name.to_string()
+            };
+            Some((name.to_string(), shown))
+        })
+        .collect();
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let truncated = entries.len() > limit;
+    entries.truncate(limit);
+    if entries.is_empty() {
+        return (vec![format!("(empty) {path}")], false);
+    }
+    (
+        entries.into_iter().map(|(_, shown)| shown).collect(),
+        truncated,
+    )
+}
+
+/// `dir_list` against the editor's machine: one `find`, then this side's
+/// formatting.
+pub(crate) async fn client_dir_list(
+    client: &std::sync::Arc<dyn AcpClient>,
+    input: &serde_json::Value,
+) -> Result<String> {
+    let path = input["path"].as_str().context("missing 'path'")?;
+    let stdout = run_client_bash(
+        client,
+        &find_script(LIST_SH),
+        LIST_ARGV0,
+        &[path.to_string()],
+    )
+    .await?;
+    let (entries, _) = shape_entries(&stdout, path, usize::MAX);
+    Ok(entries.join("\n"))
+}
+
+/// `dir_walk` against the editor's machine. Same script as `dir_list` with
+/// the two bounds as positional arguments, and the agent-side truncation
+/// marker appended when the cap was hit.
+pub(crate) async fn client_dir_walk(
+    client: &std::sync::Arc<dyn AcpClient>,
+    input: &serde_json::Value,
+) -> Result<String> {
+    let path = input["path"].as_str().context("missing 'path'")?;
+    let max_depth = input["max_depth"].as_u64().unwrap_or(5).min(20);
+    let max_entries = input["max_entries"].as_u64().unwrap_or(500).clamp(1, 5000) as usize;
+    let stdout = run_client_bash(
+        client,
+        &find_script(WALK_SH),
+        WALK_ARGV0,
+        &[
+            // `max_depth = 0` means "direct children only", matching the
+            // agent side -- hence `+ 1`, since `find -maxdepth` counts the
+            // starting point as depth 0.
+            (max_depth + 1).to_string(),
+            (max_entries + 1).to_string(),
+        ],
+    )
+    .await?;
+    let (mut entries, truncated) = shape_entries(&stdout, path, max_entries);
+    if truncated {
+        entries.push(format!(
+            "[truncated \u{2014} more than {max_entries} entries; raise max_entries or narrow path]"
+        ));
+    }
+    Ok(entries.join("\n"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1453,5 +1620,144 @@ mod tests {
             Some(1),
             "the handle stays tracked — a release failure is not proof it actually freed"
         );
+    }
+
+    /// `#262`'s feature, over the interface the old design rejected: the
+    /// listing is a shell command on the client, and the *shape* the model
+    /// sees is this side's -- so a `dir_list` result reads identically
+    /// whichever machine it came from.
+    ///
+    /// The fake answers deliberately out of order and with a directory in
+    /// the middle. `sub.txt` is there to pin the sort key: sorting the
+    /// *shown* names would put `sub.txt` before `sub/` (`.` sorts before
+    /// `/`), which is not the order the agent-side `PathBuf` sort produces.
+    #[tokio::test]
+    async fn dir_list_shapes_the_clients_find_output_like_the_agents_own() {
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout("F\t/z/b.txt\nD\t/z/sub\nF\t/z/a.txt\nF\t/z/sub.txt\n");
+        let as_client = Arc::clone(&client) as Arc<dyn AcpClient>;
+
+        let out = scope_acp_client(
+            Arc::clone(&as_client),
+            client_dir_list(&as_client, &json!({"path": "/z"})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "/z/a.txt\n/z/b.txt\n/z/sub/\n/z/sub.txt");
+
+        let argv = client
+            .last_terminal_command()
+            .expect("a terminal was created");
+        assert_eq!(argv[0], "bash");
+        assert_eq!(argv[1], "-c");
+        assert!(
+            argv[2].contains("-mindepth 1"),
+            "the listing must not include the directory itself, got: {}",
+            argv[2]
+        );
+        assert!(
+            argv[2].contains("-maxdepth 1"),
+            "a listing does not recurse, got: {}",
+            argv[2]
+        );
+        assert_eq!(
+            argv[3], "client_dir_list",
+            "argv0 is a placeholder; the path must not sit in `$0`, which no script reads"
+        );
+        assert_eq!(argv[4], "/z", "the path is `$1`, as a positional argument");
+        assert_eq!(argv.len(), 5, "no extra arguments: {argv:?}");
+    }
+
+    /// The walk honours `max_depth`/`max_entries` and reports truncation
+    /// with the same marker the agent-side walk uses -- the model must not
+    /// have to learn a second vocabulary for "there was more".
+    ///
+    /// Both bounds travel as positional arguments, so they are asserted in
+    /// the argv rather than inside the script: `max_depth + 1` (find counts
+    /// the starting point as depth 0) and `max_entries + 1` (one more than
+    /// will be shown, which is what makes truncation decidable here).
+    #[tokio::test]
+    async fn dir_walk_truncates_with_the_same_marker_as_the_agent_side() {
+        let client = Arc::new(FakeClient::default());
+        let mut out = String::new();
+        for i in 0..3 {
+            out.push_str(&format!("F\t/z/f{i}\n"));
+        }
+        client.queue_terminal_stdout(&out);
+        let as_client = Arc::clone(&client) as Arc<dyn AcpClient>;
+
+        let text = scope_acp_client(
+            Arc::clone(&as_client),
+            client_dir_walk(
+                &as_client,
+                &json!({"path": "/z", "max_depth": 2, "max_entries": 2}),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            text,
+            "/z/f0\n/z/f1\n[truncated \u{2014} more than 2 entries; \
+             raise max_entries or narrow path]"
+        );
+
+        let argv = client.last_terminal_command().unwrap();
+        assert!(
+            argv[2].contains("-maxdepth \"$2\""),
+            "the depth is an argument, got: {}",
+            argv[2]
+        );
+        assert!(
+            argv[2].contains("head -n \"$3\""),
+            "the entry cap is an argument, got: {}",
+            argv[2]
+        );
+        assert_eq!(argv[3], "client_dir_walk");
+        assert_eq!(argv[4], "3", "max_depth + 1, got: {argv:?}");
+        assert_eq!(argv[5], "3", "max_entries + 1, got: {argv:?}");
+        assert_eq!(argv.len(), 6, "no extra arguments: {argv:?}");
+    }
+
+    /// An empty directory is `(empty) <path>` here too: the script prints
+    /// nothing at all for one, and the marker is added on this side.
+    #[tokio::test]
+    async fn an_empty_client_directory_gets_the_empty_marker() {
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout("");
+        let as_client = Arc::clone(&client) as Arc<dyn AcpClient>;
+
+        let listed = scope_acp_client(
+            Arc::clone(&as_client),
+            client_dir_list(&as_client, &json!({"path": "/z"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed, "(empty) /z");
+
+        client.queue_terminal_stdout("");
+        let walked = scope_acp_client(
+            Arc::clone(&as_client),
+            client_dir_walk(&as_client, &json!({"path": "/z"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(walked, "(empty) /z");
+    }
+
+    /// A line that is not a `D`/`F` classification is dropped, not shown:
+    /// the script is the only writer, but a newline inside a filename
+    /// arrives as a line of its own, and a stray diagnostic on stdout must
+    /// not become a file name.
+    #[test]
+    fn only_classified_lines_become_entries() {
+        let (entries, truncated) = shape_entries(
+            "noise\nF\t/z/a.txt\nX\t/z/b.txt\nD\t/z/sub\n",
+            "/z",
+            usize::MAX,
+        );
+        assert_eq!(entries, vec!["/z/a.txt".to_string(), "/z/sub/".to_string()]);
+        assert!(!truncated);
     }
 }

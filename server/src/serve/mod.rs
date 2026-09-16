@@ -2210,10 +2210,9 @@ pub(crate) fn visible_tool_predicate(
             "file_append" => client_fs_read && client_fs_write,
             // No ACP request exists for delete, so it is spelled as a
             // command on the terminal.
-            "file_delete" | "shell" => client_terminal,
-            // Listing and walking were client-only tools before #270 and
-            // keep their own names and arm; unifying them is a later task.
-            "dir_list" | "dir_walk" => has_client && client_terminal,
+            // No ACP request exists for delete, list or walk, so all three
+            // are spelled as a command on the terminal.
+            "file_delete" | "dir_list" | "dir_walk" | "shell" => client_terminal,
             // The three lifecycle tools have no agent-side body at all, so
             // their names are unchanged from before #270.
             "client_shell_start" | "client_shell_output" | "client_shell_kill" => client_terminal,
