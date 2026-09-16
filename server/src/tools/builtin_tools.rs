@@ -19,7 +19,9 @@ use std::sync::{Arc, Mutex, Weak};
 // other session this agent's own. Naming a fixed machine would be wrong in
 // one of the two cases every time, so the sentence lives here once rather
 // than in seven drifting copies.
-pub(crate) const REACHES_SENTENCE: &str = "Reaches whichever machine this     conversation is about: inside an ACP session, the machine the connected     editor is running on; otherwise this agent's own machine. ";
+pub(crate) const REACHES_SENTENCE: &str = "Reaches whichever machine this \
+    conversation is about: inside an ACP session, the machine the connected \
+    editor is running on; otherwise this agent's own machine. ";
 
 fn expand_path(path_str: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path_str).as_ref())
