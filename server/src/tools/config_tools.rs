@@ -125,11 +125,6 @@ tokio::task_local! {
 /// `TurnLoop::run`, wrapping the same tool execution the timer and ACP-client
 /// scopes wrap.
 ///
-/// `#[allow(dead_code)]` until that call site lands (the turn-loop wiring is
-/// its own task); without it the function is unused in exactly the build
-/// where this module compiles, and `-D warnings` CI would refuse the seam
-/// the wiring needs to drop into.
-#[allow(dead_code)]
 pub(crate) fn scope_admin_room_profile<F: std::future::Future>(
     profile: Option<String>,
     fut: F,
@@ -1739,6 +1734,7 @@ You are a reviewer.
             timer_origin: None,
             session_id: None,
             subagent_depth: 0,
+            admin_room_profile: None,
         });
         let out = crate::serve::scope_turn_context(
             ctx,
