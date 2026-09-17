@@ -592,12 +592,16 @@ fn capped_test_turns(requested: Option<usize>) -> usize {
 /// One line for why a test run ended.
 ///
 /// `TurnStop`'s `Debug` prints `BudgetExhausted { partial_text: "..." }`,
-/// which is not a sentence an operator can read in a report.
-fn describe_stop(stop: &TurnStop) -> &'static str {
+/// which is not a sentence an operator can read in a report. Returns an
+/// owned `String` rather than `&'static str`, unlike before: a provider
+/// error now carries its own message, and an operator reading a
+/// `task_test` report deserves the same cause a subagent's parent model
+/// gets (see `TurnStop::ProviderError`'s doc), not just "provider error".
+fn describe_stop(stop: &TurnStop) -> String {
     match stop {
-        TurnStop::Replied => "replied",
-        TurnStop::ProviderError => "provider error",
-        TurnStop::BudgetExhausted { .. } => "tool-round budget exhausted",
+        TurnStop::Replied => "replied".to_string(),
+        TurnStop::ProviderError { message } => format!("provider error: {message}"),
+        TurnStop::BudgetExhausted { .. } => "tool-round budget exhausted".to_string(),
     }
 }
 

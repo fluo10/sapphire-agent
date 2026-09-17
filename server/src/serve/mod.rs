@@ -2131,15 +2131,19 @@ pub(crate) enum RoundBudget {
 pub(crate) enum TurnStop {
     /// The model produced its final message; `text` is `Some`.
     Replied,
-    /// A `Provider::chat` call failed; `text` is `None`. `TurnHost::turn_error`
-    /// has already been handed the message, so the cause is available to
-    /// whoever is reporting — on every path except a subagent's nested
-    /// turn, where `SubagentTool::execute` runs it under
-    /// `SubagentHost`, which deliberately swallows
-    /// `turn_error` (see that type's doc, `src/tools/subagent.rs`). On
-    /// that path the cause reaches only the log line right before this
-    /// is returned, not any `TurnHost`.
-    ProviderError,
+    /// A `Provider::chat` call failed; `text` is `None` and `message` is
+    /// the error's `Display` (`e.to_string()`, the same text logged right
+    /// before this is returned and handed to `TurnHost::turn_error`).
+    /// Carried on the variant — not just logged — because
+    /// `SubagentTool::execute` (`src/tools/subagent.rs`) runs a subagent's
+    /// nested turn under `SubagentHost`, which deliberately swallows
+    /// `turn_error` (see that type's doc), so the log line used to be the
+    /// only place this reached: a subagent's `OpenRouter insufficient
+    /// credit` or similar came back to the parent model as an
+    /// indistinguishable-from-a-quiet-failure "[the subagent produced no
+    /// answer]". `SubagentTool::run_and_store` reads `message` off this
+    /// variant to surface it as the tool's own error instead.
+    ProviderError { message: String },
     /// The turn's `[tools.tool_rounds]` budget was reached with the model
     /// still calling tools. `text` is `None` — deliberately, because every
     /// caller that predates ACP treats this as a failed turn and must
@@ -2547,8 +2551,9 @@ impl TurnLoop<'_> {
             match response {
                 Err(e) => {
                     error!("Provider error: {e:#}");
-                    progress.turn_error(&e.to_string()).await;
-                    break (None, TurnStop::ProviderError);
+                    let message = e.to_string();
+                    progress.turn_error(&message).await;
+                    break (None, TurnStop::ProviderError { message });
                 }
                 Ok(resp) if !resp.has_tool_calls() => {
                     let text = resp.text.unwrap_or_default();
