@@ -2494,6 +2494,51 @@ mod tests {
         }
     }
 
+    /// The grant this feature exists for, pinned end to end: an editor's
+    /// `session/prompt` turn scopes the room profile its bearer token pinned,
+    /// so `agent_config` — which ACP has no room id to allow — can be judged
+    /// against `[tools.admin].room_profiles`. The probe stands in for one of
+    /// the admin tools: it is offered and judged on the same path.
+    #[tokio::test]
+    async fn an_acp_turn_scopes_its_pinned_room_profile() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "heartbeat_config".to_string(),
+                        input: serde_json::json!({"action": "list"}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        let probe = crate::serve::AdminProfileProbe::new();
+        state
+            .tools
+            .register_tool(Box::new(Arc::clone(&probe)))
+            .await;
+
+        let addr = spawn(Arc::clone(&state)).await;
+        let (_, updates, reply) = drive(&addr, text_prompt("manage the definitions")).await;
+        assert!(reply["error"].is_null(), "the turn must not fail: {reply}");
+        assert_eq!(
+            probe.seen(),
+            Some(Some("developer".to_string())),
+            "the fixture's `sa-acp-token` resolves to room profile 'developer', so that is \
+             the name the admin gate must see; updates: {updates:?}"
+        );
+    }
+
     /// `Provider::chat` returns a whole response, so the reply arrives as
     /// exactly one `agent_message_chunk` — one, not zero, and not a faked
     /// token stream.
