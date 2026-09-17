@@ -8,14 +8,14 @@
 //!
 //! Two properties hold the design together:
 //!
-//! - **A room must be named.** `[tools.admin].rooms` is a host-layer
-//!   grant, and it is checked twice: the tools are not registered at all
-//!   with an empty list (`register_admin_tools`, in the task that wires
-//!   `main`), and every action refuses at run time in a room that is not
-//!   on it. The room comes from the `TimerOrigin::Chat` the channel path
-//!   already scopes around every tool call — no new plumbing, and the
-//!   transports that have no room of their own (`/rpc`, `/acp`, voice)
-//!   get `None`, which is a refusal.
+//! - **A room profile must be named.** `[tools.admin].room_profiles` is a
+//!   host-layer list of room-profile names, and every action refuses in a
+//!   session whose profile is not on it. A channel room resolves to its
+//!   profile the same way its provider does; an ACP session carries the
+//!   profile its bearer token pinned at `session/new` (or `load`/`resume`),
+//!   which is what lets an editor manage definitions at all — ACP has no
+//!   room id. The transports that name no profile (`/rpc`, A2A, voice, the
+//!   unattended loops) get `None`, which is a refusal.
 //! - **The write side refuses what the loader would drop.** `parse_definition`
 //!   is the loader's own parse, failing instead of skipping, so a
 //!   definition that would never fire cannot be written and then puzzled
@@ -113,37 +113,67 @@ pub(crate) fn definition_path(workspace_root: &Path, dir: &str, name: &str) -> R
     Ok(workspace_root.join(dir).join(format!("{stem}.md")))
 }
 
-/// The room this tool call came from, when it came from one.
+tokio::task_local! {
+    /// The room profile an ACP turn runs under, scoped around tool execution
+    /// by `TurnLoop::run` from the profile pinned at `session/new` (or
+    /// `load`/`resume`). `None` on every other serve-path turn.
+    static ADMIN_ROOM_PROFILE_TL: Option<String>;
+}
+
+/// Run `fut` with the turn's room profile reachable from
+/// [`current_admin_room_profile`]. Called once per round by
+/// `TurnLoop::run`, wrapping the same tool execution the timer and ACP-client
+/// scopes wrap.
 ///
-/// The channel path (`Agent::handle_message`) scopes `TimerOrigin::Chat`
-/// around every tool call it makes, and the heartbeat's chat leg goes
-/// through that same path, so a heartbeat-fired turn carries the room it
-/// targets. `/rpc` and `/acp` synthesise a `room_id` out of the session
-/// id and voice is `TimerOrigin::Voice`, so those get `None` — which is a
-/// refusal. That is the point rather than an oversight: the allow-list
-/// names places the operator knows who can write in, and those are not
-/// such places.
+/// `#[allow(dead_code)]` until that call site lands (the turn-loop wiring is
+/// its own task); without it the function is unused in exactly the build
+/// where this module compiles, and `-D warnings` CI would refuse the seam
+/// the wiring needs to drop into.
+#[allow(dead_code)]
+pub(crate) fn scope_admin_room_profile<F: std::future::Future>(
+    profile: Option<String>,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    ADMIN_ROOM_PROFILE_TL.scope(profile, fut)
+}
+
+/// The room profile scoped around the tool call currently executing, if the
+/// turn came in on a transport that pins one — today only ACP.
 ///
-/// One consequence worth naming: an unattended heartbeat task that fires
-/// *into* a listed room is scoped to that room too, so it can call these
-/// tools with nobody present. That is intended — the grant is the room,
-/// not the caller — and is why a listed room should not also be a
-/// task's delivery target.
-pub(crate) fn current_call_room() -> Option<String> {
+/// `None` outside `scope_admin_room_profile` and `None` for a `/rpc`, A2A or
+/// unattended turn, which pins no profile. The two are the same answer on
+/// purpose: neither is a place an operator declared.
+pub(crate) fn current_admin_room_profile() -> Option<String> {
+    ADMIN_ROOM_PROFILE_TL.try_with(Clone::clone).ok().flatten()
+}
+
+/// The room profile this call's admin grant is judged by, or `None` when the
+/// transport names no profile an operator could have allowed.
+///
+/// A channel turn (`Agent::handle_message`, and the heartbeat's chat leg
+/// through it) carries `TimerOrigin::Chat`, so its room resolves to a profile
+/// exactly as its provider does — the grant follows the room, which is why a
+/// heartbeat fired *into* a listed room can call these tools with nobody
+/// present. Voice is a device, not a room or an editor. With no timer origin
+/// the turn is on the serve path: an ACP turn scopes the profile its bearer
+/// token pinned, while `/rpc`, A2A and the unattended loops scope nothing.
+pub(crate) fn current_admin_room_profile_for(config: &Config) -> Option<String> {
     match crate::timer::current_origin() {
-        Some(crate::timer::TimerOrigin::Chat { room_id }) => Some(room_id),
-        _ => None,
+        Some(crate::timer::TimerOrigin::Chat { room_id }) => {
+            Some(config.room_profile_name_for_room(&room_id).to_string())
+        }
+        Some(crate::timer::TimerOrigin::Voice { .. }) => None,
+        None => current_admin_room_profile(),
     }
 }
 
-/// What every action answers with when the calling room is not on
-/// `[tools.admin].rooms`.
+/// What every action answers with when the calling room profile is not on
+/// `[tools.admin].room_profiles`.
 ///
-/// The wording names the config key on purpose: a model that is refused
-/// has no other way to find out, and an operator being told by the agent
-/// *which* setting to change is the whole reason the refusal is not just
-/// "denied".
-pub(crate) const ROOM_REFUSAL: &str = "Permission denied: the config tools are not available in this room. An operator can allow them with `[tools.admin].rooms` in the host config.";
+/// The wording names the config key on purpose: a model that is refused has
+/// no other way to find out, and an operator being told by the agent *which*
+/// setting to change is the whole reason the refusal is not just "denied".
+pub(crate) const ROOM_REFUSAL: &str = "Permission denied: the config tools are not available for this room profile. An operator can allow them with `[tools.admin].room_profiles` in the host config.";
 
 /// The *effective* `enabled` value of a definition, as the loaders read
 /// it: `enabled:` when present, `true` when absent (both loaders declare
@@ -235,9 +265,9 @@ impl ConfigTool {
             );
         }
         description.push_str(
-            " These tools are available only in the rooms an operator listed in \
-             `[tools.admin].rooms`; in every other room, every action including `list` \
-             is refused.",
+            " These tools are available only in sessions whose room profile an operator \
+             listed in `[tools.admin].room_profiles`; anywhere else, every action including \
+             `list` is refused.",
         );
 
         let spec = ToolSpec {
@@ -304,16 +334,14 @@ impl ConfigTool {
             .map_err(|_| anyhow!("refusing to touch {}: outside the workspace", abs.display()))
     }
 
-    /// The room gate. A refusal here is the only permission check these
+    /// The profile gate. A refusal here is the only permission check these
     /// tools have — they are `ToolKind::Edit` and deliberately outside
-    /// `ToolPolicy`, because the grant that matters is the host's
-    /// room-profile allow list, not a per-tool policy the workspace can
-    /// set.
+    /// `ToolPolicy`, because the grant that matters is the host's room-profile
+    /// list, not a per-tool policy the workspace can set.
     fn gate(&self) -> Result<()> {
-        let allowed = current_call_room()
-            .map(|room| self.config.room_profile_name_for_room(&room).to_string())
-            .is_some_and(|name| self.config.admin_allows_room_profile(&name));
-        if allowed {
+        if current_admin_room_profile_for(&self.config)
+            .is_some_and(|name| self.config.admin_allows_room_profile(&name))
+        {
             Ok(())
         } else {
             Err(anyhow!(ROOM_REFUSAL))
@@ -646,8 +674,8 @@ impl TaskTestTool {
                  prompt and is always exactly one turn. Delivery is not verified: a heartbeat \
                  task's `room_id:` / `voice:` targets are ignored, because what this tool \
                  checks is the prompt and how the task ends, not where a result would go. \
-                 These tools are available only in the rooms an operator listed in \
-                 `[tools.admin].rooms`."
+                 These tools are available only in sessions whose room profile an operator \
+                 listed in `[tools.admin].room_profiles`."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -688,12 +716,12 @@ impl TaskTestTool {
         }
     }
 
-    /// The namespace the test session lands in: the calling room's, so the
-    /// report is readable where the operator already is. `None` only
+    /// The namespace the test session lands in: the calling room profile's, so
+    /// the report is readable where the operator already is. `None` only
     /// happens on a path the gate has already refused.
     fn namespace(&self) -> &str {
-        match current_call_room() {
-            Some(room) => self.state.config.namespace_for_room(&room),
+        match current_admin_room_profile_for(&self.state.config) {
+            Some(name) => self.state.config.namespace_for_room_profile(&name),
             None => DEFAULT_NAMESPACE_NAME,
         }
     }
@@ -865,18 +893,13 @@ impl Tool for TaskTestTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
-        // Before the arguments are even read: the room gate every config
-        // tool shares. A run is the most powerful thing on this surface —
-        // it drives a whole turn — so it is refused as firmly as a write.
-        let allowed = current_call_room()
-            .map(|room| {
-                self.state
-                    .config
-                    .room_profile_name_for_room(&room)
-                    .to_string()
-            })
-            .is_some_and(|name| self.state.config.admin_allows_room_profile(&name));
-        if !allowed {
+        // Before the arguments are even read: the room-profile gate every
+        // config tool shares. A run is the most powerful thing on this
+        // surface — it drives a whole turn — so it is refused as firmly as a
+        // write.
+        if !current_admin_room_profile_for(&self.state.config)
+            .is_some_and(|name| self.state.config.admin_allows_room_profile(&name))
+        {
             anyhow::bail!(ROOM_REFUSAL);
         }
         let kind = input["kind"]
@@ -1024,6 +1047,13 @@ mod tests {
             fut,
         )
         .await
+    }
+
+    /// Every call goes through the ACP path's scope, the way an editor's
+    /// prompt does: `run_llm_turn` scopes the profile the session pinned
+    /// around tool execution, and no `TimerOrigin` is set on that path.
+    async fn from_room_profile<F: Future>(profile: Option<&str>, fut: F) -> F::Output {
+        scope_admin_room_profile(profile.map(str::to_string), fut).await
     }
 
     async fn call(tool: &ConfigTool, input: serde_json::Value) -> anyhow::Result<String> {
@@ -1222,6 +1252,129 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Permission denied"), "{err}");
+    }
+
+    /// The ACP path: an editor's session carries the room profile its bearer
+    /// token pinned, with no room id anywhere. Listing that profile is what
+    /// lets `agent_config` manage subagent definitions from Zed — the whole
+    /// reason this grant is no longer written in room ids.
+    #[tokio::test]
+    async fn an_acp_session_is_allowed_by_its_pinned_room_profile() {
+        let f = fixture(ConfigDir::Agents);
+        let listing = from_room_profile(Some("ops"), f.tool.execute(&json!({"action": "list"})))
+            .await
+            .unwrap();
+        assert!(listing.contains("No agents definitions."), "{listing}");
+    }
+
+    /// Every other profile-shaped input refuses: a profile the operator did
+    /// not list, and a turn with no profile at all (`/rpc`, A2A, the
+    /// unattended loops).
+    #[tokio::test]
+    async fn an_acp_session_off_the_list_is_refused() {
+        let f = fixture(ConfigDir::Agents);
+        for profile in [Some("guest"), None] {
+            let err = from_room_profile(profile, f.tool.execute(&json!({"action": "list"})))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Permission denied"), "{profile:?}: {err}");
+            assert!(err.contains("room_profiles"), "{profile:?}: {err}");
+        }
+    }
+
+    /// A channel turn resolves its room to a profile the same way its
+    /// provider does, so `[room_profile.default]` captures an unlisted room
+    /// there exactly as it does for the provider. A room in a *different*
+    /// profile than the allow list is a refusal.
+    #[tokio::test]
+    async fn a_channel_room_is_gated_by_its_resolved_room_profile() {
+        let (d, root, ws) = test_workspace();
+        let mut config = Config::for_test();
+        config.tools.admin.room_profiles = vec!["ops".to_string()];
+        for (name, room) in [("ops", "!ops:x"), ("guest", "!lounge:y")] {
+            config.room_profiles.insert(
+                name.to_string(),
+                crate::config::RoomProfileConfig {
+                    profile: "dev".to_string(),
+                    rooms: vec![room.to_string()],
+                    ..Default::default()
+                },
+            );
+        }
+        let tool = ConfigTool::new(ConfigDir::Agents, root, config, ws, None, Weak::new());
+
+        in_room("!ops:x", tool.execute(&json!({"action": "list"})))
+            .await
+            .unwrap();
+        let err = in_room("!lounge:y", tool.execute(&json!({"action": "list"})))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Permission denied"), "{err}");
+        let _dir = d;
+    }
+
+    /// Voice is a device, not a room or an editor. It carries no profile a
+    /// grant could name, and an `ops` allow list must not change that.
+    #[tokio::test]
+    async fn a_voice_turn_is_refused_even_when_a_profile_is_listed() {
+        let f = fixture(ConfigDir::Agents);
+        let err = scope_timer_origin(
+            TimerOrigin::Voice {
+                device_id: "speaker".to_string(),
+            },
+            f.tool.execute(&json!({"action": "list"})),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Permission denied"), "{err}");
+    }
+
+    /// The test session lands under the calling room profile's memory
+    /// namespace, resolved from the profile rather than from a room id — so
+    /// an ACP call writes its report where the operator already reads.
+    #[tokio::test]
+    async fn a_test_session_uses_the_room_profiles_namespace() {
+        let mut state = ServeState::for_test_scripted(false, vec![test_response("ok")]);
+        {
+            let config = &mut Arc::get_mut(&mut state)
+                .expect("uniquely owned immediately after construction")
+                .config;
+            config.tools.admin.room_profiles = vec!["ops".to_string()];
+            config.room_profiles.insert(
+                "ops".to_string(),
+                crate::config::RoomProfileConfig {
+                    profile: "dev".to_string(),
+                    rooms: vec!["!ops:x".to_string()],
+                    memory_namespace: Some("ops_ns".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        // A heartbeat test runs the real one-prompt path, which reads the
+        // definition first — so the definition has to exist for the run to
+        // reach the session at all.
+        let ws = state.workspace.dir().to_path_buf();
+        std::fs::create_dir_all(ws.join("heartbeat")).unwrap();
+        std::fs::write(
+            ws.join("heartbeat/x.md"),
+            "---\nschedule: \"0 8 * * *\"\n---\nHeartbeat.\n",
+        )
+        .unwrap();
+        let tool = TaskTestTool::new(Arc::clone(&state));
+        from_room_profile(
+            Some("ops"),
+            tool.execute(&json!({"kind": "heartbeat", "name": "x"})),
+        )
+        .await
+        .unwrap();
+        // The session file, not only the report line: the namespace is what
+        // routes it.
+        let rows = state.autonomous_session_store.session_rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].meta.namespace.as_deref(), Some("ops_ns"));
     }
 
     #[tokio::test]
