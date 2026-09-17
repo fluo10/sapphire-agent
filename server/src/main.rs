@@ -514,7 +514,7 @@ async fn main() -> Result<()> {
             // `src/agent.rs`, stay untouched by this feature. Registered
             // when at least one definition loaded — a tool with nobody to
             // delegate to has no reason to be offered — and also when
-            // `[tools.admin].rooms` is set, since `agent_config` can
+            // `[tools.admin].room_profiles` is set, since `agent_config` can
             // create a definition while the process is running.
             let agent_defs = agents::load_agents_dir(&workspace_dir.join("agents"));
             // Taken before `new` moves the list: an empty list is not an
@@ -528,7 +528,7 @@ async fn main() -> Result<()> {
                 );
             }
             // Registered when there is something to delegate to, and also
-            // when `[tools.admin].rooms` is set: `agent_config` can create
+            // when `[tools.admin].room_profiles` is set: `agent_config` can create
             // a definition while the process is running. `Arc` rather than
             // a bare `Box` because `agent_config` holds a `Weak` to it —
             // same shape `SkillTool` uses.
@@ -926,10 +926,10 @@ async fn main() -> Result<()> {
             // ── Config tools ────────────────────────────────────────────────
             // The agent's own heartbeat / autonomous / subagent definitions,
             // editable from a chat room an operator names in
-            // `[tools.admin].rooms`. Registered here rather than in
+            // `[tools.admin].room_profiles`. Registered here rather than in
             // `default_tool_set` because `task_test` needs `serve_state`,
-            // which is built above, and because a `rooms` that names nobody
-            // must register none of the four at all — see
+            // which is built above, and because a `room_profiles` that names
+            // nobody must register none of the four at all — see
             // `register_admin_tools`.
             tools::config_tools::register_admin_tools(
                 &tool_set,

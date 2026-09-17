@@ -306,13 +306,14 @@ impl ConfigTool {
 
     /// The room gate. A refusal here is the only permission check these
     /// tools have — they are `ToolKind::Edit` and deliberately outside
-    /// `ToolPolicy`, because the grant that matters is the host's room
-    /// list, not a per-tool policy the workspace can set.
+    /// `ToolPolicy`, because the grant that matters is the host's
+    /// room-profile allow list, not a per-tool policy the workspace can
+    /// set.
     fn gate(&self) -> Result<()> {
-        if self
-            .config
-            .config_tools_allowed_in(current_call_room().as_deref())
-        {
+        let allowed = current_call_room()
+            .map(|room| self.config.room_profile_name_for_room(&room).to_string())
+            .is_some_and(|name| self.config.admin_allows_room_profile(&name));
+        if allowed {
             Ok(())
         } else {
             Err(anyhow!(ROOM_REFUSAL))
@@ -867,11 +868,15 @@ impl Tool for TaskTestTool {
         // Before the arguments are even read: the room gate every config
         // tool shares. A run is the most powerful thing on this surface —
         // it drives a whole turn — so it is refused as firmly as a write.
-        if !self
-            .state
-            .config
-            .config_tools_allowed_in(current_call_room().as_deref())
-        {
+        let allowed = current_call_room()
+            .map(|room| {
+                self.state
+                    .config
+                    .room_profile_name_for_room(&room)
+                    .to_string()
+            })
+            .is_some_and(|name| self.state.config.admin_allows_room_profile(&name));
+        if !allowed {
             anyhow::bail!(ROOM_REFUSAL);
         }
         let kind = input["kind"]
@@ -984,14 +989,22 @@ mod tests {
         tool: ConfigTool,
     }
 
-    /// The tool as the deployment wires it: `[tools.admin].rooms =
-    /// ["!ops:x"]`, the three directories present, no subagent / tool set
-    /// back-reference (that is the agents-directory wiring, tested where
-    /// it exists).
+    /// The tool as the deployment wires it: `[tools.admin].room_profiles =
+    /// ["ops"]`, `[room_profile.ops]` claiming `!ops:x`, the three
+    /// directories present, no subagent / tool set back-reference (that is
+    /// the agents-directory wiring, tested where it exists).
     fn fixture(dir: ConfigDir) -> Fixture {
         let (d, root, ws) = test_workspace();
         let mut config = Config::for_test();
-        config.tools.admin.rooms = vec!["!ops:x".to_string()];
+        config.tools.admin.room_profiles = vec!["ops".to_string()];
+        config.room_profiles.insert(
+            "ops".to_string(),
+            crate::config::RoomProfileConfig {
+                profile: "dev".to_string(),
+                rooms: vec!["!ops:x".to_string()],
+                ..Default::default()
+            },
+        );
         let tool = ConfigTool::new(dir, root.clone(), config, ws, None, Weak::new());
         Fixture {
             _dir: d,
@@ -1235,16 +1248,24 @@ mod tests {
         }
     }
 
-    /// A `ServeState` whose scripted provider answers with `responses`,
-    /// with `!ops:x` allow-listed so the tool's room gate is passable.
+    /// A `ServeState` whose scripted provider answers with `responses`, with
+    /// the `ops` room profile allow-listed so the tool's gate is passable.
     fn test_state(responses: Vec<ChatResponse>) -> Arc<ServeState> {
         let mut state = ServeState::for_test_scripted(false, responses);
-        Arc::get_mut(&mut state)
-            .expect("uniquely owned immediately after construction")
-            .config
-            .tools
-            .admin
-            .rooms = vec!["!ops:x".to_string()];
+        {
+            let config = &mut Arc::get_mut(&mut state)
+                .expect("uniquely owned immediately after construction")
+                .config;
+            config.tools.admin.room_profiles = vec!["ops".to_string()];
+            config.room_profiles.insert(
+                "ops".to_string(),
+                crate::config::RoomProfileConfig {
+                    profile: "dev".to_string(),
+                    rooms: vec!["!ops:x".to_string()],
+                    ..Default::default()
+                },
+            );
+        }
         state
     }
 
@@ -1418,7 +1439,7 @@ mod tests {
         let serve_state = test_state(vec![test_response("ok")]);
         let set = Arc::new(ToolSet::new(Vec::new(), Vec::new()));
         let mut config = Config::for_test();
-        config.tools.admin.rooms = Vec::new();
+        config.tools.admin.room_profiles = Vec::new();
         assert!(!config.config_tools_enabled());
 
         register_admin_tools(&set, &root, config, ws, None, serve_state).await;
@@ -1441,7 +1462,7 @@ mod tests {
         let serve_state = test_state(vec![test_response("ok")]);
         let set = Arc::new(ToolSet::new(Vec::new(), Vec::new()));
         let mut config = Config::for_test();
-        config.tools.admin.rooms = vec!["!ops:x".to_string()];
+        config.tools.admin.room_profiles = vec!["ops".to_string()];
 
         register_admin_tools(&set, &root, config, ws, None, serve_state).await;
 
@@ -1486,7 +1507,15 @@ mod tests {
             Vec::new(),
         ));
         let mut config = Config::for_test();
-        config.tools.admin.rooms = vec!["!ops:x".to_string()];
+        config.tools.admin.room_profiles = vec!["ops".to_string()];
+        config.room_profiles.insert(
+            "ops".to_string(),
+            crate::config::RoomProfileConfig {
+                profile: "dev".to_string(),
+                rooms: vec!["!ops:x".to_string()],
+                ..Default::default()
+            },
+        );
         let tool = ConfigTool::new(
             ConfigDir::Agents,
             root.clone(),

@@ -773,26 +773,40 @@ fn default_serve_port() -> u16 {
 }
 
 /// The config-file management tools (`heartbeat`, `autonomous`, `agents`),
-/// bound to the rooms that may use them.
+/// bound to the room profiles that may use them.
 ///
 /// Empty means all four tools are unregistered — the same shape as
 /// `[tools] host_access`, where the switch itself is the opt-in. The tools
 /// write the files under the workspace (`heartbeats/`, `autonomous/`,
-/// `agents/`) that the *unattended* loops then execute, so a room's
+/// `agents/`) that the *unattended* loops then execute, so a room profile's
 /// presence here is a grant to author unattended work, not merely to read
 /// config.
 ///
-/// `rooms` is the same room-id namespace as `room_profile.<n>.rooms`
-/// (Matrix room ids, Discord channel ids, and the synthetic ids those fold
-/// to) — the same string that `Config::room_profile_for` resolves, so an
-/// operator writing both tables does not have to translate between them.
+/// Each entry is a `[room_profile.<n>]` key — the same name every other
+/// access decision resolves: the provider a session runs on, its memory
+/// namespace, the devices bound to it. An operator writing this table names
+/// a unit of the deployment, not a room id that has to be translated into
+/// one.
 ///
 /// Host-layer only: `[tools]` is outside the workspace-layer allowlist, so
 /// a synced workspace config cannot hand itself this grant.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AdminToolsConfig {
+    /// Room-profile names whose sessions may use the config tools
+    /// (`heartbeat_config`, `autonomous_config`, `agent_config`,
+    /// `task_test`). A room profile is the unit every other access decision
+    /// already uses — the provider it runs on, its memory namespace, the
+    /// devices bound to it — so an operator writing this table does not have
+    /// to translate a room id into a profile. Empty (the default) leaves the
+    /// four tools unregistered.
     #[serde(default)]
-    pub rooms: Vec<String>,
+    pub room_profiles: Vec<String>,
+    /// Removed: replaced by `room_profiles`, which names room profiles rather
+    /// than rooms. Retained only so `Config::migration_errors` can name the
+    /// leftover key and stop startup instead of letting the grant vanish
+    /// silently. Never populated by anything else.
+    #[serde(default, rename = "rooms", skip_serializing_if = "Vec::is_empty")]
+    pub legacy_rooms: Vec<String>,
 }
 
 /// Configuration for built-in tools.
@@ -1539,6 +1553,16 @@ api_key = "test"
                 }
             }
         }
+        // The admin allow list names room profiles. A typo there would grant
+        // nothing and say nothing — the same hour-costing shape
+        // `validate_subagent_profiles` exists to close.
+        for name in &self.tools.admin.room_profiles {
+            if name != DEFAULT_PROFILE_NAME && !self.room_profiles.contains_key(name) {
+                errors.push(format!(
+                    "[tools.admin].room_profiles references unknown room_profile '{name}'"
+                ));
+            }
+        }
         // Memory namespace include references and cycle detection.
         for (ns_name, ns_cfg) in &self.memory_namespaces {
             for parent in &ns_cfg.include {
@@ -1635,6 +1659,18 @@ api_key = "test"
     pub fn migration_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
 
+        if !self.tools.admin.legacy_rooms.is_empty() {
+            errors.push(
+                "[tools.admin].rooms was replaced by `[tools.admin].room_profiles`, which names \
+                 room profiles instead of room ids. Delete the `rooms` line and write the room \
+                 profile names you mean, e.g. `room_profiles = [\"ops\"]` — the profile whose \
+                 `[room_profile.<name>]` block the room is listed under in that block's `rooms` \
+                 array. Leaving `rooms` in place would drop the grant without saying so, so \
+                 startup refuses until it is gone."
+                    .to_string(),
+            );
+        }
+
         let mut names: Vec<&String> = self.devices.keys().collect();
         names.sort();
         for name in names {
@@ -1670,27 +1706,42 @@ api_key = "test"
         errors
     }
 
-    /// True when `room_id` is one of the rooms declared in
-    /// `[tools.admin].rooms`.
+    /// True when `name` is one of the room profiles declared in
+    /// `[tools.admin].room_profiles`.
     ///
-    /// `None` is always `false`, deliberately. Both `/rpc` and `/acp` have
-    /// no room of their own and synthesise a `room_id` out of the session
-    /// id, so a `None` here is not "the operator's own session" — it is a
-    /// session nobody declared. Treating it as trusted would mean the
-    /// endpoint a client reaches first, before any room is named, is the
-    /// one that can author unattended work. Voice is the same: the caller
-    /// is a device, not a room.
-    pub fn config_tools_allowed_in(&self, room_id: Option<&str>) -> bool {
-        match room_id {
-            Some(r) => self.tools.admin.rooms.iter().any(|allowed| allowed == r),
-            None => false,
-        }
+    /// The name is a `[room_profile.<n>]` key, resolved from the calling
+    /// transport rather than typed by the caller: a channel room through
+    /// [`Self::room_profile_name_for_room`], an ACP session through the
+    /// profile its bearer token pinned. The transports that name no profile —
+    /// voice, `/rpc`, A2A, the unattended loops — never reach this with a
+    /// value, which is the point: the endpoint a client reaches first, before
+    /// any profile is pinned, must not be the one that can author unattended
+    /// work.
+    pub fn admin_allows_room_profile(&self, name: &str) -> bool {
+        self.tools
+            .admin
+            .room_profiles
+            .iter()
+            .any(|allowed| allowed == name)
     }
 
-    /// True when `[tools.admin].rooms` names at least one room, i.e. the
-    /// config-file management tools are registered at all.
+    /// The room profile a channel `room_id` runs under, by name.
+    ///
+    /// The same resolution [`Self::profile_for`] and
+    /// [`Self::namespace_for_room`] use — an explicit listing in
+    /// `[room_profile.<n>].rooms` wins, then `[room_profile.default]` catches
+    /// every unmatched room, then the implicit `"default"` applies — so a
+    /// room's admin grant cannot disagree with the provider it runs on.
+    pub fn room_profile_name_for_room(&self, room_id: &str) -> &str {
+        self.room_profile_for(room_id)
+            .map(|(name, _)| name)
+            .unwrap_or(DEFAULT_PROFILE_NAME)
+    }
+
+    /// True when `[tools.admin].room_profiles` names at least one room
+    /// profile, i.e. the config-file management tools are registered at all.
     pub fn config_tools_enabled(&self) -> bool {
-        !self.tools.admin.rooms.is_empty()
+        !self.tools.admin.room_profiles.is_empty()
     }
 
     /// True if `name` is either the implicit `"default"` namespace or has a
@@ -2089,23 +2140,106 @@ mod tests {
         Config::parse_for_test(s)
     }
 
+    /// The default is off: no room profile is named, so none of the four
+    /// tools is ever registered.
     #[test]
-    fn config_tools_are_off_until_a_room_is_named() {
+    fn config_tools_are_off_until_a_room_profile_is_named() {
         let cfg = parse("[anthropic]\napi_key = \"test\"\n");
         assert!(!cfg.config_tools_enabled());
-        assert!(!cfg.config_tools_allowed_in(Some("!ops:x")));
-        assert!(!cfg.config_tools_allowed_in(None));
+        assert!(!cfg.admin_allows_room_profile("ops"));
+        assert!(!cfg.admin_allows_room_profile("default"));
     }
 
+    /// A named room profile is the grant, and the name is the room_profile
+    /// key — not a room id.
     #[test]
-    fn config_tools_are_allowed_in_a_named_room_and_nowhere_else() {
+    fn config_tools_are_allowed_in_a_named_room_profile() {
         let cfg = parse(
-            "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\nrooms = [\"!ops:x\", \"!dev:y\"]\n",
+            "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\n\
+             room_profiles = [\"ops\", \"developer\"]\n",
         );
         assert!(cfg.config_tools_enabled());
-        assert!(cfg.config_tools_allowed_in(Some("!ops:x")));
-        assert!(!cfg.config_tools_allowed_in(Some("!random:z")));
-        assert!(!cfg.config_tools_allowed_in(None)); // /rpc, /acp, voice: never
+        assert!(cfg.admin_allows_room_profile("ops"));
+        assert!(cfg.admin_allows_room_profile("developer"));
+        assert!(!cfg.admin_allows_room_profile("guest"));
+        assert!(
+            !cfg.admin_allows_room_profile("!ops:x"),
+            "a room id is not a room_profile name"
+        );
+    }
+
+    /// A channel room resolves to the profile the rest of the config uses:
+    /// an explicit listing wins, `[room_profile.default]` catches the rest,
+    /// and with neither defined the implicit `"default"` applies.
+    #[test]
+    fn a_room_resolves_to_the_same_profile_everywhere() {
+        let cfg = parse(
+            "[anthropic]\napi_key = \"test\"\n\n[profiles.dev]\nprovider = \"stub\"\n\n\
+             [room_profile.ops]\nprofile = \"dev\"\nrooms = [\"!ops:x\"]\n\n\
+             [room_profile.default]\nprofile = \"dev\"\n",
+        );
+        assert_eq!(cfg.room_profile_name_for_room("!ops:x"), "ops");
+        assert_eq!(cfg.room_profile_name_for_room("!unlisted:y"), "default");
+
+        let bare = parse("[anthropic]\napi_key = \"test\"\n");
+        assert_eq!(
+            bare.room_profile_name_for_room("!anything:z"),
+            "default",
+            "with no room_profile table at all the implicit default still names a profile"
+        );
+    }
+
+    /// Listing the implicit `"default"` profile is what an operator writes to
+    /// allow every room no profile claims — a broad grant, and the reason the
+    /// docs say so.
+    #[test]
+    fn default_profile_is_allowed_by_name() {
+        let cfg = parse(
+            "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\n\
+             room_profiles = [\"default\"]\n",
+        );
+        assert!(cfg.config_tools_enabled());
+        assert!(cfg.admin_allows_room_profile("default"));
+    }
+
+    /// `rooms` is gone: a config that still sets it must not start, because
+    /// silently dropping it makes the admin tools vanish with no symptom that
+    /// names the config file.
+    #[test]
+    fn the_removed_admin_rooms_key_is_a_migration_error() {
+        let cfg = parse("[anthropic]\napi_key = \"test\"\n\n[tools.admin]\nrooms = [\"!ops:x\"]\n");
+        let errors = cfg.migration_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("[tools.admin].rooms"), "{errors:?}");
+        assert!(errors[0].contains("room_profiles"), "{errors:?}");
+    }
+
+    /// A typo in the allow list must fail `verify` and startup, not silently
+    /// grant nothing.
+    #[test]
+    fn an_unknown_room_profile_in_the_allow_list_is_reported() {
+        let cfg = parse(
+            "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\n\
+             room_profiles = [\"typo\"]\n",
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("[tools.admin].room_profiles") && e.contains("typo")),
+            "{errors:?}"
+        );
+
+        // `"default"` is always valid, defined or not.
+        let ok = parse(
+            "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\n\
+             room_profiles = [\"default\"]\n",
+        );
+        assert!(
+            ok.validate_profiles().is_empty(),
+            "{:?}",
+            ok.validate_profiles()
+        );
     }
 
     /// The default is off. An agent that starts working on its own
