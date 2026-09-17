@@ -927,10 +927,10 @@ impl Tool for TaskTestTool {
     }
 }
 
-/// Register the four admin tools when the deployment has named a room.
+/// Register the four admin tools when the deployment has named a room profile.
 ///
 /// Extracted from `main.rs` so the condition is testable, because the
-/// condition *is* the grant: with `[tools.admin].rooms` empty, `main`
+/// condition *is* the grant: with `[tools.admin].room_profiles` empty, `main`
 /// must register nothing at all — four tools that always refuse would
 /// still tell the model they exist, and "exists but never works" is a
 /// worse answer than "does not exist". The run-time gate in
