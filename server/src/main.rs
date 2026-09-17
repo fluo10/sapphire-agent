@@ -514,7 +514,7 @@ async fn main() -> Result<()> {
             // `src/agent.rs`, stay untouched by this feature. Registered
             // when at least one definition loaded — a tool with nobody to
             // delegate to has no reason to be offered — and also when
-            // `[tools.admin].room_profiles` is set, since `agent_config` can
+            // `[tools.admin].room_profiles` names a profile: `agent_config` can
             // create a definition while the process is running.
             let agent_defs = agents::load_agents_dir(&workspace_dir.join("agents"));
             // Taken before `new` moves the list: an empty list is not an
@@ -528,9 +528,9 @@ async fn main() -> Result<()> {
                 );
             }
             // Registered when there is something to delegate to, and also
-            // when `[tools.admin].room_profiles` is set: `agent_config` can create
-            // a definition while the process is running. `Arc` rather than
-            // a bare `Box` because `agent_config` holds a `Weak` to it —
+            // when `[tools.admin].room_profiles` names a profile: `agent_config`
+            // can create a definition while the process is running. `Arc` rather
+            // than a bare `Box` because `agent_config` holds a `Weak` to it —
             // same shape `SkillTool` uses.
             let subagent = Arc::new(tools::subagent::SubagentTool::new(agent_defs));
             if !no_agent_defs || config.config_tools_enabled() {
