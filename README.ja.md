@@ -13,8 +13,7 @@
 - **チャネル**： Matrix（`matrix-sdk`によるE2EE）とDiscord（`serenity`）を並行稼働。
 - **プロバイダ**： SSEストリーミングとマルチラウンドのツール使用ループを備えたAnthropic Messages APIに加え、OpenAI互換バックエンド（ローカルLLM、OpenRouterなど）を `[providers]` / `[profiles]` / `[room_profile]` スキーマでルーム／セッションごとに選択可能。
 - **ワークスペース**： [`sapphire-framework`](https://github.com/fluo10/sapphire-framework) をバックエンドに使用 — ファイルインデックス、全文＋ベクトル検索（redb＋tantivy、デフォルトでLanceDBベクトル付き）。
-- **内蔵ツール**： `file_read`、`file_write`、`file_append`、`file_delete`、`dir_list`、`dir_walk`、`web_search`、`weather`、`shell`、`timer_set` / `timer_preset` / `timer_cancel` / `timer_status`（ポモドーロプリセット含む）、さらにワークスペースのメモリー／検索／同期ツール。このエージェント自身のファイルシステムとシェルに触る7つ（`file_read`、`file_write`、`file_append`、`file_delete`、`dir_list`、`dir_walk`、`shell`）はオプトイン： `[tools.host_access] enabled = false` がデフォルトで、`/rpc`や`/a2a`を含むすべてのオージンに適用されます。有効化は意図的な行為です。有効にしたうえでエージェントをコンテナで動かすのが推奨される方法です。
-- **クライアント側ツール**： `client_file_read`、`client_file_write`、`client_shell`、`client_shell_start`、`client_shell_output`、`client_shell_kill` — これらは `/acp`の`fs/*`と`terminal/*`リクエストを介して*エディタの*マシンに触ります。ACPセッション内でのみ、かつ接続したエディタが`initialize`で実際に宣言した機能に対してのみ提供されます。下記「クライアント側ツール：誰のマシンか」参照。
+- **シェル・ファイルツール**： `file_read`、`file_write`、`file_append`、`file_delete`、`dir_list`、`dir_walk`、`shell`、それに長時間実行用の `shell_start` / `shell_output` / `shell_kill`。これらの**届くマシンは名前ではなくセッションで決まります**。ACPセッション内では、接続したエディタが動いているマシンに、`/acp`の`fs/*`と`terminal/*`リクエストを介して作用します。ただし接続したエディタが`initialize`で宣言した機能に対してのみで、欠けた機能はエージェント自身のディスクへのフォールバックなしに非表示になります。それ以外（Matrix、Discord、`/rpc`、音声、`/a2a`、ハートビート、autonomous、サブエージェント）ではエージェント自身のマシンに作用し、オプトインです： `[tools.host_access] enabled = false`がデフォルトで、すべてのオージンに適用されます。有効化は意図的な行為で、有効化したうえでエージェントをコンテナで動かすのが推奨されます。下記「シェル・ファイルツール：誰のマシンか」参照。
 - **セッション**： 人間が読める[`grain-id`](https://crates.io/crates/grain-id)エイリアス、自動生成タイトル、再開時の履歴ダンプ。
 - **バックグラウンド**： ハートビートcronタスク、定期的なメモリー圧縮、定期的なワークスペース再インデックス、キャッチアップ付きの日次／週次／月次／年次ログ。
 - **音声**： オプションの`sapphire-call voice`サテライト。ローカルSTT/TTS（`sherpa-onnx`経由）とSilero VADを備える。[cli/](cli/)参照。ウェイクワードゲーティングは検出がサーバーへ移行中のため一時的に利用不可（[#183](https://github.com/fluo10/sapphire-agent/issues/183)）。サテライトはVADのみ稼働。
@@ -90,7 +89,7 @@ WARN Ignoring 1 unrecognised key(s) in /home/you/.config/sapphire-agent/config.t
 サブエージェント、Zed / ACP統合、スキル、既知の制限事項など、アーキテクチャの詳細な解説は英語版README（[README.md](README.md)）の該当セクションを参照してください。
 
 - Subagents — サブエージェントの定義・委譲・ネスト・再開
-- Zed / ACP — ACPエンドポイント、権限とモード、クライアント側ツール、過去セッションの読み込み
+- Zed / ACP — ACPエンドポイント、権限とモード、シェル・ファイルツール、過去セッションの読み込み
 - Skills — スキルの読み込み元ディレクトリ、有効化、4つのツール
 - エージェント自身の定義編集 — heartbeat / autonomous / agents の定義ファイルを読み書きする4ツールと `[tools.admin].rooms` のルーム許可リスト
 

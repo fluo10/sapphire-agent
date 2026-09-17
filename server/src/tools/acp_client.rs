@@ -122,7 +122,7 @@ pub trait AcpClient: Send + Sync {
     /// [`create_terminal`](AcpClient::create_terminal) based on what it
     /// saw: `run_llm_turn` executes a turn's permitted tool calls
     /// concurrently (`futures_util::future::join_all`), so one
-    /// assistant message with N `client_shell_start` (or `client_shell`)
+    /// assistant message with N `shell_start` (or `shell`)
     /// calls had all N read the count before any of them wrote it back
     /// — the cap was bypassable within a single turn. Reserving
     /// atomically here closes that gap.
@@ -317,7 +317,7 @@ pub(crate) mod tests {
         pub killed: Mutex<Vec<TerminalHandle>>,
         /// Set by [`FakeClient::make_exit_never_return`]. When true,
         /// `wait_for_terminal_exit` blocks forever instead of resolving
-        /// — the only way to make `ClientShell`'s
+        /// — the only way to make the one-shot `shell` tool's
         /// `tokio::time::timeout` race actually win on the timeout arm
         /// without a test sleeping out a real wall-clock timeout.
         exit_never_returns: Mutex<bool>,
@@ -461,12 +461,47 @@ pub(crate) mod tests {
                 .push_back((text.to_string(), exit_code));
         }
 
+        /// Queue `text` as the answer to the next `read_text_file`,
+        /// which reports it with a successful status. Without this the
+        /// fake answers with an empty string, which is indistinguishable
+        /// from a real client's empty file — so a test asserting on what
+        /// the *client's* copy holds needs this to say so.
+        pub(crate) fn queue_read_result(&self, text: &str) {
+            *self.read_answer.lock().unwrap() = Some(Ok(text.to_string()));
+        }
+
+        /// The paths this client has been asked to read, in call order —
+        /// how a routing test proves that a read went to the editor's
+        /// machine rather than the agent's own.
+        pub(crate) fn read_paths(&self) -> Vec<String> {
+            self.reads
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(path, _, _)| path.clone())
+                .collect()
+        }
+
         /// How many terminals this client has been asked to create —
         /// what `skill_tools`'s cache test uses to prove the skills
         /// index is resolved once and reused, not re-resolved on every
         /// call.
         pub(crate) fn terminal_count(&self) -> usize {
             self.creates.lock().unwrap().len()
+        }
+
+        /// The command and argv of the most recent `terminal/create`, or
+        /// `None` if there has not been one. Used by `client_tools`'s
+        /// terminal-routed tests, which assert on the *shape* of the
+        /// command (script, positional arguments, argv0 placeholder)
+        /// rather than only on what came back from it.
+        pub(crate) fn last_terminal_command(&self) -> Option<Vec<String>> {
+            let creates = self.creates.lock().unwrap();
+            let (command, args, _, _) = creates.last()?;
+            let mut argv = Vec::with_capacity(args.len() + 1);
+            argv.push(command.clone());
+            argv.extend(args.iter().cloned());
+            Some(argv)
         }
     }
 

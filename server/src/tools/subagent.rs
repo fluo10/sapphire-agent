@@ -319,6 +319,17 @@ fn build_spec(agents: &[AgentDef]) -> ToolSpec {
 /// still resolve to the parent's own host, because those are what keep
 /// delegation inside the same permission gate — `turn_error`,
 /// `message_chunk`, and `round_budget` are the three special-cased.
+///
+/// `acp_client()` is forwarded for that same reason and one more: a
+/// delegated child runs *where its parent runs*. On an ACP turn that
+/// machine is the editor's, so a child's `file_read`/`file_write`/
+/// `shell` calls must reach that same editor — the point of the
+/// unified tool names (#270) — rather than falling back to the agent's
+/// own disk, which is exactly what a `None` here would silently select.
+/// `TurnLoop::run` is what scopes the client as a task-local around each
+/// tool call, and the nested turn is awaited inside that scope, so the
+/// child's tools inherit it; see
+/// `a_delegated_subagents_tool_calls_still_reach_the_editor`.
 struct SubagentHost(std::sync::Arc<dyn crate::serve::TurnHost>);
 
 #[async_trait]
@@ -1030,7 +1041,7 @@ mod tests {
         vec![crate::agents::AgentDef {
             name: "reviewer".to_string(),
             description: "Reviews a diff.".to_string(),
-            tools: Some(vec!["client_file_read".to_string()]),
+            tools: Some(vec!["file_read".to_string()]),
             subagents: None,
             prompt: "You are a reviewer.".to_string(),
             profile: None,
@@ -1155,10 +1166,7 @@ mod tests {
     /// `subagent` spec verbatim.
     #[test]
     fn the_subagent_tool_is_offered_only_below_the_depth_cap() {
-        let parent_visible = [
-            spec_named("client_file_read"),
-            spec_named(SUBAGENT_TOOL_NAME),
-        ];
+        let parent_visible = [spec_named("file_read"), spec_named(SUBAGENT_TOOL_NAME)];
         let all = defs();
 
         // At the cap: under `max_depth = 1` only the main turn (depth 0)
@@ -1174,7 +1182,7 @@ mod tests {
         };
         let inherited = subagent_tool_specs(&unrestricted, &parent_visible, &all, 1, 1);
         assert!(!inherited.iter().any(|s| s.name == SUBAGENT_TOOL_NAME));
-        assert!(inherited.iter().any(|s| s.name == "client_file_read"));
+        assert!(inherited.iter().any(|s| s.name == "file_read"));
 
         // The shipped default (`max_depth = 2`): the list built at
         // depth 1 — for the turn a depth-1 agent would produce — carries
@@ -1262,15 +1270,12 @@ mod tests {
         let greedy = crate::agents::AgentDef {
             tools: Some(vec![
                 SUBAGENT_TOOL_NAME.to_string(),
-                "client_file_read".to_string(),
+                "file_read".to_string(),
             ]),
             profile: None,
             ..defs()[0].clone()
         };
-        let parent_visible = [
-            spec_named("client_file_read"),
-            spec_named(SUBAGENT_TOOL_NAME),
-        ];
+        let parent_visible = [spec_named("file_read"), spec_named(SUBAGENT_TOOL_NAME)];
         let inherited = subagent_tool_specs(&greedy, &parent_visible, &defs(), 0, 0);
         assert!(!inherited.iter().any(|s| s.name == SUBAGENT_TOOL_NAME));
     }
@@ -1283,7 +1288,7 @@ mod tests {
             profile: None,
             ..defs()[0].clone()
         };
-        let parent_visible = [spec_named("client_file_read")];
+        let parent_visible = [spec_named("file_read")];
         assert!(subagent_tool_specs(&toolless, &parent_visible, &defs(), 0, 2).is_empty());
     }
 
@@ -1301,11 +1306,11 @@ mod tests {
     #[test]
     fn an_unknown_tool_name_is_reported_once() {
         let tool = SubagentTool::new(defs());
-        let def = agent(&tool, 0); // tools: Some(["client_file_read"])
-        let parent_visible = [spec_named("client_file_read")];
+        let def = agent(&tool, 0); // tools: Some(["file_read"])
+        let parent_visible = [spec_named("file_read")];
 
         let unknown = crate::agents::AgentDef {
-            tools: Some(vec!["client_file_read".to_string(), "retrieve".to_string()]),
+            tools: Some(vec!["file_read".to_string(), "retrieve".to_string()]),
             profile: None,
             ..def.clone()
         };
@@ -1464,6 +1469,69 @@ mod tests {
         );
     }
 
+    /// A parent turn with an editor on the other end — the one thing
+    /// `turn_context()`'s `NullProgress` cannot stand in for, since its
+    /// own `acp_client()` answers `None` (the `TurnHost` default).
+    struct AcpParentHost {
+        client: std::sync::Arc<dyn crate::tools::acp_client::AcpClient>,
+    }
+
+    #[async_trait]
+    impl crate::serve::TurnHost for AcpParentHost {
+        async fn tool_start(&self, _id: &str, _name: &str) {}
+        async fn tool_end(&self, _id: &str, _name: &str) {}
+        async fn turn_error(&self, _message: &str) {}
+        fn acp_client(&self) -> Option<std::sync::Arc<dyn crate::tools::acp_client::AcpClient>> {
+            Some(std::sync::Arc::clone(&self.client))
+        }
+    }
+
+    /// A subagent delegated from an ACP session reaches the same machine
+    /// its parent does. `SubagentHost::acp_client()` forwards to the
+    /// parent's host, and `TurnLoop::run` is what scopes the task-local —
+    /// so this is the assertion that delegation cannot silently become
+    /// "the agent's own disk instead of the editor's".
+    #[tokio::test]
+    async fn a_delegated_subagents_tool_calls_still_reach_the_editor() {
+        let client = std::sync::Arc::new(crate::tools::acp_client::tests::FakeClient::default());
+        let as_client = std::sync::Arc::clone(&client)
+            as std::sync::Arc<dyn crate::tools::acp_client::AcpClient>;
+        let parent: std::sync::Arc<dyn crate::serve::TurnHost> =
+            std::sync::Arc::new(AcpParentHost {
+                client: std::sync::Arc::clone(&as_client),
+            });
+        // Exactly what `run_and_store` wraps the parent's host in before
+        // driving a nested turn — so what the closures below read is
+        // what a dispatched child's tools read.
+        let childs_host = SubagentHost(std::sync::Arc::clone(&parent));
+
+        let reaches_editor = crate::serve::scope_turn_context(
+            turn_context_with_host(
+                crate::serve::ServeState::for_test(false),
+                ScriptedProvider::new(vec![text_response("answer")])
+                    as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+                std::sync::Arc::clone(&parent),
+            ),
+            crate::tools::acp_client::scope_acp_client(std::sync::Arc::clone(&as_client), async {
+                // The delegating turn's own `TurnHost::acp_client` is what a
+                // subagent's `SubagentHost` forwards...
+                let forwarded = crate::serve::TurnHost::acp_client(&childs_host).is_some();
+                // ...and `current_acp_client()` is what the unified
+                // `file_read`/`shell` tools actually read at execution
+                // time. Both halves have to hold for a child's call to land
+                // on the editor's machine.
+                let scoped = crate::tools::acp_client::current_acp_client().is_some();
+                forwarded && scoped
+            }),
+        )
+        .await;
+        assert!(
+            reaches_editor,
+            "a delegated child's tool call must reach the editor, not the agent's own disk"
+        );
+    }
+
     // -----------------------------------------------------------------
     // Resume (Task 6)
     // -----------------------------------------------------------------
@@ -1475,10 +1543,7 @@ mod tests {
         vec![crate::agents::AgentDef {
             name: "impl".to_string(),
             description: "Implements a task.".to_string(),
-            tools: Some(vec![
-                "client_file_read".to_string(),
-                "client_shell".to_string(),
-            ]),
+            tools: Some(vec!["file_read".to_string(), "shell".to_string()]),
             subagents: None,
             prompt: "You are impl.".to_string(),
             profile: None,
@@ -1608,10 +1673,29 @@ mod tests {
         provider: std::sync::Arc<dyn crate::provider::Provider>,
         visible_specs: Vec<ToolSpec>,
     ) -> std::sync::Arc<crate::serve::TurnContext> {
+        turn_context_with_host(
+            state,
+            provider,
+            visible_specs,
+            std::sync::Arc::new(crate::serve::NullProgress),
+        )
+    }
+
+    /// The same context as [`turn_context`], with the turn's own host
+    /// supplied rather than a [`crate::serve::NullProgress`]. That
+    /// default's `acp_client()` is `None` (see `TurnHost`'s doc), so a
+    /// test about `SubagentHost` forwarding the *editor* needs a host
+    /// that actually has one.
+    fn turn_context_with_host(
+        state: std::sync::Arc<crate::serve::ServeState>,
+        provider: std::sync::Arc<dyn crate::provider::Provider>,
+        visible_specs: Vec<ToolSpec>,
+        progress: std::sync::Arc<dyn crate::serve::TurnHost>,
+    ) -> std::sync::Arc<crate::serve::TurnContext> {
         std::sync::Arc::new(crate::serve::TurnContext {
             state,
             provider,
-            progress: std::sync::Arc::new(crate::serve::NullProgress),
+            progress,
             visible_specs: visible_specs.into(),
             timer_origin: None,
             // `None` here matches what a subagent's own nested `TurnLoop`
@@ -1741,8 +1825,8 @@ mod tests {
         // empty* (rather than exactly recomputed) would still fail this
         // test.
         let visible = vec![
-            spec_named("client_file_read"),
-            spec_named("client_shell"),
+            spec_named("file_read"),
+            spec_named("shell"),
             spec_named("some_other_tool"),
             spec_named(SUBAGENT_TOOL_NAME),
         ];
@@ -1778,7 +1862,7 @@ mod tests {
 
         let specs = resume_provider.last_specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_ref()).collect();
-        assert_eq!(names, vec!["client_file_read", "client_shell"]);
+        assert_eq!(names, vec!["file_read", "shell"]);
     }
 
     /// A handle nobody ever stored (typo'd, expired, from a different

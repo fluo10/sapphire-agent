@@ -13,8 +13,7 @@ A personal AI assistant agent that lives in a [`sapphire-framework`](https://git
 - **Channels**: Matrix (E2EE via `matrix-sdk`) and Discord (`serenity`), running concurrently.
 - **Providers**: Anthropic Messages API with SSE streaming and a multi-round tool-use loop, plus OpenAI-compatible backends (local LLMs, OpenRouter, …) selectable per room/session via the `[providers]` / `[profiles]` / `[room_profile]` schema.
 - **Workspace**: backed by [`sapphire-framework`](https://github.com/fluo10/sapphire-framework) — file index, full-text + vector search (redb + tantivy, plus LanceDB vectors by default).
-- **Built-in tools**: `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `web_search`, `weather`, `shell`, `timer_set` / `timer_preset` / `timer_cancel` / `timer_status` (incl. Pomodoro presets), plus workspace memory / search / sync tools. The seven that touch this agent's own filesystem and shell (`file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`) are opt-in: `[tools.host_access] enabled = false` by default, for every origin including `/rpc` and `/a2a`. Turning it on is a deliberate act; running the agent in a container is the recommended way to do it once it is.
-- **Client-side tools**: `client_file_read`, `client_file_write`, `client_shell`, `client_shell_start`, `client_shell_output`, `client_shell_kill` — touch the *editor's* machine instead, over `/acp`'s `fs/*` and `terminal/*` requests. Only offered inside an ACP session, and only for the capabilities the connected editor actually declared at `initialize`. See [Client-side tools: whose machine](#client-side-tools-whose-machine) below.
+- **Built-in tools**: `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`, `timer_set` / `timer_preset` / `timer_cancel` / `timer_status` (incl. Pomodoro presets), plus workspace memory / search / sync tools. The seven that touch a filesystem or a shell (`file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`) plus `shell_start` / `shell_output` / `shell_kill` for long-running commands are **session-routed: which machine they reach is decided by the session, not by the name**. Inside an ACP session they act on the machine the connected editor is running on, over `/acp`'s `fs/*` and `terminal/*` requests, and only for the capabilities that editor declared at `initialize` — with no fallback to the agent's own disk when one is missing. Everywhere else (Matrix, Discord, `/rpc`, voice, `/a2a`, heartbeat, autonomous, subagents) they act on this agent's own machine, and are opt-in: `[tools.host_access] enabled = false` by default, for every origin. Turning that on is a deliberate act; running the agent in a container is the recommended way to do it once it is. See [Shell and file tools: whose machine](#shell-and-file-tools-whose-machine) below.
 - **Sessions**: human-readable [`grain-id`](https://crates.io/crates/grain-id) aliases, auto-generated titles, history dump on resume.
 - **Background**: heartbeat cron tasks, periodic memory compaction, periodic workspace re-index, daily / weekly / monthly / yearly logs with catch-up.
 - **Voice**: optional `sapphire-agent-cli voice` satellite with local STT/TTS (via `sherpa-onnx`) and Silero VAD. See [cli/](cli/). Wake-word gating is temporarily unavailable while detection moves to the server ([#183](https://github.com/fluo10/sapphire-agent/issues/183)); the satellite runs VAD-only.
@@ -119,7 +118,7 @@ body for the prompt:
 ```markdown
 ---
 description: Reviews a diff. Reads and reports; does not edit.
-tools: [client_file_read, workspace_search, memory_read]
+tools: [file_read, workspace_search, memory_read]
 profile: dev
 ---
 You are a reviewer. Read the diff, report problems, and stop there.
@@ -443,7 +442,7 @@ would let it broker its own permission request.
 them — they are still never asked. But none of the three can reach the seven
 host-machine tools either, once `[tools.host_access] enabled = false` (the
 default this crate ships): that gate applies to every origin, not just chat.
-See "The agent's own filesystem and shell are opt-in" below.
+See "Reaching the agent's own machine is opt-in" below.
 
 **The heartbeat's chat leg counts as a channel.** A scheduled task under
 `<workspace>/heartbeat/` runs through the same path as a chat message when it
@@ -499,83 +498,92 @@ server being broken. Coarser, but it cannot rot.
 Nothing about `decide` changes. A `read` server's tools take the same path
 `workspace_search` already takes, and an `edit` server's take `file_write`'s.
 
-### Client-side tools: whose machine
+### Shell and file tools: whose machine
 
-Six tools reach the connected editor's machine instead of this agent's own,
-by making ACP `agent → client` requests instead of touching a filesystem or
-spawning a process locally:
+Ten tools — `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`,
+`dir_walk`, `shell`, and the long-running trio `shell_start` / `shell_output` /
+`shell_kill` — read or write a filesystem or run a shell. **Which machine they
+reach is decided by the session, not by the name.** Inside an ACP session they
+act on the machine the connected editor is running on, over `/acp`'s `fs/*` and
+`terminal/*` requests; everywhere else (Matrix, Discord, `/rpc`, voice, `/a2a`,
+heartbeat, autonomous, subagents) they act on this agent's own machine. Inside
+an ACP session each tool maps to a request on the editor's machine:
 
 | Tool | ACP call(s) | `ToolKind` |
 |---|---|---|
-| `client_file_read` | `fs/read_text_file` | `Read` |
-| `client_file_write` | `fs/write_text_file` | `Edit` |
-| `client_shell` | `terminal/create` → `wait_for_exit` → `output` → `release` | `Execute` |
-| `client_shell_start` | `terminal/create` | `Execute` |
-| `client_shell_output` | `terminal/output` | `Read` |
-| `client_shell_kill` | `terminal/kill` + `terminal/release` | `Execute` |
+| `file_read` | `fs/read_text_file` | `Read` |
+| `file_write` | `fs/write_text_file` | `Edit` |
+| `file_append` | `fs/read_text_file` then `fs/write_text_file` | `Edit` |
+| `file_delete` | `terminal/*` — runs `rm` | `Delete` |
+| `dir_list` | `terminal/*` — runs `find` | `Search` |
+| `dir_walk` | `terminal/*` — runs `find` | `Search` |
+| `shell` | `terminal/create` → `wait_for_exit` → `output` → `release` | `Execute` |
+| `shell_start` | `terminal/create` | `Execute` |
+| `shell_output` | `terminal/output` | `Read` |
+| `shell_kill` | `terminal/kill` + `terminal/release` | `Execute` |
 
-Each is offered only inside an ACP session, and only for the capability the
-connected editor actually declared in `initialize`. `fs.read_text_file` and
-`fs.write_text_file` are read **independently** — an editor that can read but
-not write files gets `client_file_read` and nothing else; `terminal` gates
-all four shell tools together. There is no round trip spent finding this
-out: an unsupported tool is simply absent from the list the model sees.
+Inside an ACP session a tool is offered only for the capability the connected
+editor actually declared in `initialize`, and there is no fallback: a missing
+capability simply hides the tool rather than routing it to the agent's own disk.
+`fs.read_text_file` and `fs.write_text_file` are read **independently** — an
+editor that can read but not write files gets `file_read` (and the read half of
+`file_append`) and nothing that writes. `terminal` gates the delete, directory,
+and shell tools together. There is no round trip spent finding this out: an
+unsupported tool is simply absent from the list the model sees.
 
-`client_file_read` passes `line`/`limit` straight through to
-`fs/read_text_file`; that pair exists in ACP for exactly this reason, so a
-large file can be read in pieces instead of shipped over the wire whole.
+`file_read` passes `line`/`limit` straight through to `fs/read_text_file`; that
+pair exists in ACP for exactly this reason, so a large file can be read in
+pieces instead of shipped over the wire whole.
 
-**`client_shell`'s timeout does not kill the command.** It waits up to
-`timeout_secs` (default 120, overridable per call, capped at 600) and, if the
-command is still running when that runs out, hands back the terminal handle
-instead of an error — the process is left running. ACP defines
-`terminal/release` as also killing the command, so releasing on timeout would
-throw away however long a build had already run, and for a non-idempotent
-command (`git push`, a migration, a script that writes files) a subsequent
-retry would run it a second time. The result text tells the model explicitly
-not to re-run, and points it at `client_shell_output` / `client_shell_kill`
-instead.
+**`shell`'s timeout does not kill the command.** It waits up to `timeout_secs`
+(default 120, overridable per call, capped at 600) and, if the command is still
+running when that runs out, hands back the terminal handle instead of an error —
+the process is left running. ACP defines `terminal/release` as also killing the
+command, so releasing on timeout would throw away however long a build had
+already run, and for a non-idempotent command (`git push`, a migration, a script
+that writes files) a subsequent retry would run it a second time. The result
+text tells the model explicitly not to re-run, and points it at `shell_output` /
+`shell_kill` instead.
 
 **Terminals are tracked per session, not per connection, and a dropped
-connection releases nothing.** `terminal/release` kills the command, so a
-network blip must not trigger one — tracking by session id (rather than by
-connection) is what lets a client that reconnects and reloads the session
-reach the same handles with `client_shell_output` / `client_shell_kill`. A
-handle is released in exactly two cases — the one-shot `client_shell`
-finishing inside its timeout, or the model calling `client_shell_kill` — plus
-one case that is an *untrack* rather than a release: the client reporting the
-handle unknown, where there is nothing left to free. An output check that
-fails does **not** untrack the handle: the failure could be transient, and
-dropping tracking of a terminal that might still be running would be
-unrecoverable. `client_shell_kill`, by contrast, untracks unconditionally
-even when the underlying kill or release call itself errors — over-counting
-is the recoverable direction (the model can check or kill again); a
-permanently stuck cap slot is not.
+connection releases nothing.** `terminal/release` kills the command, so a network
+blip must not trigger one — tracking by session id (rather than by connection)
+is what lets a client that reconnects and reloads the session reach the same
+handles with `shell_output` / `shell_kill`. A handle is released in exactly two
+cases — the one-shot `shell` finishing inside its timeout, or the model calling
+`shell_kill` — plus one case that is an *untrack* rather than a release: the
+client reporting the handle unknown, where there is nothing left to free. An
+output check that fails does **not** untrack the handle: the failure could be
+transient, and dropping tracking of a terminal that might still be running would
+be unrecoverable. `shell_kill`, by contrast, untracks unconditionally even when
+the underlying kill or release call itself errors — over-counting is the
+recoverable direction (the model can check or kill again); a permanently stuck
+cap slot is not.
 
 Each session may hold at most 8 terminals at once, counting both
-`client_shell_start`'s handles and any `client_shell` call that timed out
-without finishing. A ninth is refused, and the refusal names every handle
-currently held so the model knows what to `client_shell_kill` first.
+`shell_start`'s handles and any `shell` call that timed out without finishing. A
+ninth is refused, and the refusal names every handle currently held so the model
+knows what to `shell_kill` first.
 
-**No client-side directory listing, delete, or append.** ACP's
-`agent → client` surface is exactly `session/request_permission`, `fs/*` and
-`terminal/*` — there is no request for listing, deleting, or appending.
-Layering a structured wrapper over `terminal/create` to fake them would mean
-inventing a second, protocol-unbacked convention — a made-up output format,
-absorbing every client's differences in `ls` — and maintaining it
-indefinitely. So that work goes through `client_shell` instead. This is a
-decision, not a gap: ACP does not have this surface.
+**Directory listing and delete go over the terminal, not a dedicated request.**
+ACP's `agent → client` surface is exactly `session/request_permission`, `fs/*`
+and `terminal/*` — there is no request for listing or deleting. `file_delete`,
+`dir_list` and `dir_walk` run a `rm` / `find` through `terminal/*` inside an ACP
+session rather than inventing a protocol-unbacked convention, and produce the
+same output shape as their agent-side siblings (DFS order, `~` expanded), so the
+model sees one tool either way.
 
-**The agent's own filesystem and shell are opt-in, and that closed a real
-hole.** The seven host-machine tools (`file_read`, `file_write`,
+**Reaching the agent's own machine is opt-in, and that closed a real hole.**
+Outside an ACP session these tools reach the agent's own machine, and there they
+are opt-in: the seven file and shell tools (`file_read`, `file_write`,
 `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`) require
-`[tools.host_access] enabled = true` in config; the default is `false`, for
-every origin. Before this switch existed, `Origin::Channel` (Matrix/Discord)
-refused only `Execute` and `Other` calls, so `file_write` (`Edit`) and
-`file_delete` (`Delete`) went through unconditionally — a Discord message
-asking to delete a file reached the agent's own filesystem. Enabling host
-access is now a deliberate, config-level act; running the agent in a
-container is the recommended way to do it once it is on.
+`[tools.host_access] enabled = true`; the default is `false`, for every origin.
+Before this switch existed, `Origin::Channel` (Matrix/Discord) refused only
+`Execute` and `Other` calls, so `file_write` (`Edit`) and `file_delete`
+(`Delete`) went through unconditionally — a Discord message asking to delete a
+file reached the agent's own filesystem. Enabling host access is now a
+deliberate, config-level act; running the agent in a container is the
+recommended way to do it once it is on.
 
 ### Loading past sessions
 

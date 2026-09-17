@@ -279,4 +279,52 @@ mod tests {
             Some(true)
         );
     }
+
+    /// #270 renamed the names the client-side file and shell tools used,
+    /// and the ruling was that the standing answers do **not** follow
+    /// them: `always_allow` is keyed by tool name, an old name's grant is
+    /// a dead entry, and the new name is asked once.
+    ///
+    /// The reason is that the rename is not a rename: `client_file_read`
+    /// and `file_read` reach different machines depending on the session,
+    /// so carrying a grant over would widen a permission the user gave
+    /// for something they were looking at when they gave it. There is
+    /// deliberately no migration code — the assertion that the old keys
+    /// are still on disk, untouched, is what would fail if someone added
+    /// one.
+    #[test]
+    fn pre_270_grants_do_not_transfer_to_the_unified_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acp-permissions.json");
+
+        let store = PermissionStore::open(path.clone());
+        store.record("zed", "client_file_read", Approval::AllowAlways);
+        store.record("zed", "client_shell", Approval::AllowAlways);
+        assert_eq!(store.standing("zed", "client_file_read"), Some(true));
+
+        // What the next process — i.e. the upgraded agent — sees.
+        let reopened = PermissionStore::open(path.clone());
+        assert_eq!(
+            reopened.standing("zed", "file_read"),
+            None,
+            "a grant for the old name must not settle the new one"
+        );
+        assert_eq!(reopened.standing("zed", "shell"), None);
+
+        // And nothing rewrote or pruned the record on the way through.
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["profiles"]["zed"]["always_allow"],
+            serde_json::json!(["client_file_read", "client_shell"]),
+            "the old keys stay as dead entries — no migration, no cleanup"
+        );
+
+        // The new name is asked once and then sticks, like any other.
+        reopened.record("zed", "file_read", Approval::AllowAlways);
+        assert_eq!(
+            PermissionStore::open(path).standing("zed", "file_read"),
+            Some(true)
+        );
+    }
 }

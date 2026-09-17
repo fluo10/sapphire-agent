@@ -319,16 +319,19 @@ system_prompt = "You are a helpful personal assistant."
 # concerns live here:
 #
 #   - `[tools.host_access]` — the switch that lets the agent touch its
-#     own filesystem and shell at all: `file_read`, `file_write`,
-#     `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`.
-#     `enabled = false` by default, for every origin — `/rpc`, voice,
-#     `/a2a`, Matrix/Discord and ACP alike — so those seven tools are
-#     simply absent from the tool list until this is turned on. Client-
-#     side tools that reach the *editor's* machine over ACP
-#     (`client_file_read`, `client_shell`, …) are unaffected either
-#     way. Running the agent in a container is the recommended way to
-#     turn this on, since it then bounds what "the agent's own
-#     filesystem" actually reaches.
+#     own filesystem and shell: `file_read`, `file_write`, `file_append`,
+#     `file_delete`, `dir_list`, `dir_walk`, `shell`. `enabled = false`
+#     by default, for every origin — `/rpc`, voice, `/a2a`, Matrix/Discord
+#     and ACP alike.
+#
+#     Inside an ACP session these same seven names reach the *editor's*
+#     machine instead, and this switch does not speak for it: what that
+#     session may call is decided by the capabilities the connected editor
+#     declared at `initialize` (`fs.read_text_file`, `fs.write_text_file`,
+#     `terminal/*`), and a missing capability hides the tool rather than
+#     falling back to the agent's own disk. Turning this on is therefore
+#     only about the agent's own machine; running the agent in a container
+#     is the recommended way to do it once it is on.
 #   - `tavily_api_key` — enables the `web_search` tool. Omit to leave
 #     the tool unregistered.
 #   - `[tools.tool_rounds]` — how many tool rounds one turn may spend,

@@ -147,7 +147,7 @@ mod tests {
         write(
             d.path(),
             "reviewer.md",
-            "---\ndescription: Reviews a diff.\ntools: [client_file_read]\n---\nYou are a reviewer.\n",
+            "---\ndescription: Reviews a diff.\ntools: [file_read]\n---\nYou are a reviewer.\n",
         );
 
         let agents = load_agents_dir(d.path());
@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(agents[0].description, "Reviews a diff.");
         assert_eq!(
             agents[0].tools.as_deref(),
-            Some(["client_file_read".to_string()].as_slice())
+            Some(["file_read".to_string()].as_slice())
         );
         assert_eq!(agents[0].prompt.trim(), "You are a reviewer.");
     }

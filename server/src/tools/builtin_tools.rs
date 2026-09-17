@@ -13,6 +13,16 @@ use std::sync::{Arc, Mutex, Weak};
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+// The one sentence every session-routed shell/file tool's description opens
+// with. Which machine a call reaches is a property of the *session*, not of
+// the tool: an ACP session reaches the connected editor's machine, every
+// other session this agent's own. Naming a fixed machine would be wrong in
+// one of the two cases every time, so the sentence lives here once rather
+// than in seven drifting copies.
+pub(crate) const REACHES_SENTENCE: &str = "Reaches whichever machine this \
+    conversation is about: inside an ACP session, the machine the connected \
+    editor is running on; otherwise this agent's own machine. ";
+
 fn expand_path(path_str: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path_str).as_ref())
 }
@@ -32,13 +42,15 @@ impl FileReadTool {
             state,
             spec: ToolSpec {
                 name: "file_read".into(),
-                description: "Read a file with optional line-based pagination. \
+                description: format!(
+                    "{REACHES_SENTENCE}Read a file with optional line-based pagination. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
                     (resolved against the workspace root). \
                     Returns lines prefixed with their 1-indexed line number in 'N|content' format. \
                     Use offset and limit for large files. \
-                    Cannot read binary files or device paths (/dev/, /proc/)."
-                    .into(),
+                    Cannot read binary files or device paths (/dev/, /proc/).",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -77,6 +89,15 @@ impl Tool for FileReadTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // Which machine this call reaches is decided once, here: a client
+        // scoped to this turn means the *editor's* filesystem, and no client
+        // means this agent's own — the pre-#270 behaviour, kept for every
+        // non-ACP transport. There is no fallback in either direction; see
+        // `client_tools`' module doc.
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            return crate::tools::client_tools::client_read(&client, input).await;
+        }
+
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = input["limit"].as_u64().unwrap_or(500).min(2000) as usize;
@@ -470,15 +491,16 @@ impl FileWriteTool {
             state,
             spec: ToolSpec {
                 name: "file_write".into(),
-                description: "Write content to a file, completely replacing its existing content. \
+                description: format!("{REACHES_SENTENCE}Write content to a file, completely replacing its existing content. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
                     (resolved against the workspace root). \
                     Creates the file and any missing parent directories automatically. \
                     When the target file is inside the workspace, the search index \
                     is updated automatically. \
                     Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.) \
-                    and to this agent's own config.toml and acp-permissions.json."
-                    .into(),
+                    and to this agent's own config.toml and acp-permissions.json.",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -509,6 +531,12 @@ impl Tool for FileWriteTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // The editor's machine when a client is scoped, this one otherwise —
+        // see `FileReadTool::execute` and `client_tools`' module doc.
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            return crate::tools::client_tools::client_write(&client, input).await;
+        }
+
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
 
@@ -551,15 +579,16 @@ impl FileDeleteTool {
             state,
             spec: ToolSpec {
                 name: "file_delete".into(),
-                description: "Delete a file from the filesystem. \
+                description: format!("{REACHES_SENTENCE}In an ACP session the delete runs a `rm` on the editor's machine over `terminal/*`. Delete a file from the filesystem. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
                     (resolved against the workspace root). \
                     When the file is inside the workspace, it is also removed from the search index \
                     automatically. \
                     Refuses deletes of sensitive system paths (/etc, /boot, /bin, etc.) \
                     and of this agent's own config.toml and acp-permissions.json. \
-                    Cannot delete directories."
-                    .into(),
+                    Cannot delete directories.",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -587,6 +616,12 @@ impl Tool for FileDeleteTool {
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let path_str = input["path"].as_str().context("missing 'path'")?;
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            // ACP has no delete, so the client's side is `rm` over the
+            // terminal — see `client_tools::client_delete`.
+            return crate::tools::client_tools::client_delete(&client, input).await;
+        }
+
         let path = expand_path(path_str);
 
         let workspace_root = self
@@ -623,15 +658,16 @@ impl FileAppendTool {
             state,
             spec: ToolSpec {
                 name: "file_append".into(),
-                description: "Append content to the end of a file, creating it if missing. \
+                description: format!("{REACHES_SENTENCE}Append content to the end of a file, creating it if missing. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
                     (resolved against the workspace root). \
                     Creates any missing parent directories automatically. \
                     When the target file is inside the workspace, the search index \
                     is updated automatically. \
                     Refuses writes to sensitive system paths (/etc, /boot, /bin, etc.) \
-                    and to this agent's own config.toml and acp-permissions.json."
-                    .into(),
+                    and to this agent's own config.toml and acp-permissions.json.",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -662,6 +698,13 @@ impl Tool for FileAppendTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // `client_append` is read -> concatenate -> write on the editor's
+        // side, since ACP has no append — see its doc for what that costs
+        // (two crossings of the whole file, and no atomicity).
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            return crate::tools::client_tools::client_append(&client, input).await;
+        }
+
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
 
@@ -704,11 +747,12 @@ impl DirListTool {
             state,
             spec: ToolSpec {
                 name: "dir_list".into(),
-                description: "List the direct children of a directory (non-recursive). \
+                description: format!("{REACHES_SENTENCE}In an ACP session the listing runs a `find` on the editor's machine over `terminal/*`. List the direct children of a directory (non-recursive). \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths. \
                     Entries are sorted alphabetically. Directories are shown with a \
-                    trailing slash. For deeper exploration, use dir_walk."
-                    .into(),
+                    trailing slash. For deeper exploration, use dir_walk.",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -735,6 +779,13 @@ impl Tool for DirListTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // ACP has no list/stat, so the editor's listing is one `find` over
+        // the terminal -- see `client_tools::client_dir_list`. Outside an
+        // ACP session this is the agent's own workspace, below.
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            return crate::tools::client_tools::client_dir_list(&client, input).await;
+        }
+
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let path = expand_path(path_str);
 
@@ -763,6 +814,17 @@ impl Tool for DirListTool {
     }
 }
 
+/// The one sentence a truncated `dir_walk` reports, shared with the client.
+///
+/// The wording used to sit, verbatim, in both `DirWalkTool::execute` here and
+/// `client_tools::client_dir_walk` -- which is exactly the drift the
+/// unification exists to avoid: a model that learned "there was more" on one
+/// machine must not meet a differently worded cap on the other. The agent side
+/// owns the sentence; the client path calls this.
+pub(crate) fn truncation_marker(max_entries: usize) -> String {
+    format!("[truncated — more than {max_entries} entries; raise max_entries or narrow path]")
+}
+
 // ---------------------------------------------------------------------------
 // dir_walk
 // ---------------------------------------------------------------------------
@@ -778,12 +840,13 @@ impl DirWalkTool {
             state,
             spec: ToolSpec {
                 name: "dir_walk".into(),
-                description: "Recursively list all files and directories under a path. \
+                description: format!("{REACHES_SENTENCE}In an ACP session the walk runs a `find` on the editor's machine over `terminal/*`. Recursively list all files and directories under a path. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths. \
                     Output is a sorted flat list; directories carry a trailing slash. \
                     Bounded by max_depth (default 5) and max_entries (default 500) to \
-                    avoid runaway walks into large trees."
-                    .into(),
+                    avoid runaway walks into large trees.",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -861,6 +924,13 @@ impl Tool for DirWalkTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // Same routing as `dir_list`: `find` on the editor's side, with the
+        // same sorting, trailing slashes and truncation marker produced
+        // here (see `client_tools::client_dir_walk`).
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            return crate::tools::client_tools::client_dir_walk(&client, input).await;
+        }
+
         let path_str = input["path"].as_str().context("missing 'path'")?;
         let max_depth = input["max_depth"].as_u64().unwrap_or(5).min(20) as usize;
         let max_entries = input["max_entries"].as_u64().unwrap_or(500).clamp(1, 5000) as usize;
@@ -897,9 +967,7 @@ impl Tool for DirWalkTool {
             })
             .collect();
         if truncated {
-            out.push(format!(
-                "[truncated — more than {max_entries} entries; raise max_entries or narrow path]"
-            ));
+            out.push(truncation_marker(max_entries));
         }
         Ok(out.join("\n"))
     }
@@ -923,7 +991,8 @@ impl ShellTool {
             workspace_root,
             spec: ToolSpec {
                 name: "shell".into(),
-                description: "Execute a shell command and return its output. \
+                description: format!(
+                    "{REACHES_SENTENCE}Execute a shell command and return its output. \
                     Returns stdout, stderr, and exit code. \
                     The default working directory is the workspace root. \
                     By default the command runs under the shell named by the \
@@ -931,8 +1000,9 @@ impl ShellTool {
                     override per call with the `shell` parameter (e.g. `bash`, \
                     `zsh`, `fish`, or an absolute path). \
                     Use the timeout parameter for long-running commands (default 60 s, max 600 s). \
-                    Not suitable for interactive commands or persistent daemons."
-                    .into(),
+                    Not suitable for interactive commands or persistent daemons.",
+                )
+                .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -974,6 +1044,45 @@ impl Tool for ShellTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        // The editor's machine when a client is scoped to this turn, this
+        // one otherwise. Same one-shot contract either way: wait up to
+        // `timeout`, and on timeout hand back a *running* handle rather than
+        // killing the command — see `client_tools::format_timed_out`.
+        if let Some(client) = crate::tools::acp_client::current_acp_client() {
+            let command = input["command"].as_str().context("missing 'command'")?;
+            let timeout = crate::tools::client_tools::clamp_timeout(input["timeout"].as_u64());
+            // `workdir` names a directory on the *client's* machine, so it is
+            // passed through as written: expanding a `~` here would expand
+            // this agent's home instead. `None` lets the client default to
+            // the session's own cwd.
+            let cwd = input["workdir"].as_str();
+            // ACP's `terminal/create` takes a command plus an argv, not a
+            // shell string, while this tool's `command` parameter *is* one —
+            // so the shell is spelled out here, the same way the agent-side
+            // body below runs the line under `$SHELL -c`.
+            let args = vec!["-c".to_string(), command.to_string()];
+
+            let run =
+                crate::tools::client_exec::run_client_command(&client, "sh", &args, cwd, timeout)
+                    .await?;
+            return match run.timed_out_handle {
+                Some(handle) => Ok(crate::tools::client_tools::format_timed_out(
+                    &handle, timeout,
+                )),
+                None => {
+                    let status = run.status.expect(
+                        "run_client_command always sets `status` when it does not time out",
+                    );
+                    let mut out = crate::tools::client_tools::format_finished(&run.output, &status);
+                    if let Some(warning) = run.release_warning {
+                        out.push('\n');
+                        out.push_str(&warning);
+                    }
+                    Ok(out)
+                }
+            };
+        }
+
         use std::time::Duration;
         use tokio::process::Command;
 
@@ -2157,5 +2266,612 @@ mod refresh_system_prompt_tests {
         let tool = RefreshSystemPromptTool::new(Weak::new());
         let err = tool.execute(&json!({})).await.unwrap_err();
         assert_eq!(format!("{err:#}"), "agent unavailable");
+    }
+}
+
+#[cfg(test)]
+mod session_routing_tests {
+    use super::*;
+    use crate::tools::acp_client::{AcpClient, scope_acp_client, tests::FakeClient};
+    use sapphire_framework::workspace::{AppContext, Workspace};
+    use std::sync::Mutex;
+
+    static TEST_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
+
+    /// A fresh workspace in a temp dir. Same shape as `tools::tests`'
+    /// helper of the same name, duplicated rather than shared because the
+    /// intervening `mod tests` is private and this module is not its
+    /// descendant.
+    fn test_workspace() -> Arc<Mutex<WorkspaceState>> {
+        // `AppContext` panics on any `cache_dir()` access until
+        // `set_cache_dir` has been called once, and `Workspace::from_root`
+        // reads it to compute the workspace's cache path. First writer
+        // wins and later calls are ignored, so calling it here every time
+        // is safe.
+        TEST_CTX
+            .set_cache_dir(std::env::temp_dir().join("sapphire-agent-builtin-tools-test-cache"));
+        // Leaked on purpose: this is a test binary and the OS reclaims the
+        // directory when it exits.
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        std::fs::create_dir_all(dir.path().join(".sapphire-agent")).unwrap();
+        let ws = Workspace::from_root(&TEST_CTX, dir.path()).unwrap();
+        Arc::new(Mutex::new(WorkspaceState::open(ws).unwrap()))
+    }
+
+    fn file_read_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, FileReadTool) {
+        let state = test_workspace();
+        (Arc::clone(&state), FileReadTool::new(state))
+    }
+
+    fn file_write_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, FileWriteTool) {
+        let state = test_workspace();
+        (Arc::clone(&state), FileWriteTool::new(state))
+    }
+
+    fn file_append_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, FileAppendTool) {
+        let state = test_workspace();
+        (Arc::clone(&state), FileAppendTool::new(state))
+    }
+
+    fn file_delete_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, FileDeleteTool) {
+        let state = test_workspace();
+        (Arc::clone(&state), FileDeleteTool::new(state))
+    }
+
+    fn dir_list_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, DirListTool) {
+        let state = test_workspace();
+        (Arc::clone(&state), DirListTool::new(state))
+    }
+
+    fn dir_walk_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, DirWalkTool) {
+        let state = test_workspace();
+        (Arc::clone(&state), DirWalkTool::new(state))
+    }
+
+    /// `ShellTool` takes the workspace root rather than the state: its own
+    /// default working directory *is* that root.
+    fn shell_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, ShellTool) {
+        let state = test_workspace();
+        let root = state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .clone();
+        (Arc::clone(&state), ShellTool::new(root))
+    }
+
+    /// Put `content` in the *agent's* copy of `name` — the machine the
+    /// routing tests below must not touch.
+    fn write_workspace_file(state: &Arc<Mutex<WorkspaceState>>, name: &str, content: &str) {
+        state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .write_file(Path::new(name), content)
+            .unwrap();
+    }
+
+    fn read_workspace_file(state: &Arc<Mutex<WorkspaceState>>, name: &str) -> Option<String> {
+        state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .read_file(Path::new(name))
+            .ok()
+    }
+
+    /// The point of the unification: with an ACP client scoped, `file_read`
+    /// reads the *editor's* machine. The workspace and the fake client are
+    /// given deliberately different contents so the assertion cannot pass by
+    /// accident.
+    #[tokio::test]
+    async fn file_read_reads_the_clients_machine_inside_an_acp_session() {
+        let (state, tool) = file_read_tool_for_test();
+        // The agent's own file, which must NOT be what comes back.
+        write_workspace_file(&state, "note.txt", "agent side\n");
+
+        let client = Arc::new(FakeClient::default());
+        client.queue_read_result("client side\n");
+        let out = scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"path": "note.txt"})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "client side\n");
+        assert!(
+            client.read_paths().contains(&"note.txt".to_string()),
+            "the read must have gone to the client, got {:?}",
+            client.read_paths()
+        );
+    }
+
+    /// Without a client scoped, the same tool reads the agent's own machine —
+    /// unchanged behaviour for every non-ACP transport.
+    #[tokio::test]
+    async fn file_read_reads_the_agents_machine_outside_an_acp_session() {
+        let (state, tool) = file_read_tool_for_test();
+        write_workspace_file(&state, "note.txt", "agent side\n");
+        let out = tool.execute(&json!({"path": "note.txt"})).await.unwrap();
+        assert!(out.contains("agent side"), "got: {out}");
+    }
+
+    /// The write direction of the same routing: an ACP turn's `file_write`
+    /// lands on the editor's machine and the agent's own copy of that path is
+    /// left exactly as it was.
+    #[tokio::test]
+    async fn file_write_writes_the_clients_machine_inside_an_acp_session() {
+        let (state, tool) = file_write_tool_for_test();
+        write_workspace_file(&state, "note.txt", "agent side\n");
+
+        let client = Arc::new(FakeClient::default());
+        scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"path": "note.txt", "content": "client side\n"})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            client.writes.lock().unwrap().as_slice(),
+            &[("note.txt".to_string(), "client side\n".to_string())]
+        );
+        assert_eq!(
+            read_workspace_file(&state, "note.txt").as_deref(),
+            Some("agent side\n"),
+            "the agent's own file must be untouched: the write went to the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_writes_the_agents_machine_outside_an_acp_session() {
+        let (state, tool) = file_write_tool_for_test();
+        tool.execute(&json!({"path": "note.txt", "content": "agent side\n"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_workspace_file(&state, "note.txt").as_deref(),
+            Some("agent side\n")
+        );
+    }
+
+    /// `file_append` is not an ACP request at all: the client's file is read
+    /// whole, the addition concatenated, and the result written back. The
+    /// agent's own copy is the "before" in that pair and must stay it.
+    #[tokio::test]
+    async fn file_append_concatenates_on_the_clients_machine_inside_an_acp_session() {
+        let (state, tool) = file_append_tool_for_test();
+        write_workspace_file(&state, "note.txt", "agent side\n");
+
+        let client = Arc::new(FakeClient::default());
+        client.queue_read_result("client side\n");
+        let out = scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"path": "note.txt", "content": "more\n"})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "Appended: note.txt (+5 bytes)");
+        assert_eq!(
+            client.writes.lock().unwrap().as_slice(),
+            &[("note.txt".to_string(), "client side\nmore\n".to_string())],
+            "the client's existing content must be the prefix, not the agent's"
+        );
+        assert_eq!(
+            read_workspace_file(&state, "note.txt").as_deref(),
+            Some("agent side\n"),
+            "the agent's own file must be untouched"
+        );
+    }
+
+    /// `file_delete` on the client is `rm` over the terminal, since ACP has
+    /// no delete. The argv assertion is what pins the shape of that call —
+    /// the path travels as a positional argument, never interpolated into
+    /// the script — and the agent's own file is what proves the call went to
+    /// the other machine.
+    #[tokio::test]
+    async fn file_delete_deletes_on_the_clients_machine_inside_an_acp_session() {
+        let (state, tool) = file_delete_tool_for_test();
+        write_workspace_file(&state, "note.txt", "agent side\n");
+
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout("");
+        let out = scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"path": "note.txt"})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "Deleted: note.txt");
+        assert_eq!(
+            read_workspace_file(&state, "note.txt").as_deref(),
+            Some("agent side\n"),
+            "the agent's own file must be untouched: the delete ran on the client"
+        );
+        // Positional-argument placement is the whole contract here, and
+        // `$0` is the trap: `bash -c <script> <argv0> [args...]` puts the
+        // first word *after* the script in `$0`, so a path passed as
+        // `argv0` would land where no script reads it and every delete
+        // would fail. Assert every slot, not just "somewhere in the argv".
+        let creates = client.creates.lock().unwrap();
+        assert_eq!(creates[0].0, "bash");
+        let argv = &creates[0].1;
+        assert_eq!(argv[0], "-c");
+        assert_eq!(
+            argv[1],
+            crate::tools::client_tools::delete_script(),
+            "the script is the `-c` operand"
+        );
+        assert_eq!(
+            argv[2], "client_delete",
+            "argv0 is a placeholder; the path must not sit in `$0`, which no script reads"
+        );
+        assert_eq!(
+            argv[3], "note.txt",
+            "the path is `$1` — the first real argument — not interpolated into the script"
+        );
+        assert_eq!(argv.len(), 4, "no extra arguments: {argv:?}");
+    }
+
+    /// ACP's `terminal/create` takes a command plus an argv, not a shell
+    /// string, while this tool's own `command` parameter *is* a shell string.
+    /// So the ACP path has to spell `sh -c` out itself, and `workdir` maps
+    /// onto the client call's `cwd`.
+    #[tokio::test]
+    async fn shell_runs_the_command_line_through_sh_c_on_the_client() {
+        let (_state, tool) = shell_tool_for_test();
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout("hi\n");
+
+        let out = scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"command": "echo hi", "workdir": "/z"})),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("hi"), "got: {out}");
+        let creates = client.creates.lock().unwrap();
+        assert_eq!(creates[0].0, "sh");
+        assert_eq!(creates[0].1, vec!["-c".to_string(), "echo hi".to_string()]);
+        assert_eq!(
+            creates[0].2.as_deref(),
+            Some("/z"),
+            "`workdir` is the client call's `cwd`"
+        );
+    }
+
+    /// Outside an ACP session the same tool still runs on this machine — the
+    /// agent-side body, untouched.
+    #[tokio::test]
+    async fn shell_runs_on_the_agents_machine_outside_an_acp_session() {
+        let (_state, tool) = shell_tool_for_test();
+        let out = tool
+            .execute(&json!({"command": "echo agent side"}))
+            .await
+            .unwrap();
+        assert!(out.contains("agent side"), "got: {out}");
+    }
+
+    /// `dir_list` on an ACP turn runs on the editor's machine. The path is
+    /// outside this workspace on purpose (`/z`): the agent-side body would
+    /// refuse it, so a listing can only have come from the client.
+    ///
+    /// The queued stdout is what the script actually emits, in the script's own
+    /// order (agent-side pre-order DFS, `E` announcement first), because the
+    /// client passes that order through: a fixture in some other order would
+    /// only be testing the fixture.
+    #[tokio::test]
+    async fn dir_list_lists_the_clients_machine_inside_an_acp_session() {
+        let (_state, tool) = dir_list_tool_for_test();
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout("E\t/z\nF\t/z/a.txt\nF\t/z/b.txt\nD\t/z/sub\n");
+
+        let out = scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"path": "/z"})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "/z/a.txt\n/z/b.txt\n/z/sub/");
+        let creates = client.creates.lock().unwrap();
+        assert_eq!(creates.len(), 1, "exactly one terminal, on the client");
+        assert_eq!(
+            creates[0].0, "bash",
+            "the listing is a command on the client"
+        );
+    }
+
+    /// The same routing for `dir_walk`, whose two bounds are positional
+    /// arguments: `max_depth + 1` for `find` (it counts the starting point
+    /// as depth 0) and `max_entries + 1` so truncation is decidable without
+    /// a second round trip.
+    #[tokio::test]
+    async fn dir_walk_walks_the_clients_machine_inside_an_acp_session() {
+        let (_state, tool) = dir_walk_tool_for_test();
+        let client = Arc::new(FakeClient::default());
+        client.queue_terminal_stdout("F\t/z/f0\nF\t/z/f1\nF\t/z/f2\n");
+
+        let out = scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            tool.execute(&json!({"path": "/z", "max_depth": 2, "max_entries": 2})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            out,
+            "/z/f0\n/z/f1\n[truncated \u{2014} more than 2 entries; \
+             raise max_entries or narrow path]"
+        );
+        let creates = client.creates.lock().unwrap();
+        let argv = &creates[0].1;
+        assert_eq!(argv[3], "3", "max_depth + 1, got: {argv:?}");
+        assert_eq!(argv[4], "3", "max_entries + 1, got: {argv:?}");
+    }
+
+    /// Outside an ACP session both tools are the agent's own bodies, untouched:
+    /// sorted, directories with a trailing slash.
+    ///
+    /// The order is a **pre-order DFS**, which is what the client's script has
+    /// to reproduce: `sub` comes before the sibling file `sub.txt`, and
+    /// everything under `sub` is emitted right after `sub`. A flat sort of the
+    /// whole listing would put `sub.txt` first, because `/` sorts above `.`.
+    #[tokio::test]
+    async fn dir_list_still_lists_the_agents_machine_outside_an_acp_session() {
+        let (state, tool) = dir_list_tool_for_test();
+        let root = state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .clone();
+        write_workspace_file(&state, "a.txt", "a\n");
+        write_workspace_file(&state, "b.txt", "b\n");
+        write_workspace_file(&state, "sub/inner.txt", "inner\n");
+        write_workspace_file(&state, "sub.txt", "sub\n");
+
+        let out = tool
+            .execute(&json!({"path": root.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        // Sliced rather than compared whole: the workspace root carries the
+        // framework's own `.sapphire-agent` directory, which sorts before
+        // `a.txt` and is not what this test is about.
+        let lines: Vec<&str> = out.lines().collect();
+        let a = lines.iter().position(|l| *l == "a.txt").expect("a.txt");
+        assert_eq!(
+            &lines[a..a + 4],
+            ["a.txt", "b.txt", "sub/", "sub.txt"],
+            "one level, sorted, directories with a slash: {out}"
+        );
+    }
+
+    /// The truncation sentence is the same one `client_tools` adds, so a model
+    /// that learned it on this machine reads the client's answer the same way
+    /// -- neither machine's walk reports "there was more" in its own words.
+    /// Read from the shared function, so a reworded marker is reworded on both
+    /// sides or on neither.
+    #[tokio::test]
+    async fn dir_walk_truncates_on_the_agents_machine_with_the_same_marker() {
+        let (state, tool) = dir_walk_tool_for_test();
+        let dir = state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .join("d");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_workspace_file(&state, "d/a.txt", "a\n");
+        write_workspace_file(&state, "d/b.txt", "b\n");
+
+        let out = tool
+            .execute(&json!({"path": dir.to_str().unwrap(), "max_entries": 1}))
+            .await
+            .unwrap();
+
+        assert!(out.contains("a.txt"), "got: {out}");
+        assert!(out.contains(&truncation_marker(1)), "got: {out}");
+    }
+
+    /// A shell to run the client's own scripts with, or `None` where neither is
+    /// on `PATH` -- the same guard `skills`' script tests use. The scripts are
+    /// shell running on someone else's machine, so a Rust-side assertion that
+    /// never evaluates them would prove nothing about the order the two
+    /// machines produce.
+    fn shell_for_scripts() -> Option<&'static str> {
+        ["bash", "sh"].into_iter().find(|c| {
+            std::process::Command::new(c)
+                .arg("-c")
+                .arg("exit 0")
+                .status()
+                .is_ok()
+        })
+    }
+
+    /// Run one of the client's scripts the way `run_client_bash` does --
+    /// `<shell> -c <script> <argv0> <args...>` -- against a real directory.
+    fn run_client_script(
+        shell: &str,
+        script: &str,
+        argv0: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> std::process::Output {
+        let mut cmd = std::process::Command::new(shell);
+        cmd.arg("-c").arg(script).arg(argv0).args(args);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("the shell runs")
+    }
+
+    /// The review's finding, pinned against the real thing: the client's `find`
+    /// script must produce the **agent's own pre-order DFS** -- `sub`, the
+    /// entries under `sub`, then the sibling file `sub.txt` -- and not a flat
+    /// sort of the whole listing, which a byte comparison puts the other way
+    /// round (`/` is 0x2F, above `.`).
+    ///
+    /// Both machines are run against one real tree, so this is the comparison
+    /// the two fake-driven tests can only approximate: the agent's own tools on
+    /// this side, and the client's script through a real shell on the other.
+    #[tokio::test]
+    async fn the_client_scripts_keep_the_agents_own_dfs_order() {
+        let Some(shell) = shell_for_scripts() else {
+            return;
+        };
+        let (state, walk) = dir_walk_tool_for_test();
+        let list = DirListTool::new(Arc::clone(&state));
+        let root = state
+            .lock()
+            .expect("WorkspaceState mutex poisoned")
+            .workspace
+            .root
+            .clone();
+        write_workspace_file(&state, "a.txt", "a\n");
+        write_workspace_file(&state, "b.txt", "b\n");
+        write_workspace_file(&state, "sub/inner.txt", "inner\n");
+        write_workspace_file(&state, "sub.txt", "sub\n");
+        let root = root.to_str().unwrap().to_string();
+
+        // The agent's own tools, on this machine.
+        let agent_list = list.execute(&json!({"path": root})).await.unwrap();
+        let agent_walk = walk.execute(&json!({"path": root})).await.unwrap();
+
+        // The client's scripts, through a real shell, over the same tree.
+        let client_list = run_client_script(
+            shell,
+            &crate::tools::client_tools::list_script(),
+            "client_dir_list",
+            &[&root],
+            &[],
+        );
+        let client_walk = run_client_script(
+            shell,
+            &crate::tools::client_tools::walk_script(),
+            "client_dir_walk",
+            &[&root, "6", "1001"],
+            &[],
+        );
+        assert!(client_list.status.success(), "list script: {client_list:?}");
+        assert!(client_walk.status.success(), "walk script: {client_walk:?}");
+
+        // The agent's listing is relative to the workspace root (both tools
+        // treat it as internal), the script's is absolute: strip the shared
+        // prefix so the two are compared as one list of names, in one order.
+        let prefix = format!("{}/", root.trim_end_matches('/'));
+        let shape = |out: &std::process::Output| {
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let (entries, _) = crate::tools::client_tools::shape_entries(&stdout, &root, 1000);
+            entries
+                .into_iter()
+                .map(|entry| {
+                    entry
+                        .strip_prefix(&prefix)
+                        .expect("every entry is under the root")
+                        .to_string()
+                })
+                .collect::<Vec<String>>()
+        };
+
+        assert_eq!(shape(&client_list), agent_list.lines().collect::<Vec<_>>());
+        assert_eq!(shape(&client_walk), agent_walk.lines().collect::<Vec<_>>());
+
+        // The fixture's own sanity: the pair this task is about, in the order
+        // the agent emits it -- `sub` and its contents before the sibling file
+        // `sub.txt`.
+        let lines: Vec<&str> = agent_walk.lines().collect();
+        let sub = lines.iter().position(|l| *l == "sub/").expect("sub/");
+        assert_eq!(
+            &lines[sub..sub + 3],
+            ["sub/", "sub/inner.txt", "sub.txt"],
+            "the agent's DFS, which the client's script has to match: {agent_walk}"
+        );
+    }
+
+    /// The review's finding 2, pinned against the real thing: `find` prints
+    /// nothing on stdout when it cannot read the directory, so a script that
+    /// only reported what came back would let `(empty) <path>` stand in for a
+    /// path that is not there. The script refuses instead, before `find` runs,
+    /// and `run_client_bash` turns a non-zero exit into an error.
+    #[test]
+    fn the_client_script_refuses_a_missing_directory() {
+        let Some(shell) = shell_for_scripts() else {
+            return;
+        };
+        let missing = "/nonexistent-sapphire-agent-test-dir";
+        assert!(!std::path::Path::new(missing).exists());
+
+        for script in [
+            crate::tools::client_tools::list_script(),
+            crate::tools::client_tools::walk_script(),
+        ] {
+            let out =
+                run_client_script(shell, &script, "client_dir_list", &[missing, "3", "3"], &[]);
+            assert!(
+                !out.status.success(),
+                "a missing directory must not exit 0: {out:?}"
+            );
+            assert!(
+                out.stdout.is_empty(),
+                "nothing may reach stdout that could be shaped into a listing: {out:?}"
+            );
+        }
+    }
+
+    /// The review's other half of finding 2: `~/...` is quoted on its way into
+    /// `find`, and quoting is exactly what stops a tilde from expanding -- so
+    /// the path that every one of these tools advertises failed on the client.
+    /// The scripts now expand it against the **client's** `$HOME`, which is the
+    /// only `$HOME` that can answer for the client's machine; `file_delete`
+    /// carries the same resolution, since its `rm` was reachable the same way.
+    #[test]
+    fn the_client_scripts_resolve_a_tilde_against_the_clients_home() {
+        let Some(shell) = shell_for_scripts() else {
+            return;
+        };
+        let home =
+            std::env::temp_dir().join(format!("sapphire-agent-tilde-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("x")).unwrap();
+        std::fs::write(home.join("x/f.txt"), "f\n").unwrap();
+        let home = home.to_str().unwrap().to_string();
+        let env = [("HOME", home.as_str())];
+
+        let list = run_client_script(
+            shell,
+            &crate::tools::client_tools::list_script(),
+            "client_dir_list",
+            &["~/x"],
+            &env,
+        );
+        assert!(list.status.success(), "{list:?}");
+        let stdout = String::from_utf8_lossy(&list.stdout).into_owned();
+        assert!(
+            stdout.contains(&format!("E\t{home}/x\n")),
+            "the announcement names the client's resolved path: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("F\t{home}/x/f.txt\n")),
+            "`~` resolved against the client's own $HOME: {stdout}"
+        );
+
+        let delete = run_client_script(
+            shell,
+            &crate::tools::client_tools::delete_script(),
+            "client_delete",
+            &["~/x/f.txt"],
+            &env,
+        );
+        assert!(delete.status.success(), "{delete:?}");
+        assert!(
+            !std::path::Path::new(&home).join("x/f.txt").exists(),
+            "the tilde path must have deleted the client's file, not failed on it"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }

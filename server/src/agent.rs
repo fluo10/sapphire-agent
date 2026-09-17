@@ -562,11 +562,13 @@ impl Agent {
         // Filtered the same way `run_llm_turn` filters an ACP turn's
         // specs (see `visible_tool_predicate`'s doc): a Matrix/Discord
         // turn has no ACP client, so every client-capability flag is
-        // forced `false` here, hiding all six client-side tools —
-        // which could otherwise only ever answer "no editor is
-        // connected" — while `host_access_enabled` still governs the
-        // seven host-machine tools exactly as it does on every other
-        // transport.
+        // forced `false` here. That hides the names with no agent-side
+        // body — the lifecycle trio and the skill tools, which could
+        // otherwise only ever answer "no editor is connected" — while
+        // `host_access_enabled` remains the sole gate on the seven
+        // unified names (`file_read`, `file_write`, `file_append`,
+        // `file_delete`, `dir_list`, `dir_walk`, `shell`), whose
+        // agent-side bodies are what this transport runs.
         let host_access_enabled = self.config.tools.host_access.enabled;
         let tool_specs = match &self.tools {
             Some(t) => Some(
@@ -756,11 +758,19 @@ impl Agent {
                     // tool_use blocks in history keep every call, and
                     // the refusals below supply their tool_results.
                     let kinds = tools.kinds().await;
+                    // `routed_to_client` is `false`, and it is `false`
+                    // for the whole channel path rather than a value
+                    // read from somewhere: a Matrix/Discord turn never
+                    // has an ACP client, so the host gate speaks for
+                    // every one of these names here exactly as it always
+                    // has. #270 changed the gate's meaning on ACP turns
+                    // only; this path is the control case.
                     let (tool_calls, refused) = crate::tools::policy::partition_without_asking(
                         crate::tools::policy::Origin::Channel,
                         &tool_calls,
                         &kinds,
                         self.config.tools.host_access.enabled,
+                        false,
                     );
                     for (id, reason) in &refused {
                         info!("Refused tool call {id} on the channel path: {reason}");
@@ -996,7 +1006,8 @@ mod tests {
     async fn the_channel_gate_refuses_shell_but_keeps_the_chat_tools() {
         let (calls, kinds) = channel_gate_test_calls().await;
 
-        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds, true);
+        let (permitted, refused) =
+            partition_without_asking(Origin::Channel, &calls, &kinds, true, false);
 
         let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
@@ -1046,7 +1057,8 @@ mod tests {
     async fn the_channel_gate_also_refuses_host_tools_when_host_access_is_off() {
         let (calls, kinds) = channel_gate_test_calls().await;
 
-        let (permitted, refused) = partition_without_asking(Origin::Channel, &calls, &kinds, false);
+        let (permitted, refused) =
+            partition_without_asking(Origin::Channel, &calls, &kinds, false, false);
 
         let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
