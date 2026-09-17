@@ -267,8 +267,7 @@ async fn main() -> Result<()> {
     let migration_errors = config.migration_errors();
     if !migration_errors.is_empty() {
         anyhow::bail!(
-            "config at {} uses settings that were removed in the device-registry \
-             migration:\n\n  - {}\n",
+            "config at {} uses settings that were removed:\n\n  - {}\n",
             config_path.display(),
             migration_errors.join("\n\n  - ")
         );

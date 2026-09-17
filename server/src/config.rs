@@ -1663,9 +1663,9 @@ api_key = "test"
             errors.push(
                 "[tools.admin].rooms was replaced by `[tools.admin].room_profiles`, which names \
                  room profiles instead of room ids. Delete the `rooms` line and write the room \
-                 profile names you mean, e.g. `room_profiles = [\"ops\"]` — the profile whose \
-                 `[room_profile.<name>]` block the room is listed under in that block's `rooms` \
-                 array. Leaving `rooms` in place would drop the grant without saying so, so \
+                 profile names you mean, e.g. `room_profiles = [\"ops\"]`. For each room, use \
+                 the name of the profile whose `[room_profile.<name>].rooms` array lists that \
+                 room. Leaving `rooms` in place would drop the grant without saying so, so \
                  startup refuses until it is gone."
                     .to_string(),
             );

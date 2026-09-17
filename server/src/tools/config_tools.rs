@@ -712,8 +712,12 @@ impl TaskTestTool {
     }
 
     /// The namespace the test session lands in: the calling room profile's, so
-    /// the report is readable where the operator already is. `None` only
-    /// happens on a path the gate has already refused.
+    /// the report is readable where the operator already is. `None` is the
+    /// lookup's answer on every path with neither a timer origin nor a
+    /// task-local profile — voice-origin turns, turns that pin no profile
+    /// (`/rpc`, A2A, unattended), and callers outside any turn at all,
+    /// whether or not the gate could ever be reached. Display only, so this
+    /// degrades to the default namespace rather than failing the report.
     fn namespace(&self) -> &str {
         match current_admin_room_profile_for(&self.state.config) {
             Some(name) => self.state.config.namespace_for_room_profile(&name),
