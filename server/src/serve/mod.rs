@@ -2377,6 +2377,17 @@ pub(crate) struct TurnContext {
     /// `tools.subagent.max_depth`, this is what `subagent_tool_specs`
     /// uses to decide whether this turn may delegate further.
     pub subagent_depth: u32,
+    /// The room profile this turn's admin-tool grant hangs on, or `None` on a
+    /// transport that names no profile an operator could have allowed
+    /// (`/rpc`, A2A, voice, the unattended loops). Set by `run_llm_turn` from
+    /// the profile an ACP session pinned, and read through
+    /// `config_tools::current_admin_room_profile_for` while a tool call runs.
+    ///
+    /// Copied straight into the nested `TurnLoop` a delegated subagent builds,
+    /// so a delegation keeps the grant its parent ran under — the grant is the
+    /// session's, not the caller's, the same way `timer_origin` is carried.
+    /// A definition that must not hold it narrows its own `tools:` instead.
+    pub admin_room_profile: Option<String>,
 }
 
 tokio::task_local! {
@@ -2427,6 +2438,10 @@ pub(crate) struct TurnLoop<'a> {
     /// builds its `TurnLoop` with `0`; a nested subagent turn with its
     /// delegator's depth + 1.
     pub subagent_depth: u32,
+    /// The admin-tool grant this loop's tool calls are judged by. Copied into
+    /// every round's `TurnContext` and scoped around tool execution the same
+    /// way `timer_origin` is. See `TurnContext::admin_room_profile`.
+    pub admin_room_profile: Option<String>,
 }
 
 impl TurnLoop<'_> {
@@ -2697,6 +2712,7 @@ impl TurnLoop<'_> {
                     let tools = Arc::clone(&self.state.tools);
                     let ns = namespace.clone();
                     let timer_origin = self.timer_origin.clone();
+                    let admin_room_profile = self.admin_room_profile.clone();
                     // Read once per turn, same as `timer_origin`: `None` on
                     // every non-ACP transport, which is what keeps the
                     // client-side tools refusing there rather than reaching
@@ -2719,6 +2735,7 @@ impl TurnLoop<'_> {
                         timer_origin: timer_origin.clone(),
                         session_id: self.persistence.map(|p| p.session_id.clone()),
                         subagent_depth: self.subagent_depth,
+                        admin_room_profile: self.admin_room_profile.clone(),
                     });
                     let mut results: Vec<(String, crate::tools::ToolOutput)> =
                         futures_util::future::join_all(permitted.into_iter().map(|c| {
@@ -2727,6 +2744,7 @@ impl TurnLoop<'_> {
                             let origin = timer_origin.clone();
                             let client = acp_client.clone();
                             let turn_ctx = Arc::clone(&turn_ctx);
+                            let admin_room_profile = admin_room_profile.clone();
                             async move {
                                 let fut = crate::tools::workspace_tools::scope_memory_namespace(
                                     ns,
@@ -2743,6 +2761,17 @@ impl TurnLoop<'_> {
                                 // so `current_turn_context()` is available
                                 // to any tool this round, not just the one
                                 // named `subagent`.
+                                // The admin tools read this through
+                                // `config_tools::current_admin_room_profile()`.
+                                // Scoped here rather than inside the match
+                                // below so the four (origin, client) arms do
+                                // not each need their own copy; `None` is a
+                                // meaningful value (no profile to allow), not
+                                // "unset".
+                                let fut = crate::tools::config_tools::scope_admin_room_profile(
+                                    admin_room_profile.clone(),
+                                    fut,
+                                );
                                 let fut = scope_turn_context(turn_ctx, fut);
                                 // Both remaining scopes have to wrap
                                 // execution too: the timer tool reads one
@@ -2884,6 +2913,23 @@ pub(crate) async fn run_llm_turn(
     // turn lands in the same place (device-default vs cross-device).
     let store = Arc::clone(state.store_for_session(&session_id));
     let is_acp = state.is_acp(&session_id).await;
+    // The room profile this turn's admin-tool grant hangs on. An ACP session
+    // carries the one its bearer token pinned at `session/new` (or
+    // `load`/`resume`); `/rpc`, A2A, voice and the unattended loops name no
+    // profile an operator declared, so they get `None` and the admin tools
+    // refuse there. Channel rooms never reach this function — `Agent::
+    // handle_message` runs its own loop, where the room travels as
+    // `TimerOrigin::Chat` instead.
+    let admin_room_profile = if is_acp {
+        state
+            .session_room_profiles
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+    } else {
+        None
+    };
 
     // 1. Hydrate history fresh from storage every turn, rather than only
     //    the first time this process touches the session.
@@ -3060,6 +3106,7 @@ pub(crate) async fn run_llm_turn(
         namespace: namespace.clone(),
         persistence: Some(&persistence),
         subagent_depth: 0,
+        admin_room_profile: admin_room_profile.clone(),
     }
     .run(&mut history)
     .await;
@@ -3432,6 +3479,78 @@ impl crate::tools::Tool for NamedStubTool {
     }
 }
 
+/// A `ToolKind::Read` tool registered under a name the ACP turn's visibility
+/// predicate passes through, whose only job is to record which room profile
+/// the surrounding tool execution was scoped with.
+///
+/// The task-local is only observable from inside a tool, which is exactly
+/// where the gate reads it, so a probe is the honest instrument: a test that
+/// asserted on the scope directly would pin the plumbing rather than the
+/// behaviour. Registered by name (`heartbeat_config`) that
+/// `visible_tool_predicate` neither gates on `host_access` nor on a client
+/// capability, so it is offered on both the ACP and the non-ACP path.
+#[cfg(test)]
+pub(crate) struct AdminProfileProbe {
+    seen: std::sync::Mutex<Option<Option<String>>>,
+    spec: crate::provider::ToolSpec,
+}
+
+#[cfg(test)]
+impl AdminProfileProbe {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            seen: std::sync::Mutex::new(None),
+            spec: crate::provider::ToolSpec {
+                name: "heartbeat_config".into(),
+                description: "Records the room profile this turn scoped.".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        })
+    }
+
+    /// `Some(value)` once the tool ran, `None` before it did.
+    pub(crate) fn seen(&self) -> Option<Option<String>> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::tools::Tool for AdminProfileProbe {
+    fn spec(&self) -> &crate::provider::ToolSpec {
+        &self.spec
+    }
+
+    fn kind(&self) -> crate::tools::ToolKind {
+        crate::tools::ToolKind::Read
+    }
+
+    async fn execute(&self, _input: &serde_json::Value) -> anyhow::Result<String> {
+        *self.seen.lock().unwrap() = Some(crate::tools::config_tools::current_admin_room_profile());
+        Ok("probed".to_string())
+    }
+}
+
+/// The tool is registered as a `Box<dyn Tool>`, which needs a direct
+/// `Tool` impl — but the test keeps its own `Arc` handle to read
+/// `seen()` after registration. Forwarding through the `Arc` (the same
+/// shape `SkillTool` and `SubagentTool` use) lets one instance back
+/// both the registration and the assertion handle.
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::tools::Tool for Arc<AdminProfileProbe> {
+    fn spec(&self) -> &crate::provider::ToolSpec {
+        (**self).spec()
+    }
+
+    fn kind(&self) -> crate::tools::ToolKind {
+        (**self).kind()
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> anyhow::Result<String> {
+        (**self).execute(input).await
+    }
+}
 /// Every `chat()` call a [`StubProvider`] has seen, in call order:
 /// `(system, tool names offered)`. `system` is owned (not the borrowed
 /// `Option<&str>` `chat()` receives) so the log outlives the call.
@@ -3997,6 +4116,218 @@ mod tests {
             ran.load(std::sync::atomic::Ordering::SeqCst),
             "a trusted origin must have executed it"
         );
+    }
+
+    /// The control case for the ACP test in `serve::acp`: `/rpc` and A2A
+    /// call `run_llm_turn` with no ACP session behind them, so no profile
+    /// is scoped and the admin tools refuse. Asserting `None` — not merely
+    /// "not 'developer'" — keeps the two paths distinguishable.
+    #[tokio::test]
+    async fn a_non_acp_turn_scopes_no_room_profile() {
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "heartbeat_config".to_string(),
+                        input: json!({"action": "list"}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        let probe = AdminProfileProbe::new();
+        state
+            .tools
+            .register_tool(Box::new(Arc::clone(&probe)))
+            .await;
+
+        run_llm_turn(
+            Arc::clone(&state),
+            "s-plain".to_string(),
+            ChatMessage::user("go"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert_eq!(probe.seen(), Some(None), "no profile may be scoped here");
+    }
+
+    /// A config tool must be reachable through the room profile an ACP
+    /// session pinned — the whole grant this branch wires. Read
+    /// end to end through `run_llm_turn`, not by inspecting fields: an
+    /// implementation that computed the profile but never scoped it
+    /// around tool execution (or scoped a value other than the session's
+    /// pinned one) must fail here, the way Task 4's probe would.
+    ///
+    /// The tool is a real `ConfigTool` over a real workspace with
+    /// `[tools.admin].room_profiles = ["ops"]`; the turn is an ACP turn
+    /// only by `state.acp_sessions` plus the pin in
+    /// `session_room_profiles`, exactly what `session/new` writes. The
+    /// policy layer is left at the default `Origin::Trusted` so the
+    /// profile gate is the only permission this call passes through —
+    /// if the profile does not reach the tool, the call is refused.
+    #[tokio::test]
+    async fn an_acp_turn_carries_its_pinned_room_profile_to_its_tools() {
+        let (state, _dir) = scripted_state_with_agent_config(vec!["ops".to_string()]).await;
+
+        // The pin `session/new` writes: ACP session + a room profile name.
+        let sid = "acp-profile-carry".to_string();
+        state.acp_sessions.lock().await.insert(sid.clone());
+        state
+            .session_room_profiles
+            .lock()
+            .await
+            .insert(sid.clone(), "ops".to_string());
+
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("list the agents"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("listed"));
+        let result = tool_result_for(&state, &sid, "call-1").await;
+        assert!(
+            result.contains("No agents definitions."),
+            "the profile gate must have opened: got {result}"
+        );
+    }
+
+    /// The fail-closed half: a turn on a transport that pins no profile
+    /// (`/rpc` — not in `acp_sessions`) is refused by the profile gate
+    /// even though a profile is on the allow list, and the turn still
+    /// carries on with the refusal as the tool's result.
+    #[tokio::test]
+    async fn a_non_acp_turn_is_refused_by_the_profile_gate() {
+        let (state, _dir) = scripted_state_with_agent_config(vec!["ops".to_string()]).await;
+
+        // Not registered in `acp_sessions`, so this is an /rpc session —
+        // `run_llm_turn` must hand its tools no profile at all, not the
+        // one some *other* session pinned.
+        let sid = "rpc-no-profile".to_string();
+        state
+            .session_room_profiles
+            .lock()
+            .await
+            .insert("some-other-session".to_string(), "ops".to_string());
+
+        run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("list the agents"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        let result = tool_result_for(&state, &sid, "call-1").await;
+        assert!(
+            result.contains("Permission denied") && result.contains("room_profiles"),
+            "a /rpc turn must be refused by the profile gate: got {result}"
+        );
+    }
+
+    /// The state + real `agent_config` tool the two wiring tests above
+    /// share: a scripted one-round-then-answer provider, and a
+    /// `ConfigTool` over `state.workspace` itself with
+    /// `[tools.admin].room_profiles` set to `profiles`. The framework
+    /// workspace the tool writes through is opened over the same
+    /// directory (`Workspace::from_root` needs the `.sapphire-agent`
+    /// marker), with a cache dir under the leaked test TempDir so the
+    /// redb files it creates are reclaimed with the process.
+    ///
+    /// The returned `TempDir` must be held: it is the only thing keeping
+    /// the workspace directory (and everything pointing into it) alive.
+    #[cfg(test)]
+    async fn scripted_state_with_agent_config(
+        profiles: Vec<String>,
+    ) -> (Arc<ServeState>, Box<tempfile::TempDir>) {
+        static TEST_CTX: std::sync::OnceLock<sapphire_framework::workspace::AppContext> =
+            std::sync::OnceLock::new();
+        let ctx = TEST_CTX.get_or_init(|| {
+            sapphire_framework::workspace::AppContext::new("sapphire-agent").allow_external_paths()
+        });
+
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "agent_config".to_string(),
+                        input: json!({"action": "list"}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: Some("listed".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+        let dir = Box::new(tempfile::tempdir().unwrap());
+        let root = dir.path().to_path_buf();
+        // `state.workspace`'s own dir is inside the leaked fixture base,
+        // not this one — the tool's `workspace_root` is what matters, so
+        // point both at the same root.
+        std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
+        ctx.set_cache_dir(root.join(".sapphire-agent-cache"));
+
+        let mut config = state.config.clone();
+        config.tools.admin.room_profiles = profiles;
+        let sw = sapphire_framework::workspace::Workspace::from_root(ctx, &root).unwrap();
+        let ws = Arc::new(std::sync::Mutex::new(
+            sapphire_framework::workspace::WorkspaceState::open(sw).unwrap(),
+        ));
+
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::config_tools::ConfigTool::new(
+                crate::tools::config_tools::ConfigDir::Agents,
+                root,
+                config,
+                ws,
+                None,
+                std::sync::Weak::new(),
+            )))
+            .await;
+        (state, dir)
+    }
+
+    /// The text of the `tool_result` answering `tool_use_id` in `sid`'s
+    /// history — the way the model itself would see it.
+    async fn tool_result_for(state: &Arc<ServeState>, sid: &str, tool_use_id: &str) -> String {
+        let history = state.sessions.lock().await;
+        let messages = history.get(sid).expect("the session exists");
+        messages
+            .iter()
+            .flat_map(|m| &m.parts)
+            .find_map(|part| match part {
+                ContentPart::ToolResult {
+                    tool_use_id: id,
+                    content,
+                } if id == tool_use_id => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the call still owes the model a tool_result")
     }
 
     /// A subagent runs under the parent's `Origin`, so it cannot do

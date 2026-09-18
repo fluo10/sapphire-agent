@@ -810,6 +810,7 @@ impl SubagentTool {
             tool_specs: &specs,
             progress: &progress,
             timer_origin: ctx.timer_origin.clone(),
+            admin_room_profile: ctx.admin_room_profile.clone(),
             namespace,
             // This nested turn sits one level below whoever delegated to
             // it, so it can delegate further exactly when
@@ -1789,6 +1790,7 @@ mod tests {
             // pass because a test handed it a `Some`.
             session_id: None,
             subagent_depth: 0,
+            admin_room_profile: None,
         })
     }
 
@@ -1833,6 +1835,7 @@ mod tests {
                 timer_origin: None,
                 session_id: Some("parent-session".to_string()),
                 subagent_depth: 0,
+                admin_room_profile: None,
             })
         };
 
